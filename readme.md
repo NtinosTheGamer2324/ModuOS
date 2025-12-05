@@ -2,7 +2,6 @@
 
 ModuOS is a hobby operating system written in C and assembly for the AMD64 architecture. It includes a custom kernel, drivers, file system support, and basic applications and games. The project uses Docker for building and QEMU for testing.
 
-
 ## Requirements
 
 - [Docker Desktop](https://www.docker.com/products/docker-desktop)
@@ -19,11 +18,18 @@ ModuOS is a hobby operating system written in C and assembly for the AMD64 archi
 git clone https://github.com/yourusername/ModuOS.git
 cd ModuOS
 
+2. **Build the Docker image for ModuOS:**
 
-2. **Ensure Docker is running.**  
+Before running the build script, you need to create the Docker image used for compiling the kernel:
+
+docker build buildenv -t modu-os
+
+This will use the Dockerfile in the `buildenv` folder to create the `modu-os` image.
+
+3. **Ensure Docker is running.**  
    The `run.bat` script will automatically start Docker if it is not running.
 
-3. **Provide a disk image manually:**  
+4. **Provide a disk image manually:**  
    Create a **1GB FAT32-formatted disk image** named `disk.img` in the project root.  
    Example tools you can use on Windows:
    - [Win32 Disk Imager](https://sourceforge.net/projects/win32diskimager/)
@@ -31,12 +37,12 @@ cd ModuOS
 
 > ⚠️ The script **does not create the disk image automatically**. You must provide it manually.
 
-4. **Run the build and test script:**
+5. **Run the build and test script:**
 
 run.bat
 
 This script will:
-- Build the kernel inside Docker.
+- Build the kernel inside Docker using the `modu-os` image.
 - Boot the kernel in QEMU using your provided `disk.img`.
 - Output logs to `com1.log` and `com2.log`.
 
@@ -58,6 +64,7 @@ ModuOS/
 ```
 
 ### Log Viewer for COM Logs
+
 
 To view the ModuOS log files (com1.log, com2.log), you need the Log Viewer application:
 
