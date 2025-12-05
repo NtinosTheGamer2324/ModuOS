@@ -57,6 +57,22 @@ ModuOS/
 └── LICENSE # Project license
 ```
 
+### Log Viewer for COM Logs
+
+To view the ModuOS log files (com1.log, com2.log), you need the Log Viewer application:
+
+1. Download the Log Viewer executable from SourceForge:
+   https://sourceforge.net/projects/log-viewer-v1/
+
+2. Create the following folder structure inside your ModuOS project:
+   vendor/
+       NTSoftware/
+           Log Viewer.exe
+
+3. Place the downloaded Log Viewer.exe inside the NTSoftware folder.
+
+⚠️ This step is required for the COM log viewing functionality. The repository does not include the executable due to size and licensing considerations.
+
 
 ---
 
