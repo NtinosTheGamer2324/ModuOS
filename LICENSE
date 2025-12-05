@@ -5,16 +5,3 @@ Copyright (C) 2025 New Technologies Software
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License version 2 only,
 as published by the Free Software Foundation.
-
-An explicit syscall exception applies, allowing certain system calls
-to be used by external programs without imposing GPL on them. Details
-can be found in:
-
-    LICENSES/exceptions/Linux-syscall-note
-
-Other licenses may also apply to specific parts of the project.
-Please consult:
-
-    Documentation/process/license-rules.rst
-
-SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-exception
