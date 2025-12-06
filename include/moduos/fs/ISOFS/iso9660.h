@@ -7,13 +7,13 @@
 #define ISO9660_MAX_MOUNTS 8
 
 typedef struct {
-    int active;              /* Is this slot in use? */
-    int drive_index;
+    int active;
+    int vdrive_id;      
     uint32_t partition_lba;
     uint32_t logical_block_size;
     uint32_t root_extent_lba;
     uint32_t root_size;
-    int is_atapi;
+    int is_optical;
 } iso9660_fs_t;
 
 /* ISO9660 directory entry info (for fs_stat compatibility) */

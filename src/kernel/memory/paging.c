@@ -299,32 +299,48 @@ int paging_map_range_to_pml4(uint64_t *pml4_virt, uint64_t virt_base, uint64_t p
 }
 
 uint64_t paging_virt_to_phys(uint64_t virt) {
-    if (!pml4) return 0;
-
-    unsigned i4 = (virt >> 39) & 0x1FF;
-    unsigned i3 = (virt >> 30) & 0x1FF;
-    unsigned i2 = (virt >> 21) & 0x1FF;
-    unsigned i1 = (virt >> 12) & 0x1FF;
-
-    uint64_t ent4 = pml4[i4];
-    if (!(ent4 & PFLAG_PRESENT)) return 0;
-    uint64_t *pdpt = (uint64_t *)phys_to_virt(ent4 & PAGE_MASK);
-    if (!pdpt) return 0;
-
-    uint64_t ent3 = pdpt[i3];
-    if (!(ent3 & PFLAG_PRESENT)) return 0;
-    uint64_t *pd = (uint64_t *)phys_to_virt(ent3 & PAGE_MASK);
-    if (!pd) return 0;
-
-    uint64_t ent2 = pd[i2];
-    if (!(ent2 & PFLAG_PRESENT)) return 0;
-    uint64_t *pt = (uint64_t *)phys_to_virt(ent2 & PAGE_MASK);
-    if (!pt) return 0;
-
-    uint64_t ent1 = pt[i1];
-    if (!(ent1 & PFLAG_PRESENT)) return 0;
-
-    uint64_t phys_page = ent1 & PAGE_MASK;
-    uint64_t offset = virt & 0xFFFULL;
-    return phys_page + offset;
+    // Get current PML4
+    uint64_t *pml4 = paging_get_pml4();
+    
+    // Extract indices from virtual address
+    uint64_t pml4_idx = (virt >> 39) & 0x1FF;
+    uint64_t pdpt_idx = (virt >> 30) & 0x1FF;
+    uint64_t pd_idx   = (virt >> 21) & 0x1FF;
+    uint64_t pt_idx   = (virt >> 12) & 0x1FF;
+    uint64_t offset   = virt & 0xFFF;
+    
+    // Check PML4 entry
+    if (!(pml4[pml4_idx] & PFLAG_PRESENT)) {
+        return 0; // Not mapped
+    }
+    
+    // Get PDPT
+    uint64_t *pdpt = (uint64_t*)(pml4[pml4_idx] & 0xFFFFFFFFF000ULL);
+    if (!(pdpt[pdpt_idx] & PFLAG_PRESENT)) {
+        return 0; // Not mapped
+    }
+    
+    // Get PD
+    uint64_t *pd = (uint64_t*)(pdpt[pdpt_idx] & 0xFFFFFFFFF000ULL);
+    if (!(pd[pd_idx] & PFLAG_PRESENT)) {
+        return 0; // Not mapped
+    }
+    
+    // Check for 2MB page
+    if (pd[pd_idx] & (1ULL << 7)) {
+        // 2MB page
+        uint64_t page_phys = pd[pd_idx] & 0xFFFFFFFE00000ULL;
+        uint64_t page_offset = virt & 0x1FFFFF;
+        return page_phys | page_offset;
+    }
+    
+    // Get PT
+    uint64_t *pt = (uint64_t*)(pd[pd_idx] & 0xFFFFFFFFF000ULL);
+    if (!(pt[pt_idx] & PFLAG_PRESENT)) {
+        return 0; // Not mapped
+    }
+    
+    // Get physical address
+    uint64_t page_phys = pt[pt_idx] & 0xFFFFFFFFF000ULL;
+    return page_phys | offset;
 }

@@ -1,6 +1,5 @@
 #include "moduos/fs/ISOFS/iso9660.h"
-#include "moduos/drivers/Drive/ATA/ata.h"
-#include "moduos/drivers/Drive/ATA/atapi.h"
+#include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/memory/string.h"
 #include <stdint.h>
@@ -40,21 +39,41 @@ static int iso9660_valid_handle(int handle) {
 
 /* Read blocks relative to partition for ATA, or absolute for ATAPI */
 static int read_logical_blocks_rel(const iso9660_fs_t* fs, uint32_t block_rel, uint32_t block_count, void* buffer) {
-    if (fs->is_atapi) {
-        return atapi_read_blocks_pio(fs->drive_index, block_rel, block_count, buffer);
+    if (fs->is_optical) {
+        // Use ATAPI directly for optical drives
+        extern int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* out);
+        
+        vdrive_t* vdrive = vdrive_get(fs->vdrive_id);
+        if (!vdrive) return -1;
+        
+        int ata_index = vdrive->backend_id;
+        
+        // For optical, block_rel is already the logical block number (2048 bytes)
+        // Add partition_lba if it's non-zero (shouldn't be for optical, but just in case)
+        uint32_t absolute_block = fs->partition_lba + block_rel;
+        
+        return atapi_read_blocks_pio(ata_index, absolute_block, block_count, buffer);
     } else {
+        // For hard drives, convert logical blocks to 512-byte sectors
         uint32_t sectors_per_block = fs->logical_block_size / 512;
         uint32_t start_sector = fs->partition_lba + block_rel * sectors_per_block;
-        return ata_read_sectors(fs->drive_index, start_sector, buffer, sectors_per_block * block_count);
+        uint32_t total_sectors = sectors_per_block * block_count;
+        
+        int result = vdrive_read(fs->vdrive_id, start_sector, total_sectors, buffer);
+        return (result == VDRIVE_SUCCESS) ? 0 : -1;
     }
 }
 
 /* --- PUBLIC API --- */
 
-int iso9660_mount(int drive_index, uint32_t partition_lba) {
+int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
     iso9660_init_once();
     
-    if (drive_index < 0 || drive_index > 3) return -1;
+    // Validate vDrive
+    if (!vdrive_is_ready(vdrive_id)) {
+        VGA_Writef("ISO9660: vDrive %d not ready\n", vdrive_id);
+        return -1;
+    }
 
     int handle = iso9660_alloc_handle();
     if (handle < 0) {
@@ -65,25 +84,48 @@ int iso9660_mount(int drive_index, uint32_t partition_lba) {
     iso9660_fs_t* fs = &iso_mounts[handle];
     memset(fs, 0, sizeof(iso9660_fs_t));
     
-    fs->drive_index = drive_index;
+    fs->vdrive_id = vdrive_id;
     fs->partition_lba = partition_lba;
 
-    /* Detect ATAPI device */
-    const ata_drive_t* d = ata_get_drive(drive_index);
-    fs->is_atapi = (d && d->exists && d->is_atapi);
+    // Check if it's an optical drive
+    vdrive_t* vdrive = vdrive_get(vdrive_id);
+    if (vdrive) {
+        fs->is_optical = (vdrive->type == VDRIVE_TYPE_ATA_ATAPI || 
+                         vdrive->type == VDRIVE_TYPE_SATA_OPTICAL);
+    }
 
     /* Read PVD sector (logical block 16) */
     uint8_t pvd_buf[2048];
-    int r;
-    if (fs->is_atapi) {
-        r = atapi_read_blocks_pio(drive_index, ISO9660_PVD_SECTOR, 1, pvd_buf);
+    
+    // CRITICAL FIX: For optical drives, use ATAPI which reads 2048-byte blocks directly
+    // For regular drives, calculate sector position (512-byte sectors)
+    if (fs->is_optical) {
+        // Optical drive: read 2048-byte block 16 directly using ATAPI
+        VGA_Writef("ISO9660: Reading PVD from optical drive (block %d)...\n", ISO9660_PVD_SECTOR);
+        
+        // Use ATAPI directly for optical drives
+        extern int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* out);
+        
+        // Get the backend drive index (ATA index, not vDrive index)
+        int ata_index = vdrive->backend_id;
+        
+        int r = atapi_read_blocks_pio(ata_index, ISO9660_PVD_SECTOR, 1, pvd_buf);
+        if (r != 0) {
+            VGA_Writef("ISO9660: ATAPI read failed (error %d)\n", r);
+            return -3;
+        }
     } else {
-        uint32_t pvd_sector = partition_lba + ISO9660_PVD_SECTOR * (2048 / 512);
-        r = ata_read_sectors(drive_index, pvd_sector, pvd_buf, 2048 / 512);
-    }
-    if (r != 0) {
-        VGA_Writef("ISO9660: failed to read PVD from drive %d\n", drive_index);
-        return -3;
+        // Regular hard drive: calculate LBA in 512-byte sectors
+        // Block 16 * 4 sectors per block = sector 64
+        uint32_t pvd_lba = partition_lba + (ISO9660_PVD_SECTOR * 4);
+        
+        VGA_Writef("ISO9660: Reading PVD from hard drive (sector %u)...\n", pvd_lba);
+        
+        int r = vdrive_read(vdrive_id, pvd_lba, 4, pvd_buf);
+        if (r != VDRIVE_SUCCESS) {
+            VGA_Writef("ISO9660: failed to read PVD from vDrive %d\n", vdrive_id);
+            return -3;
+        }
     }
 
     /* Validate PVD */
@@ -105,34 +147,45 @@ int iso9660_mount(int drive_index, uint32_t partition_lba) {
     fs->root_size = rd[10] | (rd[11] << 8) | (rd[12] << 16) | (rd[13] << 24);
     fs->active = 1;
 
-    VGA_Writef("ISO9660: mounted handle=%d, drive=%d, lbs=%u, root_extent=%u, atapi=%d\n",
-               handle, drive_index, fs->logical_block_size, fs->root_extent_lba, fs->is_atapi);
+    VGA_Writef("ISO9660: mounted handle=%d, vdrive=%d, lbs=%u, root_extent=%u, optical=%d\n",
+               handle, vdrive_id, fs->logical_block_size, fs->root_extent_lba, fs->is_optical);
     return handle;
 }
 
-int iso9660_mount_auto(int drive_index) {
+int iso9660_mount_auto(int vdrive_id) {
     iso9660_init_once();
     
-    int start = (drive_index >= 0) ? drive_index : 0;
-    int end = (drive_index >= 0) ? drive_index : 3;
+    int start = (vdrive_id >= 0) ? vdrive_id : 0;
+    int end = (vdrive_id >= 0) ? vdrive_id : (vdrive_get_count() - 1);
 
     for (int d = start; d <= end; d++) {
+        if (!vdrive_is_ready(d)) {
+            continue;
+        }
+        
+        // Try direct mount (works for optical drives and whole-disk ISOs)
         int handle = iso9660_mount(d, 0);
         if (handle >= 0) return handle;
 
-        /* Try MBR partitions */
-        uint8_t mbr[512];
-        if (ata_read_sector_lba28(d, 0, mbr) != 0) continue;
-        if (mbr[510] != 0x55 || mbr[511] != 0xAA) continue;
+        // Try MBR partitions for hard drives
+        vdrive_t* vdrive = vdrive_get(d);
+        if (vdrive && !vdrive->read_only) {
+            uint8_t mbr[512];
+            if (vdrive_read_sector(d, 0, mbr) != VDRIVE_SUCCESS) continue;
+            if (mbr[510] != 0x55 || mbr[511] != 0xAA) continue;
 
-        for (int i = 0; i < 4; i++) {
-            uint32_t off = 0x1BE + i * 16;
-            uint32_t lba = mbr[off + 8] | (mbr[off + 9] << 8) | (mbr[off + 10] << 16) | (mbr[off + 11] << 24);
-            if (lba == 0) continue;
-            handle = iso9660_mount(d, lba);
-            if (handle >= 0) return handle;
+            for (int i = 0; i < 4; i++) {
+                uint32_t off = 0x1BE + i * 16;
+                uint32_t lba = mbr[off + 8] | (mbr[off + 9] << 8) | 
+                              (mbr[off + 10] << 16) | (mbr[off + 11] << 24);
+                if (lba == 0) continue;
+                
+                handle = iso9660_mount(d, lba);
+                if (handle >= 0) return handle;
+            }
         }
     }
+    
     VGA_Write("ISO9660: no valid PVD found\n");
     return -1;
 }
@@ -173,13 +226,13 @@ int iso9660_read_extent(int handle, uint32_t extent_lba, uint32_t size_bytes, vo
     uint32_t blocks = (size_bytes + lbs - 1) / lbs;
     
     // Temporary buffer for reading full blocks
-    static uint8_t block_buf[2048];  // ISO9660 standard block size
+    static uint8_t block_buf[2048];
     
     uint32_t remaining = size_bytes;
     uint8_t* dest = (uint8_t*)buffer;
     
     for (uint32_t b = 0; b < blocks; b++) {
-        // Read block into temporary buffer
+
         int r = read_logical_blocks_rel(fs, extent_lba + b, 1, block_buf);
         if (r != 0) return -2;
         
