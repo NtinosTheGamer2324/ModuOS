@@ -15,7 +15,7 @@ ModuOS is a hobby operating system written in C and assembly for the AMD64 archi
 
 1. **Clone the repository:**
 
-git clone https://github.com/yourusername/ModuOS.git
+git clone https://github.com/NtinosTheGamer2324/ModuOS.git
 cd ModuOS
 
 2. **Build the Docker image for ModuOS:**
