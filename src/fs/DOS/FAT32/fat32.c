@@ -1,5 +1,5 @@
 #include "moduos/fs/DOS/FAT32/fat32.h"
-#include "moduos/drivers/Drive/ATA/ata.h"
+#include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/memory/string.h"
 #include <stdint.h>
@@ -9,6 +9,7 @@
 #define PARTITION_ENTRY_SIZE 16
 #define FAT32_TYPE_B 0x0B
 #define FAT32_TYPE_C 0x0C
+#define USE_DYNAMIC_BUFFERS 1
 
 struct __attribute__((packed)) fat_dir_entry {
     char name[11];
@@ -27,6 +28,14 @@ struct __attribute__((packed)) fat_dir_entry {
 
 /* Global array of mounted filesystems */
 static fat32_fs_t fat32_mounts[FAT32_MAX_MOUNTS];
+
+static void* fat32_alloc_cluster_buffer(const fat32_fs_t* fs) {
+    uint32_t clus_size = (uint32_t)fs->bytes_per_sector * (uint32_t)fs->sectors_per_cluster;
+    if (clus_size == 0 || clus_size > FAT32_MAX_CLUSTER_SIZE) {
+        return NULL;
+    }
+    return kmalloc(clus_size);
+}
 
 /* Initialize on first use */
 static void fat32_init_once(void) {
@@ -59,7 +68,7 @@ static uint32_t safe_divide(uint32_t numerator, uint32_t denominator) {
 }
 
 /* --- MOUNT --- */
-int fat32_mount(int drive_index, uint32_t partition_lba) {
+int fat32_mount(int vdrive_id, uint32_t partition_lba) {
     fat32_init_once();
     
     int handle = fat32_alloc_handle();
@@ -72,13 +81,14 @@ int fat32_mount(int drive_index, uint32_t partition_lba) {
     fat32_fs_t* fs = &fat32_mounts[handle];
     
     memset(fs, 0, sizeof(fat32_fs_t));
-    fs->drive_index = drive_index;
+    fs->vdrive_id = vdrive_id;  
     fs->partition_lba = partition_lba;
 
-    VGA_Writef("FAT32: attempting mount drive=%d, LBA=%u -> handle=%d\n", 
-               drive_index, partition_lba, handle);
+    VGA_Writef("FAT32: attempting mount vdrive=%d, LBA=%u -> handle=%d\n", 
+               vdrive_id, partition_lba, handle);  
 
-    if (ata_read_sector_lba28(drive_index, partition_lba, sector) != 0) {
+
+    if (vdrive_read_sector(vdrive_id, partition_lba, sector) != VDRIVE_SUCCESS) {
         VGA_Write("FAT32: failed to read boot sector\n");
         return -2;
     }
@@ -155,23 +165,28 @@ int fat32_mount(int drive_index, uint32_t partition_lba) {
     return handle;
 }
 
-int fat32_mount_auto(int drive_index) {
+int fat32_mount_auto(int vdrive_id) {
     fat32_init_once();
     
-    int start = (drive_index >= 0) ? drive_index : 0;
-    int end = (drive_index >= 0) ? drive_index : 3;
+    int start = (vdrive_id >= 0) ? vdrive_id : 0;
+    int end = (vdrive_id >= 0) ? vdrive_id : (vdrive_get_count() - 1);
     
-    if (drive_index < 0) {
-        VGA_Write("FAT32: scanning drives 0-3...\n");
+    if (vdrive_id < 0) {
+        VGA_Write("FAT32: scanning all vDrives...\n");
     }
 
     uint8_t mbr[512];
     
     for (int d = start; d <= end; d++) {
-        VGA_Writef("FAT32: checking drive %d\n", d);
+        if (!vdrive_is_ready(d)) {
+            continue;
+        }
         
-        if (ata_read_sector_lba28(d, 0, mbr) != 0) {
-            VGA_Writef("FAT32: cannot read drive %d\n", d);
+        VGA_Writef("FAT32: checking vDrive %d\n", d);
+        
+        // CHANGED: Use vDrive
+        if (vdrive_read_sector(d, 0, mbr) != VDRIVE_SUCCESS) {
+            VGA_Writef("FAT32: cannot read vDrive %d\n", d);
             continue;
         }
 
@@ -234,7 +249,10 @@ int fat32_read_cluster(int handle, uint32_t cluster, void* buffer) {
     
     fat32_fs_t* fs = &fat32_mounts[handle];
     uint32_t lba = cluster_to_lba(fs, cluster);
-    return ata_read_sectors(fs->drive_index, lba, buffer, fs->sectors_per_cluster);
+    
+
+    int result = vdrive_read(fs->vdrive_id, lba, fs->sectors_per_cluster, buffer);
+    return (result == VDRIVE_SUCCESS) ? 0 : -1;
 }
 
 int fat32_next_cluster(int handle, uint32_t cluster, uint32_t* out_next) {
@@ -250,7 +268,9 @@ int fat32_next_cluster(int handle, uint32_t cluster, uint32_t* out_next) {
     uint32_t ent_offset = fat_offset % fs->bytes_per_sector;
 
     uint8_t sec[512];
-    if (ata_read_sector_lba28(fs->drive_index, fat_sector, sec) != 0) {
+    
+    
+    if (vdrive_read_sector(fs->vdrive_id, fat_sector, sec) != VDRIVE_SUCCESS) {
         return -4;
     }
 
@@ -263,7 +283,9 @@ int fat32_next_cluster(int handle, uint32_t cluster, uint32_t* out_next) {
     } else {
         /* Entry crosses sector boundary */
         uint8_t sec2[512];
-        if (ata_read_sector_lba28(fs->drive_index, fat_sector + 1, sec2) != 0) {
+        
+
+        if (vdrive_read_sector(fs->vdrive_id, fat_sector + 1, sec2) != VDRIVE_SUCCESS) {
             return -5;
         }
         

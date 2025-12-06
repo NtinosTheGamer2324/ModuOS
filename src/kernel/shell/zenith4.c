@@ -15,8 +15,7 @@
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/events/events.h"
 #include "moduos/kernel/applications/rl-clock.h"
-#include "moduos/drivers/Drive/ATA/ata.h"
-#include "moduos/drivers/Drive/ATA/atapi.h"
+#include "moduos/drivers/Drive/vDrive.h"  // Changed from ATA to vDrive
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/exec.h"
 #include "moduos/kernel/kernel.h"  // For boot_drive_index
@@ -267,32 +266,69 @@ void parse_command2(char* input, char* command, char* args) {
 }
 
 static int auto_mount_boot_drive(void) {
-    if (boot_drive_index < 0) {
-        return 0; // No boot drive detected
+    // Strategy: Just mount the first working FAT32 drive we can find
+    // Don't require boot marker - let user work with any mounted filesystem
+    
+    VGA_Write("\\cySearching for bootable filesystem...\\rr\n");
+    
+    // Try vDrive 1 first (typically the hard disk)
+    int slot = fs_mount_drive(1, 0, FS_TYPE_UNKNOWN);
+    if (slot >= 0) {
+        shell_state.current_slot = slot;
+        shell_state.boot_slot = slot;
+        strcpy(shell_state.cwd, "/");
+        update_shell_path();
+        
+        fs_type_t type;
+        fs_get_mount_info(slot, NULL, NULL, &type);
+        const char* fs_name = fs_type_name(type);
+        char drive_letter = slot_to_letter(slot);
+        VGA_Writef("\\cgMounted filesystem as %c: (%s)\\rr\n", drive_letter, fs_name);
+        
+        // Check for boot marker (informational only)
+        fs_mount_t* mount = fs_get_mount(slot);
+        if (mount && fs_file_exists(mount, "/ModuOS/System64/mdsys.sqr")) {
+            VGA_Write("\\cgBoot marker found: /ModuOS/System64/mdsys.sqr\\rr\n");
+        } else {
+            VGA_Write("\\cyNote: Boot marker not found (non-bootable disk)\\rr\n");
+        }
+        
+        return 1;
     }
     
-    // Mount using kernel's mount table
-    int slot = fs_mount_drive(boot_drive_index, 0, FS_TYPE_UNKNOWN);
-    
-    if (slot < 0) {
-        COM_LOG_WARN(COM1_PORT, "Failed to mount boot drive\n");
-        return 0;
+    // Try vDrive 0 (might be a bootable ISO)
+    slot = fs_mount_drive(0, 0, FS_TYPE_UNKNOWN);
+    if (slot >= 0) {
+        shell_state.current_slot = slot;
+        shell_state.boot_slot = slot;
+        strcpy(shell_state.cwd, "/");
+        update_shell_path();
+        
+        fs_type_t type;
+        fs_get_mount_info(slot, NULL, NULL, &type);
+        const char* fs_name = fs_type_name(type);
+        char drive_letter = slot_to_letter(slot);
+        VGA_Writef("\\cgMounted filesystem as %c: (%s)\\rr\n", drive_letter, fs_name);
+        return 1;
     }
     
-    // Set as current and boot slot
-    shell_state.current_slot = slot;
-    shell_state.boot_slot = slot;
-    strcpy(shell_state.cwd, "/");
-    update_shell_path();
+    // Try vDrive 2
+    slot = fs_mount_drive(2, 0, FS_TYPE_UNKNOWN);
+    if (slot >= 0) {
+        shell_state.current_slot = slot;
+        shell_state.boot_slot = slot;
+        strcpy(shell_state.cwd, "/");
+        update_shell_path();
+        
+        fs_type_t type;
+        fs_get_mount_info(slot, NULL, NULL, &type);
+        const char* fs_name = fs_type_name(type);
+        char drive_letter = slot_to_letter(slot);
+        VGA_Writef("\\cgMounted filesystem as %c: (%s)\\rr\n", drive_letter, fs_name);
+        return 1;
+    }
     
-    fs_type_t type;
-    fs_get_mount_info(slot, NULL, NULL, &type);
-    const char* fs_name = fs_type_name(type);
-    char drive_letter = slot_to_letter(slot);
-    VGA_Writef("\\cgBoot drive mounted as %c: (%s)\\rr\n", drive_letter, fs_name);
-    VGA_Write("\\cyBoot marker: /ModuOS/System64/mdsys.sqr\\rr\n");
-    
-    return 1;
+    return 0; // No filesystem found
 }
 
 #define BUFFER_SIZE 64
@@ -398,18 +434,34 @@ void handle_kill_command(const char *args) {
 }
 
 void zenith4_start() {
-    if (!auto_mount_boot_drive()) {
-        VGA_Write("\\cyNo boot drive detected. Use 'mount' to mount filesystems.\\rr\n");
+    // Get boot slot from kernel (already mounted!)
+    int boot_slot = kernel_get_boot_slot();
+    if (boot_slot < 0) {
+        VGA_Write("\\crERROR: No boot drive mounted!\\rr\n");
+        VGA_Write("\\cyThe kernel failed to mount a boot filesystem.\\rr\n");
+        return;
     }
+
+    // Store it in shell state
+    shell_state.boot_slot = boot_slot;
+    shell_state.current_slot = boot_slot;
+    strcpy(shell_state.cwd, "/");
+    update_shell_path();
 
     VGA_Clear();
     zsbanner();
     VGA_Write("\\cc(c) New Technologies Software 2025. All Rights Reserved\\rr\n");
     VGA_Write("\\cy type 'help' to see available commands\\rr\n");
-        
-    /* Initialize shell path */
-    update_shell_path();
-
+    
+    // Show which drive is mounted
+    fs_type_t type;
+    int vdrive_id;
+    fs_get_mount_info(boot_slot, &vdrive_id, NULL, &type);
+    const char* fs_name = fs_type_name(type);
+    char drive_letter = 'A' + boot_slot;
+    VGA_Writef("\\cgBoot drive mounted as %c: (%s, vDrive %d)\\rr\n", 
+               drive_letter, fs_name, vdrive_id);
+    
     read_pcname_file();
 
     while (shell_state.running == 1)
@@ -466,7 +518,7 @@ void zenith4_start() {
             VGA_Write("\\cyreboot - restart    Restart the computer\\rr\n");
             VGA_Write("\\cyzsfetch             Show System Stats\\rr\n");
             VGA_Write("\\cyhistory             Show command history\\rr\n");
-            VGA_Write("\\cylsblk - dev         Shows all ATA devices\\rr\n");
+            VGA_Write("\\cylsblk - dev         Shows all storage devices (ATA + SATA)\\rr\n");
             VGA_Write("\\cymount               Mount filesystem (mount <drive> [lba] [type])\\rr\n");
             VGA_Write("\\cyunmount             Unmount filesystem (unmount <letter>)\\rr\n");
             VGA_Write("\\cymounts              List all mounted filesystems\\rr\n");
@@ -521,16 +573,17 @@ void zenith4_start() {
             *dest = '\0';
         
             if (strlen(drive_str) == 0) {
-                VGA_Write("\\crUsage: mount <drive_index> [partition_lba] [type]\\rr\n");
+                VGA_Write("\\crUsage: mount <vdrive_id> [partition_lba] [type]\\rr\n");
                 VGA_Write("\\cyExample: mount 0\\rr\n");
                 VGA_Write("\\cyExample: mount 0 2048 fat32\\rr\n");
+                VGA_Write("\\cyUse 'lsblk' to see available drives\\rr\n");
                 goto mount_done;
             }
         
             int drive_index = -1;
             uint32_t partition_lba = 0;
             if (parse_int(drive_str, &drive_index) != 0) {
-                VGA_Write("\\crError: Invalid drive index\\rr\n");
+                VGA_Write("\\crError: Invalid vdrive index\\rr\n");
                 goto mount_done;
             }
         
@@ -563,7 +616,7 @@ void zenith4_start() {
                 fs_get_mount_info(slot, NULL, NULL, &type);
                 const char* fs_name = fs_type_name(type);
                 char drive_letter = slot_to_letter(slot);
-                VGA_Writef("\\cgMounted %s on %c: (drive=%d, lba=%u)\\rr\n",
+                VGA_Writef("\\cgMounted %s on %c: (vdrive=%d, lba=%u)\\rr\n",
                            fs_name, drive_letter, drive_index, partition_lba);
             } else if (slot == -2) {
                 VGA_Write("\\crError: Drive already mounted\\rr\n");
@@ -721,7 +774,8 @@ void zenith4_start() {
             VGA_Write("  \\br    \\rr \\bg    \\rr \\bb    \\rr\n");
             VGA_Write("  \\br    \\rr \\bg    \\rr \\bb    \\rr\n");
         } else if (strcmp(command, "dev") == 0 || strcmp(command, "lsblk") == 0) {
-            ata_print_drives();
+            // Use vDrive to list all storage devices (ATA + SATA)
+            vdrive_print_table();
         } else if (strcmp(command, "date") == 0) {
             rtc_datetime_t clock;
             rtc_get_datetime(&clock);
@@ -761,8 +815,20 @@ void zenith4_start() {
                 fs_get_mount_info(shell_state.boot_slot, &drive_idx, &lba, &type);
                 const char* fs_name = fs_type_name(type);
                 VGA_Writef("\\cgBoot Drive: %c: (%s)\\rr\n", drive_letter, fs_name);
-                VGA_Writef("\\cyPhysical Drive: %d\\rr\n", drive_idx);
+                VGA_Writef("\\cyVirtual Drive ID: %d\\rr\n", drive_idx);
                 VGA_Writef("\\cyPartition LBA: %u\\rr\n", lba);
+                
+                // Get vDrive info for the boot drive
+                vdrive_t* vd = vdrive_get(drive_idx);
+                if (vd && vd->present) {
+                    VGA_Writef("\\cyDrive Type: %s\\rr\n", vdrive_get_type_string(vd->type));
+                    VGA_Writef("\\cyBackend: %s\\rr\n", vdrive_get_backend_string(vd->backend));
+                    VGA_Writef("\\cyModel: %s\\rr\n", vd->model);
+                    if (vd->backend == VDRIVE_BACKEND_SATA && strlen(vd->serial) > 0) {
+                        VGA_Writef("\\cySerial: %s\\rr\n", vd->serial);
+                    }
+                }
+                
                 VGA_Write("\\cyBoot Marker: /ModuOS/System64/mdsys.sqr\\rr\n");
                 
                 if (shell_state.current_slot == shell_state.boot_slot) {

@@ -42,11 +42,14 @@ start "QEMU" qemu-system-x86_64 ^
     -serial file:com1.log ^
     -serial file:com2.log ^
     -drive file=dist\AMD64\kernel.iso,format=raw,index=0,media=cdrom ^
-    -drive file=.\disk.img,format=raw,index=1,media=disk ^
-    -boot d 
+    -drive id=disk,file=.\disk.img,if=none,format=raw ^
+    -device ahci,id=ahci ^
+    -device ide-hd,drive=disk,bus=ahci.0 ^
+    -boot d
 REM    -vga std ^
 REM    -no-reboot ^
 REM    -no-shutdown
+
 
 timeout /t 1 /nobreak >nul
 

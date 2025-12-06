@@ -8,9 +8,9 @@
 #define FAT32_MAX_CLUSTER_SIZE 65536
 
 typedef struct {
-    int active;                /* Is this slot in use? */
-    int drive_index;           /* ATA drive index (0..3) */
-    uint32_t partition_lba;    /* LBA of partition start (0 = superfloppy) */
+    int active;
+    int vdrive_id;          // CHANGED: was drive_index
+    uint32_t partition_lba;
     uint16_t bytes_per_sector;
     uint8_t sectors_per_cluster;
     uint16_t reserved_sectors;

@@ -1,7 +1,8 @@
-//fs.c - Kernel-owned mount table
+//fs.c - Kernel-owned mount table (UPDATED FOR vDrive)
 #include "moduos/fs/fs.h"
 #include "moduos/fs/DOS/FAT32/fat32.h"
 #include "moduos/fs/ISOFS/iso9660.h"
+#include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/COM/com.h"
@@ -11,9 +12,9 @@
 
 typedef struct {
     fs_mount_t mount;
-    int drive_index;
+    int vdrive_id;          // Changed from drive_index to vdrive_id
     uint32_t partition_lba;
-    char mount_point[256];  // Future: support arbitrary mount points
+    char mount_point[256];
     int in_use;
 } mount_entry_t;
 
@@ -29,7 +30,7 @@ void fs_init(void) {
         mount_table[i].mount.valid = 0;
         mount_table[i].mount.type = FS_TYPE_UNKNOWN;
         mount_table[i].mount.handle = -1;
-        mount_table[i].drive_index = -1;
+        mount_table[i].vdrive_id = -1;
         mount_table[i].partition_lba = 0;
         mount_table[i].mount_point[0] = '\0';
     }
@@ -47,10 +48,10 @@ static int find_free_slot(void) {
 }
 
 /* Check if drive already mounted */
-static int find_existing_mount(int drive_index, uint32_t partition_lba) {
+static int find_existing_mount(int vdrive_id, uint32_t partition_lba) {
     for (int i = 0; i < MAX_MOUNTS; i++) {
         if (mount_table[i].in_use &&
-            mount_table[i].drive_index == drive_index &&
+            mount_table[i].vdrive_id == vdrive_id &&
             mount_table[i].partition_lba == partition_lba) {
             return i;
         }
@@ -58,22 +59,28 @@ static int find_existing_mount(int drive_index, uint32_t partition_lba) {
     return -1;
 }
 
-/* Mount filesystem - returns slot ID or negative on error */
-int fs_mount_drive(int drive_index, uint32_t partition_lba, fs_type_t type) {
+/* Mount filesystem - NOW USES vDrive! */
+int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
     fs_init();
     
+    /* Validate vDrive */
+    if (!vdrive_is_ready(vdrive_id)) {
+        com_write_string(COM1_PORT, "[FS] vDrive not ready\n");
+        return -6;
+    }
+    
     /* Check if already mounted */
-    int existing = find_existing_mount(drive_index, partition_lba);
+    int existing = find_existing_mount(vdrive_id, partition_lba);
     if (existing >= 0) {
         com_write_string(COM1_PORT, "[FS] Drive already mounted\n");
-        return -2; /* Already mounted */
+        return -2;
     }
     
     /* Find free slot */
     int slot = find_free_slot();
     if (slot < 0) {
         com_write_string(COM1_PORT, "[FS] Mount table full\n");
-        return -3; /* No free slots */
+        return -3;
     }
     
     /* Mount the filesystem */
@@ -82,13 +89,13 @@ int fs_mount_drive(int drive_index, uint32_t partition_lba, fs_type_t type) {
     
     if (type == FS_TYPE_UNKNOWN) {
         /* Auto-detect */
-        handle = fat32_mount_auto(drive_index);
+        handle = fat32_mount_auto(vdrive_id);
         if (handle >= 0) {
             mount.type = FS_TYPE_FAT32;
             mount.handle = handle;
             mount.valid = 1;
         } else {
-            handle = iso9660_mount_auto(drive_index);
+            handle = iso9660_mount_auto(vdrive_id);
             if (handle >= 0) {
                 mount.type = FS_TYPE_ISO9660;
                 mount.handle = handle;
@@ -99,7 +106,7 @@ int fs_mount_drive(int drive_index, uint32_t partition_lba, fs_type_t type) {
         /* Mount specific type */
         switch (type) {
             case FS_TYPE_FAT32:
-                handle = fat32_mount(drive_index, partition_lba);
+                handle = fat32_mount(vdrive_id, partition_lba);
                 if (handle >= 0) {
                     mount.type = FS_TYPE_FAT32;
                     mount.handle = handle;
@@ -108,7 +115,7 @@ int fs_mount_drive(int drive_index, uint32_t partition_lba, fs_type_t type) {
                 break;
                 
             case FS_TYPE_ISO9660:
-                handle = iso9660_mount(drive_index, partition_lba);
+                handle = iso9660_mount(vdrive_id, partition_lba);
                 if (handle >= 0) {
                     mount.type = FS_TYPE_ISO9660;
                     mount.handle = handle;
@@ -117,23 +124,29 @@ int fs_mount_drive(int drive_index, uint32_t partition_lba, fs_type_t type) {
                 break;
                 
             default:
-                return -4; /* Unknown type */
+                return -4;
         }
     }
     
     if (!mount.valid) {
-        return -5; /* Mount failed */
+        return -5;
     }
     
     /* Store in mount table */
     mount_table[slot].mount = mount;
-    mount_table[slot].drive_index = drive_index;
+    mount_table[slot].vdrive_id = vdrive_id;
     mount_table[slot].partition_lba = partition_lba;
     mount_table[slot].in_use = 1;
     
     com_write_string(COM1_PORT, "[FS] Mounted ");
     com_write_string(COM1_PORT, fs_type_name(mount.type));
-    com_write_string(COM1_PORT, " in slot ");
+    com_write_string(COM1_PORT, " on vDrive ");
+    char vd_str[4];
+    vd_str[0] = '0' + vdrive_id;
+    vd_str[1] = ' ';
+    vd_str[2] = '\0';
+    com_write_string(COM1_PORT, vd_str);
+    com_write_string(COM1_PORT, "in slot ");
     char slot_str[4];
     slot_str[0] = '0' + slot;
     slot_str[1] = '\0';
@@ -189,14 +202,14 @@ fs_mount_t* fs_get_mount(int slot) {
 }
 
 /* Get mount info by slot ID */
-int fs_get_mount_info(int slot, int* drive_index, uint32_t* partition_lba, fs_type_t* type) {
+int fs_get_mount_info(int slot, int* vdrive_id, uint32_t* partition_lba, fs_type_t* type) {
     fs_init();
     
     if (slot < 0 || slot >= MAX_MOUNTS || !mount_table[slot].in_use) {
         return -1;
     }
     
-    if (drive_index) *drive_index = mount_table[slot].drive_index;
+    if (vdrive_id) *vdrive_id = mount_table[slot].vdrive_id;
     if (partition_lba) *partition_lba = mount_table[slot].partition_lba;
     if (type) *type = mount_table[slot].mount.type;
     
@@ -207,8 +220,8 @@ int fs_get_mount_info(int slot, int* drive_index, uint32_t* partition_lba, fs_ty
 void fs_list_mounts(void) {
     fs_init();
     
-    VGA_Write("Slot  Type      Drive  LBA\n");
-    VGA_Write("----  --------  -----  ----------\n");
+    VGA_Write("Slot  Type      vDrive  LBA\n");
+    VGA_Write("----  --------  ------  ----------\n");
     
     for (int i = 0; i < MAX_MOUNTS; i++) {
         if (mount_table[i].in_use) {
@@ -221,9 +234,9 @@ void fs_list_mounts(void) {
             for (int j = strlen(fs_name); j < 10; j++) VGA_Write(" ");
             
             char num[16];
-            itoa(mount_table[i].drive_index, num, 10);
+            itoa(mount_table[i].vdrive_id, num, 10);
             VGA_Write(num);
-            VGA_Write("      ");
+            VGA_Write("       ");
             
             itoa(mount_table[i].partition_lba, num, 10);
             VGA_Write(num);
@@ -301,7 +314,6 @@ int fs_stat(fs_mount_t* mount, const char* path, fs_file_info_t* info) {
             int result = fat32_find_file(mount->handle, path, &entry);
             if (result != 0) return -2;
             
-            /* Extract short name */
             int idx = 0;
             for (int j = 0; j < 8 && entry.name[j] != ' '; j++) {
                 info->name[idx++] = entry.name[j];
@@ -326,13 +338,11 @@ int fs_stat(fs_mount_t* mount, const char* path, fs_file_info_t* info) {
         }
             
         case FS_TYPE_ISO9660: {
-            // Use the correct type from iso9660.h
             iso9660_dir_entry_t entry;
             
             int result = iso9660_find_file(mount->handle, path, &entry);
             if (result != 0) return -2;
             
-            /* Copy name */
             strncpy(info->name, entry.name, sizeof(info->name) - 1);
             info->name[sizeof(info->name) - 1] = '\0';
             

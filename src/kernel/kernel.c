@@ -11,6 +11,8 @@
 #include "moduos/kernel/interrupts/timer.h"
 #include "moduos/kernel/interrupts/fault.h"
 #include "moduos/drivers/Drive/ATA/ata.h"
+#include "moduos/drivers/Drive/SATA/SATA.h"
+#include "moduos/drivers/Drive/SATA/AHCI.h"
 #include "moduos/fs/fs.h"
 #include "moduos/drivers/power/ACPI.h"
 #include "moduos/kernel/kernel.h"
@@ -18,11 +20,14 @@
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/syscall/syscall.h"
+#include "moduos/drivers/PCI/pci.h"
 #include "moduos/fs/fd.h" 
+#include "moduos/drivers/Drive/vDrive.h"
 #include <stdint.h>
 
 int acpi_initialized;
 int boot_drive_index = -1;  // Global to store boot drive
+int boot_drive_slot = -1;
 extern uint64_t multiboot_info_ptr;
 
 // ------------------ HELPER FUNCTIONS ------------------
@@ -71,71 +76,158 @@ static void com_print_dec64(uint64_t v) {
 }
 
 // ------------------ BOOT DRIVE DETECTION ------------------
-// ------------------ BOOT DRIVE DETECTION ------------------
 static int detect_boot_drive(void) {
     com_write_string(COM1_PORT, "[INFO] Scanning drives for boot marker: /ModuOS/System64/mdsys.sqr\n");
     
-    int max_drives = 4;
+    // Get total vDrive count
+    int drive_count = vdrive_get_count();
     
-    for (int drive = 0; drive < max_drives; drive++) {
-        com_write_string(COM1_PORT, "[INFO] Checking drive ");
-        char drive_str[4];
-        drive_str[0] = '0' + drive;
-        drive_str[1] = '.';
-        drive_str[2] = '.';
-        drive_str[3] = '\0';
-        com_write_string(COM1_PORT, drive_str);
-        com_write_string(COM1_PORT, ".\n");
+    if (drive_count == 0) {
+        COM_LOG_WARN(COM1_PORT, "No drives available for boot detection!");
+        return -1;
+    }
+    
+    com_write_string(COM1_PORT, "[INFO] Scanning ");
+    char count_str[4];
+    count_str[0] = '0' + drive_count;
+    count_str[1] = ' ';
+    count_str[2] = '\0';
+    com_write_string(COM1_PORT, count_str);
+    com_write_string(COM1_PORT, "vDrives...\n");
+    
+    // Scan all vDrives
+    for (int vdrive_id = 0; vdrive_id < VDRIVE_MAX_DRIVES; vdrive_id++) {
+        vdrive_t *drive = vdrive_get(vdrive_id);
         
-        // Mount the drive with auto-detection (returns slot ID or negative on error)
-        int slot = fs_mount_drive(drive, 0, FS_TYPE_UNKNOWN);
+        if (!drive || !vdrive_is_ready(vdrive_id)) {
+            continue;
+        }
+        
+        com_write_string(COM1_PORT, "[INFO] Checking vDrive ");
+        char id_str[4];
+        id_str[0] = '0' + vdrive_id;
+        id_str[1] = ' ';
+        id_str[2] = '(';
+        id_str[3] = '\0';
+        com_write_string(COM1_PORT, id_str);
+        com_write_string(COM1_PORT, vdrive_get_backend_string(drive->backend));
+        com_write_string(COM1_PORT, " - ");
+        com_write_string(COM1_PORT, drive->model);
+        com_write_string(COM1_PORT, ")...\n");
+        
+        // Try ISO9660 first for optical drives
+        int slot = -1;
+        if (drive->type == VDRIVE_TYPE_ATA_ATAPI || 
+            drive->type == VDRIVE_TYPE_SATA_OPTICAL) {
+            
+            com_write_string(COM1_PORT, "[INFO] Optical drive detected, trying ISO9660...\n");
+            slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_ISO9660);
+            
+            if (slot >= 0) {
+                com_write_string(COM1_PORT, "[INFO] ISO9660 mounted successfully\n");
+            } else {
+                com_write_string(COM1_PORT, "[INFO] ISO9660 mount failed, trying auto-detect...\n");
+                slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_UNKNOWN);
+            }
+        } else {
+            // For hard drives, use auto-detection
+            slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_UNKNOWN);
+        }
         
         if (slot < 0) {
-            com_write_string(COM1_PORT, "[INFO] Drive ");
-            com_write_string(COM1_PORT, drive_str);
+            com_write_string(COM1_PORT, "[INFO] vDrive ");
+            id_str[0] = '0' + vdrive_id;
+            id_str[1] = '\0';
+            com_write_string(COM1_PORT, id_str);
             com_write_string(COM1_PORT, " No valid filesystem\n");
             continue;
         }
         
-        // Get the mount handle from the slot
         fs_mount_t* mount = fs_get_mount(slot);
         if (!mount || !mount->valid) {
-            com_write_string(COM1_PORT, "[INFO] Drive ");
-            com_write_string(COM1_PORT, drive_str);
+            com_write_string(COM1_PORT, "[INFO] vDrive ");
+            id_str[0] = '0' + vdrive_id;
+            id_str[1] = '\0';
+            com_write_string(COM1_PORT, id_str);
             com_write_string(COM1_PORT, " Mount invalid\n");
             fs_unmount_slot(slot);
             continue;
         }
         
         const char* fs_name = fs_type_name(mount->type);
-        com_write_string(COM1_PORT, "[INFO] Drive ");
-        com_write_string(COM1_PORT, drive_str);
+        com_write_string(COM1_PORT, "[INFO] vDrive ");
+        id_str[0] = '0' + vdrive_id;
+        id_str[1] = '\0';
+        com_write_string(COM1_PORT, id_str);
         com_write_string(COM1_PORT, " Found ");
         com_write_string(COM1_PORT, fs_name);
         com_write_string(COM1_PORT, " filesystem\n");
         
-        // ONLY check if file exists - DO NOT try to load it!
+        // Check for boot marker
+        com_write_string(COM1_PORT, "[INFO] Checking for boot marker...\n");
         if (fs_file_exists(mount, "/ModuOS/System64/mdsys.sqr")) {
-            com_write_string(COM1_PORT, "[OK] Boot drive found on drive ");
-            com_write_string(COM1_PORT, drive_str);
-            com_write_string(COM1_PORT, " (");
-            com_write_string(COM1_PORT, fs_name);
-            com_write_string(COM1_PORT, ")\n");
+            com_write_string(COM1_PORT, "[OK] Boot drive found on vDrive ");
+            id_str[0] = '0' + vdrive_id;
+            id_str[1] = '\0';
+            com_write_string(COM1_PORT, id_str);
+            com_write_string(COM1_PORT, "\n");
             
-            // Just unmount and return - don't load anything!
-            fs_unmount_slot(slot);
-            return drive;
+            com_write_string(COM1_PORT, "     Model: ");
+            com_write_string(COM1_PORT, drive->model);
+            com_write_string(COM1_PORT, "\n");
+            
+            com_write_string(COM1_PORT, "     Type:  ");
+            com_write_string(COM1_PORT, vdrive_get_type_string(drive->type));
+            com_write_string(COM1_PORT, "\n");
+            
+            com_write_string(COM1_PORT, "     FS:    ");
+            com_write_string(COM1_PORT, fs_name);
+            com_write_string(COM1_PORT, "\n");
+            
+            com_write_string(COM1_PORT, "     Slot:  ");
+            id_str[0] = '0' + slot;
+            id_str[1] = '\0';
+            com_write_string(COM1_PORT, id_str);
+            com_write_string(COM1_PORT, "\n");
+            
+            // CRITICAL: Store both the vDrive ID and the mount slot
+            boot_drive_slot = slot;
+            
+            // Keep mount active - don't unmount boot drive!
+            return vdrive_id;
         }
         
-        com_write_string(COM1_PORT, "[INFO] Drive ");
-        com_write_string(COM1_PORT, drive_str);
+        com_write_string(COM1_PORT, "[INFO] vDrive ");
+        id_str[0] = '0' + vdrive_id;
+        id_str[1] = '\0';
+        com_write_string(COM1_PORT, id_str);
         com_write_string(COM1_PORT, " Boot marker not found\n");
+        
+        // IMPORTANT: Unmount drives that don't have the boot marker
+        // This prevents non-boot drives from cluttering the mount table
+        com_write_string(COM1_PORT, "[INFO] Unmounting non-boot drive\n");
         fs_unmount_slot(slot);
     }
     
     COM_LOG_WARN(COM1_PORT, "No boot drive detected!");
     return -1;
 }
+
+int kernel_get_boot_drive(void) {
+    return boot_drive_index;
+}
+
+int kernel_get_boot_slot(void) {
+    return boot_drive_slot;
+}
+
+fs_mount_t* kernel_get_boot_mount(void) {
+    if (boot_drive_slot < 0) {
+        return NULL;
+    }
+    return fs_get_mount(boot_drive_slot);
+}
+
 // ------------------ MEMORY TESTS ------------------
 void memory_smoke_test(void) {
     COM_LOG_INFO(COM1_PORT, "Running memory smoke tests...");
@@ -276,6 +368,30 @@ static void device_Init(void)
 
     irq_install_handler(1, keyboard_irq_handler);
 
+    // PCI Initialization
+    COM_LOG_INFO(COM1_PORT, "Initializing PCI subsystem");
+    pci_init();
+    COM_LOG_OK(COM1_PORT, "PCI subsystem initialized");
+    
+    // AHCI Initialization
+    COM_LOG_INFO(COM1_PORT, "Initializing AHCI");
+    int ahci_status = ahci_init();
+    if (ahci_status == 0) {
+        COM_LOG_OK(COM1_PORT, "AHCI initialized successfully");
+    } else {
+        COM_LOG_WARN(COM1_PORT, "AHCI initialization failed or no drives found");
+    }
+
+    // SATA Initialization
+    COM_LOG_INFO(COM1_PORT, "Initializing SATA subsystem");
+    int sata_status = sata_init();
+    if (sata_status == SATA_SUCCESS) {
+        COM_LOG_OK(COM1_PORT, "SATA subsystem initialized");
+    } else {
+        COM_LOG_WARN(COM1_PORT, "SATA initialization failed");
+    }
+
+    // ATA Initialization (fallback for older systems)
     COM_LOG_INFO(COM1_PORT, "Initializing ATA Controller / Drives");
     int ata_status = ata_init();
     if (ata_status == 0) {
@@ -284,7 +400,26 @@ static void device_Init(void)
         COM_LOG_WARN(COM1_PORT, "ATA controller present, but no drives found");
     } else if (ata_status == -2) {
         COM_LOG_ERROR(COM1_PORT, "ATA controller not responding!");
-        trigger_panic_doata();
+    }
+
+    // vDrive Initialization - UNIFIES ALL STORAGE
+    COM_LOG_INFO(COM1_PORT, "Initializing vDrive unified drive interface");
+    int vdrive_status = vdrive_init();
+    
+    if (vdrive_status == VDRIVE_SUCCESS || vdrive_status == VDRIVE_ERR_NO_DRIVES) {
+        COM_LOG_OK(COM1_PORT, "vDrive subsystem initialized");
+        
+        // Print nice table of all drives
+        vdrive_print_table();
+        
+        if (vdrive_get_count() == 0) {
+            COM_LOG_WARN(COM1_PORT, "No storage drives available!");
+            if (sata_status != SATA_SUCCESS && ata_status != 0) {
+                trigger_panic_doata();  // No drives at all - panic!
+            }
+        }
+    } else {
+        COM_LOG_ERROR(COM1_PORT, "vDrive initialization failed");
     }
 }
 
@@ -350,7 +485,7 @@ static void init(uint64_t mb2_ptr_init)
     memory_smoke_test();
     com_write_string(COM1_PORT, "=== MEMORY INITIALIZATION COMPLETE ===\n\n");
 
-    // Initialize devices
+    // Initialize devices (includes vDrive!)
     device_Init();
 
     // Initialize filesystem layer
@@ -374,8 +509,22 @@ static void init(uint64_t mb2_ptr_init)
     syscall_init();
     COM_LOG_OK(COM1_PORT, "Process management initialized");
 
-    // Detect boot drive after all devices are initialized
+    // Detect boot drive using vDrive!
+    com_write_string(COM1_PORT, "\n=== BOOT DRIVE DETECTION ===\n");
     boot_drive_index = detect_boot_drive();
+    
+    if (boot_drive_index >= 0) {
+        com_write_string(COM1_PORT, "\n[OK] Boot drive: vDrive ");
+        char id[4];
+        id[0] = '0' + boot_drive_index;
+        id[1] = '\0';
+        com_write_string(COM1_PORT, id);
+        com_write_string(COM1_PORT, "\n");
+    } else {
+        COM_LOG_ERROR(COM1_PORT, "Failed to detect boot drive!");
+    }
+    
+    com_write_string(COM1_PORT, "=== BOOT DRIVE DETECTION COMPLETE ===\n\n");
     
     // Clear screen and show boot logo again
     VGA_Clear();
