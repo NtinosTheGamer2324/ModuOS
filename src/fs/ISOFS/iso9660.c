@@ -10,6 +10,12 @@
 #define ISO9660_MAX_LB 4096
 #define ISO9660_READ_BUFFER_LIMIT (64 * 1024)
 
+/* Rock Ridge / SUSP signature identifiers */
+#define RR_SIGNATURE_SP 0x5053  // "SP" - System Use Sharing Protocol
+#define RR_SIGNATURE_NM 0x4D4E  // "NM" - Alternate Name (long filename)
+#define RR_SIGNATURE_PX 0x5850  // "PX" - POSIX attributes
+#define RR_SIGNATURE_CE 0x4543  // "CE" - Continuation Area
+
 /* Global array of mounted filesystems */
 static iso9660_fs_t iso_mounts[ISO9660_MAX_MOUNTS];
 
@@ -40,21 +46,16 @@ static int iso9660_valid_handle(int handle) {
 /* Read blocks relative to partition for ATA, or absolute for ATAPI */
 static int read_logical_blocks_rel(const iso9660_fs_t* fs, uint32_t block_rel, uint32_t block_count, void* buffer) {
     if (fs->is_optical) {
-        // Use ATAPI directly for optical drives
         extern int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* out);
         
         vdrive_t* vdrive = vdrive_get(fs->vdrive_id);
         if (!vdrive) return -1;
         
         int ata_index = vdrive->backend_id;
-        
-        // For optical, block_rel is already the logical block number (2048 bytes)
-        // Add partition_lba if it's non-zero (shouldn't be for optical, but just in case)
         uint32_t absolute_block = fs->partition_lba + block_rel;
         
         return atapi_read_blocks_pio(ata_index, absolute_block, block_count, buffer);
     } else {
-        // For hard drives, convert logical blocks to 512-byte sectors
         uint32_t sectors_per_block = fs->logical_block_size / 512;
         uint32_t start_sector = fs->partition_lba + block_rel * sectors_per_block;
         uint32_t total_sectors = sectors_per_block * block_count;
@@ -64,12 +65,105 @@ static int read_logical_blocks_rel(const iso9660_fs_t* fs, uint32_t block_rel, u
     }
 }
 
+/* Parse Rock Ridge NM (Name) entry to extract long filename */
+static int parse_rockridge_nm(const uint8_t* sue_data, uint8_t sue_len, char* name_buf, int* name_pos, int max_len) {
+    if (sue_len < 5) return 0; // Too short
+    
+    uint8_t flags = sue_data[4];
+    uint8_t name_len = sue_len - 5;
+    
+    // Copy name data
+    for (uint8_t i = 0; i < name_len && *name_pos < max_len - 1; i++) {
+        name_buf[(*name_pos)++] = sue_data[5 + i];
+    }
+    
+    // Check if continuation flag is set (bit 0)
+    return (flags & 0x01) ? 1 : 0;
+}
+
+/* Parse System Use Entry Area (SUSP) for Rock Ridge extensions */
+static int parse_system_use_area(const uint8_t* sua, int sua_len, char* long_name, int max_name_len) {
+    int offset = 0;
+    int name_pos = 0;
+    int found_name = 0;
+    
+    while (offset + 4 <= sua_len) {
+        uint16_t signature = (uint16_t)sua[offset] | ((uint16_t)sua[offset + 1] << 8);
+        uint8_t sue_len = sua[offset + 2];
+        uint8_t sue_version = sua[offset + 3];
+        
+        if (sue_len < 4 || offset + sue_len > sua_len) {
+            break; // Invalid or truncated entry
+        }
+        
+        // Check for NM (alternate name) entry
+        if (signature == RR_SIGNATURE_NM && sue_version == 1) {
+            int continues = parse_rockridge_nm(sua + offset, sue_len, long_name, &name_pos, max_name_len);
+            found_name = 1;
+            
+            if (!continues) {
+                long_name[name_pos] = '\0';
+                return 1; // Complete name found
+            }
+        }
+        
+        offset += sue_len;
+    }
+    
+    if (found_name) {
+        long_name[name_pos] = '\0';
+        return 1;
+    }
+    
+    return 0; // No Rock Ridge name found
+}
+
+/* Parse directory record and extract both ISO and Rock Ridge names */
+static int parse_dir_record(const uint8_t* buf, uint32_t offset, 
+                            char* out_name, uint32_t* out_extent,
+                            uint32_t* out_size, uint8_t* out_flags) {
+    uint8_t len = buf[offset];
+    if (len == 0) return 0;
+    
+    uint8_t name_len = buf[offset + 32];
+    *out_flags = buf[offset + 25];
+    *out_extent = buf[offset + 2] | (buf[offset + 3] << 8) | 
+                  (buf[offset + 4] << 16) | (buf[offset + 5] << 24);
+    *out_size = buf[offset + 10] | (buf[offset + 11] << 8) | 
+                (buf[offset + 12] << 16) | (buf[offset + 13] << 24);
+    
+    // First, extract standard ISO9660 name as fallback
+    int nm = 0;
+    for (int i = 0; i < name_len && i < 255; i++) {
+        char c = buf[offset + 33 + i];
+        if (c == ';') break; /* Version separator */
+        out_name[nm++] = c;
+    }
+    out_name[nm] = '\0';
+    
+    // Check for System Use Area (Rock Ridge extensions)
+    // System Use starts after: length(1) + ext_attr_len(1) + extent(8) + size(8) + date(7) + flags(1) + file_unit_size(1) + gap_size(1) + volume_seq(4) + name_len(1) + name + padding
+    int sua_offset = 33 + name_len;
+    if (name_len % 2 == 0) sua_offset++; // Padding byte if name_len is even
+    
+    int sua_len = len - sua_offset;
+    if (sua_len > 0 && sua_offset < len) {
+        char long_name[256];
+        if (parse_system_use_area(buf + offset + sua_offset, sua_len, long_name, sizeof(long_name))) {
+            // Rock Ridge name found - use it instead
+            strncpy(out_name, long_name, 255);
+            out_name[255] = '\0';
+        }
+    }
+    
+    return len;
+}
+
 /* --- PUBLIC API --- */
 
 int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
     iso9660_init_once();
     
-    // Validate vDrive
     if (!vdrive_is_ready(vdrive_id)) {
         VGA_Writef("ISO9660: vDrive %d not ready\n", vdrive_id);
         return -1;
@@ -87,26 +181,16 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
     fs->vdrive_id = vdrive_id;
     fs->partition_lba = partition_lba;
 
-    // Check if it's an optical drive
     vdrive_t* vdrive = vdrive_get(vdrive_id);
     if (vdrive) {
         fs->is_optical = (vdrive->type == VDRIVE_TYPE_ATA_ATAPI || 
                          vdrive->type == VDRIVE_TYPE_SATA_OPTICAL);
     }
 
-    /* Read PVD sector (logical block 16) */
     uint8_t pvd_buf[2048];
     
-    // CRITICAL FIX: For optical drives, use ATAPI which reads 2048-byte blocks directly
-    // For regular drives, calculate sector position (512-byte sectors)
     if (fs->is_optical) {
-        // Optical drive: read 2048-byte block 16 directly using ATAPI
-        VGA_Writef("ISO9660: Reading PVD from optical drive (block %d)...\n", ISO9660_PVD_SECTOR);
-        
-        // Use ATAPI directly for optical drives
         extern int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* out);
-        
-        // Get the backend drive index (ATA index, not vDrive index)
         int ata_index = vdrive->backend_id;
         
         int r = atapi_read_blocks_pio(ata_index, ISO9660_PVD_SECTOR, 1, pvd_buf);
@@ -115,12 +199,7 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
             return -3;
         }
     } else {
-        // Regular hard drive: calculate LBA in 512-byte sectors
-        // Block 16 * 4 sectors per block = sector 64
         uint32_t pvd_lba = partition_lba + (ISO9660_PVD_SECTOR * 4);
-        
-        VGA_Writef("ISO9660: Reading PVD from hard drive (sector %u)...\n", pvd_lba);
-        
         int r = vdrive_read(vdrive_id, pvd_lba, 4, pvd_buf);
         if (r != VDRIVE_SUCCESS) {
             VGA_Writef("ISO9660: failed to read PVD from vDrive %d\n", vdrive_id);
@@ -128,7 +207,6 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
         }
     }
 
-    /* Validate PVD */
     if (pvd_buf[0] != 1 || memcmp(&pvd_buf[1], ISO9660_ID, ISO9660_ID_LEN) != 0 || pvd_buf[6] != 1) {
         VGA_Write("ISO9660: invalid Primary Volume Descriptor\n");
         return -4;
@@ -138,7 +216,6 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
     if (fs->logical_block_size == 0) fs->logical_block_size = 2048;
     if (fs->logical_block_size > ISO9660_MAX_LB) return -5;
 
-    /* Root directory record at offset 156 */
     uint8_t* rd = &pvd_buf[156];
     uint8_t rd_len = rd[0];
     if (rd_len == 0) return -6;
@@ -147,8 +224,8 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
     fs->root_size = rd[10] | (rd[11] << 8) | (rd[12] << 16) | (rd[13] << 24);
     fs->active = 1;
 
-    VGA_Writef("ISO9660: mounted handle=%d, vdrive=%d, lbs=%u, root_extent=%u, optical=%d\n",
-               handle, vdrive_id, fs->logical_block_size, fs->root_extent_lba, fs->is_optical);
+    VGA_Writef("ISO9660: mounted handle=%d, vdrive=%d, lbs=%u, root_extent=%u (with Rock Ridge LFN support)\n",
+               handle, vdrive_id, fs->logical_block_size, fs->root_extent_lba);
     return handle;
 }
 
@@ -159,15 +236,11 @@ int iso9660_mount_auto(int vdrive_id) {
     int end = (vdrive_id >= 0) ? vdrive_id : (vdrive_get_count() - 1);
 
     for (int d = start; d <= end; d++) {
-        if (!vdrive_is_ready(d)) {
-            continue;
-        }
+        if (!vdrive_is_ready(d)) continue;
         
-        // Try direct mount (works for optical drives and whole-disk ISOs)
         int handle = iso9660_mount(d, 0);
         if (handle >= 0) return handle;
 
-        // Try MBR partitions for hard drives
         vdrive_t* vdrive = vdrive_get(d);
         if (vdrive && !vdrive->read_only) {
             uint8_t mbr[512];
@@ -225,18 +298,14 @@ int iso9660_read_extent(int handle, uint32_t extent_lba, uint32_t size_bytes, vo
     uint32_t lbs = fs->logical_block_size;
     uint32_t blocks = (size_bytes + lbs - 1) / lbs;
     
-    // Temporary buffer for reading full blocks
     static uint8_t block_buf[2048];
-    
     uint32_t remaining = size_bytes;
     uint8_t* dest = (uint8_t*)buffer;
     
     for (uint32_t b = 0; b < blocks; b++) {
-
         int r = read_logical_blocks_rel(fs, extent_lba + b, 1, block_buf);
         if (r != 0) return -2;
         
-        // Copy only the bytes we need from this block
         uint32_t to_copy = (remaining < lbs) ? remaining : lbs;
         memcpy(dest, block_buf, to_copy);
         
@@ -245,32 +314,6 @@ int iso9660_read_extent(int handle, uint32_t extent_lba, uint32_t size_bytes, vo
     }
     
     return 0;
-}
-
-/* Helper: Parse directory record at offset in buffer */
-static int parse_dir_record(const uint8_t* buf, uint32_t offset, 
-                            char* out_name, uint32_t* out_extent,
-                            uint32_t* out_size, uint8_t* out_flags) {
-    uint8_t len = buf[offset];
-    if (len == 0) return 0;
-    
-    uint8_t name_len = buf[offset + 32];
-    *out_flags = buf[offset + 25];
-    *out_extent = buf[offset + 2] | (buf[offset + 3] << 8) | 
-                  (buf[offset + 4] << 16) | (buf[offset + 5] << 24);
-    *out_size = buf[offset + 10] | (buf[offset + 11] << 8) | 
-                (buf[offset + 12] << 16) | (buf[offset + 13] << 24);
-    
-    /* Extract name */
-    int nm = 0;
-    for (int i = 0; i < name_len && i < 255; i++) {
-        char c = buf[offset + 33 + i];
-        if (c == ';') break; /* Version separator */
-        out_name[nm++] = c;
-    }
-    out_name[nm] = '\0';
-    
-    return len;
 }
 
 /* Helper: Find entry in directory extent */
@@ -301,7 +344,6 @@ static int find_entry_in_extent(int handle, uint32_t extent_lba, uint32_t extent
         int rec_len = parse_dir_record(buf, offset, entry_name, 
                                        &entry_extent, &entry_size, &entry_flags);
         if (rec_len == 0) {
-            /* Skip to next block */
             offset = ((offset / lbs) + 1) * lbs;
             if (offset >= total) break;
             continue;
@@ -323,14 +365,14 @@ static int find_entry_in_extent(int handle, uint32_t extent_lba, uint32_t extent
                 *out_extent = entry_extent;
                 *out_size = entry_size;
                 *out_flags = entry_flags;
-                return 0; /* Found */
+                return 0;
             }
         }
         
         offset += rec_len;
     }
     
-    return -4; /* Not found */
+    return -4;
 }
 
 /* Helper: List all entries in a directory extent */
@@ -358,7 +400,6 @@ static int list_extent_entries(int handle, uint32_t extent_lba, uint32_t extent_
         
         int rec_len = parse_dir_record(buf, offset, name, &extent, &size, &flags);
         if (rec_len == 0) {
-            /* Skip to next block */
             offset = ((offset / lbs) + 1) * lbs;
             if (offset >= total) break;
             continue;
@@ -378,28 +419,21 @@ static int list_extent_entries(int handle, uint32_t extent_lba, uint32_t extent_
     return 0;
 }
 
-/* Find file and return its directory entry info */
 int iso9660_find_file(int handle, const char* path, iso9660_dir_entry_t* out_entry) {
     if (!iso9660_valid_handle(handle)) return -1;
     if (path == NULL || path[0] == '\0' || out_entry == NULL) return -2;
     
     iso9660_fs_t* fs = &iso_mounts[handle];
-    
-    /* Start at root */
     uint32_t current_extent = fs->root_extent_lba;
     uint32_t current_size = fs->root_size;
     
-    /* Parse and traverse path */
     char component[256];
     int comp_idx = 0;
     int path_idx = 0;
     
-    /* Skip leading slash */
     if (path[0] == '/') path_idx++;
     
-    /* Extract path components until we reach the file */
     while (path[path_idx] != '\0') {
-        /* Extract path component */
         comp_idx = 0;
         while (path[path_idx] != '\0' && path[path_idx] != '/' && comp_idx < 255) {
             component[comp_idx++] = path[path_idx++];
@@ -411,76 +445,53 @@ int iso9660_find_file(int handle, const char* path, iso9660_dir_entry_t* out_ent
             continue;
         }
         
-        /* Find this component in current directory */
         uint32_t next_extent, next_size;
         uint8_t flags;
         
         if (find_entry_in_extent(handle, current_extent, current_size,
                                  component, &next_extent, &next_size, &flags) != 0) {
-            return -3; /* Not found */
+            return -3;
         }
         
-        /* Check if this is the last component */
         if (path[path_idx] == '\0') {
-            /* Found it - fill out_entry */
             strncpy(out_entry->name, component, sizeof(out_entry->name) - 1);
             out_entry->name[sizeof(out_entry->name) - 1] = '\0';
             out_entry->extent_lba = next_extent;
             out_entry->size = next_size;
             out_entry->flags = flags;
-            return 0; /* Success */
+            return 0;
         }
         
-        /* Not the last component - must be a directory */
         if (!(flags & 0x02)) {
-            return -4; /* Not a directory */
+            return -4;
         }
         
-        /* Move to next directory */
         current_extent = next_extent;
         current_size = next_size;
         
         if (path[path_idx] == '/') path_idx++;
     }
     
-    /* Should not reach here */
     return -5;
 }
 
 int iso9660_read_file_by_path(int handle, const char* path, void* out_buf, 
                                size_t buf_size, size_t* out_size) {
-    if (!iso9660_valid_handle(handle)) {
-        VGA_Write("ISO9660: invalid handle\n");
-        return -1;
-    }
-    
-    if (path == NULL || path[0] == '\0') {
-        VGA_Write("ISO9660: invalid path\n");
-        return -2;
-    }
-    
-    if (out_buf == NULL || buf_size == 0) {
-        VGA_Write("ISO9660: invalid buffer\n");
-        return -3;
-    }
+    if (!iso9660_valid_handle(handle)) return -1;
+    if (path == NULL || path[0] == '\0') return -2;
+    if (out_buf == NULL || buf_size == 0) return -3;
     
     iso9660_fs_t* fs = &iso_mounts[handle];
-    
-    /* Start at root */
     uint32_t current_extent = fs->root_extent_lba;
     uint32_t current_size = fs->root_size;
     
-    /* Parse and traverse path */
     char component[256];
     int comp_idx = 0;
     int path_idx = 0;
     
-    /* Skip leading slash */
     if (path[0] == '/') path_idx++;
     
-    /* Extract path components until we reach the file */
     while (path[path_idx] != '\0') {
-        /* Extract path component */
         comp_idx = 0;
         while (path[path_idx] != '\0' && path[path_idx] != '/' && comp_idx < 255) {
             component[comp_idx++] = path[path_idx++];
@@ -492,7 +503,6 @@ int iso9660_read_file_by_path(int handle, const char* path, void* out_buf,
             continue;
         }
         
-        /* Find this component in current directory */
         uint32_t next_extent, next_size;
         uint8_t flags;
         
@@ -502,22 +512,18 @@ int iso9660_read_file_by_path(int handle, const char* path, void* out_buf,
             return -4;
         }
         
-        /* Check if this is the last component (the file) */
         if (path[path_idx] == '\0') {
-            /* This should be a file, not a directory */
             if (flags & 0x02) {
                 VGA_Writef("ISO9660: '%s' is a directory, not a file\n", component);
                 return -5;
             }
             
-            /* Found the file - read it */
             if (next_size > buf_size) {
                 VGA_Writef("ISO9660: file size (%u) exceeds buffer size (%zu)\n", 
                           next_size, buf_size);
                 return -6;
             }
             
-            /* Read the file extent */
             if (iso9660_read_extent(handle, next_extent, next_size, out_buf) != 0) {
                 VGA_Writef("ISO9660: failed to read file '%s'\n", path);
                 return -7;
@@ -527,57 +533,44 @@ int iso9660_read_file_by_path(int handle, const char* path, void* out_buf,
                 *out_size = (size_t)next_size;
             }
             
-            // VGA_Writef("ISO9660: successfully read file '%s' (%u bytes)\n", 
-            //          path, next_size);
-            return 0; /* Success */
+            return 0;
         }
         
-        /* Not the last component - must be a directory */
         if (!(flags & 0x02)) {
             VGA_Writef("ISO9660: '%s' is not a directory\n", component);
             return -8;
         }
         
-        /* Move to next directory */
         current_extent = next_extent;
         current_size = next_size;
         
         if (path[path_idx] == '/') path_idx++;
     }
     
-    /* Should not reach here */
     VGA_Write("ISO9660: empty filename\n");
     return -9;
 }
 
-/* Public API: List any directory by path */
 int iso9660_list_directory(int handle, const char* path) {
-    if (!iso9660_valid_handle(handle)) {
-        VGA_Write("ISO9660: invalid handle\n");
-        return -1;
-    }
+    if (!iso9660_valid_handle(handle)) return -1;
     
     iso9660_fs_t* fs = &iso_mounts[handle];
     
-    /* Handle root or empty path */
     if (path == NULL || path[0] == '\0' || 
         (path[0] == '/' && path[1] == '\0')) {
         VGA_Writef("ISO9660 root directory (handle %d):\n", handle);
         return list_extent_entries(handle, fs->root_extent_lba, fs->root_size);
     }
     
-    /* Parse path and traverse */
     uint32_t current_extent = fs->root_extent_lba;
     uint32_t current_size = fs->root_size;
     char component[256];
     int comp_idx = 0;
     int path_idx = 0;
     
-    /* Skip leading slash */
     if (path[0] == '/') path_idx++;
     
     while (path[path_idx] != '\0') {
-        /* Extract path component */
         comp_idx = 0;
         while (path[path_idx] != '\0' && path[path_idx] != '/' && comp_idx < 255) {
             component[comp_idx++] = path[path_idx++];
@@ -589,7 +582,6 @@ int iso9660_list_directory(int handle, const char* path) {
             continue;
         }
         
-        /* Find this component in current directory */
         uint32_t next_extent, next_size;
         uint8_t flags;
         
@@ -599,20 +591,17 @@ int iso9660_list_directory(int handle, const char* path) {
             return -2;
         }
         
-        /* Check if it's a directory */
         if (!(flags & 0x02)) {
             VGA_Writef("ISO9660: '%s' is not a directory\n", component);
             return -3;
         }
         
-        /* Move to next directory */
         current_extent = next_extent;
         current_size = next_size;
         
         if (path[path_idx] == '/') path_idx++;
     }
     
-    /* List the final directory */
     VGA_Writef("ISO9660 directory '%s' (handle %d):\n", path, handle);
     return list_extent_entries(handle, current_extent, current_size);
 }
@@ -622,13 +611,11 @@ int iso9660_directory_exists(int handle, const char* path) {
     
     iso9660_fs_t* fs = &iso_mounts[handle];
     
-    /* Handle root */
     if (path == NULL || path[0] == '\0' || 
         (path[0] == '/' && path[1] == '\0')) {
-        return 1; /* Root always exists */
+        return 1;
     }
     
-    /* Parse path and traverse */
     uint32_t current_extent = fs->root_extent_lba;
     uint32_t current_size = fs->root_size;
     char component[256];
@@ -649,18 +636,16 @@ int iso9660_directory_exists(int handle, const char* path) {
             continue;
         }
         
-        /* Find this component */
         uint32_t next_extent, next_size;
         uint8_t flags;
         
         if (find_entry_in_extent(handle, current_extent, current_size,
                                  component, &next_extent, &next_size, &flags) != 0) {
-            return 0; /* Not found */
+            return 0;
         }
         
-        /* Check if it's a directory */
         if (!(flags & 0x02)) {
-            return 0; /* Not a directory */
+            return 0;
         }
         
         current_extent = next_extent;
@@ -669,50 +654,12 @@ int iso9660_directory_exists(int handle, const char* path) {
         if (path[path_idx] == '/') path_idx++;
     }
     
-    return 1; /* Path exists and is a directory */
+    return 1;
 }
 
 int iso9660_list_root(int handle) {
     if (!iso9660_valid_handle(handle)) return -1;
     
     iso9660_fs_t* fs = &iso_mounts[handle];
-    uint32_t lbs = fs->logical_block_size;
-    uint32_t blocks = (fs->root_size + lbs - 1) / lbs;
-
-    if (blocks * lbs > ISO9660_READ_BUFFER_LIMIT) return -2;
-    static uint8_t buf[ISO9660_READ_BUFFER_LIMIT];
-    if (iso9660_read_extent(handle, fs->root_extent_lba, blocks * lbs, buf) != 0) return -3;
-
-    VGA_Writef("ISO9660 root directory (handle %d):\n", handle);
-    uint32_t offset = 0;
-    uint32_t total = blocks * lbs;
-    while (offset < total) {
-        uint8_t len = buf[offset];
-        if (len == 0) {
-            offset = ((offset / lbs) + 1) * lbs;
-            continue;
-        }
-
-        uint8_t name_len = buf[offset + 32];
-        uint8_t flags = buf[offset + 25];
-        uint32_t extent = buf[offset + 2] | (buf[offset + 3] << 8) | (buf[offset + 4] << 16) | (buf[offset + 5] <<24);
-        uint32_t data_len = buf[offset + 10] | (buf[offset + 11] << 8) | (buf[offset + 12] << 16) | (buf[offset + 13] << 24);
-            char name[256];
-            int nm = 0;
-            for (int i = 0; i < name_len && i < (int)sizeof(name)-1; i++) {
-                char c = buf[offset + 33 + i];
-                if (c == ';') break;
-                name[nm++] = c;
-            }
-            name[nm] = 0;
-        
-            if (!(name_len == 1 && (buf[offset + 33] == 0 || buf[offset + 33] == 1))) {
-                VGA_Writef("  %s %s size=%u extent=%u\n", name, (flags & 0x02) ? "<DIR>" : "", data_len, extent);
-            }
-        
-            offset += len;
-        }
-
-return 0;
+    return list_extent_entries(handle, fs->root_extent_lba, fs->root_size);
 }
-
