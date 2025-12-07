@@ -16,7 +16,7 @@ static void get_cpu_vendor(char* buf) {
     buf[12] = '\0';
 }
 
-void _start(void) {
+int md_main(long argc, char** argv) {
     char cpu_vendor[13];
     get_cpu_vendor(cpu_vendor);
 

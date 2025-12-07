@@ -299,3 +299,12 @@ static inline void yield(void) {
 static inline int kill(int pid, int sig) {
     return (int)syscall(SYS_KILL, pid, sig, 0);
 }
+
+int md_main(long argc, char** argv);
+
+void _start(long argc, char** argv)
+{
+    // ModuOS start wrapper / ABI
+    int mdm = md_main(argc, argv);
+    exit(mdm);
+}

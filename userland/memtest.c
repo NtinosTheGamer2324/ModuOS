@@ -5,7 +5,7 @@ void print_hex(unsigned int n) {
     print_uint(n, 16, 0);
 }
 
-void _start(void) {
+int md_main(long argc, char** argv) {
     printf("=== ModuOS Memory Diagnostics ===\n\n");
 
     // Show initial program break
@@ -53,5 +53,5 @@ void _start(void) {
 
     printf("Memory diagnostics complete.\n");
 
-    exit(0);
+    return 0;
 }

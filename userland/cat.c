@@ -1,10 +1,10 @@
 #include "libc.h"
 
-void _start(long argc, char** argv)
+int md_main(long argc, char** argv)
 {
-    if (argc != 2) {
+    if (argc < 2) {
         printf("Usage: %s <filename>\n", argv[0]);
-        exit(1);
+        return 1;
     }
 
     const char* filename = argv[1];
@@ -13,7 +13,7 @@ void _start(long argc, char** argv)
         
     if (fd < 0) {
         printf("cat: cannot open '%s': No such file or directory\n", filename);
-        exit(1);
+        return 1;
     }
 
     char buffer[513];
@@ -27,9 +27,9 @@ void _start(long argc, char** argv)
     if (bytes_read < 0) {
         printf("\ncat: error reading file\n");
         close(fd);
-        exit(1);
+        return 1;
     }
 
     close(fd);
-    exit(0);
+    return 0;
 }
