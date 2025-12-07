@@ -15,8 +15,12 @@ file_dump.bat
 #############################################
 # Build output
 #############################################
-build/
-dist/
+# Ignore top-level build and dist
+/build/
+/dist/
+# But keep source/build inside userland ignored separately
+/userland/build/
+/userland/dist/
 
 #############################################
 # ISO files and logs

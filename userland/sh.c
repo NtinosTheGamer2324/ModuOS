@@ -2,12 +2,6 @@
 #include "string.h"
 int sh_running = 1;
 
-void _start() {
-    int mdm = md_main();
-
-    exit(mdm);
-}
-
 void parse_command(char* input, char* command, char* args) {
     while (*input == ' ' || *input == '\t') input++;
     while (*input && *input != ' ' && *input != '\t') {
@@ -21,7 +15,7 @@ void parse_command(char* input, char* command, char* args) {
     *args = '\0';
 }
 
-int md_main() {
+int md_main(long argc, char** argv) {
     while (sh_running) {
 
         printf("someuser@pcnames> ");
