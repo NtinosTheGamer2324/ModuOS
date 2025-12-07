@@ -259,11 +259,9 @@ void memory_smoke_test(void) {
             COM_LOG_ERROR(COM1_PORT, "Memory write/read test FAILED");
         }
         
-        /* Skip kfree for now - we'll test it later
         com_write_string(COM1_PORT, "[TEST] Freeing memory...\n");
         kfree(p1);
         COM_LOG_OK(COM1_PORT, "Memory freed");
-        */
     } else {
         COM_LOG_ERROR(COM1_PORT, "kmalloc failed!");
         return;
