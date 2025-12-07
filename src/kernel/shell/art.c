@@ -1,5 +1,5 @@
 #include "moduos/kernel/shell/art.h"
-#include "moduos/drivers/graphics/VGA.h"  // ADD THIS
+#include "moduos/drivers/graphics/VGA.h"  
 
 
 void mdbanner(void) {
