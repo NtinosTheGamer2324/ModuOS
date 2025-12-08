@@ -1,5 +1,3 @@
-// kheap.c - FIXED: Proper virtual address management in error paths
-
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/string.h"
@@ -345,6 +343,33 @@ void *kmalloc(size_t size) {
     /* Return pointer after header */
     return result;
 }
+
+void *kmalloc_aligned(size_t size, size_t alignment)
+{
+    if (alignment < sizeof(void *)) {
+        alignment = sizeof(void *);
+    }
+
+    /* kmalloc always returns at least PAGE_SIZE-aligned base + header */
+    size_t total = size + alignment;
+
+    void *raw = kmalloc(total);
+    if (!raw)
+        return NULL;
+
+    uintptr_t addr = (uintptr_t)raw;
+
+    /* Align returned pointer */
+    uintptr_t aligned = (addr + (alignment - 1)) & ~(alignment - 1);
+
+    /*
+     * If aligning moved us past 'raw', the header is still valid,
+     * because the header is BEFORE 'raw', not before 'aligned'.
+     */
+
+    return (void *)aligned;
+}
+
 
 void kfree(void *ptr) {
     if (!ptr) return;

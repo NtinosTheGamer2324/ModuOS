@@ -1,15 +1,3 @@
-/*
- * paging.c — 4-level x86_64 paging helpers (4 KiB pages)
- *
- * Robust phys->virt handling:
- *  - Default: use identity mapping (safe for early boot when bootloader left identity).
- *  - Allow switching to a higher-half direct map at runtime via paging_set_phys_offset().
- *
- * Integration:
- *  - If you later create a direct-map region (phys -> virt at phys + OFFSET),
- *    call paging_set_phys_offset(OFFSET).
- */
-
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/COM/com.h"
