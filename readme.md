@@ -16,7 +16,7 @@
 - **Process Management**: Multitasking, context switching, ELF executable loading, syscall interface
 - **Drivers**: 
   - Storage: ATA/ATAPI, AHCI/SATA support
-  - Graphics: VGA text mode, VBE framebuffer
+  - Graphics: VGA text mode
   - Input: PS/2 keyboard and mouse
   - System: PCI enumeration, ACPI, RTC, PIC/Timer
 - **File Systems**: FAT32 and ISO9660 (read-only) with virtual file system layer
