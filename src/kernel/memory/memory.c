@@ -1,5 +1,3 @@
-//memory.c - Fixed Memory System Initialization
-
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/phys.h"

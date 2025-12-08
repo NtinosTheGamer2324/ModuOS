@@ -1,5 +1,3 @@
-//phys.c - Physical Memory Allocator with Bitmap
-
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/COM/com.h"

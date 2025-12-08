@@ -1,5 +1,3 @@
-// multiboot2.c - Fixed version with proper identity mapping
-
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/memory/paging.h"  // Make sure this is included
