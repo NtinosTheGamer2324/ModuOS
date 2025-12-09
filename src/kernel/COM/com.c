@@ -255,3 +255,185 @@ int com_write_hex(uint16_t port, uint8_t value) {
 
     return 2;  // Two characters written
 }
+
+/* Helper function to convert integer to string */
+static int int_to_string(int value, char *buf, int base) {
+    if (base < 2 || base > 16) return 0;
+    
+    int i = 0;
+    int is_negative = 0;
+    
+    if (value < 0 && base == 10) {
+        is_negative = 1;
+        value = -value;
+    }
+    
+    if (value == 0) {
+        buf[i++] = '0';
+        buf[i] = '\0';
+        return i;
+    }
+    
+    char temp[32];
+    int temp_i = 0;
+    
+    while (value != 0) {
+        int rem = value % base;
+        temp[temp_i++] = (rem > 9) ? (rem - 10) + 'a' : rem + '0';
+        value = value / base;
+    }
+    
+    if (is_negative) {
+        buf[i++] = '-';
+    }
+    
+    while (temp_i > 0) {
+        buf[i++] = temp[--temp_i];
+    }
+    
+    buf[i] = '\0';
+    return i;
+}
+
+/* Helper function to convert unsigned integer to string */
+static int uint_to_string(unsigned int value, char *buf, int base) {
+    if (base < 2 || base > 16) return 0;
+    
+    int i = 0;
+    
+    if (value == 0) {
+        buf[i++] = '0';
+        buf[i] = '\0';
+        return i;
+    }
+    
+    char temp[32];
+    int temp_i = 0;
+    
+    while (value != 0) {
+        int rem = value % base;
+        temp[temp_i++] = (rem > 9) ? (rem - 10) + 'a' : rem + '0';
+        value = value / base;
+    }
+    
+    while (temp_i > 0) {
+        buf[i++] = temp[--temp_i];
+    }
+    
+    buf[i] = '\0';
+    return i;
+}
+
+int com_printf(uint16_t port, const char* format, ...) {
+    if (format == NULL) return -1;
+    
+    __builtin_va_list args;
+    __builtin_va_start(args, format);
+    
+    int count = 0;
+    char buffer[32];
+    
+    while (*format) {
+        if (*format == '%' && *(format + 1)) {
+            format++;
+            switch (*format) {
+                case 'd':
+                case 'i': {
+                    int val = __builtin_va_arg(args, int);
+                    int_to_string(val, buffer, 10);
+                    com_write_string(port, buffer);
+                    count += int_to_string(val, buffer, 10);
+                    break;
+                }
+                case 'u': {
+                    unsigned int val = __builtin_va_arg(args, unsigned int);
+                    uint_to_string(val, buffer, 10);
+                    com_write_string(port, buffer);
+                    count += uint_to_string(val, buffer, 10);
+                    break;
+                }
+                case 'x': {
+                    unsigned int val = __builtin_va_arg(args, unsigned int);
+                    uint_to_string(val, buffer, 16);
+                    com_write_string(port, buffer);
+                    count += uint_to_string(val, buffer, 16);
+                    break;
+                }
+                case 'X': {
+                    unsigned int val = __builtin_va_arg(args, unsigned int);
+                    int len = uint_to_string(val, buffer, 16);
+                    for (int i = 0; i < len; i++) {
+                        if (buffer[i] >= 'a' && buffer[i] <= 'f') {
+                            buffer[i] = buffer[i] - 'a' + 'A';
+                        }
+                    }
+                    com_write_string(port, buffer);
+                    count += len;
+                    break;
+                }
+                case 's': {
+                    char *str = __builtin_va_arg(args, char*);
+                    if (str) {
+                        int len = com_write_string(port, str);
+                        count += (len > 0) ? len : 0;
+                    } else {
+                        com_write_string(port, "(null)");
+                        count += 6;
+                    }
+                    break;
+                }
+                case 'c': {
+                    char ch = (char)__builtin_va_arg(args, int);
+                    com_write_byte(port, ch);
+                    count++;
+                    break;
+                }
+                case '%': {
+                    com_write_byte(port, '%');
+                    count++;
+                    break;
+                }
+                case '0': {
+                    // Handle format like %02x, %04x
+                    int width = 0;
+                    format++;
+                    while (*format >= '0' && *format <= '9') {
+                        width = width * 10 + (*format - '0');
+                        format++;
+                    }
+                    if (*format == 'x' || *format == 'X') {
+                        unsigned int val = __builtin_va_arg(args, unsigned int);
+                        int len = uint_to_string(val, buffer, 16);
+                        // Pad with zeros
+                        for (int i = len; i < width; i++) {
+                            com_write_byte(port, '0');
+                            count++;
+                        }
+                        if (*format == 'X') {
+                            for (int i = 0; i < len; i++) {
+                                if (buffer[i] >= 'a' && buffer[i] <= 'f') {
+                                    buffer[i] = buffer[i] - 'a' + 'A';
+                                }
+                            }
+                        }
+                        com_write_string(port, buffer);
+                        count += len;
+                    }
+                    break;
+                }
+                default:
+                    com_write_byte(port, '%');
+                    com_write_byte(port, *format);
+                    count += 2;
+                    break;
+            }
+        } else {
+            com_write_byte(port, *format);
+            count++;
+        }
+        format++;
+    }
+    
+    __builtin_va_end(args);
+    return count;
+}

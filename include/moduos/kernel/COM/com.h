@@ -178,5 +178,13 @@ int com_test(uint16_t port);
  */
 int com_write_hex(uint16_t port, uint8_t value);
 
+/**
+ * Write formatted output to a COM port (printf-style)
+ * @param port COM port base address
+ * @param format Format string
+ * @param ... Variable arguments
+ * @return Number of characters written
+ */
+int com_printf(uint16_t port, const char* format, ...);
 
 #endif /* COM_H */

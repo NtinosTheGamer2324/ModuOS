@@ -2,6 +2,7 @@
 #include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/memory/memory.h"
 #include <stdint.h>
 #include <stddef.h>
 

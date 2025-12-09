@@ -31,4 +31,9 @@ uint64_t paging_create_process_pml4(void);
 int paging_map_range_to_pml4(uint64_t *pml4_virt, uint64_t virt_base, uint64_t phys_base, uint64_t size, uint64_t flags);
 uint64_t paging_virt_to_phys(uint64_t virt);
 
+/* Map physical I/O memory (MMIO) to virtual address space
+ * Returns virtual address on success, 0 on failure
+ */
+void* ioremap(uint64_t phys_addr, uint64_t size);
+
 #endif /* PAGING_H */

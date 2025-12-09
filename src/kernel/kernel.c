@@ -3,7 +3,7 @@
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/shell/zenith4.h"
-#include "moduos/drivers/ps2/ps2.h"
+#include "moduos/drivers/input/input.h"
 #include "moduos/kernel/panic.h"
 #include "moduos/kernel/interrupts/idt.h"
 #include "moduos/kernel/interrupts/irq.h"
@@ -357,13 +357,8 @@ static void Interrupts_Init(void)
 // ------------------ DEVICE INIT ------------------
 static void device_Init(void)
 {
-    COM_LOG_INFO(COM1_PORT, "Initializing PS/2");
-    if (ps2_init() != 0) {
-        COM_LOG_WARN(COM1_PORT, "PS/2 did not respond! (This happens on some VMs)");
-    } else {
-        COM_LOG_OK(COM1_PORT, "PS/2 initialized");
-    }
-
+    COM_LOG_INFO(COM1_PORT, "Initializing input subsystem");
+    input_init();
     irq_install_handler(1, keyboard_irq_handler);
 
     // PCI Initialization

@@ -16,42 +16,29 @@
 static uint64_t *pml4 = NULL;       /* virtual pointer (via phys_to_virt) to PML4 */
 static uint64_t pml4_phys = 0;      /* physical address of PML4 */
 
-/* phys_to_virt offset. Starts at 0 (identity). Kernel can call paging_set_phys_offset()
- * to switch this to a higher-half direct-map when that mapping is actually in place.
- */
+/* phys_to_virt offset. Starts at 0 (identity). */
 static uint64_t phys_offset = 0; /* 0 means identity mapping */
 
-/* API to set the phys->virt offset when direct map is established */
+/* MMIO virtual address space tracking */
+#define IOREMAP_BASE 0xFFFFFF8000000000ULL
+static uint64_t ioremap_next = IOREMAP_BASE;
+
 void paging_set_phys_offset(uint64_t offset) {
     phys_offset = offset;
 }
 
-/* Convert a physical address to the kernel virtual address where it's accessible.
- * If phys_offset == 0 we assume identity mapping (virt == phys).
- * If phys_offset != 0 we map as virt = phys + phys_offset.
- *
- * The caller must ensure the chosen mapping is actually present before switching
- * phys_offset to a non-zero value.
- */
 static inline void *phys_to_virt(uint64_t phys) {
     if (phys == 0) return NULL;
     if (phys_offset == 0) return (void *)(uintptr_t)phys;
     return (void *)(uintptr_t)(phys + phys_offset);
 }
 
-/* Allocate one physical page for a page-table and return its virtual pointer. */
 static uint64_t *alloc_pt_page(void) {
     uint64_t phys = phys_alloc_frame();
     if (!phys) return NULL;
 
     void *v = phys_to_virt(phys);
-    if (!v) {
-        /* Should not happen if identity mapping is available for low memory.
-         * If you switch to a non-zero phys_offset later you must ensure that
-         * offset actually provides access to the returned phys frames.
-         */
-        return NULL;
-    }
+    if (!v) return NULL;
 
     memset(v, 0, PAGE_SIZE);
     return (uint64_t *)v;
@@ -65,7 +52,6 @@ uint64_t paging_get_pml4_phys(void) {
     return pml4_phys;
 }
 
-/* small helper to print 64-bit hex into buffer (buf must be >=19 bytes) */
 static void format_hex64(char *buf, uint64_t v) {
     const char hex[] = "0123456789abcdef";
     buf[0] = '0';
@@ -84,7 +70,6 @@ void paging_init(void) {
 
     com_write_string(COM1_PORT, "[PAGING] Allocating PML4...\n");
 
-    /* Get current CR3 from bootloader (physical address) */
     uint64_t old_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
 
@@ -94,15 +79,12 @@ void paging_init(void) {
     com_write_string(COM1_PORT, tmpbuf);
     com_write_string(COM1_PORT, "\n");
 
-    /* allocate a PML4 page */
     uint64_t *new_pml4_virt = alloc_pt_page();
     if (!new_pml4_virt) {
         com_write_string(COM1_PORT, "[PAGING] FATAL: Cannot allocate PML4!\n");
-        com_write_string(COM1_PORT, "[PAGING] phys_alloc_frame() returned 0\n");
         return;
     }
 
-    /* compute physical address of allocated page (virt - phys_offset if non-zero) */
     uint64_t new_pml4_phys;
     {
         uint64_t v = (uint64_t)(uintptr_t)new_pml4_virt;
@@ -120,10 +102,9 @@ void paging_init(void) {
 
     com_write_string(COM1_PORT, "[PAGING] Copying bootloader's page table entries...\n");
 
-    /* old_cr3 is a physical address of the bootloader PML4; access via phys_to_virt */
     uint64_t *old_pml4 = (uint64_t *)phys_to_virt(old_cr3 & PAGE_MASK);
     if (!old_pml4) {
-        com_write_string(COM1_PORT, "[PAGING] FATAL: cannot access old PML4 (phys_to_virt failed)\n");
+        com_write_string(COM1_PORT, "[PAGING] FATAL: cannot access old PML4\n");
         return;
     }
 
@@ -133,16 +114,10 @@ void paging_init(void) {
     }
 
     com_write_string(COM1_PORT, "[PAGING] Loading new CR3...\n");
-
-    /* Load CR3 with physical address of our new PML4 */
     __asm__ volatile("mov %0, %%cr3" :: "r"(pml4_phys) : "memory");
-
     com_write_string(COM1_PORT, "[PAGING] CR3 loaded successfully!\n");
 }
 
-/* Get or create next-level page table.
- * 'table' is a virtual pointer to a page-table page (so we index it directly).
- */
 static uint64_t *get_or_create(uint64_t *table, unsigned idx) {
     uint64_t ent = table[idx];
     if (ent & PFLAG_PRESENT) {
@@ -216,7 +191,7 @@ int paging_map_range(uint64_t virt_base, uint64_t phys_base, uint64_t size, uint
         uint64_t vaddr = virt_base + i * PAGE_SIZE;
         uint64_t paddr = phys_base + i * PAGE_SIZE;
         if (paging_map_page(vaddr, paddr, flags) != 0) {
-            com_write_string(COM1_PORT, "[PAGING] Failed to map page at virt=0x");
+            com_write_string(COM1_PORT, "[PAGING] Failed to map page at virt=");
             format_hex64(tmp, vaddr);
             com_write_string(COM1_PORT, tmp);
             com_write_string(COM1_PORT, "\n");
@@ -287,48 +262,70 @@ int paging_map_range_to_pml4(uint64_t *pml4_virt, uint64_t virt_base, uint64_t p
 }
 
 uint64_t paging_virt_to_phys(uint64_t virt) {
-    // Get current PML4
-    uint64_t *pml4 = paging_get_pml4();
+    uint64_t *current_pml4 = paging_get_pml4();
+    if (!current_pml4) return 0;
     
-    // Extract indices from virtual address
     uint64_t pml4_idx = (virt >> 39) & 0x1FF;
     uint64_t pdpt_idx = (virt >> 30) & 0x1FF;
     uint64_t pd_idx   = (virt >> 21) & 0x1FF;
     uint64_t pt_idx   = (virt >> 12) & 0x1FF;
     uint64_t offset   = virt & 0xFFF;
     
-    // Check PML4 entry
-    if (!(pml4[pml4_idx] & PFLAG_PRESENT)) {
-        return 0; // Not mapped
-    }
+    if (!(current_pml4[pml4_idx] & PFLAG_PRESENT)) return 0;
     
-    // Get PDPT
-    uint64_t *pdpt = (uint64_t*)(pml4[pml4_idx] & 0xFFFFFFFFF000ULL);
-    if (!(pdpt[pdpt_idx] & PFLAG_PRESENT)) {
-        return 0; // Not mapped
-    }
+    uint64_t *pdpt = (uint64_t*)phys_to_virt(current_pml4[pml4_idx] & PAGE_MASK);
+    if (!pdpt || !(pdpt[pdpt_idx] & PFLAG_PRESENT)) return 0;
     
-    // Get PD
-    uint64_t *pd = (uint64_t*)(pdpt[pdpt_idx] & 0xFFFFFFFFF000ULL);
-    if (!(pd[pd_idx] & PFLAG_PRESENT)) {
-        return 0; // Not mapped
-    }
+    uint64_t *pd = (uint64_t*)phys_to_virt(pdpt[pdpt_idx] & PAGE_MASK);
+    if (!pd || !(pd[pd_idx] & PFLAG_PRESENT)) return 0;
     
     // Check for 2MB page
     if (pd[pd_idx] & (1ULL << 7)) {
-        // 2MB page
         uint64_t page_phys = pd[pd_idx] & 0xFFFFFFFE00000ULL;
         uint64_t page_offset = virt & 0x1FFFFF;
         return page_phys | page_offset;
     }
     
-    // Get PT
-    uint64_t *pt = (uint64_t*)(pd[pd_idx] & 0xFFFFFFFFF000ULL);
-    if (!(pt[pt_idx] & PFLAG_PRESENT)) {
-        return 0; // Not mapped
+    uint64_t *pt = (uint64_t*)phys_to_virt(pd[pd_idx] & PAGE_MASK);
+    if (!pt || !(pt[pt_idx] & PFLAG_PRESENT)) return 0;
+    
+    uint64_t page_phys = pt[pt_idx] & PAGE_MASK;
+    return page_phys | offset;
+}
+
+/* CRITICAL FIX: ioremap for MMIO regions */
+void* ioremap(uint64_t phys_addr, uint64_t size) {
+    if (!pml4) {
+        paging_init();
+        if (!pml4) return NULL;
     }
     
-    // Get physical address
-    uint64_t page_phys = pt[pt_idx] & 0xFFFFFFFFF000ULL;
-    return page_phys | offset;
+    // Align to page boundaries
+    uint64_t phys_base = phys_addr & PAGE_MASK;
+    uint64_t offset = phys_addr & 0xFFF;
+    uint64_t aligned_size = ((size + offset + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    
+    // Allocate virtual address space
+    uint64_t virt_base = ioremap_next;
+    ioremap_next += aligned_size;
+    
+    // Map with caching disabled for MMIO
+    uint64_t flags = PFLAG_WRITABLE | PFLAG_PWT | PFLAG_PCD;
+    
+    char tmpbuf[32];
+    com_write_string(COM1_PORT, "[IOREMAP] Mapping phys ");
+    format_hex64(tmpbuf, phys_base);
+    com_write_string(COM1_PORT, tmpbuf);
+    com_write_string(COM1_PORT, " to virt ");
+    format_hex64(tmpbuf, virt_base);
+    com_write_string(COM1_PORT, tmpbuf);
+    com_write_string(COM1_PORT, "\n");
+    
+    if (paging_map_range(virt_base, phys_base, aligned_size, flags) != 0) {
+        com_write_string(COM1_PORT, "[IOREMAP] FAILED to map MMIO region\n");
+        return NULL;
+    }
+    
+    com_write_string(COM1_PORT, "[IOREMAP] Successfully mapped MMIO\n");
+    return (void*)(virt_base + offset);
 }
