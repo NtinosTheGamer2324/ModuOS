@@ -1,7 +1,7 @@
 #include "moduos/kernel/io/io.h"
-#include "moduos/drivers/ps2/ports.h"
+#include "moduos/drivers/input/ps2/ports.h"
 #include "moduos/arch/AMD64/interrupts/pic.h"
-#include "moduos/drivers/ps2/scancodes.h"
+#include "moduos/drivers/input/ps2/scancodes.h"
 #include <stdbool.h>
 #include "moduos/drivers/graphics/VGA.h"
 #include <stddef.h>
@@ -9,7 +9,7 @@
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/shell/zenith4.h"
 #include "moduos/kernel/events/events.h"
-#include "moduos/drivers/ps2/ps2.h"
+#include "moduos/drivers/input/ps2/ps2.h"
 
 
 #define TIMEOUT_LIMIT 1000000
@@ -143,9 +143,10 @@ static bool extended = false;
 static bool break_code = false;
 static bool shifted = false;
 
-static char input_buffer[INPUT_BUFFER_SIZE];
-static size_t input_index = 0;
-static bool input_ready = false;
+// Made non-static so USB input can share the same buffer
+char input_buffer[INPUT_BUFFER_SIZE];
+size_t input_index = 0;
+bool input_ready = false;
 
 char* input() {
     input_index = 0;

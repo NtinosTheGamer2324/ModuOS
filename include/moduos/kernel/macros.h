@@ -50,39 +50,39 @@
 } while(0)
 
 /* COM-only logging macros (no VGA output) */
-#define COM_LOG_INFO(COM_PORT, text) do { \
+#define COM_LOG_INFO(COM_PORT, ...) do { \
     com_write_string(COM_PORT, "[INFO] "); \
-    com_write_string(COM_PORT, text); \
+    com_printf(COM_PORT, __VA_ARGS__); \
     com_write_string(COM_PORT, "\n"); \
 } while(0)
 
-#define COM_LOG_WARN(COM_PORT, text) do { \
+#define COM_LOG_WARN(COM_PORT, ...) do { \
     com_write_string(COM_PORT, "[WARN] "); \
-    com_write_string(COM_PORT, text); \
+    com_printf(COM_PORT, __VA_ARGS__); \
     com_write_string(COM_PORT, "\n"); \
 } while(0)
 
-#define COM_LOG_ERROR(COM_PORT, text) do { \
+#define COM_LOG_ERROR(COM_PORT, ...) do { \
     com_write_string(COM_PORT, "[ERROR] "); \
-    com_write_string(COM_PORT, text); \
+    com_printf(COM_PORT, __VA_ARGS__); \
     com_write_string(COM_PORT, "\n"); \
 } while(0)
 
-#define COM_LOG_PANIC(COM_PORT, text) do { \
+#define COM_LOG_PANIC(COM_PORT, ...) do { \
     com_write_string(COM_PORT, "[PANIC] "); \
-    com_write_string(COM_PORT, text); \
+    com_printf(COM_PORT, __VA_ARGS__); \
     com_write_string(COM_PORT, "\n"); \
 } while(0)
 
-#define COM_LOG_CRIT(COM_PORT, text) do { \
+#define COM_LOG_CRIT(COM_PORT, ...) do { \
     com_write_string(COM_PORT, "[CRITICAL] "); \
-    com_write_string(COM_PORT, text); \
+    com_printf(COM_PORT, __VA_ARGS__); \
     com_write_string(COM_PORT, "\n"); \
 } while(0)
 
-#define COM_LOG_OK(COM_PORT, text) do { \
+#define COM_LOG_OK(COM_PORT, ...) do { \
     com_write_string(COM_PORT, "[OK] "); \
-    com_write_string(COM_PORT, text); \
+    com_printf(COM_PORT, __VA_ARGS__); \
     com_write_string(COM_PORT, "\n"); \
 } while(0)
 

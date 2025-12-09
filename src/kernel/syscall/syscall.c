@@ -9,7 +9,7 @@
 #include "moduos/fs/fs.h"
 #include "moduos/fs/fd.h"
 #include "moduos/kernel/exec.h"
-#include "moduos/drivers/ps2/ps2.h"
+#include "moduos/drivers/input/input.h"
 
 extern void syscall_entry(void);
 
@@ -53,7 +53,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_KILL:    return sys_kill((int)arg1, (int)arg2);
         case SYS_TIME:    return sys_time();
         case SYS_EXEC:    return sys_exec((const char*)arg1);
-        case SYS_INPUT:   return sys_input();
+        case SYS_INPUT:   return (uint64_t)sys_input();
         default:
             com_write_string(COM1_PORT, "[SYSCALL] Unknown syscall: ");
             itoa(syscall_num, buf, 10);

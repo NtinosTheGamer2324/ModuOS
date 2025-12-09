@@ -117,6 +117,10 @@ void pci_config_write_dword(uint8_t bus, uint8_t device, uint8_t func, uint8_t o
 void pci_config_write_word(uint8_t bus, uint8_t device, uint8_t func, uint8_t offset, uint16_t value);
 void pci_config_write_byte(uint8_t bus, uint8_t device, uint8_t func, uint8_t offset, uint8_t value);
 
+// Compatibility aliases
+#define pci_read_config pci_config_read_dword
+#define pci_write_config pci_config_write_dword
+
 // Device enumeration
 int pci_scan_bus(void);
 pci_device_t* pci_get_device(int index);

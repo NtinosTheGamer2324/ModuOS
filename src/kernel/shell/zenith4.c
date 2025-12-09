@@ -6,7 +6,8 @@
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/drivers/graphics/VGA.h"
-#include "moduos/drivers/ps2/ps2.h"
+#include "moduos/drivers/input/input.h"
+#include "moduos/drivers/input/ps2/ps2.h"
 #include "moduos/drivers/Time/RTC.h"
 #include "moduos/arch/AMD64/interrupts/irq.h"
 #include "moduos/fs/fs.h"  // Unified filesystem interface

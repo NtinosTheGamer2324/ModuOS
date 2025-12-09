@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+// External declarations for rand/srand (defined in eatfruit.c)
+extern void srand(uint32_t seed);
+extern uint32_t rand(void);
+
 // Pong constants
 #define GAME_WIDTH 40
 #define GAME_HEIGHT 20

@@ -17,6 +17,7 @@ void early_identity_map_all();
 
 /* Kernel heap alloc/free */
 void *kmalloc(size_t size);
+void *kmalloc_aligned(size_t size, size_t alignment);
 void *kzalloc(size_t size);
 void kfree(void *ptr);
 void kheap_stats(void);
