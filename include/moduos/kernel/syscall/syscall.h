@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "moduos/kernel/md64api.h"
 
 #ifndef _SSIZE_T_DEFINED
 #define _SSIZE_T_DEFINED
@@ -34,6 +35,7 @@ typedef long ssize_t;
 #define SYS_RMDIR       21
 #define SYS_UNLINK      22
 #define SYS_INPUT       23
+#define SYS_SSTATS      24
 #define SYS_WRITEFILE   30
 
 
@@ -62,5 +64,7 @@ void* sys_sbrk(intptr_t increment);
 int sys_kill(int pid, int sig);
 uint64_t sys_time(void);
 char* sys_input(void);
+
+md64api_sysinfo_data* sys_get_sysinfo(void);  // Changed to return pointer
 
 #endif

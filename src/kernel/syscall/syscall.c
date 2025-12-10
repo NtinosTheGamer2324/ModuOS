@@ -1,4 +1,5 @@
 #include "moduos/kernel/syscall/syscall.h"
+#include "moduos/kernel/md64api.h"
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/interrupts/idt.h"
@@ -23,17 +24,7 @@ void syscall_init(void) {
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
                          uint64_t arg3, uint64_t arg4, uint64_t arg5) {
     // DEBUG: Log every syscall
-    com_write_string(COM1_PORT, "[SYSCALL] num=");
     char buf[32];
-    itoa(syscall_num, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, " arg1=0x");
-    for (int j = 15; j >= 0; j--) {
-        uint8_t nibble = (arg1 >> (j * 4)) & 0xF;
-        char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
-        com_write_byte(COM1_PORT, hex);
-    }
-    com_write_string(COM1_PORT, "\n");
     
     switch (syscall_num) {
         case SYS_EXIT:    return sys_exit((int)arg1);
@@ -54,6 +45,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_TIME:    return sys_time();
         case SYS_EXEC:    return sys_exec((const char*)arg1);
         case SYS_INPUT:   return (uint64_t)sys_input();
+        case SYS_SSTATS:
+            return (uint64_t)sys_get_sysinfo();
         default:
             com_write_string(COM1_PORT, "[SYSCALL] Unknown syscall: ");
             itoa(syscall_num, buf, 10);
@@ -99,6 +92,12 @@ ssize_t sys_read(int fd, void *buf, size_t count) {
     com_write_string(COM1_PORT, "\n");
     
     return result;
+}
+
+md64api_sysinfo_data* sys_get_sysinfo(void) {
+    static md64api_sysinfo_data info;
+    info = get_system_info(); // populate the static struct
+    return &info;
 }
 
 ssize_t sys_writefile(int fd, const char *str, size_t count) {

@@ -23,6 +23,7 @@
 #include "moduos/drivers/PCI/pci.h"
 #include "moduos/fs/fd.h" 
 #include "moduos/drivers/Drive/vDrive.h"
+#include "moduos/drivers/USB/usb.h"
 #include <stdint.h>
 
 int acpi_initialized;
@@ -358,62 +359,87 @@ static void Interrupts_Init(void)
 static void device_Init(void)
 {
     COM_LOG_INFO(COM1_PORT, "Initializing input subsystem");
+    VGA_Write("Initializing input subsystem\n");
     input_init();
     irq_install_handler(1, keyboard_irq_handler);
+    VGA_Write("Initialized input subsystem\n");
 
     // PCI Initialization
     COM_LOG_INFO(COM1_PORT, "Initializing PCI subsystem");
+    VGA_Write("Initializing PCI subsystem\n");
     pci_init();
     COM_LOG_OK(COM1_PORT, "PCI subsystem initialized");
+    VGA_Write("PCI subsystem initialized\n");
     
     // AHCI Initialization
+    VGA_Write("Initializing AHCI\n");
     COM_LOG_INFO(COM1_PORT, "Initializing AHCI");
     int ahci_status = ahci_init();
     if (ahci_status == 0) {
         COM_LOG_OK(COM1_PORT, "AHCI initialized successfully");
+        VGA_Write("AHCI initialized successfully\n");
     } else {
         COM_LOG_WARN(COM1_PORT, "AHCI initialization failed or no drives found");
+        VGA_Write("AHCI initialization failed or no drives found\n");
     }
 
     // SATA Initialization
     COM_LOG_INFO(COM1_PORT, "Initializing SATA subsystem");
+    VGA_Write("Initializing SATA subsystem\n");
     int sata_status = sata_init();
     if (sata_status == SATA_SUCCESS) {
         COM_LOG_OK(COM1_PORT, "SATA subsystem initialized");
+        VGA_Write("SATA subsystem initialized\n");
     } else {
         COM_LOG_WARN(COM1_PORT, "SATA initialization failed");
+        VGA_Write("SATA initialization failed\n");
     }
 
     // ATA Initialization (fallback for older systems)
     COM_LOG_INFO(COM1_PORT, "Initializing ATA Controller / Drives");
+    VGA_Write("Initializing ATA Controller / Drives\n");
     int ata_status = ata_init();
     if (ata_status == 0) {
         COM_LOG_OK(COM1_PORT, "ATA initialized successfully, drives detected");
+        VGA_Write("ATA initialized successfully, drives detected\n");
     } else if (ata_status == -1) {
         COM_LOG_WARN(COM1_PORT, "ATA controller present, but no drives found");
+        VGA_Write("ATA controller present, but no drives found\n");
     } else if (ata_status == -2) {
         COM_LOG_ERROR(COM1_PORT, "ATA controller not responding!");
+        VGA_Write("ATA controller not responding!\n");
     }
 
     // vDrive Initialization - UNIFIES ALL STORAGE
     COM_LOG_INFO(COM1_PORT, "Initializing vDrive unified drive interface");
+    VGA_Write("Initializing vDrive unified drive interface\n");
     int vdrive_status = vdrive_init();
     
     if (vdrive_status == VDRIVE_SUCCESS || vdrive_status == VDRIVE_ERR_NO_DRIVES) {
         COM_LOG_OK(COM1_PORT, "vDrive subsystem initialized");
+        VGA_Write("vDrive subsystem initialized\n");
         
         // Print nice table of all drives
         vdrive_print_table();
         
         if (vdrive_get_count() == 0) {
             COM_LOG_WARN(COM1_PORT, "No storage drives available!");
+            VGA_Write("No storage drives available!\n");
             if (sata_status != SATA_SUCCESS && ata_status != 0) {
                 trigger_panic_doata();  // No drives at all - panic!
             }
         }
     } else {
         COM_LOG_ERROR(COM1_PORT, "vDrive initialization failed");
+        VGA_Write("vDrive initialization failed\n");
     }
+
+    // USB Initialization
+    COM_LOG_INFO(COM1_PORT, "Initializing USB subsystem");
+    VGA_Write("Initializing USB subsystem\n");
+    usb_init();
+    COM_LOG_OK(COM1_PORT, "USB subsystem initialized");
+    VGA_Write("USB subsystem initialized\n");
 }
 
 // ------------------ BOOT SCREEN ------------------
@@ -474,33 +500,47 @@ static void init(uint64_t mb2_ptr_init)
     // Initialize memory system (phys allocator + paging + heap)
     memory_system_init((void*)(uintptr_t)mb2_ptr_init);
     
+    com_write_string(COM1_PORT, "[KERNEL] memory_system_init() returned!\n");
+    com_write_string(COM1_PORT, "[KERNEL] Starting memory smoke tests...\n");
+    VGA_Write("[KERNEL] memory_system_init() returned!\n");
+    VGA_Write("[KERNEL] Starting memory smoke tests...\n");
+    
     // Run memory smoke tests to verify everything works
     memory_smoke_test();
     com_write_string(COM1_PORT, "=== MEMORY INITIALIZATION COMPLETE ===\n\n");
+    VGA_Write("=== MEMORY INITIALIZATION COMPLETE ===\n");
 
+    VGA_Write("Initializing Devices\n");
     // Initialize devices (includes vDrive!)
     device_Init();
+    VGA_Write("Initialized Devices\n");
 
     // Initialize filesystem layer
     COM_LOG_INFO(COM1_PORT, "Initializing filesystem layer");
+    VGA_Write("Initializing filesystem layer\n");
     fs_init();
     fd_init();
     COM_LOG_OK(COM1_PORT, "Filesystem layer initialized");
+    VGA_Write("Filesystem layer initialized\n");
 
     // Initialize ACPI
     if (acpi_init() == 0) {
         acpi_initialized = 1;
         COM_LOG_OK(COM1_PORT, "ACPI initialized");
+        VGA_Write("ACPI initialized\n");
     } else {
         COM_LOG_WARN(COM1_PORT, "ACPI initialization failed");
+        VGA_Write("ACPI initialization failed\n");
     }
 
     // Initialize process management system
     COM_LOG_INFO(COM1_PORT, "Initializing process management");
+    VGA_Write("Initializing process management\n");
     process_init();
     scheduler_init();
     syscall_init();
     COM_LOG_OK(COM1_PORT, "Process management initialized");
+    VGA_Write("Process management initialized\n");
 
     // Detect boot drive using vDrive!
     com_write_string(COM1_PORT, "\n=== BOOT DRIVE DETECTION ===\n");

@@ -51,14 +51,14 @@ static inline void select_drive(uint16_t base, uint8_t drive, uint8_t lba_high4)
 
 /* Poll utilities (used for IDENTIFY and some waits) */
 static int ata_wait_not_busy(uint16_t base) {
-    for (int i = 0; i < 1000000; ++i) {
+    for (int i = 0; i < 100000; ++i) {
         uint8_t s = read_status(base);
         if (!(s & ATA_SR_BSY)) return 0;
     }
     return -1;
 }
 static int ata_wait_drq(uint16_t base) {
-    for (int i = 0; i < 1000000; ++i) {
+    for (int i = 0; i < 100000; ++i) {
         uint8_t s = read_status(base);
         if (s & ATA_SR_ERR) return -2;
         if (s & ATA_SR_DRQ) return 0;
@@ -114,8 +114,8 @@ static int ata_identify_drive(int drive_index) {
     io_wait();
 
     uint8_t status = inb(base + REG_STATUS);
-    if (status == 0) {
-        /* No device present */
+    if (status == 0 || status == 0xFF) {
+        /* No device present (0x00) or floating bus (0xFF) */
         return -1;
     }
 
@@ -237,6 +237,16 @@ static void ata_irq_secondary(void){ ata_irq_handler_common(1, 15); }
 
 /* Public API: initialization */
 int ata_init(void) {
+    /* Quick check: if primary and secondary status registers both return 0xFF,
+     * the ATA controller likely doesn't exist - skip initialization entirely */
+    uint8_t prim_status = inb(ATA_PRIMARY_BASE + REG_STATUS);
+    uint8_t sec_status = inb(ATA_SECONDARY_BASE + REG_STATUS);
+    
+    if (prim_status == 0xFF && sec_status == 0xFF) {
+        /* Floating bus - no ATA controller present */
+        return -2;
+    }
+
     for (int i = 0; i < 4; ++i) {
         ata_drives[i].exists = 0;
         ata_drives[i].is_atapi = 0;

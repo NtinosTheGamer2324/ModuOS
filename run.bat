@@ -34,7 +34,7 @@ echo. > com2.log
 timeout /t 1 /nobreak >nul
 
 REM Start QEMU in background and wait shortly for log files to start populating
-REM Start QEMU with real VBE support and USB 2.0 keyboard
+REM Start QEMU with real VBE support and PS/2 keyboard
 start "QEMU" qemu-system-x86_64 ^
     -M pc-i440fx-6.2 ^
     -m 1024M ^
@@ -45,12 +45,11 @@ start "QEMU" qemu-system-x86_64 ^
     -drive id=disk,file=.\disk.img,if=none,format=raw ^
     -device ahci,id=ahci ^
     -device ide-hd,drive=disk,bus=ahci.0 ^
-    -device usb-ehci,id=ehci ^
-    -device usb-kbd,bus=ehci.0 ^
     -boot d
 REM    -vga std ^
 REM    -no-reboot ^
 REM    -no-shutdown
+
 
 
 timeout /t 1 /nobreak >nul
