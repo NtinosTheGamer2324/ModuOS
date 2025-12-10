@@ -31,6 +31,7 @@
 #define SYS_RMDIR       21
 #define SYS_UNLINK      22
 #define SYS_INPUT       23
+#define SYS_SSTATS      24      // System statistics
 #define SYS_WRITEFILE   30     // NEW: fd-based writing
 
 // File descriptor constants
@@ -51,6 +52,66 @@
 #define _SSIZE_T_DEFINED
 typedef long ssize_t;
 #endif
+
+typedef const char* string;
+
+/* System Information Structure */
+typedef struct md64api_sysinfo_data
+{
+    /* --- Memory Info --- */
+    uint64_t sys_available_ram;     /* Available RAM in MB */
+    uint64_t sys_total_ram;         /* Total system RAM in MB */
+
+    /* --- OS / Kernel Info --- */
+    int SystemVersion;              /* OS major version */
+    int KernelVersion;              /* Kernel version number */
+    string KernelVendor;            /* NTSoftware / New Technologies Software */
+    string os_name;                 /* ModuOS */
+    string os_arch;                 /* AMD64 only (ARM version not implemented) */
+
+    /* --- System Identity --- */
+    string pcname;                  /* Host / computer name */
+    string username;                /* Current user */
+    string domain;                  /* Domain / workgroup */
+    string kconsole;                /* VGA console / VBE text console */
+
+    /* --- CPU Info --- */
+    string cpu;                     /* Vendor string: GenuineIntel, AuthenticAMD, etc */
+    string cpu_manufacturer;        /* Intel / AMD / etc */
+    string cpu_model;               /* Core i5-13600K, Ryzen 7 5800X, etc */
+    int cpu_cores;                  /* Physical cores */
+    int cpu_threads;                /* Logical processors */
+    int cpu_hyperthreading_enabled; /* 1 = enabled, 0 = disabled */
+    int cpu_base_mhz;               /* Base clock in MHz */
+    int cpu_max_mhz;                /* Max turbo clock in MHz */
+    int cpu_cache_l1_kb;            /* L1 cache size */
+    int cpu_cache_l2_kb;            /* L2 cache size */
+    int cpu_cache_l3_kb;            /* L3 cache size */
+    string cpu_flags;               /* SSE, SSE2, AVX, AVX2, AES, etc */
+
+    /* --- Virtualization Info --- */
+    int is_virtual_machine;         /* 1 = VM detected, 0 = physical */
+    string virtualization_vendor;   /* VMware, VirtualBox, KVM, Hyper-V, etc */
+
+    /* --- GPU Info --- */
+    string gpu_name;                /* GPU model */
+    int gpu_vram_mb;                /* VRAM in MB */
+
+    /* --- Storage Info --- */
+    uint64_t storage_total_mb;      /* Total storage space in MB */
+    uint64_t storage_free_mb;       /* Free storage space in MB */
+    string primary_disk_model;      /* Disk model name */
+
+    /* --- Firmware / BIOS --- */
+    string bios_vendor;             /* AMI, Phoenix, UEFI vendor */
+    string bios_version;            /* BIOS/UEFI version */
+    string motherboard_model;       /* Motherboard identifier */
+
+    /* --- Security Features --- */
+    int secure_boot_enabled;        /* 1 = Secure Boot enabled */
+    int tpm_version;                /* 0 = none, 1.2 = 1, 2.0 = 2 */
+
+} md64api_sysinfo_data;
 
 // Syscall wrapper (3 args max)
 static inline long syscall(long num, long arg1, long arg2, long arg3) {
@@ -91,7 +152,15 @@ static inline void puts(const char *s) {
 }
 
 static inline char* input() {
-    return syscall(SYS_INPUT, 0, 0, 0);
+    return (char*)syscall(SYS_INPUT, 0, 0, 0);
+}
+
+/* ============================================================
+   SYSTEM INFO
+   ============================================================ */
+
+static inline md64api_sysinfo_data* get_system_info(void) {
+    return (md64api_sysinfo_data*)syscall(SYS_SSTATS, 0, 0, 0);
 }
 
 /* ============================================================
@@ -168,6 +237,25 @@ static void print_ulong(unsigned long n, int base, int upper) {
         putc(buf[--i]);
 }
 
+static void print_ulonglong(unsigned long long n, int base, int upper) {
+    char buf[64];
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+
+    if (n == 0) {
+        putc('0');
+        return;
+    }
+
+    int i = 0;
+    while (n > 0) {
+        buf[i++] = digits[n % base];
+        n /= base;
+    }
+
+    while (i > 0)
+        putc(buf[--i]);
+}
+
 static void print_long(long n) {
     if (n < 0) {
         putc('-');
@@ -189,9 +277,15 @@ int printf(const char *fmt, ...) {
             fmt++;
 
             int longmod = 0;
-            if (*fmt == 'l') {   // handle 'l' modifier
+            int longlongmod = 0;
+            
+            if (*fmt == 'l') {
                 longmod = 1;
                 fmt++;
+                if (*fmt == 'l') {  // 'll' for long long
+                    longlongmod = 1;
+                    fmt++;
+                }
             }
 
             switch (*fmt) {
@@ -205,28 +299,42 @@ int printf(const char *fmt, ...) {
 
                 case 'd':
                 case 'i':
-                    if (longmod)
+                    if (longlongmod) {
+                        long long n = va_arg(ap, long long);
+                        if (n < 0) {
+                            putc('-');
+                            n = -n;
+                        }
+                        print_ulonglong((unsigned long long)n, 10, 0);
+                    } else if (longmod) {
                         print_long(va_arg(ap, long));
-                    else
+                    } else {
                         print_int(va_arg(ap, int));
+                    }
                     break;
 
                 case 'u':
-                    if (longmod)
+                    if (longlongmod)
+                        print_ulonglong(va_arg(ap, unsigned long long), 10, 0);
+                    else if (longmod)
                         print_ulong(va_arg(ap, unsigned long), 10, 0);
                     else
                         print_uint(va_arg(ap, unsigned int), 10, 0);
                     break;
 
                 case 'x':
-                    if (longmod)
+                    if (longlongmod)
+                        print_ulonglong(va_arg(ap, unsigned long long), 16, 0);
+                    else if (longmod)
                         print_ulong(va_arg(ap, unsigned long), 16, 0);
                     else
                         print_uint(va_arg(ap, unsigned int), 16, 0);
                     break;
 
                 case 'X':
-                    if (longmod)
+                    if (longlongmod)
+                        print_ulonglong(va_arg(ap, unsigned long long), 16, 1);
+                    else if (longmod)
                         print_ulong(va_arg(ap, unsigned long), 16, 1);
                     else
                         print_uint(va_arg(ap, unsigned int), 16, 1);

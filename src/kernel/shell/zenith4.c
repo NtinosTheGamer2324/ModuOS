@@ -751,29 +751,6 @@ void zenith4_start() {
                     VGA_Writef("  %d: %s\n", i + 1, shell_state.history[idx]);
                 }
             }
-        } else if (strcmp(command, "zsfetch") == 0) {
-            rtc_datetime_t dt;
-            rtc_get_datetime(&dt);
-
-            char cpu_vendor[13];
-            get_cpu_vendor2(cpu_vendor);
-
-            VGA_Write("\n");
-            VGA_Writef("\\cp%s\\rr@\\cc%s\\rr\n", shell_state.user, shell_state.pcname);
-            VGA_Write("\\cg--------------\\rr\n");
-            VGA_Write("\\cyOS:\\rr ModuOS v0.3.23\n");
-            VGA_Write("\\cyShell:\\rr Zenith v0.4.1\n");
-            VGA_Write("\\cyKernel Architecture:\\rr AMD64 (x86_64)\n");
-            VGA_Writef("\\cyCPU:\\rr %s\n", cpu_vendor);
-            VGA_Write("\\cyUptime:\\rr N/A\n");
-            VGA_Write("\\cyTerminal:\\rr VGA Console\n");
-            VGA_Write("\\cyResolution:\\rr 80x25\n");
-            VGA_Write("\n");
-            VGA_Writef("\\cyDate:\\rr %04u-%02u-%02u\n", dt.year, dt.month, dt.day);
-            VGA_Writef("\\cyTime:\\rr %02u:%02u:%02u\n", dt.hour, dt.minute, dt.second);
-            VGA_Write("\n");
-            VGA_Write("  \\br    \\rr \\bg    \\rr \\bb    \\rr\n");
-            VGA_Write("  \\br    \\rr \\bg    \\rr \\bb    \\rr\n");
         } else if (strcmp(command, "dev") == 0 || strcmp(command, "lsblk") == 0) {
             // Use vDrive to list all storage devices (ATA + SATA)
             vdrive_print_table();

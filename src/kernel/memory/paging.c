@@ -33,6 +33,11 @@ static inline void *phys_to_virt(uint64_t phys) {
     return (void *)(uintptr_t)(phys + phys_offset);
 }
 
+void *phys_to_virt_kernel(uint64_t phys) {
+    // Identity mapping for kernel (phys_offset = 0)
+    return (void *)(uintptr_t)phys;
+}
+
 static uint64_t *alloc_pt_page(void) {
     uint64_t phys = phys_alloc_frame();
     if (!phys) return NULL;
@@ -68,7 +73,7 @@ void paging_init(void) {
         return;
     }
 
-    com_write_string(COM1_PORT, "[PAGING] Allocating PML4...\n");
+    com_write_string(COM1_PORT, "[PAGING] Initializing AMD64 paging...\n");
 
     uint64_t old_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
@@ -79,43 +84,24 @@ void paging_init(void) {
     com_write_string(COM1_PORT, tmpbuf);
     com_write_string(COM1_PORT, "\n");
 
-    uint64_t *new_pml4_virt = alloc_pt_page();
-    if (!new_pml4_virt) {
-        com_write_string(COM1_PORT, "[PAGING] FATAL: Cannot allocate PML4!\n");
+    // CRITICAL FIX: Just use the bootloader's PML4 directly!
+    // Don't try to create a new one - that requires allocating memory
+    // which itself needs page tables to access!
+    pml4_phys = old_cr3 & PAGE_MASK;
+    pml4 = (uint64_t *)phys_to_virt(pml4_phys);
+    
+    if (!pml4) {
+        com_write_string(COM1_PORT, "[PAGING] FATAL: Cannot access bootloader PML4\n");
         return;
     }
 
-    uint64_t new_pml4_phys;
-    {
-        uint64_t v = (uint64_t)(uintptr_t)new_pml4_virt;
-        if (phys_offset == 0) new_pml4_phys = v;
-        else new_pml4_phys = v - phys_offset;
-    }
-
-    pml4 = new_pml4_virt;
-    pml4_phys = new_pml4_phys;
-
-    com_write_string(COM1_PORT, "[PAGING] New PML4 allocated at: ");
+    com_write_string(COM1_PORT, "[PAGING] Using bootloader's PML4 at: ");
     format_hex64(tmpbuf, pml4_phys);
     com_write_string(COM1_PORT, tmpbuf);
     com_write_string(COM1_PORT, "\n");
-
-    com_write_string(COM1_PORT, "[PAGING] Copying bootloader's page table entries...\n");
-
-    uint64_t *old_pml4 = (uint64_t *)phys_to_virt(old_cr3 & PAGE_MASK);
-    if (!old_pml4) {
-        com_write_string(COM1_PORT, "[PAGING] FATAL: cannot access old PML4\n");
-        return;
-    }
-
-    for (int i = 0; i < PT_ENTRIES; ++i) {
-        if (old_pml4[i] & PFLAG_PRESENT) pml4[i] = old_pml4[i];
-        else pml4[i] = 0;
-    }
-
-    com_write_string(COM1_PORT, "[PAGING] Loading new CR3...\n");
-    __asm__ volatile("mov %0, %%cr3" :: "r"(pml4_phys) : "memory");
-    com_write_string(COM1_PORT, "[PAGING] CR3 loaded successfully!\n");
+    
+    com_write_string(COM1_PORT, "[PAGING] Bootloader has already set up identity mapping\n");
+    com_write_string(COM1_PORT, "[PAGING] We will extend it as needed\n");
 }
 
 static uint64_t *get_or_create(uint64_t *table, unsigned idx) {
@@ -263,7 +249,15 @@ int paging_map_range_to_pml4(uint64_t *pml4_virt, uint64_t virt_base, uint64_t p
 
 uint64_t paging_virt_to_phys(uint64_t virt) {
     uint64_t *current_pml4 = paging_get_pml4();
-    if (!current_pml4) return 0;
+    if (!current_pml4) {
+        /* PML4 not initialized yet - try to use CR3 directly */
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        
+        /* In identity mapping, we can access page tables directly */
+        uint64_t pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
+        current_pml4 = (uint64_t*)(uintptr_t)pml4_phys;
+    }
     
     uint64_t pml4_idx = (virt >> 39) & 0x1FF;
     uint64_t pdpt_idx = (virt >> 30) & 0x1FF;
@@ -271,45 +265,71 @@ uint64_t paging_virt_to_phys(uint64_t virt) {
     uint64_t pt_idx   = (virt >> 12) & 0x1FF;
     uint64_t offset   = virt & 0xFFF;
     
-    if (!(current_pml4[pml4_idx] & PFLAG_PRESENT)) return 0;
+    /* Read PML4 entry */
+    uint64_t pml4_entry = current_pml4[pml4_idx];
+    if (!(pml4_entry & PFLAG_PRESENT)) {
+        return 0;
+    }
     
-    uint64_t *pdpt = (uint64_t*)phys_to_virt(current_pml4[pml4_idx] & PAGE_MASK);
-    if (!pdpt || !(pdpt[pdpt_idx] & PFLAG_PRESENT)) return 0;
+    /* Get PDPT physical address and access it (identity mapped) */
+    uint64_t pdpt_phys = pml4_entry & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *pdpt = (uint64_t*)(uintptr_t)pdpt_phys;
     
-    uint64_t *pd = (uint64_t*)phys_to_virt(pdpt[pdpt_idx] & PAGE_MASK);
-    if (!pd || !(pd[pd_idx] & PFLAG_PRESENT)) return 0;
+    uint64_t pdpt_entry = pdpt[pdpt_idx];
+    if (!(pdpt_entry & PFLAG_PRESENT)) {
+        return 0;
+    }
     
-    // Check for 2MB page
-    if (pd[pd_idx] & (1ULL << 7)) {
-        uint64_t page_phys = pd[pd_idx] & 0xFFFFFFFE00000ULL;
+    /* Check for 1GB huge page */
+    if (pdpt_entry & (1ULL << 7)) {
+        uint64_t page_phys = pdpt_entry & 0xFFFFFFFFC0000000ULL;
+        uint64_t page_offset = virt & 0x3FFFFFFF;
+        return page_phys | page_offset;
+    }
+    
+    /* Get PD physical address */
+    uint64_t pd_phys = pdpt_entry & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *pd = (uint64_t*)(uintptr_t)pd_phys;
+    
+    uint64_t pd_entry = pd[pd_idx];
+    if (!(pd_entry & PFLAG_PRESENT)) {
+        return 0;
+    }
+    
+    /* Check for 2MB huge page */
+    if (pd_entry & (1ULL << 7)) {
+        uint64_t page_phys = pd_entry & 0xFFFFFFFFFE000000ULL;
         uint64_t page_offset = virt & 0x1FFFFF;
         return page_phys | page_offset;
     }
     
-    uint64_t *pt = (uint64_t*)phys_to_virt(pd[pd_idx] & PAGE_MASK);
-    if (!pt || !(pt[pt_idx] & PFLAG_PRESENT)) return 0;
+    /* Get PT physical address */
+    uint64_t pt_phys = pd_entry & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *pt = (uint64_t*)(uintptr_t)pt_phys;
     
-    uint64_t page_phys = pt[pt_idx] & PAGE_MASK;
+    uint64_t pt_entry = pt[pt_idx];
+    if (!(pt_entry & PFLAG_PRESENT)) {
+        return 0;
+    }
+    
+    /* Regular 4KB page */
+    uint64_t page_phys = pt_entry & 0xFFFFFFFFFFFFF000ULL;
     return page_phys | offset;
 }
 
-/* CRITICAL FIX: ioremap for MMIO regions */
 void* ioremap(uint64_t phys_addr, uint64_t size) {
     if (!pml4) {
         paging_init();
         if (!pml4) return NULL;
     }
     
-    // Align to page boundaries
     uint64_t phys_base = phys_addr & PAGE_MASK;
     uint64_t offset = phys_addr & 0xFFF;
     uint64_t aligned_size = ((size + offset + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
     
-    // Allocate virtual address space
     uint64_t virt_base = ioremap_next;
     ioremap_next += aligned_size;
     
-    // Map with caching disabled for MMIO
     uint64_t flags = PFLAG_WRITABLE | PFLAG_PWT | PFLAG_PCD;
     
     char tmpbuf[32];

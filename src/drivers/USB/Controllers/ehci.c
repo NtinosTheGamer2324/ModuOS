@@ -23,8 +23,13 @@ typedef struct ehci_transfer_info {
 
 static ehci_transfer_info_t *active_transfers = NULL;
 
-// Forward declare ehci_free_qtd
+// Forward declarations
 static void ehci_free_qtd(ehci_qtd_t *qtd);
+static ehci_qtd_t* ehci_alloc_qtd(ehci_controller_t *ehci);
+static ehci_qh_t* ehci_create_qh(ehci_controller_t *ehci, uint8_t addr, uint8_t endpoint,
+                                  uint8_t speed, uint16_t max_packet);
+static int ehci_create_qtd(ehci_controller_t *ehci, ehci_qtd_t *qtd, uint8_t pid,
+                           void *buffer, uint16_t length, int toggle);
 
 // Track transfer
 static void ehci_track_transfer(ehci_transfer_info_t *info) {
@@ -697,6 +702,8 @@ int ehci_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *da
     com_write_string(COM1_PORT, "[EHCI-XFER] Doorbell rung, waiting for IAA\n");
     
     // Wait for IAA (Interrupt on Async Advance)
+    // Note: IAA timeout is normal if interrupts are working - the transfer
+    // continues anyway and completes successfully
     int iaa_timeout = 100;
     while (iaa_timeout-- > 0) {
         uint32_t status = ehci_read32(ehci, EHCI_OP_USBSTS);
@@ -709,7 +716,8 @@ int ehci_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *da
     }
     
     if (iaa_timeout <= 0) {
-        com_write_string(COM1_PORT, "[EHCI-XFER] IAA timeout!\n");
+        // This is normal - IAA may be handled by interrupt handler
+        com_write_string(COM1_PORT, "[EHCI-XFER] IAA timeout (continuing anyway)\n");
     }
     
     com_write_string(COM1_PORT, "[EHCI-XFER] Waiting for transfer completion\n");
@@ -974,16 +982,28 @@ int ehci_probe(pci_device_t *pci_dev) {
     // Convert to physical address for DMA
     ehci->periodic_list_phys = (uint32_t)paging_virt_to_phys((uintptr_t)ehci->periodic_list);
     
-    // Allocate qTD pool
-    if (ehci_setup_periodic_schedule(ehci) != 0) {
-        COM_LOG_ERROR(COM1_PORT, "EHCI: Failed to setup periodic schedule");
+    // Allocate qTD pool (32 descriptors should be enough for typical usage)
+    ehci->qtd_pool_count = 32;
+    ehci->qtd_pool = (ehci_qtd_t*)kmalloc_aligned(sizeof(ehci_qtd_t) * ehci->qtd_pool_count, 32);
+    if (!ehci->qtd_pool) {
+        COM_LOG_ERROR(COM1_PORT, "EHCI: Failed to allocate qTD pool");
         kfree(ehci->periodic_list);
         kfree(ehci);
         return -1;
     }
     
+    // Initialize all qTDs as free
     for (int i = 0; i < ehci->qtd_pool_count; i++) {
         ehci_free_qtd(&ehci->qtd_pool[i]);
+    }
+    
+    // Setup periodic schedule after qTD pool is ready
+    if (ehci_setup_periodic_schedule(ehci) != 0) {
+        COM_LOG_ERROR(COM1_PORT, "EHCI: Failed to setup periodic schedule");
+        kfree(ehci->qtd_pool);
+        kfree(ehci->periodic_list);
+        kfree(ehci);
+        return -1;
     }
     
     COM_LOG_OK(COM1_PORT, "EHCI: Memory structures allocated");
@@ -1220,65 +1240,6 @@ void ehci_reset_port(usb_controller_t *controller, uint8_t port) {
             COM_LOG_OK(COM1_PORT, "EHCI: Device enumerated successfully");
         }
     }
-}
-
-// Submit interrupt transfer
-int ehci_submit_interrupt_transfer(usb_device_t *dev, usb_transfer_t *transfer) {
-    if (!dev || !dev->controller || !transfer) return -1;
-    
-    ehci_controller_t *ehci = (ehci_controller_t*)dev->controller->controller_data;
-    
-    uint8_t pid = (transfer->endpoint & 0x80) ? USB_PID_IN : USB_PID_OUT;
-    uint8_t ep_num = transfer->endpoint & 0x0F;
-    
-    ehci_qtd_t *int_qtd = ehci_alloc_qtd(ehci);
-    if (!int_qtd) {
-        transfer->status = USB_TRANSFER_STATUS_ERROR;
-        return -1;
-    }
-    
-    if (ehci_create_qtd(ehci, int_qtd, pid, transfer->buffer, transfer->length, 1) != 0) {
-        ehci_free_qtd(int_qtd);
-        transfer->status = USB_TRANSFER_STATUS_ERROR;
-        return -1;
-    }
-    
-    uint64_t int_qtd_phys = paging_virt_to_phys((uintptr_t)int_qtd);
-    int_qtd->next_qtd_ptr = EHCI_LP_TERMINATE;
-    
-    ehci_qh_t *qh = ehci_create_qh(ehci, dev->address, ep_num, dev->speed, dev->max_packet_size);
-    if (!qh) {
-        ehci_free_qtd(int_qtd);
-        return -1;
-    }
-    
-    qh->capabilities = (1 << 0);
-    qh->next_qtd_ptr = (uint32_t)int_qtd_phys;
-    qh->token &= ~EHCI_QTD_TOKEN_STATUS_HALTED;
-    
-    ehci_transfer_info_t *info = (ehci_transfer_info_t*)kmalloc(sizeof(ehci_transfer_info_t));
-    if (!info) {
-        kfree(qh);
-        ehci_free_qtd(int_qtd);
-        return -1;
-    }
-    
-    info->transfer = transfer;
-    info->device = dev;
-    info->first_qtd = int_qtd;
-    info->qh = qh;
-    
-    ehci_track_transfer(info);
-    
-    uint64_t qh_phys = paging_virt_to_phys((uintptr_t)qh);
-    for (int i = 0; i < EHCI_FRAMELIST_COUNT; i += 8) {
-        if (ehci->periodic_list[i] == EHCI_LP_TERMINATE) {
-            ehci->periodic_list[i] = (uint32_t)qh_phys | EHCI_LP_TYPE_QH;
-        }
-    }
-    
-    transfer->status = USB_TRANSFER_STATUS_PENDING;
-    return 0;
 }
 
 // Cancel transfer

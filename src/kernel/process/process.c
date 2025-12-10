@@ -1,4 +1,4 @@
-// process.c - With argument passing support
+// process.c - Fixed argument passing
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
@@ -169,16 +169,11 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
     proc->cpu_state.rbp = initial_rsp;
     proc->cpu_state.rflags = 0x202;
     
-    // Set up argc and argv in registers (System V ABI)
-    // RDI = argc, RSI = argv
+    // FIXED: Store argc and argv in callee-saved registers
+    // The context_switch.asm will move these to RDI/RSI before jumping to entry
     if (argc > 0 && argv) {
-        // WARNING: We're storing these in CPU state, but they're not preserved
-        // by context_switch! Need a different approach.
-        // 
-        // SOLUTION: Put argc/argv on the stack or pass via known registers
-        // For now, we'll use r12 and r13 (callee-saved, preserved by context_switch)
-        proc->cpu_state.r12 = (uint64_t)argc;     // argc in r12
-        proc->cpu_state.r13 = (uint64_t)argv;     // argv in r13
+        proc->cpu_state.r12 = (uint64_t)argc;
+        proc->cpu_state.r13 = (uint64_t)argv;
         
         com_write_string(COM1_PORT, "[PROC] Set up args: argc=");
         char buf[12];
@@ -192,6 +187,9 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
             com_write_byte(COM1_PORT, hex);
         }
         com_write_string(COM1_PORT, "\n");
+    } else {
+        proc->cpu_state.r12 = 0;
+        proc->cpu_state.r13 = 0;
     }
 
     proc->time_slice = 0;

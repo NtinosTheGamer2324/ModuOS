@@ -9,6 +9,7 @@ static inline void cpuid(uint32_t code, uint32_t* a, uint32_t* d, uint32_t* c, u
                  : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)
                  : "a"(code));
 }
+
 void get_cpu_vendor2(char* buf) {
     uint32_t ebx, ecx, edx, eax;
     cpuid(0, &eax, &edx, &ecx, &ebx);
@@ -18,6 +19,8 @@ void get_cpu_vendor2(char* buf) {
     *(uint32_t*)&buf[8] = ecx;
     buf[12] = '\0';
 }
+
+
 void poweroff2(void) {
     VGA_Clear();
     VGA_Write("\\cyShutting Down ...\\rr");
