@@ -3,8 +3,7 @@
 #include "moduos/kernel/io/io.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/macros.h"
-
-/* COM1_PORT should be defined in your com header */
+#include "moduos/kernel/memory/paging.h"  // Add this for ioremap()
 
 /* Global ACPI tables */
 static rsdp_descriptor_t* rsdp = NULL;
@@ -15,6 +14,27 @@ static madt_t* madt = NULL;
 
 /* ACPI enabled flag */
 static int acpi_enabled = 0;
+
+/* Identity-mapped region limit (512MB in your case) */
+#define IDENTITY_MAP_LIMIT 0x20000000ULL  // 512MB
+
+/* Helper to safely access physical memory beyond identity-mapped region */
+static void* map_acpi_memory(uint64_t phys_addr, size_t min_size) {
+    /* If in low memory (identity-mapped), use directly */
+    if (phys_addr < IDENTITY_MAP_LIMIT && (phys_addr + min_size) <= IDENTITY_MAP_LIMIT) {
+        return (void*)(uintptr_t)phys_addr;
+    }
+    
+    /* Otherwise, use ioremap to map it */
+    COM_LOG(COM1_PORT, "Mapping high ACPI memory");
+    VGA_Writef("  Mapping ACPI region at 0x%x (size=%d)\n", (uint32_t)phys_addr, (int)min_size);
+    void* mapped = ioremap(phys_addr, min_size);
+    if (!mapped) {
+        COM_LOG_ERROR(COM1_PORT, "Failed to map ACPI memory");
+        VGA_Write("  \\crFailed to map ACPI memory!\\rr\n");
+    }
+    return mapped;
+}
 
 /* Checksum validation for ACPI tables */
 static int acpi_checksum(void* ptr, size_t len) {
@@ -27,13 +47,13 @@ static int acpi_checksum(void* ptr, size_t len) {
     return sum == 0;
 }
 
-/* Find RSDP in memory */
+/* Find RSDP in memory - RSDP is always in low memory so no mapping needed */
 static rsdp_descriptor_t* find_rsdp(void) {
     /* Search EBDA (Extended BIOS Data Area) */
     uint16_t ebda_segment = *((volatile uint16_t*)0x40E);
     uint32_t ebda_address = (uint32_t)ebda_segment * 16;
 
-    if (ebda_address) {
+    if (ebda_address && ebda_address < 0x100000) {
         for (uint32_t addr = ebda_address; addr < ebda_address + 1024; addr += 16) {
             rsdp_descriptor_t* candidate = (rsdp_descriptor_t*)(uintptr_t)addr;
             if (memcmp(candidate->signature, "RSD PTR ", 8) == 0) {
@@ -85,10 +105,16 @@ static void* find_acpi_table(const char* signature) {
         for (uint32_t i = 0; i < entries; i++) {
             uint64_t entry_addr = xsdt->entries[i];
             if (entry_addr == 0) continue;
-            acpi_sdt_header_t* header = (acpi_sdt_header_t*)(uintptr_t)entry_addr;
+            
+            /* Map the table header first to read its length */
+            acpi_sdt_header_t* header = (acpi_sdt_header_t*)map_acpi_memory(entry_addr, sizeof(acpi_sdt_header_t));
+            if (!header) continue;
+            
             if (memcmp(header->signature, signature, 4) == 0) {
-                if (header->length != 0 && acpi_checksum(header, header->length)) {
-                    return header;
+                /* Found it - now map the full table */
+                void* full_table = map_acpi_memory(entry_addr, header->length);
+                if (full_table && acpi_checksum(full_table, header->length)) {
+                    return full_table;
                 }
             }
         }
@@ -100,10 +126,16 @@ static void* find_acpi_table(const char* signature) {
         for (uint32_t i = 0; i < entries; i++) {
             uint32_t entry_addr = rsdt->entries[i];
             if (entry_addr == 0) continue;
-            acpi_sdt_header_t* header = (acpi_sdt_header_t*)(uintptr_t)entry_addr;
+            
+            /* Map the table header first to read its length */
+            acpi_sdt_header_t* header = (acpi_sdt_header_t*)map_acpi_memory(entry_addr, sizeof(acpi_sdt_header_t));
+            if (!header) continue;
+            
             if (memcmp(header->signature, signature, 4) == 0) {
-                if (header->length != 0 && acpi_checksum(header, header->length)) {
-                    return header;
+                /* Found it - now map the full table */
+                void* full_table = map_acpi_memory(entry_addr, header->length);
+                if (full_table && acpi_checksum(full_table, header->length)) {
+                    return full_table;
                 }
             }
         }
@@ -116,7 +148,7 @@ static void* find_acpi_table(const char* signature) {
 int acpi_init(void) {
     COM_LOG(COM1_PORT, "Initializing ACPI...");
 
-    /* Find RSDP */
+    /* Find RSDP (always in low memory) */
     rsdp = find_rsdp();
     if (!rsdp) {
         COM_LOG_ERROR(COM1_PORT, "RSDP not found");
@@ -126,24 +158,45 @@ int acpi_init(void) {
     COM_LOG_OK(COM1_PORT, "RSDP found");
     VGA_Writef("  ACPI Revision: %d\n", rsdp->revision);
 
-    /* Get RSDT or XSDT */
+    /* Get RSDT or XSDT - these might be in high memory! */
     if (rsdp->revision >= 2 && rsdp->xsdt_address) {
-        xsdt = (xsdt_t*)(uintptr_t)rsdp->xsdt_address;
-        if (xsdt == NULL || xsdt->header.length == 0 || !acpi_checksum(xsdt, xsdt->header.length)) {
-            COM_LOG_ERROR(COM1_PORT, "XSDT checksum failed or invalid");
-            xsdt = NULL;
+        VGA_Writef("  XSDT at physical address: 0x%x\n", (uint32_t)rsdp->xsdt_address);
+        
+        /* Map XSDT header first to get its size */
+        xsdt_t* xsdt_header = (xsdt_t*)map_acpi_memory(rsdp->xsdt_address, sizeof(acpi_sdt_header_t));
+        if (xsdt_header && xsdt_header->header.length > 0) {
+            /* Now map the full XSDT */
+            xsdt = (xsdt_t*)map_acpi_memory(rsdp->xsdt_address, xsdt_header->header.length);
+            if (xsdt && acpi_checksum(xsdt, xsdt->header.length)) {
+                COM_LOG_OK(COM1_PORT, "XSDT found and validated");
+            } else {
+                COM_LOG_ERROR(COM1_PORT, "XSDT checksum failed or invalid");
+                xsdt = NULL;
+            }
         } else {
-            COM_LOG_OK(COM1_PORT, "XSDT found and validated");
+            COM_LOG_ERROR(COM1_PORT, "Failed to map XSDT");
+            xsdt = NULL;
         }
     }
 
     if (!xsdt) {
-        rsdt = (rsdt_t*)(uintptr_t)rsdp->rsdt_address;
-        if (rsdt == NULL || rsdt->header.length == 0 || !acpi_checksum(rsdt, rsdt->header.length)) {
-            COM_LOG_ERROR(COM1_PORT, "RSDT checksum failed or invalid");
+        VGA_Writef("  RSDT at physical address: 0x%x\n", rsdp->rsdt_address);
+        
+        /* Map RSDT header first to get its size */
+        rsdt_t* rsdt_header = (rsdt_t*)map_acpi_memory(rsdp->rsdt_address, sizeof(acpi_sdt_header_t));
+        if (rsdt_header && rsdt_header->header.length > 0) {
+            /* Now map the full RSDT */
+            rsdt = (rsdt_t*)map_acpi_memory(rsdp->rsdt_address, rsdt_header->header.length);
+            if (rsdt && acpi_checksum(rsdt, rsdt->header.length)) {
+                COM_LOG_OK(COM1_PORT, "RSDT found and validated");
+            } else {
+                COM_LOG_ERROR(COM1_PORT, "RSDT checksum failed or invalid");
+                return -1;
+            }
+        } else {
+            COM_LOG_ERROR(COM1_PORT, "Failed to map RSDT");
             return -1;
         }
-        COM_LOG_OK(COM1_PORT, "RSDT found and validated");
     }
 
     /* Find FADT (Fixed ACPI Description Table) */
@@ -243,7 +296,7 @@ void acpi_shutdown(void) {
     COM_LOG_ERROR(COM1_PORT, "ACPI shutdown failed");
 }
 
-/* ACPI reboot - FIXED VERSION */
+/* ACPI reboot */
 void acpi_reboot(void) {
     COM_LOG(COM1_PORT, "=== ACPI REBOOT REQUESTED ===");
     
@@ -252,7 +305,6 @@ void acpi_reboot(void) {
         COM_LOG(COM1_PORT, "FADT available, checking reset register...");
         
         /* Check if reset register is available (ACPI 2.0+) */
-        /* The reset_reg is at offset 116 in FADT, so we need length >= 129 */
         if (fadt->header.length >= 129) {
             COM_LOG(COM1_PORT, "FADT has reset register fields");
             VGA_Writef("Reset reg address: 0x%x\n", (uint32_t)fadt->reset_reg.address);
@@ -266,7 +318,13 @@ void acpi_reboot(void) {
                 switch (fadt->reset_reg.address_space) {
                     case 0: /* System Memory */
                         COM_LOG(COM1_PORT, "Writing to system memory reset register");
-                        *((volatile uint8_t*)(uintptr_t)fadt->reset_reg.address) = reset_value;
+                        {
+                            volatile uint8_t* reset_addr = (volatile uint8_t*)map_acpi_memory(
+                                fadt->reset_reg.address, 1);
+                            if (reset_addr) {
+                                *reset_addr = reset_value;
+                            }
+                        }
                         break;
                         
                     case 1: /* System I/O */
@@ -455,7 +513,8 @@ void acpi_list_tables(void) {
         for (uint32_t i = 0; i < entries; i++) {
             uint64_t entry_addr = xsdt->entries[i];
             if (!entry_addr) continue;
-            acpi_sdt_header_t* header = (acpi_sdt_header_t*)(uintptr_t)entry_addr;
+            acpi_sdt_header_t* header = (acpi_sdt_header_t*)map_acpi_memory(entry_addr, sizeof(acpi_sdt_header_t));
+            if (!header) continue;
             char sig[5] = {0};
             memcpy(sig, header->signature, 4);
             VGA_Writef("  [%d] \\cy%s\\rr - Length: %d bytes, Revision: %d\n",
@@ -470,7 +529,8 @@ void acpi_list_tables(void) {
         for (uint32_t i = 0; i < entries; i++) {
             uint32_t entry_addr = rsdt->entries[i];
             if (!entry_addr) continue;
-            acpi_sdt_header_t* header = (acpi_sdt_header_t*)(uintptr_t)entry_addr;
+            acpi_sdt_header_t* header = (acpi_sdt_header_t*)map_acpi_memory(entry_addr, sizeof(acpi_sdt_header_t));
+            if (!header) continue;
             char sig[5] = {0};
             memcpy(sig, header->signature, 4);
             VGA_Writef("  [%d] \\cy%s\\rr - Length: %d bytes, Revision: %d\n",

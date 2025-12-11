@@ -25,6 +25,14 @@ static void* ahci_alloc_dma(size_t size) {
     return ptr;
 }
 
+// Microsecond delay helper (you may need to implement this based on your timer)
+static void ahci_usleep(uint32_t us) {
+    // Simple busy wait - replace with proper timer-based delay if available
+    for (volatile uint32_t i = 0; i < us * 100; i++) {
+        __asm__ volatile("pause");
+    }
+}
+
 // ===========================================================================
 // Port Management Functions
 // ===========================================================================
@@ -37,18 +45,31 @@ void ahci_stop_cmd(hba_port_t *port) {
     port->cmd &= ~HBA_PxCMD_FRE;
     
     // Wait until FR (bit 14), CR (bit 15) are cleared
-    while (1) {
-        if (port->cmd & HBA_PxCMD_FR)
-            continue;
-        if (port->cmd & HBA_PxCMD_CR)
-            continue;
-        break;
+    int timeout = 500; // 500ms timeout
+    while (timeout > 0) {
+        if (!(port->cmd & HBA_PxCMD_FR) && !(port->cmd & HBA_PxCMD_CR))
+            break;
+        ahci_usleep(1000); // 1ms
+        timeout--;
+    }
+    
+    if (timeout == 0) {
+        COM_LOG_WARN(COM1_PORT, "Port stop timeout");
     }
 }
 
 void ahci_start_cmd(hba_port_t *port) {
     // Wait until CR (bit 15) is cleared
-    while (port->cmd & HBA_PxCMD_CR);
+    int timeout = 500;
+    while ((port->cmd & HBA_PxCMD_CR) && timeout > 0) {
+        ahci_usleep(1000);
+        timeout--;
+    }
+    
+    if (timeout == 0) {
+        COM_LOG_WARN(COM1_PORT, "Port start timeout");
+        return;
+    }
     
     // Set FRE (bit 4) and ST (bit 0)
     port->cmd |= HBA_PxCMD_FRE;
@@ -226,11 +247,12 @@ int ahci_identify_device(uint8_t port_num) {
     
     // Wait for port to be ready
     int spin = 0;
-    while ((port->tfd & (0x80 | 0x08)) && spin < 1000000) {
+    while ((port->tfd & (0x80 | 0x08)) && spin < 1000) {
+        ahci_usleep(1000); // 1ms
         spin++;
     }
     
-    if (spin == 1000000) {
+    if (spin == 1000) {
         COM_LOG_ERROR(COM1_PORT, "Port hung");
         kfree(identify_buf);
         return -1;
@@ -240,7 +262,8 @@ int ahci_identify_device(uint8_t port_num) {
     port->ci = 1 << slot;
     
     // Wait for completion
-    while (1) {
+    spin = 0;
+    while (spin < 5000) { // 5 second timeout
         if ((port->ci & (1 << slot)) == 0)
             break;
         if (port->is & HBA_PxIS_TFES) {
@@ -248,6 +271,14 @@ int ahci_identify_device(uint8_t port_num) {
             kfree(identify_buf);
             return -1;
         }
+        ahci_usleep(1000); // 1ms
+        spin++;
+    }
+    
+    if (spin == 5000) {
+        COM_LOG_ERROR(COM1_PORT, "IDENTIFY command timeout");
+        kfree(identify_buf);
+        return -1;
     }
     
     // Parse IDENTIFY data
@@ -360,11 +391,12 @@ int ahci_read_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, void
     
     // Wait for port to be ready
     int spin = 0;
-    while ((port->tfd & (0x80 | 0x08)) && spin < 1000000) {
+    while ((port->tfd & (0x80 | 0x08)) && spin < 1000) {
+        ahci_usleep(1000);
         spin++;
     }
     
-    if (spin == 1000000) {
+    if (spin == 1000) {
         COM_LOG_ERROR(COM1_PORT, "Port hung");
         return -1;
     }
@@ -373,13 +405,21 @@ int ahci_read_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, void
     port->ci = 1 << slot;
     
     // Wait for completion
-    while (1) {
+    spin = 0;
+    while (spin < 5000) {
         if ((port->ci & (1 << slot)) == 0)
             break;
         if (port->is & HBA_PxIS_TFES) {
             COM_LOG_ERROR(COM1_PORT, "Read command failed");
             return -1;
         }
+        ahci_usleep(1000);
+        spin++;
+    }
+    
+    if (spin == 5000) {
+        COM_LOG_ERROR(COM1_PORT, "Read command timeout");
+        return -1;
     }
     
     return 0;
@@ -453,11 +493,12 @@ int ahci_write_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, con
     
     // Wait for port to be ready
     int spin = 0;
-    while ((port->tfd & (0x80 | 0x08)) && spin < 1000000) {
+    while ((port->tfd & (0x80 | 0x08)) && spin < 1000) {
+        ahci_usleep(1000);
         spin++;
     }
     
-    if (spin == 1000000) {
+    if (spin == 1000) {
         COM_LOG_ERROR(COM1_PORT, "Port hung");
         return -1;
     }
@@ -466,15 +507,82 @@ int ahci_write_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, con
     port->ci = 1 << slot;
     
     // Wait for completion
-    while (1) {
+    spin = 0;
+    while (spin < 5000) {
         if ((port->ci & (1 << slot)) == 0)
             break;
         if (port->is & HBA_PxIS_TFES) {
             COM_LOG_ERROR(COM1_PORT, "Write command failed");
             return -1;
         }
+        ahci_usleep(1000);
+        spin++;
     }
     
+    if (spin == 5000) {
+        COM_LOG_ERROR(COM1_PORT, "Write command timeout");
+        return -1;
+    }
+    
+    return 0;
+}
+
+// ===========================================================================
+// HBA Reset and BIOS Handoff
+// ===========================================================================
+
+static int ahci_bios_handoff(hba_mem_t *abar) {
+    // Check if BOHC (BIOS/OS Handoff Control) is supported
+    uint32_t cap2 = abar->cap2;
+    if (!(cap2 & (1 << 0))) {
+        // BOH not supported, continue without handoff
+        return 0;
+    }
+    
+    // BOHC is at offset 0x28 from ABAR
+    volatile uint32_t *bohc = (volatile uint32_t*)((uintptr_t)abar + 0x28);
+    
+    // Set OS Ownership (bit 1)
+    *bohc |= (1 << 1);
+    
+    // Wait for BIOS to release ownership (bit 0 should clear)
+    int timeout = 25; // 25ms timeout
+    while ((*bohc & (1 << 0)) && timeout > 0) {
+        ahci_usleep(1000); // 1ms
+        timeout--;
+    }
+    
+    if (timeout == 0) {
+        COM_LOG_WARN(COM1_PORT, "BIOS handoff timeout");
+        return -1;
+    }
+    
+    COM_LOG_INFO(COM1_PORT, "BIOS handoff successful");
+    return 0;
+}
+
+static int ahci_hba_reset(hba_mem_t *abar) {
+    COM_LOG_INFO(COM1_PORT, "Resetting HBA");
+    
+    // Set HBA Reset bit
+    abar->ghc |= (1 << 0); // HBA_GHC_HR
+    
+    // Wait for reset to complete (bit should clear when done)
+    int timeout = 1000; // 1 second timeout
+    while ((abar->ghc & (1 << 0)) && timeout > 0) {
+        ahci_usleep(1000); // 1ms
+        timeout--;
+    }
+    
+    if (timeout == 0) {
+        COM_LOG_ERROR(COM1_PORT, "HBA reset timeout");
+        return -1;
+    }
+    
+    // Wait a bit for controller to be ready
+    ahci_usleep(1000);
+    
+    COM_LOG_INFO(COM1_PORT, "HBA reset complete");
     return 0;
 }
 
@@ -486,14 +594,19 @@ int ahci_probe_ports(void) {
     uint32_t pi = ahci_controller.abar->pi;
     int port_count = 0;
     
+    COM_LOG_INFO(COM1_PORT, "Probing AHCI ports");
+    
     for (int i = 0; i < 32; i++) {
-        if (pi & 1) {
-            ahci_device_type_t type = ahci_check_type(&((hba_port_t*)((uintptr_t)ahci_controller.abar + 0x100 + (i * 0x80)))[0]);
+        if (pi & (1 << i)) {
+            hba_port_t *port = (hba_port_t*)((uintptr_t)ahci_controller.abar + 0x100 + (i * 0x80));
+            
+            // Check device type
+            ahci_device_type_t type = ahci_check_type(port);
             
             if (type != AHCI_DEV_NULL) {
                 ahci_controller.ports[i].type = type;
                 ahci_controller.ports[i].port_num = i;
-                ahci_controller.ports[i].port = (hba_port_t*)((uintptr_t)ahci_controller.abar + 0x100 + (i * 0x80));
+                ahci_controller.ports[i].port = port;
                 
                 com_write_string(COM1_PORT, "[AHCI] Found ");
                 com_write_string(COM1_PORT, ahci_get_device_type_string(type));
@@ -504,20 +617,27 @@ int ahci_probe_ports(void) {
                 com_write_string(COM1_PORT, port_str);
                 com_write_string(COM1_PORT, "\n");
                 
+                // Disable interrupts for this port
+                port->ie = 0;
+                
+                // Clear any pending interrupts
+                port->is = (uint32_t)-1;
+                
                 // Rebase port
-                if (ahci_port_rebase(ahci_controller.ports[i].port, i) == 0) {
+                if (ahci_port_rebase(port, i) == 0) {
                     // Try to identify device
                     if (ahci_identify_device(i) == 0) {
                         com_write_string(COM1_PORT, "[AHCI]   Model: ");
                         com_write_string(COM1_PORT, ahci_controller.ports[i].model);
                         com_write_string(COM1_PORT, "\n");
                     }
+                } else {
+                    COM_LOG_ERROR(COM1_PORT, "Failed to rebase port");
                 }
                 
                 port_count++;
             }
         }
-        pi >>= 1;
     }
     
     ahci_controller.port_count = port_count;
@@ -529,13 +649,13 @@ int ahci_probe_ports(void) {
 // ===========================================================================
 
 int ahci_init(void) {
-    COM_LOG_INFO(COM1_PORT, "Initializing AHCI driver");
+    com_write_string(COM1_PORT, "[AHCI] Initializing AHCI driver...\n");
     
     // Find AHCI controller via PCI
     pci_device_t *pci_dev = pci_find_class(AHCI_CLASS_STORAGE, AHCI_SUBCLASS_SATA);
     
     if (!pci_dev) {
-        COM_LOG_WARN(COM1_PORT, "No AHCI controller found");
+        com_write_string(COM1_PORT, "[AHCI] No AHCI controller found\n");
         ahci_controller.pci_found = 0;
         return -1;
     }
@@ -546,69 +666,144 @@ int ahci_init(void) {
     com_write_string(COM1_PORT, pci_vendor_name(pci_dev->vendor_id));
     com_write_string(COM1_PORT, "\n");
     
-    // Enable PCI bus mastering and memory space
+    // Enable PCI bus mastering and memory space  
     pci_enable_bus_mastering(pci_dev);
     pci_enable_memory_space(pci_dev);
     
     // Get ABAR (BAR5)
-    uint32_t abar_phys = pci_read_bar(pci_dev, 5);
+    uint32_t abar_raw = pci_read_bar(pci_dev, 5);
+    
+    com_printf(COM1_PORT, "[AHCI] Raw BAR5 = 0x%08x\n", abar_raw);
+    
+    // Check if this is a memory BAR (bit 0 should be 0)
+    if (abar_raw & 0x1) {
+        com_write_string(COM1_PORT, "[AHCI] ERROR: ABAR is I/O BAR, expected memory BAR\n");
+        return -1;
+    }
+    
+    // Mask off the lower 4 bits (type and prefetchable bits)
+    uint64_t abar_phys = abar_raw & ~0xFULL;
+    
     if (abar_phys == 0) {
-        COM_LOG_ERROR(COM1_PORT, "Invalid ABAR");
+        com_write_string(COM1_PORT, "[AHCI] ERROR: Invalid ABAR (zero address)\n");
         return -1;
     }
     
-    com_write_string(COM1_PORT, "[AHCI] ABAR at 0x");
-    char hex[9];
-    for (int i = 0; i < 8; i++) {
-        int nibble = (abar_phys >> ((7-i)*4)) & 0xF;
-        hex[i] = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
+    com_printf(COM1_PORT, "[AHCI] ABAR physical = 0x%08x\n", (uint32_t)abar_phys);
+    
+    // CRITICAL: Ensure paging is initialized
+    com_write_string(COM1_PORT, "[AHCI] Checking paging initialization...\n");
+    if (!paging_get_pml4()) {
+        com_write_string(COM1_PORT, "[AHCI] Paging not initialized, calling paging_init()...\n");
+        paging_init();
+        if (!paging_get_pml4()) {
+            com_write_string(COM1_PORT, "[AHCI] ERROR: Failed to initialize paging\n");
+            return -1;
+        }
+        com_write_string(COM1_PORT, "[AHCI] Paging initialized successfully\n");
+    } else {
+        com_write_string(COM1_PORT, "[AHCI] Paging already initialized\n");
     }
-    hex[8] = '\0';
-    com_write_string(COM1_PORT, hex);
-    com_write_string(COM1_PORT, "\n");
     
-    // **CRITICAL FIX**: Map the AHCI MMIO region into virtual memory
-    // ABAR is typically 8KB in size, but we'll map 4KB (one page) which is sufficient
-    // Map it with cache-disable and write-through flags for MMIO
-    com_write_string(COM1_PORT, "[AHCI] Mapping ABAR into virtual memory...\n");
+    // Use ioremap() to map the MMIO region
+    // AHCI HBA memory is at least 8KB, map 16KB to be safe (covers all port registers)
+    com_printf(COM1_PORT, "[AHCI] Calling ioremap(0x%08x, 0x4000)...\n", (uint32_t)abar_phys);
     
-    uint64_t abar_virt = abar_phys; // Use identity mapping
-    int map_result = paging_map_page(abar_virt, abar_phys, 
-                                     PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_PCD | PFLAG_PWT);
+    void *abar_virt = ioremap(abar_phys, 0x4000);
     
-    if (map_result != 0) {
-        COM_LOG_ERROR(COM1_PORT, "Failed to map ABAR");
+    if (!abar_virt) {
+        com_write_string(COM1_PORT, "[AHCI] ERROR: ioremap() returned NULL\n");
+        com_write_string(COM1_PORT, "[AHCI] This usually means page allocation failed\n");
         return -1;
     }
     
-    // Map additional pages if needed (AHCI HBA is typically up to 8KB)
-    paging_map_page(abar_virt + 0x1000, abar_phys + 0x1000, 
-                   PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_PCD | PFLAG_PWT);
+    uint64_t abar_virt_addr = (uint64_t)(uintptr_t)abar_virt;
+    com_write_string(COM1_PORT, "[AHCI] ioremap() returned virtual = 0x");
+    com_printf(COM1_PORT, "%08x", (uint32_t)(abar_virt_addr >> 32));
+    com_printf(COM1_PORT, "%08x\n", (uint32_t)(abar_virt_addr & 0xFFFFFFFF));
     
-    ahci_controller.abar = (hba_mem_t*)(uintptr_t)abar_virt;
+    // Sanity check
+    if (abar_virt_addr == abar_phys) {
+        com_write_string(COM1_PORT, "[AHCI] WARNING: Virtual = Physical (identity mapping)\n");
+        com_write_string(COM1_PORT, "[AHCI] This may fail on real hardware\n");
+    }
     
-    com_write_string(COM1_PORT, "[AHCI] ABAR mapped successfully\n");
+    ahci_controller.abar = (hba_mem_t*)abar_virt;
+    
+    // CRITICAL: Add memory barriers before accessing MMIO
+    __asm__ volatile("mfence" ::: "memory");
+    
+    // Test read with error handling
+    com_write_string(COM1_PORT, "[AHCI] Testing MMIO access to CAP register...\n");
+    
+    // Add memory barrier before volatile read
+    __asm__ volatile("" ::: "memory");
+    
+    volatile uint32_t cap = ahci_controller.abar->cap;
+    
+    // Add memory barrier after volatile read
+    __asm__ volatile("mfence" ::: "memory");
+    
+    com_printf(COM1_PORT, "[AHCI] Successfully read CAP = 0x%08x\n", cap);
+    
+    // Verify the CAP value is reasonable
+    if (cap == 0) {
+        com_write_string(COM1_PORT, "[AHCI] ERROR: CAP register is 0x00000000\n");
+        com_write_string(COM1_PORT, "[AHCI] Device may not be responding or mapping failed\n");
+        return -1;
+    }
+    
+    if (cap == 0xFFFFFFFF) {
+        com_write_string(COM1_PORT, "[AHCI] ERROR: CAP register is 0xFFFFFFFF\n");
+        com_write_string(COM1_PORT, "[AHCI] Device may be disconnected or mapping failed\n");
+        return -1;
+    }
+    
+    // Read version register as additional test
+    volatile uint32_t version = ahci_controller.abar->vs;
+    com_printf(COM1_PORT, "[AHCI] AHCI Version = 0x%08x\n", version);
+    
+    com_write_string(COM1_PORT, "[AHCI] MMIO mapping verified - ABAR is accessible\n");
+    
+    // Perform BIOS handoff
+    com_write_string(COM1_PORT, "[AHCI] Performing BIOS handoff...\n");
+    if (ahci_bios_handoff(ahci_controller.abar) != 0) {
+        com_write_string(COM1_PORT, "[AHCI] WARNING: BIOS handoff failed, continuing anyway\n");
+    } else {
+        com_write_string(COM1_PORT, "[AHCI] BIOS handoff successful\n");
+    }
+    
+    // Reset HBA
+    com_write_string(COM1_PORT, "[AHCI] Resetting HBA...\n");
+    if (ahci_hba_reset(ahci_controller.abar) != 0) {
+        com_write_string(COM1_PORT, "[AHCI] ERROR: HBA reset failed\n");
+        return -1;
+    }
+    com_write_string(COM1_PORT, "[AHCI] HBA reset complete\n");
     
     // Enable AHCI mode
+    com_write_string(COM1_PORT, "[AHCI] Enabling AHCI mode...\n");
     ahci_controller.abar->ghc |= HBA_GHC_AHCI_ENABLE;
     
+    // Disable interrupts globally
+    ahci_controller.abar->ghc &= ~HBA_GHC_IE;
+    com_write_string(COM1_PORT, "[AHCI] AHCI mode enabled, interrupts disabled\n");
+    
+    // Wait for controller to be ready
+    ahci_usleep(1000);
+    
     // Probe ports
+    com_write_string(COM1_PORT, "[AHCI] Probing ports...\n");
     int ports = ahci_probe_ports();
     
     if (ports == 0) {
-        COM_LOG_WARN(COM1_PORT, "No AHCI drives detected");
+        com_write_string(COM1_PORT, "[AHCI] WARNING: No AHCI drives detected\n");
         return -1;
     }
     
-    com_write_string(COM1_PORT, "[AHCI] Detected ");
-    char port_count[4];
-    port_count[0] = '0' + ports;
-    port_count[1] = ' ';
-    port_count[2] = '\0';
-    com_write_string(COM1_PORT, port_count);
-    com_write_string(COM1_PORT, "drive(s)\n");
+    com_printf(COM1_PORT, "[AHCI] Detected %d drive(s)\n", ports);
+    com_write_string(COM1_PORT, "[AHCI] Driver initialized successfully\n");
     
-    COM_LOG_OK(COM1_PORT, "AHCI driver initialized successfully");
     return 0;
 }
 

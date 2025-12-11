@@ -5,6 +5,23 @@
 /* Timeout counter for blocking operations */
 #define COM_TIMEOUT 100000
 
+/* Global initialization state for COM ports */
+uint8_t com_global_initialized = 0;
+
+/* Track which ports are initialized */
+static uint8_t com_port_initialized[4] = {0, 0, 0, 0};
+
+/* Helper: Get port index from port address */
+static int get_port_index(uint16_t port) {
+    switch (port) {
+        case COM1_PORT: return 0;
+        case COM2_PORT: return 1;
+        case COM3_PORT: return 2;
+        case COM4_PORT: return 3;
+        default: return -1;
+    }
+}
+
 /* Helper: Wait for transmitter to be ready */
 static int wait_tx_ready(uint16_t port) {
     uint32_t timeout = COM_TIMEOUT;
@@ -21,6 +38,38 @@ static int data_ready(uint16_t port) {
     return (inb(port + COM_LINE_STATUS_REG) & COM_LSR_DATA_READY) ? 1 : 0;
 }
 
+int com_early_init(uint16_t port) {
+    int port_idx = get_port_index(port);
+    if (port_idx < 0) return -1;
+    
+    /* Minimal initialization without testing - safe for early boot */
+    
+    /* Disable interrupts */
+    outb(port + COM_INT_ENABLE_REG, 0x00);
+    
+    /* Enable DLAB (set bit 7 of Line Control Register) */
+    outb(port + COM_LINE_CTRL_REG, 0x80);
+    
+    /* Set divisor for 115200 baud */
+    outb(port + COM_DIVISOR_LOW_REG, COM_BAUD_115200 & 0xFF);
+    outb(port + COM_DIVISOR_HIGH_REG, (COM_BAUD_115200 >> 8) & 0xFF);
+    
+    /* Set line control: 8N1 (disable DLAB) */
+    outb(port + COM_LINE_CTRL_REG, COM_DATA_8_BITS | COM_STOP_1_BIT | COM_PARITY_NONE);
+    
+    /* Enable FIFO, clear them, with 14-byte threshold */
+    outb(port + COM_FIFO_CTRL_REG, 0xC7);
+    
+    /* Enable IRQs, set RTS/DSR (normal operation mode) */
+    outb(port + COM_MODEM_CTRL_REG, 0x0F);
+    
+    /* Mark as initialized */
+    com_port_initialized[port_idx] = 1;
+    com_global_initialized = 1;
+    
+    return 0;
+}
+
 int com_init(uint16_t port) {
     /* Default: 115200 baud, 8 data bits, 1 stop bit, no parity */
     return com_init_ex(port, COM_BAUD_115200, 
@@ -28,6 +77,33 @@ int com_init(uint16_t port) {
 }
 
 int com_init_ex(uint16_t port, uint16_t divisor, uint8_t line_config) {
+    int port_idx = get_port_index(port);
+    if (port_idx < 0) return -1;
+    
+    /* If already initialized by early_init, just do the test and return */
+    if (com_port_initialized[port_idx]) {
+        /* Port already initialized, just test it */
+        /* Test the serial port with loopback mode */
+        outb(port + COM_MODEM_CTRL_REG, 0x1E); /* Enable loopback */
+        outb(port + COM_DATA_REG, 0xAE);       /* Send test byte */
+        
+        /* Small delay for loopback */
+        for (volatile int i = 0; i < 100; i++);
+        
+        /* Check if serial is working */
+        int test_result = 0;
+        if (inb(port + COM_DATA_REG) != 0xAE) {
+            test_result = -1; /* Test failed, but port still usable */
+        }
+        
+        /* CRITICAL: Always restore normal operation mode after test */
+        outb(port + COM_MODEM_CTRL_REG, 0x0F);
+        
+        return test_result;
+    }
+    
+    /* Full initialization from scratch */
+    
     /* Disable interrupts */
     outb(port + COM_INT_ENABLE_REG, 0x00);
     
@@ -51,18 +127,39 @@ int com_init_ex(uint16_t port, uint16_t divisor, uint8_t line_config) {
     outb(port + COM_MODEM_CTRL_REG, 0x1E); /* Enable loopback */
     outb(port + COM_DATA_REG, 0xAE);       /* Send test byte */
     
+    /* Small delay for loopback */
+    for (volatile int i = 0; i < 100; i++);
+    
     /* Check if serial is faulty */
+    int test_result = 0;
     if (inb(port + COM_DATA_REG) != 0xAE) {
-        return -1; /* Serial port faulty */
+        test_result = -1; /* Serial port test failed */
     }
     
-    /* Set to normal operation mode */
+    /* CRITICAL: Always set to normal operation mode, even if test fails */
     outb(port + COM_MODEM_CTRL_REG, 0x0F);
     
-    return 0;
+    /* Mark as initialized regardless of test result - port is usable */
+    com_port_initialized[port_idx] = 1;
+    com_global_initialized = 1;
+    
+    return test_result;
+}
+
+int com_is_initialized(uint16_t port) {
+    int port_idx = get_port_index(port);
+    if (port_idx < 0) return 0;
+    return com_port_initialized[port_idx];
 }
 
 int com_write_byte(uint16_t port, uint8_t data) {
+    int port_idx = get_port_index(port);
+    
+    /* If port not initialized, try early init */
+    if (port_idx >= 0 && !com_port_initialized[port_idx]) {
+        com_early_init(port);
+    }
+    
     if (wait_tx_ready(port) != 0) {
         return -1; /* Timeout */
     }

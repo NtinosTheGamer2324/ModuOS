@@ -66,7 +66,18 @@ typedef struct {
     uint8_t initialized;
 } com_port_t;
 
+/* Global COM port initialization tracking */
+extern uint8_t com_global_initialized;
+
 /* Function declarations */
+
+/**
+ * Early initialization of COM port (minimal setup, no testing)
+ * This is safe to call very early in boot process
+ * @param port COM port base address (COM1_PORT, COM2_PORT, etc.)
+ * @return 0 on success, -1 on failure
+ */
+int com_early_init(uint16_t port);
 
 /**
  * Initialize a COM port with default settings (115200 baud, 8N1)
@@ -169,6 +180,13 @@ uint8_t com_get_line_status(uint16_t port);
  * @return 0 if working, -1 on failure
  */
 int com_test(uint16_t port);
+
+/**
+ * Check if a COM port has been initialized
+ * @param port COM port base address
+ * @return 1 if initialized, 0 otherwise
+ */
+int com_is_initialized(uint16_t port);
 
 /**
  * Write a byte or value as hexadecimal string to COM port
