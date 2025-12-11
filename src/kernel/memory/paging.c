@@ -318,34 +318,107 @@ uint64_t paging_virt_to_phys(uint64_t virt) {
 }
 
 void* ioremap(uint64_t phys_addr, uint64_t size) {
+    com_write_string(COM1_PORT, "[IOREMAP] Called with phys=0x");
+    com_printf(COM1_PORT, "%08x", (uint32_t)(phys_addr >> 32));
+    com_printf(COM1_PORT, "%08x", (uint32_t)(phys_addr & 0xFFFFFFFF));
+    com_printf(COM1_PORT, ", size=0x%x\n", (uint32_t)size);
+    
     if (!pml4) {
+        com_write_string(COM1_PORT, "[IOREMAP] PML4 is NULL, calling paging_init()...\n");
         paging_init();
-        if (!pml4) return NULL;
+        if (!pml4) {
+            com_write_string(COM1_PORT, "[IOREMAP] ERROR: Failed to initialize paging\n");
+            return NULL;
+        }
     }
     
+    // Align to page boundary
     uint64_t phys_base = phys_addr & PAGE_MASK;
     uint64_t offset = phys_addr & 0xFFF;
     uint64_t aligned_size = ((size + offset + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
     
+    com_printf(COM1_PORT, "[IOREMAP] Aligned phys=0x%08x, offset=0x%x, size=0x%x\n", 
+               (uint32_t)phys_base, (uint32_t)offset, (uint32_t)aligned_size);
+    
+    // Allocate virtual address from high memory region
     uint64_t virt_base = ioremap_next;
     ioremap_next += aligned_size;
     
+    com_write_string(COM1_PORT, "[IOREMAP] Allocated virtual range: 0x");
+    com_printf(COM1_PORT, "%08x%08x - 0x", 
+               (uint32_t)(virt_base >> 32), (uint32_t)(virt_base & 0xFFFFFFFF));
+    com_printf(COM1_PORT, "%08x%08x\n",
+               (uint32_t)((virt_base + aligned_size - 1) >> 32),
+               (uint32_t)((virt_base + aligned_size - 1) & 0xFFFFFFFF));
+    
+    // Set MMIO flags: Present, Writable, Cache Disable, Write-Through
     uint64_t flags = PFLAG_WRITABLE | PFLAG_PWT | PFLAG_PCD;
     
-    char tmpbuf[32];
-    com_write_string(COM1_PORT, "[IOREMAP] Mapping phys ");
-    format_hex64(tmpbuf, phys_base);
-    com_write_string(COM1_PORT, tmpbuf);
-    com_write_string(COM1_PORT, " to virt ");
-    format_hex64(tmpbuf, virt_base);
-    com_write_string(COM1_PORT, tmpbuf);
-    com_write_string(COM1_PORT, "\n");
+    com_printf(COM1_PORT, "[IOREMAP] Mapping with flags: 0x%x (W+PCD+PWT)\n", (uint32_t)flags);
     
-    if (paging_map_range(virt_base, phys_base, aligned_size, flags) != 0) {
-        com_write_string(COM1_PORT, "[IOREMAP] FAILED to map MMIO region\n");
-        return NULL;
+    // Map each page
+    uint64_t pages = aligned_size / PAGE_SIZE;
+    com_printf(COM1_PORT, "[IOREMAP] Mapping %d pages...\n", (uint32_t)pages);
+    
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t vaddr = virt_base + (i * PAGE_SIZE);
+        uint64_t paddr = phys_base + (i * PAGE_SIZE);
+        
+        int result = paging_map_page(vaddr, paddr, flags);
+        if (result != 0) {
+            com_printf(COM1_PORT, "[IOREMAP] ERROR: Failed to map page %d (result=%d)\n",
+                       (uint32_t)i, result);
+            com_write_string(COM1_PORT, "[IOREMAP]   Virtual = 0x");
+            com_printf(COM1_PORT, "%08x%08x\n", 
+                       (uint32_t)(vaddr >> 32), (uint32_t)(vaddr & 0xFFFFFFFF));
+            com_write_string(COM1_PORT, "[IOREMAP]   Physical = 0x");
+            com_printf(COM1_PORT, "%08x%08x\n",
+                       (uint32_t)(paddr >> 32), (uint32_t)(paddr & 0xFFFFFFFF));
+            return NULL;
+        }
     }
     
-    com_write_string(COM1_PORT, "[IOREMAP] Successfully mapped MMIO\n");
-    return (void*)(virt_base + offset);
+    com_write_string(COM1_PORT, "[IOREMAP] All pages mapped successfully\n");
+    
+    // CRITICAL: Flush TLB for entire mapped region
+    com_write_string(COM1_PORT, "[IOREMAP] Flushing TLB...\n");
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t vaddr = virt_base + (i * PAGE_SIZE);
+        __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
+    }
+    
+    // Also do a full CR3 reload to be absolutely sure
+    __asm__ volatile(
+        "mov %%cr3, %%rax\n"
+        "mov %%rax, %%cr3\n"
+        ::: "rax", "memory"
+    );
+    
+    com_write_string(COM1_PORT, "[IOREMAP] TLB flushed\n");
+    
+    // Add memory fence to ensure all writes are complete
+    __asm__ volatile("mfence" ::: "memory");
+    
+    uint64_t result_virt = virt_base + offset;
+    com_write_string(COM1_PORT, "[IOREMAP] Returning virtual address: 0x");
+    com_printf(COM1_PORT, "%08x%08x\n",
+               (uint32_t)(result_virt >> 32), (uint32_t)(result_virt & 0xFFFFFFFF));
+    
+    // Verify the mapping by checking the page tables
+    com_write_string(COM1_PORT, "[IOREMAP] Verifying mapping with virt_to_phys...\n");
+    uint64_t verify_phys = paging_virt_to_phys(result_virt);
+    if (verify_phys != phys_addr) {
+        com_write_string(COM1_PORT, "[IOREMAP] WARNING: virt_to_phys returned 0x");
+        com_printf(COM1_PORT, "%08x%08x, expected 0x%08x%08x\n",
+                   (uint32_t)(verify_phys >> 32), (uint32_t)(verify_phys & 0xFFFFFFFF),
+                   (uint32_t)(phys_addr >> 32), (uint32_t)(phys_addr & 0xFFFFFFFF));
+        if (verify_phys == 0) {
+            com_write_string(COM1_PORT, "[IOREMAP] ERROR: Mapping verification failed - page not present!\n");
+            return NULL;
+        }
+    } else {
+        com_write_string(COM1_PORT, "[IOREMAP] Mapping verification OK\n");
+    }
+    
+    return (void*)result_virt;
 }

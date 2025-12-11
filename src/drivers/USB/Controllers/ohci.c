@@ -2,6 +2,7 @@
 #include "moduos/drivers/USB/usb.h"
 #include "moduos/drivers/PCI/pci.h"
 #include "moduos/kernel/memory/memory.h"
+#include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/io/io.h"
 #include "moduos/kernel/interrupts/irq.h"
@@ -255,7 +256,18 @@ int ohci_probe(pci_device_t *pci_dev) {
     
     uint32_t bar0 = pci_read_config(pci_dev->bus, pci_dev->device, pci_dev->function, 0x10);
     ohci->mmio_phys = bar0 & 0xFFFFFFF0;
-    ohci->mmio_base = (volatile uint32_t*)ohci->mmio_phys;
+    
+    // Map MMIO region to virtual memory using ioremap
+    COM_LOG_INFO(COM1_PORT, "OHCI: Mapping MMIO at physical 0x%08x", ohci->mmio_phys);
+    ohci->mmio_base = (volatile uint32_t*)ioremap(ohci->mmio_phys, 4096);
+    
+    if (!ohci->mmio_base) {
+        COM_LOG_ERROR(COM1_PORT, "OHCI: Failed to map MMIO region");
+        kfree(ohci);
+        return -1;
+    }
+    
+    COM_LOG_OK(COM1_PORT, "OHCI: MMIO mapped to virtual 0x%p", ohci->mmio_base);
     
     uint16_t command = pci_read_config(pci_dev->bus, pci_dev->device, pci_dev->function, 0x04) & 0xFFFF;
     command |= 0x06;

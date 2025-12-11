@@ -473,15 +473,31 @@ static void loading(void) {
 // ------------------ INIT ------------------
 static void init(uint64_t mb2_ptr_init)
 {
+    // Initialize COM ports FIRST for early debug output
+    // Using early_init allows COM to work immediately, even before VGA
+    com_early_init(COM1_PORT);
+    com_early_init(COM2_PORT);
+    
+    // Now COM ports are available for all subsequent initialization
+    COM_LOG_INFO(COM1_PORT, "=== ModuOS Kernel Boot ===");
+    COM_LOG_INFO(COM1_PORT, "COM1 and COM2 early initialized");
+    
     VGA_Clear();
     loading();
     
-    // Initialize COM ports for debug output
+    // Full initialization with testing (loopback test)
+    COM_LOG_INFO(COM1_PORT, "Running COM1 loopback test...");
     if (com_init(COM1_PORT) == 0) {
-        COM_LOG_OK(COM1_PORT, "COM1 successfully initialized");
+        COM_LOG_OK(COM1_PORT, "COM1 loopback test PASSED");
+    } else {
+        COM_LOG_WARN(COM1_PORT, "COM1 loopback test FAILED (VirtualBox/some hardware doesn't support loopback, but port works fine for output)");
     }
+    
+    COM_LOG_INFO(COM2_PORT, "Running COM2 loopback test...");
     if (com_init(COM2_PORT) == 0) {
-        COM_LOG_OK(COM2_PORT, "COM2 successfully initialized");
+        COM_LOG_OK(COM2_PORT, "COM2 loopback test PASSED");
+    } else {
+        COM_LOG_WARN(COM2_PORT, "COM2 loopback test FAILED (VirtualBox/some hardware doesn't support loopback, but port works fine for output)");
     }
     
     // Initialize interrupt system
