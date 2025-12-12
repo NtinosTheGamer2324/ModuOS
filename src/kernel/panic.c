@@ -9,9 +9,12 @@ static void panic_header(const char* title)
 {
     panicer_close_shell4();
     VGA_Clear();
-
-    VGA_Write("New Technologies Software (c) 2025\n\n");
-    VGA_Write("[ \\crPANIC\\rr ] ");
+    VGA_Write("\\cr   XXX  XXX           XXXXX     XXX    XX   XX  XXXX   XXXX  \\rr\n");
+    VGA_Write("\\cr   XXX  XXX           XXXXX   XX   XX  XXX  XX  XXXX  XXXXX  \\rr\n");
+    VGA_Write("\\cr   XXX  XXX           XX   X  XXXXXXX  XXXX XX   XX   XX     \\rr\n");
+    VGA_Write("\\cr                      XXXXX   XX   XX  XX  XXX   XX   XX     \\rr\n");
+    VGA_Write("\\cr  XXXXXXXXXX          XXX     XX   XX  XX   XX  XXXX  XXXXX  \\rr\n");
+    VGA_Write("\\crXX          XX        XX      XX   XX  XX   XX  XXXX   XXXX  \\rr\n");
     VGA_Write(title);
     VGA_Write("\n\n");
 }

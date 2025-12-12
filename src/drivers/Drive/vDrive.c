@@ -1,5 +1,6 @@
 #include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/drivers/Drive/ATA/ata.h"
+#include "moduos/drivers/Drive/ATA/atapi.h"
 #include "moduos/drivers/Drive/SATA/SATA.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/macros.h"
