@@ -1,4 +1,3 @@
-//multiboot2.c
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/memory/paging.h"
@@ -7,69 +6,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* VGA text mode buffer */
-#define VGA_WIDTH 80
-#define VGA_HEIGHT 25
-static uint16_t* vga_buffer = (uint16_t*)0xB8000;
-static int vga_col = 0;
-static int vga_row = 0;
-static uint8_t vga_color = 0x0F; /* White on black */
-
-/* VGA helper functions */
-static void vga_putchar(char c) {
-    if (c == '\n') {
-        vga_col = 0;
-        vga_row++;
-        if (vga_row >= VGA_HEIGHT) {
-            /* Scroll */
-            for (int y = 0; y < VGA_HEIGHT - 1; y++) {
-                for (int x = 0; x < VGA_WIDTH; x++) {
-                    vga_buffer[y * VGA_WIDTH + x] = vga_buffer[(y + 1) * VGA_WIDTH + x];
-                }
-            }
-            /* Clear last line */
-            for (int x = 0; x < VGA_WIDTH; x++) {
-                vga_buffer[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = (vga_color << 8) | ' ';
-            }
-            vga_row = VGA_HEIGHT - 1;
-        }
-        return;
-    }
-    
-    if (vga_col >= VGA_WIDTH) {
-        vga_col = 0;
-        vga_row++;
-        if (vga_row >= VGA_HEIGHT) {
-            vga_row = VGA_HEIGHT - 1;
-        }
-    }
-    
-    vga_buffer[vga_row * VGA_WIDTH + vga_col] = (vga_color << 8) | c;
-    vga_col++;
-}
-
-static void vga_print(const char* str) {
-    while (*str) {
-        vga_putchar(*str);
-        str++;
-    }
-}
-
-static void vga_clear_screen(void) {
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        vga_buffer[i] = (vga_color << 8) | ' ';
-    }
-    vga_col = 0;
-    vga_row = 0;
-}
-
-static void vga_set_color(uint8_t fg, uint8_t bg) {
-    vga_color = (bg << 4) | (fg & 0x0F);
-}
-
-/* Dual output - both VGA and COM */
+/* Dual output - now only COM */
 static void log_msg(const char* msg) {
-    vga_print(msg);
     com_write_string(COM1_PORT, msg);
 }
 
@@ -127,9 +65,7 @@ void early_identity_map_all() {
     /* CRITICAL FIX: More conservative reserve */
     uint64_t reserve_for_tables = 200;
     if (free_frames < reserve_for_tables) {
-        vga_set_color(0x0C, 0x00); /* Red text */
         log_msg("[MEM] ERROR: Not enough free frames!\n");
-        vga_set_color(0x0F, 0x00);
         return;
     }
     
@@ -160,22 +96,18 @@ void early_identity_map_all() {
         /* Check reserves every 32MB to avoid too frequent checks */
         if ((addr % progress_interval) == 0) {
             if (phys_count_free_frames() < reserve_for_tables) {
-                vga_set_color(0x0E, 0x00); /* Yellow warning */
                 log_msg("[MEM] Stopped at ");
                 print_dec64(addr / (1024 * 1024));
                 log_msg(" MB (reserve limit)\n");
-                vga_set_color(0x0F, 0x00);
                 break;
             }
             
             /* Progress update */
-            vga_set_color(0x0A, 0x00); /* Green for progress */
             log_msg("[MEM] ");
             print_dec64(addr / (1024 * 1024));
             log_msg(" MB, ");
             print_dec64(phys_count_free_frames());
             log_msg(" frames free\n");
-            vga_set_color(0x0F, 0x00);
             memory_barrier();
         }
         
@@ -189,7 +121,6 @@ void early_identity_map_all() {
          * We don't distinguish here - just continue trying next pages */
     }
     
-    vga_set_color(0x0B, 0x00); /* Cyan for success */
     log_msg("[MEM] Identity mapping complete!\n");
     log_msg("[MEM]   Successfully mapped: ");
     print_dec64((mapped_count * PAGE_SIZE) / (1024 * 1024));
@@ -197,7 +128,6 @@ void early_identity_map_all() {
     log_msg("[MEM]   Free frames remaining: ");
     print_dec64(phys_count_free_frames());
     log_msg("\n");
-    vga_set_color(0x0F, 0x00);
     
     /* CRITICAL: Final memory barrier and TLB flush */
     log_msg("[MEM] Performing memory barrier...\n");
@@ -255,15 +185,10 @@ extern uint8_t _kernel_start;
 extern uint8_t _kernel_end;
 
 void memory_init(void *mb2_ptr) {
-    /* Initialize VGA for visual feedback */
-    vga_clear_screen();
-    vga_set_color(0x0F, 0x01); /* White on blue header */
     log_msg("=============== ModuOS Memory Init ===============\n");
-    vga_set_color(0x0F, 0x00); /* Back to white on black */
     
     /* CRITICAL FIX: Validate pointer first */
     if (!validate_mb2_pointer(mb2_ptr)) {
-        vga_set_color(0x0C, 0x00); /* Red error */
         log_msg("[MEM] FATAL: Invalid multiboot pointer!\n");
         log_msg("System halted. Check bootloader.\n");
         __asm__ volatile("cli; hlt");
@@ -286,7 +211,6 @@ void memory_init(void *mb2_ptr) {
     
     /* Validate total_size is reasonable */
     if (total_size < 8 || total_size > 0x10000) { /* Max 64KB */
-        vga_set_color(0x0C, 0x00); /* Red */
         log_msg("[MEM] ERROR: Invalid MB2 size: ");
         print_hex64(total_size);
         log_msg("\n");
@@ -314,9 +238,7 @@ void memory_init(void *mb2_ptr) {
     print_hex64(kernel_end);
     log_msg("\n");
     
-    vga_set_color(0x0E, 0x00); /* Yellow for parsing */
     log_msg("[MEM] Parsing memory map...\n");
-    vga_set_color(0x0F, 0x00);
     
     int tags_found = 0;
 
@@ -331,21 +253,17 @@ void memory_init(void *mb2_ptr) {
         }
         
         if (tag->size < 8) {
-            vga_set_color(0x0E, 0x00);
             log_msg("[MEM] WARNING: Invalid tag size\n");
-            vga_set_color(0x0F, 0x00);
             break;
         }
 
         tags_found++;
 
         if (tag->type == 6) { /* Memory map tag */
-            vga_set_color(0x0A, 0x00); /* Green */
             log_msg("[MEM] Found memory map tag!\n");
-            vga_set_color(0x0F, 0x00);
             
-            uint32_t entry_size    = *(uint32_t *)(tagp + 8);
-            uint32_t entry_version = *(uint32_t *)(tagp + 12);
+            uint32_t entry_size     = *(uint32_t *)(tagp + 8);
+            uint32_t entry_version  = *(uint32_t *)(tagp + 12);
             
             log_msg("[MEM]   Entry size: ");
             print_dec64(entry_size);
@@ -421,7 +339,6 @@ void memory_init(void *mb2_ptr) {
     log_msg("\n");
 
     if (rcount == 0) {
-        vga_set_color(0x0C, 0x00); /* Red */
         log_msg("[MEM] FATAL: No usable memory!\n");
         __asm__ volatile("cli; hlt");
         return;
@@ -443,22 +360,16 @@ void memory_init(void *mb2_ptr) {
         log_msg(" more)\n");
     }
 
-    vga_set_color(0x0B, 0x00); /* Cyan */
     log_msg("[MEM] Total usable: ");
     print_dec64(total_usable / (1024 * 1024));
     log_msg(" MB\n");
-    vga_set_color(0x0F, 0x00);
 
     /* CRITICAL FIX: Memory barrier before initializing physical allocator */
     memory_barrier();
     
-    vga_set_color(0x0E, 0x00); /* Yellow */
     log_msg("[MEM] Initializing physical allocator...\n");
-    vga_set_color(0x0F, 0x00);
     
     phys_init(total_usable, regions, rcount);
     
-    vga_set_color(0x0A, 0x00); /* Green success */
     log_msg("[MEM] Physical allocator ready!\n");
-    vga_set_color(0x0F, 0x00);
 }
