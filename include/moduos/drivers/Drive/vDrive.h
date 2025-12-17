@@ -180,6 +180,9 @@ void vdrive_clear_error(uint8_t vdrive_id);
 // Get error string
 const char* vdrive_get_error_string(int error_code);
 
+//debug
+void vdrive_debug_registration(void);
+
 // ===========================================================================
 // Error Codes
 // ===========================================================================

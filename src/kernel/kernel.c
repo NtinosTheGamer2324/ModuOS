@@ -116,7 +116,7 @@ static int detect_boot_drive(void) {
         com_write_string(COM1_PORT, drive->model);
         com_write_string(COM1_PORT, ")...\n");
         
-        // Try ISO9660 first for optical drives
+        // Try to mount based on drive type
         int slot = -1;
         if (drive->type == VDRIVE_TYPE_ATA_ATAPI || 
             drive->type == VDRIVE_TYPE_SATA_OPTICAL) {
@@ -124,15 +124,24 @@ static int detect_boot_drive(void) {
             com_write_string(COM1_PORT, "[INFO] Optical drive detected, trying ISO9660...\n");
             slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_ISO9660);
             
-            if (slot >= 0) {
-                com_write_string(COM1_PORT, "[INFO] ISO9660 mounted successfully\n");
-            } else {
-                com_write_string(COM1_PORT, "[INFO] ISO9660 mount failed, trying auto-detect...\n");
-                slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_UNKNOWN);
+            if (slot < 0) {
+                com_write_string(COM1_PORT, "[INFO] ISO9660 mount failed (likely no media)\n");
+                continue;  // Skip this optical drive
             }
+            com_write_string(COM1_PORT, "[INFO] ISO9660 mounted successfully\n");
         } else {
             // For hard drives, use auto-detection
+            com_write_string(COM1_PORT, "[INFO] Hard drive detected, auto-detecting filesystem...\n");
             slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_UNKNOWN);
+            
+            if (slot < 0) {
+                com_write_string(COM1_PORT, "[INFO] vDrive ");
+                id_str[0] = '0' + vdrive_id;
+                id_str[1] = '\0';
+                com_write_string(COM1_PORT, id_str);
+                com_write_string(COM1_PORT, " mount failed (may be unformatted or unreadable)\n");
+                continue;
+            }
         }
         
         if (slot < 0) {
@@ -210,7 +219,18 @@ static int detect_boot_drive(void) {
         fs_unmount_slot(slot);
     }
     
-    COM_LOG_WARN(COM1_PORT, "No boot drive detected!");
+    COM_LOG_PANIC(COM1_PORT, "No boot drive detected!");
+    panic(
+        "No boot drive detected",
+        "The system cannot continue without the boot drive.\n"
+        "This may be due to booting from a SATAPI Device ",
+        " - SATAPI Is not fully fixed, please use SATA or ATAPI to boot.\n"
+        " - If that is not the case, please contact support.",
+        "BOOT",
+        "BOOT_DRIVE_NOT_FOUND",
+        6
+    );
+
     return -1;
 }
 
@@ -382,6 +402,9 @@ static void device_Init(void)
     } else {
         COM_LOG_WARN(COM1_PORT, "SATA initialization failed");
     }
+
+    vdrive_debug_registration();
+    DEBUG_PAUSE(5);
 
     // ATA Initialization (fallback for older systems)
     COM_LOG_INFO(COM1_PORT, "Initializing ATA Controller / Drives");

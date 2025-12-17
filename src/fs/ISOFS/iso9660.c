@@ -43,19 +43,15 @@ static int iso9660_valid_handle(int handle) {
     return (handle >= 0 && handle < ISO9660_MAX_MOUNTS && iso_mounts[handle].active);
 }
 
-/* Read blocks relative to partition for ATA, or absolute for ATAPI */
+/* Read blocks relative to partition for ATA, or absolute for ATAPI/SATAPI */
 static int read_logical_blocks_rel(const iso9660_fs_t* fs, uint32_t block_rel, uint32_t block_count, void* buffer) {
     if (fs->is_optical) {
-        extern int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* out);
-        
-        vdrive_t* vdrive = vdrive_get(fs->vdrive_id);
-        if (!vdrive) return -1;
-        
-        int ata_index = vdrive->backend_id;
+        // For optical drives (both ATAPI and SATAPI), use vDrive which handles both
         uint32_t absolute_block = fs->partition_lba + block_rel;
-        
-        return atapi_read_blocks_pio(ata_index, absolute_block, block_count, buffer);
+        int result = vdrive_read(fs->vdrive_id, absolute_block, block_count, buffer);
+        return (result == VDRIVE_SUCCESS) ? 0 : -1;
     } else {
+        // For hard drives, convert logical blocks to 512-byte sectors
         uint32_t sectors_per_block = fs->logical_block_size / 512;
         uint32_t start_sector = fs->partition_lba + block_rel * sectors_per_block;
         uint32_t total_sectors = sectors_per_block * block_count;
@@ -190,15 +186,14 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
     uint8_t pvd_buf[2048];
     
     if (fs->is_optical) {
-        extern int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* out);
-        int ata_index = vdrive->backend_id;
-        
-        int r = atapi_read_blocks_pio(ata_index, ISO9660_PVD_SECTOR, 1, pvd_buf);
-        if (r != 0) {
-            VGA_Writef("ISO9660: ATAPI read failed (error %d)\n", r);
+        // For optical drives (ATAPI or SATAPI), read 2048-byte blocks via vDrive
+        int r = vdrive_read(vdrive_id, ISO9660_PVD_SECTOR, 1, pvd_buf);
+        if (r != VDRIVE_SUCCESS) {
+            VGA_Writef("ISO9660: optical drive read failed (error %d)\n", r);
             return -3;
         }
     } else {
+        // For hard drives, convert 2048-byte blocks to 512-byte sectors
         uint32_t pvd_lba = partition_lba + (ISO9660_PVD_SECTOR * 4);
         int r = vdrive_read(vdrive_id, pvd_lba, 4, pvd_buf);
         if (r != VDRIVE_SUCCESS) {

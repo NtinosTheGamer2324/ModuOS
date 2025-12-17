@@ -26,39 +26,31 @@ REM Build the kernel in Docker
 REM -----------------------------
 docker run --rm -it --privileged -v /dev:/dev -v "%cd%":/root/env modu-os /bin/bash -c "cd /root/env && make -j12 clean && make -j12 build-AMD64"
 
+
 REM -----------------------------
-REM Boot the kernel ISO in QEMU
+REM Boot the kernel ISO in QEMU (AHCI with proper SATAPI)
 REM -----------------------------
 echo. > com1.log
 echo. > com2.log
 timeout /t 1 /nobreak >nul
 
-REM Start QEMU in background and wait shortly for log files to start populating
-REM Start QEMU with real VBE support and PS/2 keyboard
+REM CRITICAL FIX: Use ide-cd for SATAPI (CD-ROM) and ide-hd for hard disk
+REM The key is using the CORRECT device types so AHCI can detect them properly
 start "QEMU" qemu-system-x86_64 ^
     -M pc-i440fx-6.2 ^
     -m 1024M ^
     -smp 2 ^
     -serial file:com1.log ^
     -serial file:com2.log ^
-    -drive file=dist\AMD64\kernel.iso,format=raw,index=0,media=cdrom ^
-    -drive id=disk,file=.\disk.img,if=none,format=raw ^
-    -device ahci,id=ahci ^
-    -device ide-hd,drive=disk,bus=ahci.0 ^
+    -drive file=dist\AMD64\kernel.iso,format=raw,media=cdrom,if=none,id=cdrom0 ^
+    -drive file=.\disk.img,format=raw,media=disk,if=none,id=disk0 ^
+    -device ahci,id=ahci0 ^
+    -device ide-cd,drive=cdrom0,bus=ahci0.0 ^
+    -device ide-hd,drive=disk0,bus=ahci0.1 ^
     -boot d
-REM    -vga std ^
-REM    -no-reboot ^
-REM    -no-shutdown
-
-
 
 timeout /t 1 /nobreak >nul
 
 ".\vendor\NTSoftware\Log Viewer.exe" com1.log com2.log
-
-REM -----------------------------
-REM Optional: boot ISO only without disk image
-REM -----------------------------
-REM qemu-system-x86_64 -cdrom dist/AMD64/kernel.iso -boot d
 
 endlocal

@@ -1,5 +1,6 @@
 #include "moduos/drivers/Drive/SATA/SATA.h"
 #include "moduos/drivers/Drive/SATA/AHCI.h"
+#include "moduos/drivers/Drive/SATA/satapi.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/memory/memory.h"
@@ -41,15 +42,17 @@ static void sata_copy_and_trim(char *dest, const char *src, int len) {
 }
 
 static sata_device_type_t sata_detect_device_type(ahci_port_info_t *ahci_port) {
-    // Try to detect device type based on model string and characteristics
-    const char *model = ahci_port->model;
-    
-    // Check for optical drive indicators
+    // Check AHCI type FIRST - this is authoritative
     if (ahci_port->type == AHCI_DEV_SATAPI) {
         return SATA_TYPE_OPTICAL;
     }
     
-    // Simple heuristic: SSDs typically have "SSD" in the model name
+    if (ahci_port->type != AHCI_DEV_SATA) {
+        return SATA_TYPE_UNKNOWN;
+    }
+    
+    // For SATA HDD/SSD, check model string
+    const char *model = ahci_port->model;
     for (int i = 0; model[i] != '\0'; i++) {
         if ((model[i] == 'S' || model[i] == 's') &&
             (model[i+1] == 'S' || model[i+1] == 's') &&
@@ -58,12 +61,7 @@ static sata_device_type_t sata_detect_device_type(ahci_port_info_t *ahci_port) {
         }
     }
     
-    // Default to HDD for SATA devices
-    if (ahci_port->type == AHCI_DEV_SATA) {
-        return SATA_TYPE_HDD;
-    }
-    
-    return SATA_TYPE_UNKNOWN;
+    return SATA_TYPE_HDD;
 }
 
 // ===========================================================================
@@ -154,6 +152,9 @@ int sata_init(void) {
     com_write_string(COM1_PORT, count_str);
     com_write_string(COM1_PORT, "SATA device(s)\n");
     
+    // Initialize SATAPI for optical drives
+    satapi_init();
+    
     COM_LOG_OK(COM1_PORT, "SATA subsystem initialized");
     return SATA_SUCCESS;
 }
@@ -164,6 +165,9 @@ void sata_shutdown(void) {
     }
     
     COM_LOG_INFO(COM1_PORT, "Shutting down SATA subsystem");
+    
+    // Shutdown SATAPI
+    satapi_shutdown();
     
     // Flush all devices
     for (int i = 0; i < 32; i++) {

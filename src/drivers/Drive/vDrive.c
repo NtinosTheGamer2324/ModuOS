@@ -2,6 +2,7 @@
 #include "moduos/drivers/Drive/ATA/ata.h"
 #include "moduos/drivers/Drive/ATA/atapi.h"
 #include "moduos/drivers/Drive/SATA/SATA.h"
+#include "moduos/drivers/Drive/SATA/satapi.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/memory/memory.h"
@@ -149,12 +150,14 @@ static int vdrive_register_ata_drive(int ata_index, const ata_drive_t *ata_drive
         vdrive->type = VDRIVE_TYPE_ATA_ATAPI;
         vdrive->read_only = 1;
         vdrive->status = VDRIVE_STATUS_READY;
+        vdrive->sector_size = 2048;  // ATAPI uses 2048-byte sectors
         
         com_write_string(COM1_PORT, "[vDrive] ATAPI drive marked as READY (will spin up on first read)\n");
     } else {
         vdrive->type = VDRIVE_TYPE_ATA_HDD;
         vdrive->read_only = 0;
         vdrive->status = VDRIVE_STATUS_READY;
+        vdrive->sector_size = 512;
     }
     
     vdrive_copy_string(vdrive->model, ata_drive->model, 40);
@@ -162,7 +165,6 @@ static int vdrive_register_ata_drive(int ata_index, const ata_drive_t *ata_drive
     
     vdrive->serial[0] = '\0';
     vdrive->total_sectors = 0;
-    vdrive->sector_size = 512;
     vdrive->capacity_mb = 0;
     vdrive->capacity_gb = 0;
     vdrive->supports_lba48 = 0;
@@ -176,6 +178,28 @@ static int vdrive_register_ata_drive(int ata_index, const ata_drive_t *ata_drive
     vdrive_system.ata_count++;
     
     return vdrive_id;
+}
+
+void vdrive_debug_registration(void) {
+    com_write_string(COM1_PORT, "\n=== vDrive Registration Debug ===\n");
+    
+    for (int i = 0; i < VDRIVE_MAX_DRIVES; i++) {
+        if (vdrive_system.drives[i].present) {
+            vdrive_t *d = &vdrive_system.drives[i];
+            
+            com_printf(COM1_PORT, "vDrive %d:\n", i);
+            com_printf(COM1_PORT, "  Type: %s (%d)\n", 
+                      vdrive_get_type_string(d->type), d->type);
+            com_printf(COM1_PORT, "  Backend: %s (%d)\n", 
+                      vdrive_get_backend_string(d->backend), d->backend);
+            com_printf(COM1_PORT, "  Backend ID: %d\n", d->backend_id);
+            com_printf(COM1_PORT, "  Model: %s\n", d->model);
+            com_printf(COM1_PORT, "  Sector Size: %u bytes\n", d->sector_size);
+            com_printf(COM1_PORT, "  Read Only: %s\n", d->read_only ? "Yes" : "No");
+        }
+    }
+    
+    com_write_string(COM1_PORT, "=================================\n\n");
 }
 
 static int vdrive_register_sata_drive(int sata_port, const sata_device_t *sata_drive) {
@@ -198,27 +222,40 @@ static int vdrive_register_sata_drive(int sata_port, const sata_device_t *sata_d
         case SATA_TYPE_HDD:
             vdrive->type = VDRIVE_TYPE_SATA_HDD;
             vdrive->read_only = 0;
+            vdrive->sector_size = 512;
             break;
         case SATA_TYPE_SSD:
             vdrive->type = VDRIVE_TYPE_SATA_SSD;
             vdrive->read_only = 0;
+            vdrive->sector_size = 512;
             break;
         case SATA_TYPE_OPTICAL:
             vdrive->type = VDRIVE_TYPE_SATA_OPTICAL;
             vdrive->read_only = 1;
+            vdrive->sector_size = 2048;  // SATAPI uses 2048-byte sectors
+            // Get capacity from SATAPI if available
+            satapi_device_t *satapi_dev = satapi_get_device(sata_port);
+            if (satapi_dev && satapi_dev->present) {
+                vdrive->total_sectors = satapi_dev->total_blocks;
+                vdrive->capacity_mb = satapi_dev->capacity_mb;
+                vdrive->capacity_gb = satapi_dev->capacity_mb / 1024;
+            }
             break;
         default:
             vdrive->type = VDRIVE_TYPE_UNKNOWN;
             vdrive->read_only = 0;
+            vdrive->sector_size = 512;
     }
     
     vdrive_copy_string(vdrive->model, sata_drive->model, 40);
     vdrive_copy_string(vdrive->serial, sata_drive->serial, 20);
     
-    vdrive->total_sectors = sata_drive->total_sectors;
-    vdrive->sector_size = sata_drive->sector_size;
-    vdrive->capacity_mb = sata_drive->capacity_mb;
-    vdrive->capacity_gb = sata_drive->capacity_gb;
+    // For non-optical drives, use SATA info
+    if (sata_drive->type != SATA_TYPE_OPTICAL) {
+        vdrive->total_sectors = sata_drive->total_sectors;
+        vdrive->capacity_mb = sata_drive->capacity_mb;
+        vdrive->capacity_gb = sata_drive->capacity_gb;
+    }
     
     vdrive->supports_lba48 = sata_drive->supports_48bit_lba;
     vdrive->supports_dma = sata_drive->supports_dma;
@@ -440,12 +477,49 @@ int vdrive_read(uint8_t vdrive_id, uint64_t lba, uint32_t count, void *buffer) {
     int result = -1;
     drive->status = VDRIVE_STATUS_BUSY;
     
-    if (drive->backend == VDRIVE_BACKEND_SATA) {
+    // ========================================================================
+    // CRITICAL: Route based on SPECIFIC drive type first, then backend
+    // ========================================================================
+    
+    if (drive->type == VDRIVE_TYPE_SATA_OPTICAL) {
+        // SATAPI - SATA optical drive with 2048-byte sectors
+        
+        if (drive->backend != VDRIVE_BACKEND_SATA) {
+            com_write_string(COM1_PORT, "[vDrive] ERROR: SATAPI drive has wrong backend!\n");
+            drive->status = VDRIVE_STATUS_ERROR;
+            drive_last_error[vdrive_id] = VDRIVE_ERR_BACKEND;
+            return VDRIVE_ERR_BACKEND;
+        }
+        
+        // IMPORTANT: SATAPI uses 2048-byte sectors, but the LBA and count 
+        // need to be converted if the caller is using 512-byte addressing
+        // For simplicity, assume caller is using 2048-byte addressing
+        result = satapi_read_blocks(drive->backend_id, (uint32_t)lba, count, buffer);
+        result = (result == SATAPI_SUCCESS) ? 0 : -1;
+    }
+    else if (drive->type == VDRIVE_TYPE_ATA_ATAPI) {
+        // ATAPI - ATA optical drive with 2048-byte sectors
+        
+        if (drive->backend != VDRIVE_BACKEND_ATA) {
+            com_write_string(COM1_PORT, "[vDrive] ERROR: ATAPI drive has wrong backend!\n");
+            drive->status = VDRIVE_STATUS_ERROR;
+            drive_last_error[vdrive_id] = VDRIVE_ERR_BACKEND;
+            return VDRIVE_ERR_BACKEND;
+        }
+        
+        result = atapi_read_blocks_pio(drive->backend_id, (uint32_t)lba, count, buffer);
+    }
+    else if (drive->backend == VDRIVE_BACKEND_SATA) {
+        // SATA hard drive or SSD with 512-byte sectors
         result = sata_read(drive->backend_id, lba, count, buffer);
         result = (result == SATA_SUCCESS) ? 0 : -1;
-    } else if (drive->backend == VDRIVE_BACKEND_ATA) {
+    }
+    else if (drive->backend == VDRIVE_BACKEND_ATA) {
+        // ATA hard drive with 512-byte sectors
         result = ata_read_sectors(drive->backend_id, (uint32_t)lba, buffer, count);
-    } else {
+    }
+    else {
+        com_write_string(COM1_PORT, "[vDrive] ERROR: Unknown backend type!\n");
         drive->status = VDRIVE_STATUS_ERROR;
         drive_last_error[vdrive_id] = VDRIVE_ERR_BACKEND;
         return VDRIVE_ERR_BACKEND;
@@ -660,12 +734,22 @@ void vdrive_print_table(void) {
             VGA_Write(": ");
             VGA_Write(d->model);
             VGA_Write(" (");
+            VGA_Write(vdrive_get_type_string(d->type));
+            VGA_Write(" - ");
             VGA_Write(vdrive_get_backend_string(d->backend));
             VGA_Write(")\n");
             
-            // Skip optical drives (no partitions)
-            if (d->read_only) {
+            //Check for ALL optical drive types
+            if (d->type == VDRIVE_TYPE_ATA_ATAPI || 
+                d->type == VDRIVE_TYPE_SATA_OPTICAL ||
+                d->read_only) {
                 VGA_Write("  [Optical Drive - No Partitions]\n\n");
+                continue;
+            }
+            
+            // Also skip if sector size is not 512 (safety check)
+            if (d->sector_size != 512) {
+                VGA_Write("  [Non-standard sector size - Skipping partition scan]\n\n");
                 continue;
             }
             
@@ -678,7 +762,14 @@ void vdrive_print_table(void) {
             
             int read_result = vdrive_read_sector(i, 0, mbr);
             if (read_result != 0) {
-                VGA_Write("  [Cannot read MBR]\n\n");
+                VGA_Write("  [Cannot read MBR - Error code: ");
+                char err[8];
+                err[0] = '0' + (-read_result);
+                err[1] = ']';
+                err[2] = '\n';
+                err[3] = '\n';
+                err[4] = '\0';
+                VGA_Write(err);
                 kfree(mbr);
                 continue;
             }

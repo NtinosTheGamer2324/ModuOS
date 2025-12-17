@@ -161,7 +161,9 @@ ahci_device_type_t ahci_check_type(hba_port_t *port) {
         return AHCI_DEV_NULL;
     
     // Check signature
-    switch (port->sig) {
+    uint32_t sig = port->sig;
+    
+    switch (sig) {
         case SATA_SIG_ATAPI:
             return AHCI_DEV_SATAPI;
         case SATA_SIG_SEMB:
@@ -197,6 +199,160 @@ int ahci_identify_device(uint8_t port_num) {
     if (!port || port_info->type == AHCI_DEV_NULL)
         return -1;
     
+    uint32_t sig = port->sig;
+    com_printf(COM1_PORT, "[AHCI] Port %d signature: 0x%08x\n", port_num, sig);
+    
+    if (sig == SATA_SIG_ATAPI) {
+        if (port_info->type != AHCI_DEV_SATAPI) {
+            com_printf(COM1_PORT, "[AHCI] Signature indicates SATAPI, updating type\n");
+            port_info->type = AHCI_DEV_SATAPI;
+        }
+    }
+    
+    // Skip IDENTIFY for SATAPI devices - they use IDENTIFY PACKET DEVICE
+    if (port_info->type == AHCI_DEV_SATAPI) {
+        com_write_string(COM1_PORT, "[AHCI] SATAPI device detected - using IDENTIFY PACKET DEVICE\n");
+        
+        // Set a generic model name for SATAPI
+        const char *default_model = "SATAPI Optical Drive";
+        for (int i = 0; default_model[i] != '\0' && i < 40; i++) {
+            port_info->model[i] = default_model[i];
+        }
+        port_info->model[40] = '\0';
+        port_info->serial[0] = '\0';
+        port_info->sector_count = 0;
+        port_info->sector_size = 2048;  // SATAPI uses 2048-byte sectors
+        
+        // Now try to get actual model string with IDENTIFY PACKET DEVICE
+        // Log port state
+        com_printf(COM1_PORT, "[AHCI] Port %d state: CMD=0x%08x TFD=0x%08x SSTS=0x%08x\n",
+                  port_num, port->cmd, port->tfd, port->ssts);
+        
+        // Clear any errors
+        if (port->serr != 0) {
+            com_printf(COM1_PORT, "[AHCI] Clearing SERR=0x%08x\n", port->serr);
+            port->serr = (uint32_t)-1;
+        }
+        
+        // Clear pending interrupts
+        port->is = (uint32_t)-1;
+        
+        int slot = ahci_find_cmdslot(port);
+        if (slot == -1) {
+            com_write_string(COM1_PORT, "[AHCI] No free command slot for SATAPI IDENTIFY\n");
+            return 0; // Return success anyway - we have a default model
+        }
+        
+        hba_cmd_header_t *cmdheader = &port_info->cmd_list[slot];
+        cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
+        cmdheader->w = 0;  // Read from device
+        cmdheader->prdtl = 1;
+        cmdheader->a = 0;  // Not ATAPI command, this is ATA IDENTIFY PACKET
+        
+        hba_cmd_table_t *cmdtbl = port_info->cmd_tables[slot];
+        
+        // Allocate buffer for IDENTIFY PACKET data (512 bytes)
+        uint16_t *identify_buf = (uint16_t*)ahci_alloc_dma(512);
+        if (!identify_buf) {
+            com_write_string(COM1_PORT, "[AHCI] Failed to allocate SATAPI identify buffer\n");
+            return 0; // Return success with default model
+        }
+        
+        uint64_t identify_phys = paging_virt_to_phys((uint64_t)identify_buf);
+        
+        // Setup PRDT
+        cmdtbl->prdt_entry[0].dba = (uint32_t)identify_phys;
+        cmdtbl->prdt_entry[0].dbau = (uint32_t)(identify_phys >> 32);
+        cmdtbl->prdt_entry[0].dbc = 511;  // 512 bytes (0-based)
+        cmdtbl->prdt_entry[0].i = 1;
+        
+        // Setup command FIS for IDENTIFY PACKET DEVICE
+        fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t*)(&cmdtbl->cfis);
+        
+        cmdfis->fis_type = FIS_TYPE_REG_H2D;
+        cmdfis->c = 1;  // Command
+        cmdfis->command = 0xA1;  // IDENTIFY PACKET DEVICE (NOT 0xEC)
+        
+        cmdfis->lba0 = 0;
+        cmdfis->lba1 = 0;
+        cmdfis->lba2 = 0;
+        cmdfis->device = 0;
+        cmdfis->lba3 = 0;
+        cmdfis->lba4 = 0;
+        cmdfis->lba5 = 0;
+        cmdfis->countl = 0;
+        cmdfis->counth = 0;
+        
+        // Wait for port to be ready
+        int spin = 0;
+        while ((port->tfd & (0x80 | 0x08)) && spin < 1000) {
+            ahci_usleep(1000);
+            spin++;
+        }
+        
+        if (spin == 1000) {
+            com_write_string(COM1_PORT, "[AHCI] SATAPI port hung before IDENTIFY\n");
+            kfree(identify_buf);
+            return 0; // Return success with default model
+        }
+        
+        // Issue command
+        port->ci = 1 << slot;
+        
+        // Wait for completion (with longer timeout for slow drives)
+        spin = 0;
+        while (spin < 10000) {
+            if ((port->ci & (1 << slot)) == 0)
+                break;
+            if (port->is & HBA_PxIS_TFES) {
+                com_write_string(COM1_PORT, "[AHCI] SATAPI IDENTIFY PACKET failed (task file error)\n");
+                com_printf(COM1_PORT, "[AHCI] Port %d TFD=0x%08x IS=0x%08x SERR=0x%08x\n", 
+                          port_num, port->tfd, port->is, port->serr);
+                kfree(identify_buf);
+                return 0; // Return success with default model
+            }
+            ahci_usleep(1000);
+            spin++;
+        }
+        
+        if (spin == 10000) {
+            com_write_string(COM1_PORT, "[AHCI] SATAPI IDENTIFY PACKET timeout\n");
+            kfree(identify_buf);
+            return 0; // Return success with default model
+        }
+        
+        // Parse IDENTIFY PACKET data (same format as regular IDENTIFY)
+        // Model number (words 27-46)
+        for (int i = 0; i < 20; i++) {
+            uint16_t word = identify_buf[27 + i];
+            port_info->model[i * 2] = (word >> 8) & 0xFF;
+            port_info->model[i * 2 + 1] = word & 0xFF;
+        }
+        port_info->model[40] = '\0';
+        
+        // Serial number (words 10-19)
+        for (int i = 0; i < 10; i++) {
+            uint16_t word = identify_buf[10 + i];
+            port_info->serial[i * 2] = (word >> 8) & 0xFF;
+            port_info->serial[i * 2 + 1] = word & 0xFF;
+        }
+        port_info->serial[20] = '\0';
+        
+        com_write_string(COM1_PORT, "[AHCI] Successfully identified SATAPI device\n");
+        kfree(identify_buf);
+        return 0;
+    }
+    
+    // Log port state before IDENTIFY
+    com_printf(COM1_PORT, "[AHCI] Port %d state before IDENTIFY: CMD=0x%08x TFD=0x%08x SSTS=0x%08x SERR=0x%08x\n",
+              port_num, port->cmd, port->tfd, port->ssts, port->serr);
+    
+    // Check if port is in error state
+    if (port->serr != 0) {
+        com_printf(COM1_PORT, "[AHCI] Port %d has errors, clearing SERR=0x%08x\n", port_num, port->serr);
+        port->serr = (uint32_t)-1;  // Clear errors
+    }
+    
     // Clear pending interrupts
     port->is = (uint32_t)-1;
     
@@ -210,6 +366,7 @@ int ahci_identify_device(uint8_t port_num) {
     cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
     cmdheader->w = 0;  // Read from device
     cmdheader->prdtl = 1;
+    cmdheader->a = 0;  // Not ATAPI
     
     hba_cmd_table_t *cmdtbl = port_info->cmd_tables[slot];
     
@@ -263,11 +420,13 @@ int ahci_identify_device(uint8_t port_num) {
     
     // Wait for completion
     spin = 0;
-    while (spin < 5000) { // 5 second timeout
+    while (spin < 10000) { // 10 second timeout (increased for slow drives)
         if ((port->ci & (1 << slot)) == 0)
             break;
         if (port->is & HBA_PxIS_TFES) {
-            COM_LOG_ERROR(COM1_PORT, "IDENTIFY command failed");
+            COM_LOG_ERROR(COM1_PORT, "IDENTIFY command failed (task file error)");
+            com_printf(COM1_PORT, "[AHCI] Port %d TFD=0x%08x IS=0x%08x SERR=0x%08x\n", 
+                      port_num, port->tfd, port->is, port->serr);
             kfree(identify_buf);
             return -1;
         }
@@ -275,8 +434,10 @@ int ahci_identify_device(uint8_t port_num) {
         spin++;
     }
     
-    if (spin == 5000) {
-        COM_LOG_ERROR(COM1_PORT, "IDENTIFY command timeout");
+    if (spin == 10000) {
+        COM_LOG_ERROR(COM1_PORT, "IDENTIFY command timeout after 10 seconds");
+        com_printf(COM1_PORT, "[AHCI] Port %d CI=0x%08x TFD=0x%08x IS=0x%08x SERR=0x%08x\n", 
+                  port_num, port->ci, port->tfd, port->is, port->serr);
         kfree(identify_buf);
         return -1;
     }
