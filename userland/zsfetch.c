@@ -1,15 +1,4 @@
-/* moduofetch.c - Compact system information display */
 #include "libc.h"
-
-/* Simple ASCII Art Logo */
-static void print_logo(void) {
-    puts("  __  __           _       ___  ____");
-    puts(" |  \\/  | ___   __| |_   _/ _ \\/ ___|");
-    puts(" | |\\/| |/ _ \\ / _` | | | | | | \\___ \\");
-    puts(" | |  | | (_) | (_| | |_| | |_| |___) |");
-    puts(" |_|  |_|\\___/ \\__,_|\\__,_|\\___/|____/");
-    puts("");
-}
 
 int md_main(long argc, char** argv) {
     (void)argc;
@@ -21,8 +10,6 @@ int md_main(long argc, char** argv) {
         puts("Error: Cannot get system info");
         return 1;
     }
-    
-    print_logo();
     
     /* Basic System Info */
     printf("%s@%s\n", info->username, info->pcname);
