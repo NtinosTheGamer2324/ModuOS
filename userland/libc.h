@@ -414,5 +414,11 @@ void _start(long argc, char** argv)
 {
     // ModuOS start wrapper / ABI
     int mdm = md_main(argc, argv);
-    exit(mdm);
+
+    if (mdm) {
+        exit(mdm);
+    } else {
+        exit(0);
+    }
+    
 }
