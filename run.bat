@@ -34,8 +34,14 @@ echo. > com1.log
 echo. > com2.log
 timeout /t 1 /nobreak >nul
 
-REM CRITICAL FIX: Use ide-cd for SATAPI (CD-ROM) and ide-hd for hard disk
-REM The key is using the CORRECT device types so AHCI can detect them properly
+REM -----------------------------
+REM Boot the kernel ISO in QEMU (AHCI with USB keyboard)
+REM -----------------------------
+echo. > com1.log
+echo. > com2.log
+timeout /t 1 /nobreak >nul
+
+REM Start QEMU
 start "QEMU" qemu-system-x86_64 ^
     -M pc-i440fx-6.2 ^
     -m 1024M ^
@@ -48,6 +54,7 @@ start "QEMU" qemu-system-x86_64 ^
     -device ide-cd,drive=cdrom0,bus=ahci0.0 ^
     -device ide-hd,drive=disk0,bus=ahci0.1 ^
     -boot d
+
 
 timeout /t 1 /nobreak >nul
 
