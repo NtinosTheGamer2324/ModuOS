@@ -1,4 +1,4 @@
-// process.c - Fixed argument passing
+// process.c - Process owns its arguments
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
@@ -120,6 +120,57 @@ void scheduler_init(void) {
     COM_LOG_OK(COM1_PORT, "Scheduler initialized");
 }
 
+/* Helper to deep copy argv */
+static char **copy_argv(int argc, char **argv) {
+    if (argc <= 0 || !argv) {
+        return NULL;
+    }
+    
+    // Allocate new argv array
+    char **new_argv = (char **)kmalloc((argc + 1) * sizeof(char *));
+    if (!new_argv) {
+        com_write_string(COM1_PORT, "[PROC] Failed to allocate argv array\n");
+        return NULL;
+    }
+    
+    // Copy each string
+    for (int i = 0; i < argc; i++) {
+        if (!argv[i]) {
+            new_argv[i] = NULL;
+            continue;
+        }
+        
+        size_t len = strlen(argv[i]);
+        new_argv[i] = (char *)kmalloc(len + 1);
+        if (!new_argv[i]) {
+            com_write_string(COM1_PORT, "[PROC] Failed to allocate argv string\n");
+            // Free previously allocated strings
+            for (int j = 0; j < i; j++) {
+                if (new_argv[j]) kfree(new_argv[j]);
+            }
+            kfree(new_argv);
+            return NULL;
+        }
+        
+        memcpy(new_argv[i], argv[i], len + 1);
+    }
+    
+    new_argv[argc] = NULL;
+    return new_argv;
+}
+
+/* Helper to free argv */
+static void free_argv(int argc, char **argv) {
+    if (!argv) return;
+    
+    for (int i = 0; i < argc; i++) {
+        if (argv[i]) {
+            kfree(argv[i]);
+        }
+    }
+    kfree(argv);
+}
+
 process_t* process_create(const char *name, void (*entry_point)(void), int priority) {
     return process_create_with_args(name, entry_point, priority, 0, NULL);
 }
@@ -142,12 +193,31 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
     strncpy(proc->name, name, PROCESS_NAME_MAX - 1);
     proc->state = PROCESS_STATE_READY;
     proc->priority = priority;
-    proc->argc = argc;
-    proc->argv = argv;
+    
+    // Deep copy arguments - process now owns them
+    if (argc > 0 && argv) {
+        proc->argv = copy_argv(argc, argv);
+        if (!proc->argv) {
+            COM_LOG_ERROR(COM1_PORT, "Failed to copy arguments");
+            kfree(proc);
+            return NULL;
+        }
+        proc->argc = argc;
+        
+        com_write_string(COM1_PORT, "[PROC] Copied ");
+        char buf[12];
+        itoa(argc, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, " arguments for process\n");
+    } else {
+        proc->argc = 0;
+        proc->argv = NULL;
+    }
 
     proc->kernel_stack = kmalloc(KERNEL_STACK_SIZE);
     if (!proc->kernel_stack) {
         COM_LOG_ERROR(COM1_PORT, "Failed to allocate kernel stack");
+        if (proc->argv) free_argv(proc->argc, proc->argv);
         kfree(proc);
         return NULL;
     }
@@ -169,19 +239,18 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
     proc->cpu_state.rbp = initial_rsp;
     proc->cpu_state.rflags = 0x202;
     
-    // FIXED: Store argc and argv in callee-saved registers
-    // The context_switch.asm will move these to RDI/RSI before jumping to entry
-    if (argc > 0 && argv) {
-        proc->cpu_state.r12 = (uint64_t)argc;
-        proc->cpu_state.r13 = (uint64_t)argv;
+    // Store argc and argv in callee-saved registers for context switch
+    if (proc->argc > 0 && proc->argv) {
+        proc->cpu_state.r12 = (uint64_t)proc->argc;
+        proc->cpu_state.r13 = (uint64_t)proc->argv;
         
         com_write_string(COM1_PORT, "[PROC] Set up args: argc=");
         char buf[12];
-        itoa(argc, buf, 10);
+        itoa(proc->argc, buf, 10);
         com_write_string(COM1_PORT, buf);
         com_write_string(COM1_PORT, ", argv=0x");
         for (int j = 15; j >= 0; j--) {
-            uint64_t addr = (uint64_t)argv;
+            uint64_t addr = (uint64_t)proc->argv;
             uint8_t nibble = (addr >> (j * 4)) & 0xF;
             char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
             com_write_byte(COM1_PORT, hex);
@@ -292,6 +361,12 @@ static void do_switch_and_reap(process_t *old, process_t *newp) {
             
             process_table[dead->pid] = NULL;
             if (dead->kernel_stack) kfree(dead->kernel_stack);
+            
+            // Free process-owned arguments
+            if (dead->argv) {
+                free_argv(dead->argc, dead->argv);
+            }
+            
             kfree(dead);
         }
     }
@@ -451,6 +526,8 @@ void process_kill(uint32_t pid) {
         scheduler_remove_process(p);
 
         if (p->kernel_stack) kfree(p->kernel_stack);
+        if (p->argv) free_argv(p->argc, p->argv);
+        
         process_table[pid] = NULL;
         kfree(p);
     }

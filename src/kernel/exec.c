@@ -17,40 +17,75 @@ extern void join_path(const char* base, const char* component, char* result);
 
 #define MAX_ARGS 32
 
-/* Parse command line into argv array (Windows-style with spaces) */
-static int parse_args(const char *cmdline, char **argv, int max_args) {
+/* Parse command line into dynamically allocated argv array */
+static int parse_args_dynamic(const char *cmdline, char ***out_argv, int max_args) {
     int argc = 0;
     const char *p = cmdline;
-    static char arg_buf[1024];  // Static buffer for argument strings
-    char *buf_ptr = arg_buf;
+    
+    // Allocate argv array (array of pointers)
+    char **argv = (char **)kmalloc(max_args * sizeof(char *));
+    if (!argv) {
+        com_write_string(COM1_PORT, "[EXEC] Failed to allocate argv array\n");
+        return -1;
+    }
     
     while (*p && argc < max_args - 1) {
         // Skip leading spaces
         while (*p == ' ' || *p == '\t') p++;
         if (!*p) break;
         
-        // Mark start of this argument
-        argv[argc++] = buf_ptr;
+        // Count argument length
+        const char *arg_start = p;
+        size_t arg_len = 0;
         
-        // Handle quoted strings
         if (*p == '"') {
             p++; // Skip opening quote
+            arg_start = p;
             while (*p && *p != '"') {
-                *buf_ptr++ = *p++;
+                arg_len++;
+                p++;
             }
             if (*p == '"') p++; // Skip closing quote
         } else {
-            // Copy until space or end
             while (*p && *p != ' ' && *p != '\t') {
-                *buf_ptr++ = *p++;
+                arg_len++;
+                p++;
             }
         }
         
-        *buf_ptr++ = '\0'; // Null-terminate this argument
+        // Allocate memory for this argument string
+        argv[argc] = (char *)kmalloc(arg_len + 1);
+        if (!argv[argc]) {
+            com_write_string(COM1_PORT, "[EXEC] Failed to allocate argument string\n");
+            // Free previously allocated strings
+            for (int i = 0; i < argc; i++) {
+                kfree(argv[i]);
+            }
+            kfree(argv);
+            return -1;
+        }
+        
+        // Copy the argument
+        memcpy(argv[argc], arg_start, arg_len);
+        argv[argc][arg_len] = '\0';
+        argc++;
     }
     
     argv[argc] = NULL; // Null-terminate argv array
+    *out_argv = argv;
     return argc;
+}
+
+/* Free dynamically allocated argv */
+static void free_argv(char **argv, int argc) {
+    if (!argv) return;
+    
+    for (int i = 0; i < argc; i++) {
+        if (argv[i]) {
+            kfree(argv[i]);
+        }
+    }
+    kfree(argv);
 }
 
 void exec(const char *args) {
@@ -77,12 +112,18 @@ void exec(const char *args) {
         return;
     }
 
-    // Parse arguments
-    char *argv[MAX_ARGS];
-    int argc = parse_args(args, argv, MAX_ARGS);
+    // Parse arguments dynamically
+    char **argv = NULL;
+    int argc = parse_args_dynamic(args, &argv, MAX_ARGS);
+    
+    if (argc < 0) {
+        VGA_Write("\\crError: Failed to parse arguments\\rr\n");
+        return;
+    }
     
     if (argc == 0) {
         VGA_Write("\\crError: No program specified\\rr\n");
+        free_argv(argv, argc);
         return;
     }
     
@@ -112,6 +153,7 @@ void exec(const char *args) {
     com_write_string(COM1_PORT, "[EXEC] Checking if file exists...\n");
     if (!fs_file_exists(mount, exec_path)) {
         VGA_Write("\\crFile not found\\rr\n");
+        free_argv(argv, argc);
         return;
     }
     com_write_string(COM1_PORT, "[EXEC] File exists\n");
@@ -122,12 +164,14 @@ void exec(const char *args) {
     if (fs_stat(mount, exec_path, &info) != 0) {
         VGA_Write("\\crFailed to get file info\\rr\n");
         com_write_string(COM1_PORT, "[EXEC] fs_stat failed\n");
+        free_argv(argv, argc);
         return;
     }
     com_write_string(COM1_PORT, "[EXEC] Got file info\n");
 
     if (info.is_directory) {
         VGA_Write("\\crError: Cannot exec a directory\\rr\n");
+        free_argv(argv, argc);
         return;
     }
 
@@ -143,6 +187,7 @@ void exec(const char *args) {
     if (!buffer) {
         VGA_Write("\\crFailed to allocate memory\\rr\n");
         com_write_string(COM1_PORT, "[EXEC] kmalloc FAILED\n");
+        free_argv(argv, argc);
         return;
     }
     
@@ -162,6 +207,7 @@ void exec(const char *args) {
         VGA_Write("\\crFailed to read file\\rr\n");
         com_write_string(COM1_PORT, "[EXEC] fs_read_file FAILED\n");
         kfree(buffer);
+        free_argv(argv, argc);
         return;
     }
     
@@ -185,6 +231,7 @@ void exec(const char *args) {
         VGA_Write("\\crFailed to load ELF\\rr\n");
         com_write_string(COM1_PORT, "[EXEC] ELF load failed!\n");
         kfree(buffer);
+        free_argv(argv, argc);
         return;
     }
     
@@ -208,18 +255,20 @@ void exec(const char *args) {
 
     com_write_string(COM1_PORT, "[EXEC] Creating process...\n");
     
-    // Create process with arguments if we have any
+    // Create process with arguments
+    // NOTE: Process will own the argv memory now - don't free it here
     process_t *proc;
-    if (argc > 1) {
-        // Skip argv[0] (program name) - pass remaining args
+    if (argc > 0) {
         proc = process_create_with_args(filename, (void(*)(void))entry_point, 1, argc, argv);
     } else {
         proc = process_create(filename, (void(*)(void))entry_point, 1);
+        free_argv(argv, argc); // Only free if not passed to process
     }
 
     if (!proc) {
         com_write_string(COM1_PORT, "[EXEC] Process creation FAILED\n");
         VGA_Write("\\crFailed to create process\\rr\n");
+        free_argv(argv, argc); // Free on error
         com_write_string(COM1_PORT, "[EXEC] ===== END EXEC COMMAND =====\n\n");
         return;
     }
