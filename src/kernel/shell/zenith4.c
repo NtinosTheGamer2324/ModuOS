@@ -460,8 +460,6 @@ void zenith4_start() {
     fs_get_mount_info(boot_slot, &vdrive_id, NULL, &type);
     const char* fs_name = fs_type_name(type);
     char drive_letter = 'A' + boot_slot;
-    VGA_Writef("\\cgBoot drive mounted as %c: (%s, vDrive %d)\\rr\n", 
-               drive_letter, fs_name, vdrive_id);
     
     read_pcname_file();
 
