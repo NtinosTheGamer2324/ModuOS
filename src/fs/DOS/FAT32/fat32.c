@@ -68,6 +68,322 @@ static uint32_t safe_divide(uint32_t numerator, uint32_t denominator) {
     return numerator / denominator;
 }
 
+static uint32_t calculate_cluster_size(uint64_t partition_sectors) {
+    uint64_t size_mb = (partition_sectors * 512) / (1024 * 1024);
+    
+    /* Microsoft's recommended cluster sizes for FAT32:
+       <= 260 MB: Not recommended for FAT32
+       <= 8 GB: 4 KB (8 sectors)
+       <= 16 GB: 8 KB (16 sectors)
+       <= 32 GB: 16 KB (32 sectors)
+       > 32 GB: 32 KB (64 sectors)
+    */
+    
+    if (size_mb <= 260) {
+        VGA_Write("Warning: Partition too small for FAT32 (< 260 MB)\n");
+        return 1; // 512 bytes (minimum)
+    } else if (size_mb <= 8192) {
+        return 8;  // 4 KB
+    } else if (size_mb <= 16384) {
+        return 16; // 8 KB
+    } else if (size_mb <= 32768) {
+        return 32; // 16 KB
+    } else {
+        return 64; // 32 KB
+    }
+}
+
+static int write_zero_sector(int vdrive_id, uint32_t lba) {
+    uint8_t sector[512];
+    memset(sector, 0, 512);
+    return vdrive_write_sector(vdrive_id, lba, sector);
+}
+
+/**
+ * Format a partition with FAT32
+ * @param vdrive_id: Virtual drive ID
+ * @param partition_lba: Starting LBA of partition
+ * @param partition_sectors: Size of partition in sectors
+ * @param volume_label: Volume label (11 chars max, or NULL for "NO NAME")
+ * @param sectors_per_cluster: Sectors per cluster (0 for auto)
+ * @return: 0 on success, negative on error
+ */
+int fat32_format(int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors,
+                 const char* volume_label, uint32_t sectors_per_cluster) {
+    
+    VGA_Write("FAT32: Formatting partition...\n");
+    
+    /* Validate parameters */
+    if (!vdrive_is_ready(vdrive_id)) {
+        VGA_Write("FAT32: vDrive not ready\n");
+        return -1;
+    }
+    
+    if (partition_sectors < 65536) {
+        VGA_Write("FAT32: Partition too small (minimum 32 MB)\n");
+        return -2;
+    }
+    
+    /* Calculate cluster size if not specified */
+    if (sectors_per_cluster == 0) {
+        sectors_per_cluster = calculate_cluster_size(partition_sectors);
+        VGA_Writef("FAT32: Using %u sectors per cluster\n", sectors_per_cluster);
+    }
+    
+    /* Validate cluster size */
+    if (sectors_per_cluster == 0 || sectors_per_cluster > 128 ||
+        (sectors_per_cluster & (sectors_per_cluster - 1)) != 0) {
+        VGA_Write("FAT32: Invalid cluster size (must be power of 2, max 128)\n");
+        return -3;
+    }
+    
+    /* Calculate FAT32 parameters */
+    uint16_t bytes_per_sector = 512;
+    uint16_t reserved_sectors = 32;  // FAT32 typically uses 32 reserved sectors
+    uint8_t num_fats = 2;
+    uint16_t root_entry_count = 0;   // FAT32 has no fixed root directory
+    uint16_t media_type = 0xF8;      // Fixed disk
+    
+    /* Calculate FAT size */
+    uint32_t total_clusters = (partition_sectors - reserved_sectors) / sectors_per_cluster;
+    uint32_t fat_size_sectors = ((total_clusters * 4) + (bytes_per_sector - 1)) / bytes_per_sector;
+    
+    /* Align FAT size to 4 KB boundary for better performance */
+    fat_size_sectors = ((fat_size_sectors + 7) / 8) * 8;
+    
+    /* Calculate first data sector */
+    uint32_t first_data_sector = reserved_sectors + (num_fats * fat_size_sectors);
+    
+    /* Verify we have enough space */
+    if (first_data_sector >= partition_sectors) {
+        VGA_Write("FAT32: Partition too small for calculated FAT size\n");
+        return -4;
+    }
+    
+    VGA_Writef("FAT32: Reserved sectors: %u\n", reserved_sectors);
+    VGA_Writef("FAT32: FAT size: %u sectors\n", fat_size_sectors);
+    VGA_Writef("FAT32: First data sector: %u\n", first_data_sector);
+    
+    /* Allocate buffer for boot sector */
+    uint8_t boot_sector[512];
+    memset(boot_sector, 0, 512);
+    
+    /* Jump instruction */
+    boot_sector[0] = 0xEB;  // JMP short
+    boot_sector[1] = 0x58;
+    boot_sector[2] = 0x90;  // NOP
+    
+    /* OEM Name */
+    memcpy(&boot_sector[3], "MODUOS  ", 8);
+    
+    /* BPB (BIOS Parameter Block) */
+    boot_sector[11] = bytes_per_sector & 0xFF;
+    boot_sector[12] = (bytes_per_sector >> 8) & 0xFF;
+    boot_sector[13] = sectors_per_cluster;
+    boot_sector[14] = reserved_sectors & 0xFF;
+    boot_sector[15] = (reserved_sectors >> 8) & 0xFF;
+    boot_sector[16] = num_fats;
+    boot_sector[17] = root_entry_count & 0xFF;
+    boot_sector[18] = (root_entry_count >> 8) & 0xFF;
+    boot_sector[19] = 0;  // Total sectors (16-bit, 0 for FAT32)
+    boot_sector[20] = 0;
+    boot_sector[21] = media_type;
+    boot_sector[22] = 0;  // FAT size (16-bit, 0 for FAT32)
+    boot_sector[23] = 0;
+    boot_sector[24] = 63;  // Sectors per track
+    boot_sector[25] = 0;
+    boot_sector[26] = 255; // Number of heads
+    boot_sector[27] = 0;
+    
+    /* Hidden sectors (LBA of partition) */
+    boot_sector[28] = partition_lba & 0xFF;
+    boot_sector[29] = (partition_lba >> 8) & 0xFF;
+    boot_sector[30] = (partition_lba >> 16) & 0xFF;
+    boot_sector[31] = (partition_lba >> 24) & 0xFF;
+    
+    /* Total sectors (32-bit) */
+    boot_sector[32] = partition_sectors & 0xFF;
+    boot_sector[33] = (partition_sectors >> 8) & 0xFF;
+    boot_sector[34] = (partition_sectors >> 16) & 0xFF;
+    boot_sector[35] = (partition_sectors >> 24) & 0xFF;
+    
+    /* FAT32 Extended BPB */
+    boot_sector[36] = fat_size_sectors & 0xFF;
+    boot_sector[37] = (fat_size_sectors >> 8) & 0xFF;
+    boot_sector[38] = (fat_size_sectors >> 16) & 0xFF;
+    boot_sector[39] = (fat_size_sectors >> 24) & 0xFF;
+    
+    boot_sector[40] = 0;  // Ext flags
+    boot_sector[41] = 0;
+    boot_sector[42] = 0;  // FS version
+    boot_sector[43] = 0;
+    
+    /* Root cluster (typically 2) */
+    boot_sector[44] = 2;
+    boot_sector[45] = 0;
+    boot_sector[46] = 0;
+    boot_sector[47] = 0;
+    
+    boot_sector[48] = 1;  // FS info sector
+    boot_sector[49] = 0;
+    boot_sector[50] = 6;  // Backup boot sector
+    boot_sector[51] = 0;
+    
+    /* Reserved (12 bytes) */
+    for (int i = 52; i < 64; i++) {
+        boot_sector[i] = 0;
+    }
+    
+    boot_sector[64] = 0x80; // Drive number (0x80 = hard disk)
+    boot_sector[65] = 0;    // Reserved
+    boot_sector[66] = 0x29; // Extended boot signature
+    
+    /* Volume ID (serial number) - use simple timestamp-based value */
+    boot_sector[67] = 0x12;
+    boot_sector[68] = 0x34;
+    boot_sector[69] = 0x56;
+    boot_sector[70] = 0x78;
+    
+    /* Volume label */
+    if (volume_label && volume_label[0]) {
+        int len = 0;
+        while (volume_label[len] && len < 11) {
+            boot_sector[71 + len] = volume_label[len];
+            len++;
+        }
+        while (len < 11) {
+            boot_sector[71 + len] = ' ';
+            len++;
+        }
+    } else {
+        memcpy(&boot_sector[71], "NO NAME    ", 11);
+    }
+    
+    /* Filesystem type */
+    memcpy(&boot_sector[82], "FAT32   ", 8);
+    
+    /* Boot code (simple message) */
+    const char *msg = "This is not a bootable device. Please insert a bootable medium and press Ctrl+Alt+Del.";
+    int msg_len = strlen(msg);
+    for (int i = 0; i < msg_len && (90 + i) < 510; i++) {
+        boot_sector[90 + i] = msg[i];
+    }
+    
+    /* Boot signature */
+    boot_sector[510] = 0x55;
+    boot_sector[511] = 0xAA;
+    
+    /* Write boot sector */
+    VGA_Write("FAT32: Writing boot sector...\n");
+    if (vdrive_write_sector(vdrive_id, partition_lba, boot_sector) != 0) {
+        VGA_Write("FAT32: Failed to write boot sector\n");
+        return -5;
+    }
+    
+    /* Write backup boot sector */
+    if (vdrive_write_sector(vdrive_id, partition_lba + 6, boot_sector) != 0) {
+        VGA_Write("FAT32: Failed to write backup boot sector\n");
+        return -6;
+    }
+    
+    /* Create FSInfo sector */
+    uint8_t fsinfo[512];
+    memset(fsinfo, 0, 512);
+    
+    fsinfo[0] = 0x52;  // Lead signature "RRaA"
+    fsinfo[1] = 0x52;
+    fsinfo[2] = 0x61;
+    fsinfo[3] = 0x41;
+    
+    fsinfo[484] = 0x72;  // Struct signature "rrAa"
+    fsinfo[485] = 0x72;
+    fsinfo[486] = 0x41;
+    fsinfo[487] = 0x61;
+    
+    /* Free cluster count (-1 = unknown) */
+    fsinfo[488] = 0xFF;
+    fsinfo[489] = 0xFF;
+    fsinfo[490] = 0xFF;
+    fsinfo[491] = 0xFF;
+    
+    /* Next free cluster (start at 3, since 2 is root) */
+    fsinfo[492] = 3;
+    fsinfo[493] = 0;
+    fsinfo[494] = 0;
+    fsinfo[495] = 0;
+    
+    fsinfo[510] = 0x55;  // Trail signature
+    fsinfo[511] = 0xAA;
+    
+    /* Write FSInfo sector */
+    VGA_Write("FAT32: Writing FSInfo sector...\n");
+    if (vdrive_write_sector(vdrive_id, partition_lba + 1, fsinfo) != 0) {
+        VGA_Write("FAT32: Failed to write FSInfo sector\n");
+        return -7;
+    }
+    
+    /* Initialize FAT tables */
+    VGA_Write("FAT32: Initializing FAT tables...\n");
+    
+    uint8_t fat_sector[512];
+    for (uint32_t fat_num = 0; fat_num < num_fats; fat_num++) {
+        uint32_t fat_start = partition_lba + reserved_sectors + (fat_num * fat_size_sectors);
+        
+        /* First FAT sector has special entries */
+        memset(fat_sector, 0, 512);
+        
+        /* Entry 0: Media type */
+        fat_sector[0] = media_type;
+        fat_sector[1] = 0xFF;
+        fat_sector[2] = 0xFF;
+        fat_sector[3] = 0x0F;
+        
+        /* Entry 1: EOC (End of Chain) */
+        fat_sector[4] = 0xFF;
+        fat_sector[5] = 0xFF;
+        fat_sector[6] = 0xFF;
+        fat_sector[7] = 0x0F;
+        
+        /* Entry 2: Root directory (EOC) */
+        fat_sector[8] = 0xFF;
+        fat_sector[9] = 0xFF;
+        fat_sector[10] = 0xFF;
+        fat_sector[11] = 0x0F;
+        
+        /* Write first FAT sector */
+        if (vdrive_write_sector(vdrive_id, fat_start, fat_sector) != 0) {
+            VGA_Writef("FAT32: Failed to write FAT %u first sector\n", fat_num);
+            return -8;
+        }
+        
+        /* Zero remaining FAT sectors */
+        memset(fat_sector, 0, 512);
+        for (uint32_t i = 1; i < fat_size_sectors; i++) {
+            if (vdrive_write_sector(vdrive_id, fat_start + i, fat_sector) != 0) {
+                VGA_Writef("FAT32: Failed to write FAT %u sector %u\n", fat_num, i);
+                return -9;
+            }
+        }
+    }
+    
+    /* Clear root directory */
+    VGA_Write("FAT32: Clearing root directory...\n");
+    uint32_t root_cluster_lba = partition_lba + first_data_sector;
+    for (uint32_t i = 0; i < sectors_per_cluster; i++) {
+        if (write_zero_sector(vdrive_id, root_cluster_lba + i) != 0) {
+            VGA_Write("FAT32: Failed to clear root directory\n");
+            return -10;
+        }
+    }
+    
+    VGA_Write("FAT32: Format complete!\n");
+    VGA_Writef("FAT32: Volume label: %s\n", volume_label ? volume_label : "NO NAME");
+    VGA_Writef("FAT32: Cluster size: %u KB\n", (sectors_per_cluster * 512) / 1024);
+    VGA_Writef("FAT32: Total clusters: %u\n", total_clusters);
+    
+    return 0;
+}
+
 /* --- MOUNT --- */
 int fat32_mount(int vdrive_id, uint32_t partition_lba) {
     fat32_init_once();
