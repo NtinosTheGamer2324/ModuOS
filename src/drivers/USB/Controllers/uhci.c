@@ -147,28 +147,26 @@ static void uhci_process_completed_transfers(uhci_controller_t *uhci) {
 // IRQ handler
 static void uhci_irq_handler(void) {
     if (!global_uhci) {
-        pic_send_eoi(11);  // Default IRQ
+        pic_send_eoi(11);
         return;
     }
     
     uhci_controller_t *uhci = global_uhci;
     uint16_t status = uhci_read16(uhci, UHCI_REG_USBSTS);
     
-    if (status == 0) {
-        pic_send_eoi(uhci->pci_dev->interrupt_line);
-        return;
+    // Always clear and send EOI
+    if (status) {
+        uhci_write16(uhci, UHCI_REG_USBSTS, status);
+        
+        if (status & UHCI_STS_USBINT) {
+            uhci_process_completed_transfers(uhci);
+        }
+        
+        if (status & UHCI_STS_ERROR) {
+            COM_LOG_ERROR(COM1_PORT, "UHCI: Error");
+        }
     }
     
-    if (status & UHCI_STS_USBINT) {
-        uhci_process_completed_transfers(uhci);
-    }
-    
-    if (status & UHCI_STS_ERROR) {
-        COM_LOG_ERROR(COM1_PORT, "UHCI: USB error interrupt");
-    }
-    
-    // Clear status
-    uhci_write16(uhci, UHCI_REG_USBSTS, status);
     pic_send_eoi(uhci->pci_dev->interrupt_line);
 }
 

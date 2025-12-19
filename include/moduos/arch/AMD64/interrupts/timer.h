@@ -6,5 +6,6 @@
 void pit_init(uint32_t frequency);
 void timer_irq_handler(void);  
 uint64_t get_system_ticks(void);  
+void usb_tick(void);
 
 #endif

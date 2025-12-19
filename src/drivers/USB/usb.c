@@ -1,4 +1,5 @@
 #include "moduos/drivers/USB/usb.h"
+#include "moduos/drivers/USB/Classes/hid.h"
 #include "moduos/drivers/USB/Controllers/uhci.h"
 #include "moduos/drivers/USB/Controllers/ohci.h"
 #include "moduos/drivers/USB/Controllers/ehci.h"
@@ -21,6 +22,31 @@ static uint8_t next_device_address = 1;
 #define PCI_PROG_IF_OHCI        0x10
 #define PCI_PROG_IF_EHCI        0x20
 
+// Enumeration state machine types (MUST BE DECLARED BEFORE USE)
+typedef enum {
+    USB_ENUM_GET_DESC8,
+    USB_ENUM_WAIT_DESC8,
+    USB_ENUM_SET_ADDRESS,
+    USB_ENUM_WAIT_ADDRESS,
+    USB_ENUM_GET_DESC_FULL,
+    USB_ENUM_WAIT_DESC_FULL,
+    USB_ENUM_SET_CONFIG,
+    USB_ENUM_WAIT_CONFIG,
+    USB_ENUM_COMPLETE
+} usb_enum_state_t;
+
+typedef struct usb_enum_context {
+    usb_device_t *dev;
+    usb_enum_state_t state;
+    uint8_t new_address;
+    uint8_t desc_buffer[18];
+    int retry_count;
+    int wait_ticks;
+    struct usb_enum_context *next;
+} usb_enum_context_t;
+
+static usb_enum_context_t *active_enumerations = NULL;
+
 // Forward declarations
 static void usb_scan_pci_bus(void);
 static void usb_enumerate_all_ports(void);
@@ -32,6 +58,7 @@ void usb_init(void) {
     usb_controllers = NULL;
     usb_drivers = NULL;
     next_device_address = 1;
+    active_enumerations = NULL;
     
     // Scan PCI bus and initialize all USB controllers automatically
     usb_scan_pci_bus();
@@ -235,58 +262,23 @@ void usb_free_device(usb_device_t *dev) {
     kfree(dev);
 }
 
-// Enumerate a USB device
+// Enumerate a USB device (async via state machine)
 int usb_enumerate_device(usb_device_t *dev) {
     if (!dev || !dev->controller) return -1;
     
-    COM_LOG_INFO(COM1_PORT, "Enumerating USB device on port %d", dev->port);
+    COM_LOG_INFO(COM1_PORT, "Starting async enumeration for device on port %d", dev->port);
     
-    // Get device descriptor (first 8 bytes to determine max packet size)
-    uint8_t desc_buffer[18];
-    int result = usb_get_descriptor(dev, USB_DESC_DEVICE, 0, desc_buffer, 8);
-    if (result < 0) {
-        COM_LOG_ERROR(COM1_PORT, "Failed to get initial device descriptor");
-        return -1;
-    }
+    usb_enum_context_t *ctx = kmalloc(sizeof(usb_enum_context_t));
+    if (!ctx) return -1;
     
-    // Update max packet size from descriptor
-    dev->max_packet_size = desc_buffer[7];
+    memset(ctx, 0, sizeof(usb_enum_context_t));
+    ctx->dev = dev;
+    ctx->state = USB_ENUM_GET_DESC8;
+    ctx->retry_count = 1000;
+    ctx->wait_ticks = 0;
     
-    // Assign a unique address
-    uint8_t new_address = next_device_address++;
-    if (next_device_address > 127) next_device_address = 1;
-    
-    result = usb_set_address(dev, new_address);
-    if (result < 0) {
-        COM_LOG_ERROR(COM1_PORT, "Failed to set device address");
-        return -1;
-    }
-    
-    dev->address = new_address;
-    
-    // Delay for device to process address change
-    for (volatile int i = 0; i < 100000; i++);
-    
-    // Get full device descriptor
-    result = usb_get_descriptor(dev, USB_DESC_DEVICE, 0, desc_buffer, 18);
-    if (result < 0) {
-        COM_LOG_ERROR(COM1_PORT, "Failed to get full device descriptor");
-        return -1;
-    }
-    
-    memcpy(&dev->descriptor, desc_buffer, sizeof(usb_device_descriptor_t));
-    
-    COM_LOG_OK(COM1_PORT, "Device VID=%04x PID=%04x Class=%02x", 
-               dev->descriptor.idVendor, dev->descriptor.idProduct, 
-               dev->descriptor.bDeviceClass);
-    
-    // Set configuration
-    if (usb_set_configuration(dev, 1) < 0) {
-        COM_LOG_WARN(COM1_PORT, "Failed to set configuration");
-    }
-    
-    // Match with drivers
-    usb_match_drivers(dev);
+    ctx->next = active_enumerations;
+    active_enumerations = ctx;
     
     return 0;
 }
@@ -449,4 +441,92 @@ int usb_cancel_transfer(usb_device_t *dev, usb_transfer_t *transfer) {
     }
     
     return -1;
+}
+
+// Enumeration state machine tick (called from timer)
+void usb_enumeration_tick(void) {
+    usb_enum_context_t **curr = &active_enumerations;
+    
+    while (*curr) {
+        usb_enum_context_t *ctx = *curr;
+        
+        if (--ctx->retry_count <= 0) {
+            COM_LOG_ERROR(COM1_PORT, "USB: Enumeration timeout");
+            *curr = ctx->next;
+            usb_free_device(ctx->dev);
+            kfree(ctx);
+            continue;
+        }
+        
+        if (ctx->wait_ticks > 0) {
+            ctx->wait_ticks--;
+            curr = &(*curr)->next;
+            continue;
+        }
+        
+        switch (ctx->state) {
+            case USB_ENUM_GET_DESC8:
+                usb_get_descriptor(ctx->dev, USB_DESC_DEVICE, 0, ctx->desc_buffer, 8);
+                ctx->state = USB_ENUM_WAIT_DESC8;
+                ctx->wait_ticks = 10;
+                break;
+                
+            case USB_ENUM_WAIT_DESC8:
+                ctx->dev->max_packet_size = ctx->desc_buffer[7];
+                ctx->new_address = next_device_address++;
+                if (next_device_address > 127) next_device_address = 1;
+                ctx->state = USB_ENUM_SET_ADDRESS;
+                break;
+                
+            case USB_ENUM_SET_ADDRESS:
+                usb_set_address(ctx->dev, ctx->new_address);
+                ctx->state = USB_ENUM_WAIT_ADDRESS;
+                ctx->wait_ticks = 20;
+                break;
+                
+            case USB_ENUM_WAIT_ADDRESS:
+                ctx->dev->address = ctx->new_address;
+                ctx->state = USB_ENUM_GET_DESC_FULL;
+                break;
+                
+            case USB_ENUM_GET_DESC_FULL:
+                usb_get_descriptor(ctx->dev, USB_DESC_DEVICE, 0, ctx->desc_buffer, 18);
+                ctx->state = USB_ENUM_WAIT_DESC_FULL;
+                ctx->wait_ticks = 10;
+                break;
+                
+            case USB_ENUM_WAIT_DESC_FULL:
+                memcpy(&ctx->dev->descriptor, ctx->desc_buffer, sizeof(usb_device_descriptor_t));
+                COM_LOG_OK(COM1_PORT, "Device VID=%04x PID=%04x", 
+                          ctx->dev->descriptor.idVendor, ctx->dev->descriptor.idProduct);
+                ctx->state = USB_ENUM_SET_CONFIG;
+                break;
+                
+            case USB_ENUM_SET_CONFIG:
+                usb_set_configuration(ctx->dev, 1);
+                ctx->state = USB_ENUM_WAIT_CONFIG;
+                ctx->wait_ticks = 10;
+                break;
+                
+            case USB_ENUM_WAIT_CONFIG:
+                ctx->state = USB_ENUM_COMPLETE;
+                break;
+                
+            case USB_ENUM_COMPLETE:
+                usb_match_drivers(ctx->dev);
+                *curr = ctx->next;
+                kfree(ctx);
+                continue;
+        }
+        
+        curr = &(*curr)->next;
+    }
+}
+
+// Main USB tick function (called from timer)
+void usb_tick(void) {
+    usb_enumeration_tick();
+    
+    // Also process HID initialization
+    hid_init_tick();
 }

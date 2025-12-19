@@ -1,13 +1,12 @@
 #include "moduos/drivers/USB/Classes/hid.h"
+#include "moduos/drivers/graphics/VGA.h"
 #include "moduos/drivers/USB/usb.h"
-#include "moduos/drivers/input/input.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/io/io.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/macros.h"
 
-// Temporary replacement for kprintf
 #define kprintf(fmt, ...) com_printf(COM1_PORT, fmt, ##__VA_ARGS__)
 
 // Global HID driver
@@ -21,12 +20,36 @@ static void hid_process_keyboard_report(hid_device_t *hid);
 static void hid_process_mouse_report(hid_device_t *hid);
 static void hid_interrupt_callback(usb_device_t *dev, usb_transfer_t *transfer);
 
+// Initialization state machine
+typedef enum {
+    HID_INIT_PARSE,
+    HID_INIT_SET_PROTOCOL,
+    HID_INIT_WAIT_PROTOCOL,
+    HID_INIT_SET_IDLE,
+    HID_INIT_WAIT_IDLE,
+    HID_INIT_DEVICE_SPECIFIC,
+    HID_INIT_WAIT_DEVICE,
+    HID_INIT_START_TRANSFERS,
+    HID_INIT_COMPLETE
+} hid_init_state_t;
+
+typedef struct hid_init_context {
+    hid_device_t *hid;
+    hid_init_state_t state;
+    int retry_count;
+    int wait_ticks;
+    struct hid_init_context *next;
+} hid_init_context_t;
+
+static hid_init_context_t *active_hid_inits = NULL;
+
 // Initialize HID subsystem
 int hid_init(void) {
     kprintf("[HID] Initializing HID subsystem\n");
     
     hid_device_count = 0;
     memset(hid_devices, 0, sizeof(hid_devices));
+    active_hid_inits = NULL;
     
     // Register HID driver with USB subsystem
     hid_usb_driver.name = "USB HID Driver";
@@ -68,61 +91,144 @@ int hid_probe(usb_device_t *dev) {
         return -1;
     }
     
-    // Set boot protocol for boot devices
-    if (hid->subclass == HID_SUBCLASS_BOOT) {
-        kprintf("[HID] Setting boot protocol\n");
-        if (hid_set_protocol(hid, 0) != 0) {
-            kprintf("[HID] Failed to set boot protocol\n");
-        }
-    }
-    
-    // Set idle rate (indefinite - only report on change)
-    hid_set_idle(hid, 0);
-    
-    // Initialize device based on protocol
-    if (hid->protocol == HID_PROTOCOL_KEYBOARD) {
-        kprintf("[HID] Keyboard detected\n");
-        if (hid_keyboard_init(hid) == 0) {
-            kprintf("[HID] Keyboard initialized successfully\n");
-            
-            // Start interrupt transfers
-            if (hid_start_interrupt_transfers(hid) == 0) {
-                kprintf("[HID] Keyboard interrupt transfers started\n");
-            } else {
-                kprintf("[HID] Failed to start interrupt transfers\n");
-                kfree(hid->transfer_buffer);
-                kfree(hid);
-                return -1;
-            }
-        }
-    } else if (hid->protocol == HID_PROTOCOL_MOUSE) {
-        kprintf("[HID] Mouse detected\n");
-        if (hid_mouse_init(hid) == 0) {
-            kprintf("[HID] Mouse initialized successfully\n");
-            
-            // Start interrupt transfers
-            if (hid_start_interrupt_transfers(hid) == 0) {
-                kprintf("[HID] Mouse interrupt transfers started\n");
-            } else {
-                kprintf("[HID] Failed to start interrupt transfers\n");
-                kfree(hid->transfer_buffer);
-                kfree(hid);
-                return -1;
-            }
-        }
-    } else {
-        kprintf("[HID] Generic HID device (protocol %d)\n", hid->protocol);
-        kfree(hid);
-        return -1;
-    }
-    
     // Add to device list
     if (hid_device_count < 16) {
         hid_devices[hid_device_count++] = hid;
         dev->driver_data = hid;
     }
     
+    // Start async initialization
+    hid_init_context_t *ctx = kmalloc(sizeof(hid_init_context_t));
+    if (!ctx) {
+        kprintf("[HID] Failed to allocate init context\n");
+        kfree(hid);
+        return -1;
+    }
+    
+    memset(ctx, 0, sizeof(hid_init_context_t));
+    ctx->hid = hid;
+    ctx->state = HID_INIT_PARSE;
+    ctx->retry_count = 500;
+    ctx->wait_ticks = 0;
+    
+    ctx->next = active_hid_inits;
+    active_hid_inits = ctx;
+    
+    kprintf("[HID] HID device probe queued for async init\n");
     return 0;
+}
+
+// HID initialization tick (called from timer via usb_tick)
+void hid_init_tick(void) {
+    hid_init_context_t **curr = &active_hid_inits;
+    
+    while (*curr) {
+        hid_init_context_t *ctx = *curr;
+        
+        if (--ctx->retry_count <= 0) {
+            kprintf("[HID] Init timeout\n");
+            *curr = ctx->next;
+            kfree(ctx);
+            continue;
+        }
+        
+        if (ctx->wait_ticks > 0) {
+            ctx->wait_ticks--;
+            curr = &(*curr)->next;
+            continue;
+        }
+        
+        hid_device_t *hid = ctx->hid;
+        
+        switch (ctx->state) {
+            case HID_INIT_PARSE:
+                kprintf("[HID] Protocol=%d Subclass=%d\n", hid->protocol, hid->subclass);
+                
+                if (hid->subclass == HID_SUBCLASS_BOOT) {
+                    ctx->state = HID_INIT_SET_PROTOCOL;
+                } else {
+                    ctx->state = HID_INIT_SET_IDLE;
+                }
+                break;
+                
+            case HID_INIT_SET_PROTOCOL:
+                kprintf("[HID] Setting boot protocol\n");
+                hid_set_protocol(hid, 0);
+                ctx->state = HID_INIT_WAIT_PROTOCOL;
+                ctx->wait_ticks = 10;
+                break;
+                
+            case HID_INIT_WAIT_PROTOCOL:
+                ctx->state = HID_INIT_SET_IDLE;
+                break;
+                
+            case HID_INIT_SET_IDLE:
+                kprintf("[HID] Setting idle rate\n");
+                hid_set_idle(hid, 0);
+                ctx->state = HID_INIT_WAIT_IDLE;
+                ctx->wait_ticks = 10;
+                break;
+                
+            case HID_INIT_WAIT_IDLE:
+                ctx->state = HID_INIT_DEVICE_SPECIFIC;
+                break;
+                
+            case HID_INIT_DEVICE_SPECIFIC:
+                if (hid->protocol == HID_PROTOCOL_KEYBOARD) {
+                    kprintf("[HID] Initializing keyboard\n");
+                    if (hid_keyboard_init(hid) == 0) {
+                        ctx->state = HID_INIT_WAIT_DEVICE;
+                        ctx->wait_ticks = 5;
+                    } else {
+                        kprintf("[HID] Keyboard init failed\n");
+                        *curr = ctx->next;
+                        kfree(ctx);
+                        continue;
+                    }
+                } else if (hid->protocol == HID_PROTOCOL_MOUSE) {
+                    kprintf("[HID] Initializing mouse\n");
+                    if (hid_mouse_init(hid) == 0) {
+                        ctx->state = HID_INIT_WAIT_DEVICE;
+                        ctx->wait_ticks = 5;
+                    } else {
+                        kprintf("[HID] Mouse init failed\n");
+                        *curr = ctx->next;
+                        kfree(ctx);
+                        continue;
+                    }
+                } else {
+                    kprintf("[HID] Unknown protocol %d\n", hid->protocol);
+                    *curr = ctx->next;
+                    kfree(ctx);
+                    continue;
+                }
+                break;
+                
+            case HID_INIT_WAIT_DEVICE:
+                ctx->state = HID_INIT_START_TRANSFERS;
+                break;
+                
+            case HID_INIT_START_TRANSFERS:
+                kprintf("[HID] Starting interrupt transfers\n");
+                if (hid_start_interrupt_transfers(hid) == 0) {
+                    kprintf("[HID] Device fully initialized!\n");
+                    ctx->state = HID_INIT_COMPLETE;
+                } else {
+                    kprintf("[HID] Failed to start transfers\n");
+                    *curr = ctx->next;
+                    kfree(ctx);
+                    continue;
+                }
+                break;
+                
+            case HID_INIT_COMPLETE:
+                *curr = ctx->next;
+                kfree(ctx);
+                continue;
+        }
+        
+        curr = &(*curr)->next;
+    }
 }
 
 // Disconnect HID device
@@ -266,7 +372,7 @@ int hid_set_idle(hid_device_t *hid, uint8_t duration) {
     return usb_control_transfer(hid->usb_dev,
                                USB_DIR_OUT | USB_REQ_TYPE_CLASS | USB_REQ_RECIPIENT_INTERFACE,
                                HID_REQ_SET_IDLE,
-                               (duration << 8) | 0,  // Duration in upper byte, Report ID in lower
+                               (duration << 8) | 0,
                                hid->interface_num,
                                NULL,
                                0);
@@ -358,7 +464,7 @@ static void hid_interrupt_callback(usb_device_t *dev, usb_transfer_t *transfer) 
     
     // Check transfer status
     if (transfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-        // Error occurred - resubmit the transfer
+        kprintf("[HID] Transfer error, resubmitting\n");
         usb_submit_interrupt_transfer(dev, hid->endpoint_in, hid->transfer_buffer,
                                       hid->max_packet_size, hid_interrupt_callback, hid);
         return;
@@ -453,10 +559,7 @@ static void hid_process_keyboard_report(hid_device_t *hid) {
 
 // Process mouse report
 static void hid_process_mouse_report(hid_device_t *hid) {
-    hid_mouse_report_t *report = &hid->report.mouse;
-    
-    // TODO: Call input system to process mouse report
-    // For now just log in debug mode
+    // Mouse processing would go here
 }
 
 // Convert HID keycode to ASCII character
@@ -473,7 +576,6 @@ char hid_keycode_to_ascii(uint8_t keycode, uint8_t modifiers) {
     // Numbers
     if (keycode >= HID_KEY_1 && keycode <= HID_KEY_9) {
         if (!shift) return '1' + (keycode - HID_KEY_1);
-        // Shifted number keys
         const char shifted[] = "!@#$%^&*(";
         return shifted[keycode - HID_KEY_1];
     }

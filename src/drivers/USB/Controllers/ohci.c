@@ -90,28 +90,26 @@ static void ohci_irq_handler(void) {
     ohci_controller_t *ohci = global_ohci;
     uint32_t status = ohci_read32(ohci, OHCI_REG_INTERRUPT_STATUS);
     
-    if (status == 0) {
-        pic_send_eoi(ohci->pci_dev->interrupt_line);
-        return;
+    if (status) {
+        if (status & OHCI_INT_WDH) {
+            ohci_process_done_queue(ohci);
+        }
+        
+        if (status & OHCI_INT_SO) {
+            COM_LOG_WARN(COM1_PORT, "OHCI: Scheduling overrun");
+        }
+        
+        if (status & OHCI_INT_RHSC) {
+            COM_LOG_INFO(COM1_PORT, "OHCI: Root hub change");
+        }
+        
+        if (status & OHCI_INT_UE) {
+            COM_LOG_ERROR(COM1_PORT, "OHCI: Unrecoverable error");
+        }
+        
+        ohci_write32(ohci, OHCI_REG_INTERRUPT_STATUS, status);
     }
     
-    if (status & OHCI_INT_WDH) {
-        ohci_process_done_queue(ohci);
-    }
-    
-    if (status & OHCI_INT_SO) {
-        COM_LOG_WARN(COM1_PORT, "OHCI: Scheduling overrun");
-    }
-    
-    if (status & OHCI_INT_RHSC) {
-        COM_LOG_INFO(COM1_PORT, "OHCI: Root hub status change");
-    }
-    
-    if (status & OHCI_INT_UE) {
-        COM_LOG_ERROR(COM1_PORT, "OHCI: Unrecoverable error");
-    }
-    
-    ohci_write32(ohci, OHCI_REG_INTERRUPT_STATUS, status);
     pic_send_eoi(ohci->pci_dev->interrupt_line);
 }
 

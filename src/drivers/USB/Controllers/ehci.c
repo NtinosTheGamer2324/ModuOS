@@ -41,32 +41,24 @@ static int ehci_setup_periodic_schedule(ehci_controller_t *ehci) {
     COM_LOG_INFO(COM1_PORT, "EHCI: Setting up periodic schedule");
     
     // Create interrupt QHs for different polling intervals
-    // 8 levels: 128ms, 64ms, 32ms, 16ms, 8ms, 4ms, 2ms, 1ms (indices 7-0)
     for (int i = 0; i < 8; i++) {
         ehci->interrupt_qhs[i] = ehci_create_qh(ehci, 0, 0, USB_SPEED_HIGH, 8);
         if (!ehci->interrupt_qhs[i]) {
             COM_LOG_ERROR(COM1_PORT, "EHCI: Failed to create interrupt QH %d", i);
-            // Cleanup previous QHs
             for (int j = 0; j < i; j++) {
                 if (ehci->interrupt_qhs[j]) kfree(ehci->interrupt_qhs[j]);
             }
             return -1;
         }
         
-        // Mark as head of reclamation (required for proper linking)
         ehci->interrupt_qhs[i]->characteristics |= EHCI_QH_CH_H;
-        
-        // Set S-mask for execution in microframe 0
         ehci->interrupt_qhs[i]->capabilities = (0x01 << 0);
-        
-        // Clear overlay to prevent spurious transfers
         ehci->interrupt_qhs[i]->next_qtd_ptr = EHCI_LP_TERMINATE;
         ehci->interrupt_qhs[i]->alt_next_qtd_ptr = EHCI_LP_TERMINATE;
         ehci->interrupt_qhs[i]->token = 0;
     }
     
-    // Link QHs in tree structure: each level points to the next faster level
-    // 128ms(7) -> 64ms(6) -> 32ms(5) -> ... -> 1ms(0) -> TERMINATE
+    // Link QHs in tree structure
     for (int i = 7; i > 0; i--) {
         uint64_t next_qh_phys = paging_virt_to_phys((uintptr_t)ehci->interrupt_qhs[i-1]);
         if (next_qh_phys == 0) {
@@ -76,17 +68,17 @@ static int ehci_setup_periodic_schedule(ehci_controller_t *ehci) {
         ehci->interrupt_qhs[i]->qh_link_ptr = (uint32_t)next_qh_phys | EHCI_LP_TYPE_QH;
     }
     
-    // Terminate the fastest (1ms) level
     ehci->interrupt_qhs[0]->qh_link_ptr = EHCI_LP_TERMINATE;
     
-    // Point all 1024 periodic list entries to appropriate interval QH
+    // Memory barrier BEFORE programming frame list
+    __asm__ volatile("mfence" ::: "memory");
+    
+    // Point all frame list entries to appropriate interval QH
     for (int i = 0; i < EHCI_FRAMELIST_COUNT; i++) {
-        // Determine which interval this frame should use
-        // Frames divisible by larger numbers use slower intervals
-        int interval_idx = 0;  // Default to 1ms (fastest)
+        int interval_idx = 0;
         
         for (int j = 7; j >= 0; j--) {
-            int period = 1 << j;  // 128, 64, 32, 16, 8, 4, 2, 1
+            int period = 1 << j;
             if (i % period == 0) {
                 interval_idx = j;
                 break;
@@ -100,6 +92,9 @@ static int ehci_setup_periodic_schedule(ehci_controller_t *ehci) {
         }
         ehci->periodic_list[i] = (uint32_t)qh_phys | EHCI_LP_TYPE_QH;
     }
+    
+    // Final memory barrier
+    __asm__ volatile("mfence" ::: "memory");
     
     COM_LOG_OK(COM1_PORT, "EHCI: Periodic schedule tree configured");
     return 0;
@@ -261,41 +256,30 @@ static void ehci_irq_handler(void) {
     ehci_controller_t *ehci = global_ehci;
     uint32_t status = ehci_read32(ehci, EHCI_OP_USBSTS);
     
-    if (status == 0) {
-        pic_send_eoi(ehci->pci_dev->interrupt_line);
-        return;
-    }
-    
-    // Handle USB interrupt (transfer completion)
+    // Process even if status is 0
     if (status & EHCI_STS_USBINT) {
         ehci_process_completed_transfers(ehci);
     }
     
-    // Handle errors
     if (status & EHCI_STS_ERROR) {
-        COM_LOG_ERROR(COM1_PORT, "EHCI: USB error interrupt");
+        COM_LOG_ERROR(COM1_PORT, "EHCI: Error");
     }
     
-    // Handle port changes
     if (status & EHCI_STS_PCD) {
         for (int i = 0; i < ehci->num_ports; i++) {
-            uint32_t port_status = ehci_read32(ehci, EHCI_OP_PORTSC + (i * 4));
-            if (port_status & (EHCI_PORT_CSC | EHCI_PORT_PEDC | EHCI_PORT_OCC)) {
-                // Clear change bits
-                ehci_write32(ehci, EHCI_OP_PORTSC + (i * 4), port_status);
+            uint32_t ps = ehci_read32(ehci, EHCI_OP_PORTSC + (i * 4));
+            if (ps & (EHCI_PORT_CSC | EHCI_PORT_PEDC | EHCI_PORT_OCC)) {
+                ehci_write32(ehci, EHCI_OP_PORTSC + (i * 4), ps);
             }
         }
     }
     
-    // Handle host system error
-    if (status & EHCI_STS_HSE) {
-        COM_LOG_ERROR(COM1_PORT, "EHCI: Host system error!");
+    // Always clear status
+    if (status) {
+        ehci_write32(ehci, EHCI_OP_USBSTS, status);
     }
     
-    // Clear all status bits we've handled
-    ehci_write32(ehci, EHCI_OP_USBSTS, status);
-    
-    // Send EOI
+    // send EOI
     pic_send_eoi(ehci->pci_dev->interrupt_line);
 }
 
@@ -913,7 +897,7 @@ int ehci_probe(pci_device_t *pci_dev) {
     com_write_string(COM1_PORT, hex_buf);
     com_write_string(COM1_PORT, "\n");
     
-    // CRITICAL FIX: Map MMIO region to virtual address space
+    // Map MMIO region to virtual address space
     // EHCI typically needs at least 4KB, but we'll map more to be safe
     ehci->mmio_base = (volatile uint8_t*)ioremap(ehci->mmio_phys, 8192);
     if (!ehci->mmio_base) {
@@ -1065,24 +1049,22 @@ int ehci_probe(pci_device_t *pci_dev) {
                  EHCI_INTR_USBINT | EHCI_INTR_ERROR | EHCI_INTR_PCD | 
                  EHCI_INTR_IAA | EHCI_INTR_HSE | EHCI_INTR_FLR);
     
-    COM_LOG_INFO(COM1_PORT, "EHCI: Starting controller");
-    
-    // Start controller
+    COM_LOG_INFO(COM1_PORT, "EHCI: Starting controller (stage 1: async only)");
+        
+    // Stage 1: Start with ONLY async schedule
     uint32_t cmd = EHCI_CMD_RS |        // Run
-                   EHCI_CMD_ASE |       // Async Schedule Enable
-                   EHCI_CMD_PSE |       // Periodic Schedule Enable
+                   EHCI_CMD_ASE |       // Async Schedule Enable ONLY
                    EHCI_CMD_FLS_1024 |  // 1024 frame list
                    (8 << EHCI_CMD_ITC_SHIFT);  // Interrupt threshold
     ehci_write32(ehci, EHCI_OP_USBCMD, cmd);
-    
+        
+    // Wait for controller to start and async schedule to activate
     int timeout = 1000;
     while (timeout-- > 0) {
         uint32_t status = ehci_read32(ehci, EHCI_OP_USBSTS);
         
-        // Check if controller is running and both schedules are active
-        if (!(status & EHCI_STS_HCHALTED) && 
-            (status & EHCI_STS_ASS) && 
-            (status & EHCI_STS_PSS)) {
+        // Check if controller is running and async is active
+        if (!(status & EHCI_STS_HCHALTED) && (status & EHCI_STS_ASS)) {
             break;
         }
         
@@ -1091,39 +1073,57 @@ int ehci_probe(pci_device_t *pci_dev) {
     
     if (timeout <= 0) {
         uint32_t status = ehci_read32(ehci, EHCI_OP_USBSTS);
-        COM_LOG_ERROR(COM1_PORT, "EHCI: Failed to start (status=0x%08x)", status);
-        // Log which schedules failed
-        if (status & EHCI_STS_HCHALTED) {
-            COM_LOG_ERROR(COM1_PORT, "EHCI: Controller still halted");
+        COM_LOG_ERROR(COM1_PORT, "EHCI: Stage 1 failed (status=0x%08x)", status);
+        // Cleanup...
+        return -1;
+    }
+    
+    COM_LOG_OK(COM1_PORT, "EHCI: Async schedule running");
+    
+    // Stage 2: Now enable periodic schedule
+    COM_LOG_INFO(COM1_PORT, "EHCI: Starting stage 2: periodic schedule");
+    
+    cmd = ehci_read32(ehci, EHCI_OP_USBCMD);
+    cmd |= EHCI_CMD_PSE;  // Add Periodic Schedule Enable
+    ehci_write32(ehci, EHCI_OP_USBCMD, cmd);
+    
+    // Wait for periodic schedule to activate
+    timeout = 1000;
+    while (timeout-- > 0) {
+        uint32_t status = ehci_read32(ehci, EHCI_OP_USBSTS);
+        
+        if (status & EHCI_STS_PSS) {
+            break;
         }
-        if (!(status & EHCI_STS_ASS)) {
-            COM_LOG_ERROR(COM1_PORT, "EHCI: Async schedule not running");
-        }
-        if (!(status & EHCI_STS_PSS)) {
-            COM_LOG_ERROR(COM1_PORT, "EHCI: Periodic schedule not running");
-        }
-        // Cleanup and return error
-        irq_uninstall_handler(ehci->pci_dev->interrupt_line);
-        kfree(ehci->interrupt_qh);
-        kfree(ehci->bulk_qh);
-        kfree(ehci->control_qh);
-        kfree(ehci->async_qh);
-        for (int i = 0; i < 8; i++) {
-            if (ehci->interrupt_qhs[i]) kfree(ehci->interrupt_qhs[i]);
-        }
-        kfree(ehci->qtd_pool);
-        kfree(ehci->periodic_list);
-        kfree(ehci);
+        
+        ehci_delay_ms(1);
+    }
+    
+    if (timeout <= 0) {
+        uint32_t status = ehci_read32(ehci, EHCI_OP_USBSTS);
+        COM_LOG_ERROR(COM1_PORT, "EHCI: Stage 2 failed (status=0x%08x)", status);
+        // Cleanup...
         return -1;
     }
     
     COM_LOG_OK(COM1_PORT, "EHCI: Controller running (async + periodic)");
     
-    // Set configure flag
+    // Set configure flag AFTER controller is fully running
     ehci_write32(ehci, EHCI_OP_CONFIGFLAG, EHCI_CONFIGFLAG_CF);
     
-    // Stabilization delay
-    for (volatile int i = 0; i < 100000; i++);
+    // Longer stabilization delay for hardware to settle
+    for (volatile int i = 0; i < 500000; i++);
+    
+    // Verify both schedules are still active
+    uint32_t final_status = ehci_read32(ehci, EHCI_OP_USBSTS);
+    if ((final_status & EHCI_STS_HCHALTED) || 
+        !(final_status & EHCI_STS_ASS) || 
+        !(final_status & EHCI_STS_PSS)) {
+        COM_LOG_ERROR(COM1_PORT, "EHCI: Controller state unstable (status=0x%08x)", final_status);
+        return -1;
+    }
+    
+    COM_LOG_OK(COM1_PORT, "EHCI: Controller verified stable");
     
     // Create USB controller structure
     usb_controller_t *controller = (usb_controller_t*)kmalloc(sizeof(usb_controller_t));
@@ -1171,19 +1171,13 @@ void ehci_reset_port(usb_controller_t *controller, uint8_t port) {
     ehci_controller_t *ehci = (ehci_controller_t*)controller->controller_data;
     uint32_t port_reg = EHCI_OP_PORTSC + (port * 4);
     
-    COM_LOG_INFO(COM1_PORT, "EHCI: Resetting port");
-    
     uint32_t status = ehci_read32(ehci, port_reg);
     
-    if (!(status & EHCI_PORT_CCS)) {
-        COM_LOG_WARN(COM1_PORT, "EHCI: No device connected");
-        return;
-    }
+    if (!(status & EHCI_PORT_CCS)) return;
     
     if (status & EHCI_PORT_PED) {
         status &= ~EHCI_PORT_PED;
         ehci_write32(ehci, port_reg, status);
-        ehci_delay_ms(10);
     }
     
     status = ehci_read32(ehci, port_reg);
@@ -1191,55 +1185,7 @@ void ehci_reset_port(usb_controller_t *controller, uint8_t port) {
     status &= ~EHCI_PORT_PED;
     ehci_write32(ehci, port_reg, status);
     
-    ehci_delay_ms(60);
-    
-    status = ehci_read32(ehci, port_reg);
-    status &= ~EHCI_PORT_PR;
-    ehci_write32(ehci, port_reg, status);
-    
-    int timeout = 100;
-    while ((ehci_read32(ehci, port_reg) & EHCI_PORT_PR) && timeout--) {
-        ehci_delay_ms(1);
-    }
-    
-    if (timeout <= 0) {
-        COM_LOG_ERROR(COM1_PORT, "EHCI: Port reset timeout");
-        return;
-    }
-    
-    ehci_delay_ms(20);
-    
-    status = ehci_read32(ehci, port_reg);
-    
-    if (!(status & EHCI_PORT_CCS)) {
-        COM_LOG_WARN(COM1_PORT, "EHCI: Device disconnected during reset");
-        return;
-    }
-    
-    if (!(status & EHCI_PORT_PED)) {
-        COM_LOG_INFO(COM1_PORT, "EHCI: Not high-speed, releasing to companion");
-        status |= EHCI_PORT_OWNER;
-        ehci_write32(ehci, port_reg, status);
-        return;
-    }
-    
-    COM_LOG_OK(COM1_PORT, "EHCI: Port reset complete, device is high-speed");
-    
-    ehci_delay_ms(10);
-    
-    usb_device_t *dev = usb_alloc_device(controller);
-    if (dev) {
-        dev->port = port;
-        dev->speed = USB_SPEED_HIGH;
-        dev->max_packet_size = 64;
-        
-        if (usb_enumerate_device(dev) != 0) {
-            COM_LOG_ERROR(COM1_PORT, "EHCI: Enumeration failed");
-            usb_free_device(dev);
-        } else {
-            COM_LOG_OK(COM1_PORT, "EHCI: Device enumerated successfully");
-        }
-    }
+    // Don't wait here - return and let timer handle the rest
 }
 
 // Cancel transfer

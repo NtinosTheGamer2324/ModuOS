@@ -262,4 +262,14 @@ int usb_submit_interrupt_transfer(usb_device_t *dev, uint8_t endpoint, void *buf
                                    void *callback_data);
 int usb_cancel_transfer(usb_device_t *dev, usb_transfer_t *transfer);
 
+void usb_tick(void);
+void usb_enumeration_tick(void);
+
+// Async control transfer with callback
+typedef void (*usb_control_callback_t)(int result);
+int usb_control_transfer_async(usb_device_t *dev, uint8_t request_type, 
+                                uint8_t request, uint16_t value, uint16_t index, 
+                                void *data, uint16_t length,
+                                usb_control_callback_t callback);
+
 #endif // MODUOS_DRIVERS_USB_H
