@@ -52,7 +52,7 @@ int input_init(void) {
 
 // Process USB keyboard report (called from HID interrupt callback)
 void usb_process_keyboard_report(hid_device_t *hid) {
-    if (!hid || !usb_available) return;
+    if (!hid) return;
     
     hid_keyboard_report_t *report = &hid->report.keyboard;
     
@@ -80,10 +80,10 @@ void usb_process_keyboard_report(hid_device_t *hid) {
             
             Event event = event_create_key_pressed(
                 keycode, 
-                key,  // Use HID code as scancode
+                key,
                 c, 
                 usb_get_event_modifiers(report->modifiers),
-                false  // Not extended
+                false
             );
             
             event_push(&event);
@@ -108,7 +108,6 @@ void usb_process_keyboard_report(hid_device_t *hid) {
         }
         
         if (!still_pressed) {
-            // Create key release event
             KeyCode keycode = usb_hid_to_keycode(old_key);
             
             Event event = event_create_key_released(
@@ -126,18 +125,8 @@ void usb_process_keyboard_report(hid_device_t *hid) {
     memcpy(&last_usb_kbd_report, report, sizeof(hid_keyboard_report_t));
 }
 
-// Legacy polling function (now just a stub for compatibility)
-void usb_input_poll(void) {
-    // No longer needed - USB input is now interrupt-driven!
-    // This function is kept for API compatibility but does nothing.
-}
-
 // Convert USB HID keycode to internal KeyCode enum
 KeyCode usb_hid_to_keycode(uint8_t hid_code) {
-    // Letters and numbers are not in KeyCode enum, return KEY_UNKNOWN for them
-    // (they're handled as ASCII characters instead)
-    
-    // Special keys
     switch (hid_code) {
         case HID_KEY_ENTER: return KEY_ENTER;
         case HID_KEY_ESCAPE: return KEY_ESCAPE;
@@ -181,7 +170,6 @@ uint8_t usb_get_event_modifiers(uint8_t hid_mods) {
         mods |= MOD_CTRL;
     if (hid_mods & (HID_MOD_LEFT_ALT | HID_MOD_RIGHT_ALT))
         mods |= MOD_ALT;
-    // Note: MOD_SUPER doesn't exist in ModifierFlags, skip GUI keys
     
     return mods;
 }
@@ -189,6 +177,10 @@ uint8_t usb_get_event_modifiers(uint8_t hid_mods) {
 // Handle USB key press for input buffer (compatibility with PS/2 input)
 void usb_handle_key_press(uint8_t hid_key, uint8_t modifiers) {
     // Use shared input buffer from ps2.h
+    extern char input_buffer[256];
+    extern size_t input_index;
+    extern bool input_ready;
+    
     char c = hid_keycode_to_ascii(hid_key, modifiers);
     
     // Handle special keys
