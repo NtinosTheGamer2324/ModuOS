@@ -36,17 +36,45 @@ typedef struct {
 void fs_init(void);
 
 /**
+ * Format a partition with FAT32 filesystem
+ * WARNING: This will erase all data on the specified partition!
+ * 
+ * The partition MUST be unmounted before formatting.
+ * After formatting, you must mount it with fs_mount_drive() to use it.
+ *
+ * @param vdrive_id: Virtual drive ID (from vDrive subsystem)
+ * @param partition_lba: Partition starting LBA offset
+ * @param partition_sectors: Size of the partition in sectors (512 bytes each)
+ * @param volume_label: Volume label string (max 11 chars, NULL for "NO NAME")
+ * @param sectors_per_cluster: Cluster size in sectors (0 for auto, or 1/2/4/8/16/32/64/128)
+ * @return: 0 on success, negative on error
+ *          -1: vDrive not ready
+ *          -2: Drive is mounted (unmount first)
+ *          -3: Invalid partition size
+ *          -4: Format failed
+ * 
+ * Example:
+ *   // Format vDrive 0, starting at LBA 2048, size 1GB (2097152 sectors)
+ *   fs_format(0, 2048, 2097152, "MYVOLUME", 0);
+ *   // Then mount it:
+ *   int slot = fs_mount_drive(0, 2048, FS_TYPE_FAT32);
+ */
+int fs_format(int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors,
+              const char* volume_label, uint32_t sectors_per_cluster);
+
+/**
  * Mount a drive (auto-detect or specific type)
- * @param drive_index: Physical drive number (0-3)
- * @param partition_lba: Partition LBA offset (0 for whole disk)
+ * @param vdrive_id: Virtual drive ID (from vDrive subsystem)
+ * @param partition_lba: Partition LBA offset (0 for whole disk/auto-detect)
  * @param type: FS_TYPE_UNKNOWN for auto-detect, or specific type
  * @return: Slot ID (0-25) on success, negative on error
  *          -2: Already mounted
  *          -3: Mount table full
  *          -4: Unknown filesystem type
  *          -5: Mount failed
+ *          -6: vDrive not ready
  */
-int fs_mount_drive(int drive_index, uint32_t partition_lba, fs_type_t type);
+int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type);
 
 /**
  * Unmount filesystem by slot ID
@@ -65,12 +93,12 @@ fs_mount_t* fs_get_mount(int slot);
 /**
  * Get mount metadata
  * @param slot: Slot ID
- * @param drive_index: Output - physical drive number (can be NULL)
+ * @param vdrive_id: Output - virtual drive ID (can be NULL)
  * @param partition_lba: Output - partition LBA (can be NULL)
  * @param type: Output - filesystem type (can be NULL)
  * @return: 0 on success, -1 if slot invalid/unmounted
  */
-int fs_get_mount_info(int slot, int* drive_index, uint32_t* partition_lba, fs_type_t* type);
+int fs_get_mount_info(int slot, int* vdrive_id, uint32_t* partition_lba, fs_type_t* type);
 
 /**
  * List all active mounts (prints to VGA)

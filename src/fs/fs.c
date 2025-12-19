@@ -1,4 +1,4 @@
-//fs.c - Kernel-owned mount table (UPDATED FOR vDrive)
+//fs.c - Kernel-owned mount table with FORMAT support
 #include "moduos/fs/fs.h"
 #include "moduos/fs/DOS/FAT32/fat32.h"
 #include "moduos/fs/ISOFS/iso9660.h"
@@ -12,7 +12,7 @@
 
 typedef struct {
     fs_mount_t mount;
-    int vdrive_id;          // Changed from drive_index to vdrive_id
+    int vdrive_id;
     uint32_t partition_lba;
     char mount_point[256];
     int in_use;
@@ -59,7 +59,69 @@ static int find_existing_mount(int vdrive_id, uint32_t partition_lba) {
     return -1;
 }
 
-/* Mount filesystem - NOW USES vDrive! */
+/* Format a partition with FAT32 */
+int fs_format(int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors,
+              const char* volume_label, uint32_t sectors_per_cluster) {
+    fs_init();
+    
+    /* Validate vDrive */
+    if (!vdrive_is_ready(vdrive_id)) {
+        com_write_string(COM1_PORT, "[FS] Format failed: vDrive not ready\n");
+        VGA_Write("FS: vDrive not ready\n");
+        return -1;
+    }
+    
+    /* Check if already mounted - must unmount first */
+    int existing = find_existing_mount(vdrive_id, partition_lba);
+    if (existing >= 0) {
+        com_write_string(COM1_PORT, "[FS] Format failed: Drive is mounted (unmount first)\n");
+        VGA_Write("FS: Drive is mounted - unmount first\n");
+        return -2;
+    }
+    
+    /* Validate partition size */
+    if (partition_sectors == 0) {
+        com_write_string(COM1_PORT, "[FS] Format failed: Invalid partition size\n");
+        VGA_Write("FS: Invalid partition size\n");
+        return -3;
+    }
+    
+    /* Format using FAT32 driver */
+    com_write_string(COM1_PORT, "[FS] Formatting vDrive ");
+    char vd_str[4];
+    vd_str[0] = '0' + vdrive_id;
+    vd_str[1] = '\0';
+    com_write_string(COM1_PORT, vd_str);
+    com_write_string(COM1_PORT, " at LBA ");
+    char lba_str[16];
+    itoa(partition_lba, lba_str, 10);
+    com_write_string(COM1_PORT, lba_str);
+    com_write_string(COM1_PORT, "...\n");
+    
+    VGA_Write("FS: Formatting ");
+    VGA_Write(volume_label ? volume_label : "NO NAME");
+    VGA_Write("...\n");
+    
+    int result = fat32_format(vdrive_id, partition_lba, partition_sectors,
+                             volume_label, sectors_per_cluster);
+    
+    if (result != 0) {
+        com_write_string(COM1_PORT, "[FS] Format failed with code ");
+        char code_str[8];
+        itoa(result, code_str, 10);
+        com_write_string(COM1_PORT, code_str);
+        com_write_string(COM1_PORT, "\n");
+        VGA_Write("FS: Format FAILED\n");
+        return -4;
+    }
+    
+    com_write_string(COM1_PORT, "[FS] Format successful!\n");
+    VGA_Write("FS: Format complete!\n");
+    
+    return 0;
+}
+
+/* Mount filesystem - USES vDrive! */
 int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
     fs_init();
     
@@ -87,15 +149,37 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
     fs_mount_t mount = {0};
     int handle = -1;
     
-    if (type == FS_TYPE_UNKNOWN) {
-        /* Auto-detect */
+    /* If partition_lba is 0, auto-detect. Otherwise, use specified LBA */
+    if (partition_lba == 0 && type == FS_TYPE_UNKNOWN) {
+        /* Auto-detect filesystem AND partition */
         handle = fat32_mount_auto(vdrive_id);
         if (handle >= 0) {
             mount.type = FS_TYPE_FAT32;
             mount.handle = handle;
             mount.valid = 1;
+            /* Get actual LBA from mounted filesystem */
+            const fat32_fs_t *fs = fat32_get_fs(handle);
+            if (fs) partition_lba = fs->partition_lba;
         } else {
             handle = iso9660_mount_auto(vdrive_id);
+            if (handle >= 0) {
+                mount.type = FS_TYPE_ISO9660;
+                mount.handle = handle;
+                mount.valid = 1;
+                /* Get actual LBA from mounted filesystem */
+                const iso9660_fs_t *fs = iso9660_get_fs(handle);
+                if (fs) partition_lba = fs->partition_lba;
+            }
+        }
+    } else if (type == FS_TYPE_UNKNOWN) {
+        /* User specified LBA, but unknown filesystem type - try both */
+        handle = fat32_mount(vdrive_id, partition_lba);
+        if (handle >= 0) {
+            mount.type = FS_TYPE_FAT32;
+            mount.handle = handle;
+            mount.valid = 1;
+        } else {
+            handle = iso9660_mount(vdrive_id, partition_lba);
             if (handle >= 0) {
                 mount.type = FS_TYPE_ISO9660;
                 mount.handle = handle;
@@ -103,7 +187,7 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
             }
         }
     } else {
-        /* Mount specific type */
+        /* User specified both LBA and filesystem type */
         switch (type) {
             case FS_TYPE_FAT32:
                 handle = fat32_mount(vdrive_id, partition_lba);
@@ -146,7 +230,11 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
     vd_str[1] = ' ';
     vd_str[2] = '\0';
     com_write_string(COM1_PORT, vd_str);
-    com_write_string(COM1_PORT, "in slot ");
+    com_write_string(COM1_PORT, "at LBA ");
+    char lba_str[16];
+    itoa(partition_lba, lba_str, 10);
+    com_write_string(COM1_PORT, lba_str);
+    com_write_string(COM1_PORT, " in slot ");
     char slot_str[4];
     slot_str[0] = '0' + slot;
     slot_str[1] = '\0';
