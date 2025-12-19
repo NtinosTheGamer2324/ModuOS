@@ -185,9 +185,8 @@ extern uint8_t _kernel_start;
 extern uint8_t _kernel_end;
 
 void memory_init(void *mb2_ptr) {
-    log_msg("=============== ModuOS Memory Init ===============\n");
     
-    /* CRITICAL FIX: Validate pointer first */
+    /*Validate pointer first */
     if (!validate_mb2_pointer(mb2_ptr)) {
         log_msg("[MEM] FATAL: Invalid multiboot pointer!\n");
         log_msg("System halted. Check bootloader.\n");
