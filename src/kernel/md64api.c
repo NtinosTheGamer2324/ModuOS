@@ -1,4 +1,5 @@
 #include "moduos/kernel/md64api.h"
+#include "moduos/drivers/Time/RTC.h"
 #include "moduos/kernel/kernel.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/memory/memory.h"
@@ -519,4 +520,21 @@ md64api_sysinfo_data get_system_info(void)
     info.tpm_version = get_tpm_version();
     
     return info;
+}
+
+md64api_date_time get_date_time(void) {
+    rtc_datetime_t time;
+
+    rtc_get_datetime(&time);
+
+    md64api_date_time date_time;
+
+    date_time.second = time.second;
+    date_time.minute = time.minute;
+    date_time.hour = time.hour;
+    date_time.day = time.day;
+    date_time.month = time.month;
+    date_time.year = time.year;
+
+    return date_time;
 }

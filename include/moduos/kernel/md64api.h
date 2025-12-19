@@ -66,6 +66,19 @@ typedef struct md64api_sysinfo_data
 
 } md64api_sysinfo_data;
 
+typedef struct md64api_date_time
+{  
+    uint8_t second;
+    uint8_t minute;
+    uint8_t hour;
+    uint8_t day;
+    uint8_t month;
+    uint16_t year;
+
+} md64api_date_time;
+
+
 md64api_sysinfo_data get_system_info(void);
+md64api_date_time get_date_time(void);
 
 #endif /* MD64API_H */
