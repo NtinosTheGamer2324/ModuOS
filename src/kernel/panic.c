@@ -79,7 +79,7 @@ void trigger_panic_dodev() {
         " - Check if your storage devices are properly connected.\n"
         " - Try a different hardware configuration if available.",
         "HW_DEVICE",
-        "ATA_NO_DEVICE_FOUND",
+        "NO_MEDIUM_FOUND",
         6
     );
 }
