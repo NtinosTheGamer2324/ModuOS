@@ -142,6 +142,7 @@ static inline void putc(char c) {
 
 // Writes a null-terminated string to VGA
 static inline void puts_raw(const char *s) {
+    if (!s) s = "(null)";
     syscall(SYS_WRITE, (long)s, 0, 0);
 }
 
