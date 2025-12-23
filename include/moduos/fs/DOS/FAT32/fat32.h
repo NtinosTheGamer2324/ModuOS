@@ -6,6 +6,17 @@
 
 #define FAT32_MAX_MOUNTS 8
 #define FAT32_MAX_CLUSTER_SIZE 65536
+#define FAT32_MAX_FOLDER_ENTRIES 256
+
+/* Directory entry for fat32_read_folder */
+typedef struct {
+    char name[260];           // Support long filenames
+    uint32_t size;
+    uint32_t first_cluster;
+    uint8_t is_directory;
+    uint8_t is_hidden;
+    uint8_t is_system;
+} fat32_folder_entry_t;
 
 typedef struct {
     int active;
@@ -32,8 +43,14 @@ int fat32_list_root(int handle);
 int fat32_directory_exists(int handle, const char* path);
 int fat32_list_directory(int handle, const char* path);
 int fat32_read_file_by_path(int handle, const char* path, void* out_buf, size_t buf_size, size_t* out_size);
+
+/* Write/overwrite a file by path (existing file only). */
+int fat32_write_file_by_path(int handle, const char* path, const void* data, size_t size);
 int fat32_read_cluster(int handle, uint32_t cluster, void* buffer);
 int fat32_next_cluster(int handle, uint32_t cluster, uint32_t* out_next);
+
+/* Read folder entries - returns number of entries read (or negative on error) */
+int fat32_read_folder(int handle, const char* path, fat32_folder_entry_t* entries, int max_entries);
 
 /* Get filesystem info */
 const fat32_fs_t* fat32_get_fs(int handle);
