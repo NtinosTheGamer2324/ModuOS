@@ -1,0 +1,6 @@
+# ModuOS users database
+# Format: username:uid:sha256_hex(password)
+# Generate hash in WSL:  printf "%s" "PASSWORD" | sha256sum | awk '{print $1}'
+
+#the ROOT/MDMAN Password is 0000
+mdman:0:9af15b336e6a9619928537df30b2e6a2376569fcf9d7e773eccede65606529a0
