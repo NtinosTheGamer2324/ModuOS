@@ -31,14 +31,15 @@ syscall_entry:
     sub rsp, 8
 .aligned:
 
-    ; Setup args...
-    mov r8, rsi
-    mov r9, rdi
-    mov rdi, rax
-    mov rsi, rbx
-    mov r10, rdx
-    mov rdx, rcx
-    mov rcx, r10
+    ; Setup args for C calling convention
+    ; Userspace passes: rax=syscall_num, rdi=arg1, rsi=arg2, rdx=arg3, r10=arg4, r8=arg5
+    ; C function expects: rdi=syscall_num, rsi=arg1, rdx=arg2, rcx=arg3, r8=arg4, r9=arg5
+    mov r9, r8      ; arg5 = r8
+    mov r8, r10     ; arg4 = r10
+    mov rcx, rdx    ; arg3 = rdx
+    mov rdx, rsi    ; arg2 = rsi
+    mov rsi, rdi    ; arg1 = rdi
+    mov rdi, rax    ; syscall_num = rax
 
     cld
     call syscall_handler
