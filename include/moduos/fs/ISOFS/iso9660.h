@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 #define ISO9660_MAX_MOUNTS 8
+#define ISO9660_MAX_FOLDER_ENTRIES 256
 
 typedef struct {
     int active;
@@ -24,6 +25,14 @@ typedef struct {
     uint8_t flags;
 } iso9660_dir_entry_t;
 
+/* Directory entry for iso9660_read_folder */
+typedef struct {
+    char name[256];
+    uint32_t size;
+    uint32_t extent_lba;
+    uint8_t is_directory;
+} iso9660_folder_entry_t;
+
 /* Mount returns a handle (index), or negative on error */
 int iso9660_mount(int drive_index, uint32_t partition_lba);
 int iso9660_mount_auto(int drive_index); /* Returns first successful mount handle */
@@ -39,6 +48,9 @@ int iso9660_read_extent(int handle, uint32_t extent_lba, uint32_t size_bytes, vo
 
 /* Find file and get its info (for fs_stat) */
 int iso9660_find_file(int handle, const char* path, iso9660_dir_entry_t* out_entry);
+
+/* Read folder entries - returns number of entries read (or negative on error) */
+int iso9660_read_folder(int handle, const char* path, iso9660_folder_entry_t* entries, int max_entries);
 
 /* Get filesystem info */
 const iso9660_fs_t* iso9660_get_fs(int handle);
