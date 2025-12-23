@@ -117,6 +117,19 @@ struct smbios_bios_info {
     /* ... more fields ... */
 } __attribute__((packed));
 
+/* Type 1: System Information */
+struct smbios_system_info {
+    struct smbios_header header;
+    uint8_t manufacturer;
+    uint8_t product;
+    uint8_t version;
+    uint8_t serial_number;
+    uint8_t uuid[16];
+    uint8_t wake_up_type;
+    uint8_t sku_number;
+    uint8_t family;
+} __attribute__((packed));
+
 /* Type 2: Baseboard Information */
 struct smbios_baseboard_info {
     struct smbios_header header;
@@ -181,6 +194,32 @@ static const char *get_smbios_bios_version(void) {
     strncpy(version_buf, version, sizeof(version_buf) - 1);
     version_buf[sizeof(version_buf) - 1] = '\0';
     return version_buf;
+}
+
+const char *md64api_get_smbios_system_manufacturer(void) {
+    static char manu_buf[64] = "";
+    if (manu_buf[0]) return manu_buf;
+
+    struct smbios_system_info *sys = find_smbios_structure(1);
+    if (!sys) return "";
+
+    const char *m = get_smbios_string(&sys->header, sys->manufacturer);
+    strncpy(manu_buf, m, sizeof(manu_buf) - 1);
+    manu_buf[sizeof(manu_buf) - 1] = '\0';
+    return manu_buf;
+}
+
+const char *md64api_get_smbios_system_product(void) {
+    static char prod_buf[64] = "";
+    if (prod_buf[0]) return prod_buf;
+
+    struct smbios_system_info *sys = find_smbios_structure(1);
+    if (!sys) return "";
+
+    const char *p = get_smbios_string(&sys->header, sys->product);
+    strncpy(prod_buf, p, sizeof(prod_buf) - 1);
+    prod_buf[sizeof(prod_buf) - 1] = '\0';
+    return prod_buf;
 }
 
 static const char *get_smbios_baseboard_product(void) {
