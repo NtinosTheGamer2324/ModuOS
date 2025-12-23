@@ -1,22 +1,67 @@
 #include "moduos/kernel/syscall/syscall.h"
+#include "moduos/fs/devfs.h"
+#include "moduos/kernel/syscall/syscall_numbers.h"
 #include "moduos/kernel/md64api.h"
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/memory/memory.h"
+#include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/interrupts/idt.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/debug.h"
+#include "moduos/kernel/process/process.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/fs/fs.h"
 #include "moduos/fs/fd.h"
+#include "moduos/fs/path.h"
+#include "moduos/fs/path_norm.h"
 #include "moduos/kernel/exec.h"
 #include "moduos/drivers/input/input.h"
+
+/* Helper: Copy string from userspace to kernel buffer */
+static int copy_string_from_user(const char *user_str, char *kernel_buf, size_t max_len) {
+    if (!user_str || !kernel_buf || max_len == 0) return -1;
+    
+    process_t *proc = process_get_current();
+    if (!proc) return -1;
+    
+    /* In ModuOS, all process virtual memory is mapped in the kernel's page table
+     * because processes share the kernel's page table. So we can directly access
+     * the virtual address. */
+    size_t i;
+    for (i = 0; i < max_len - 1; i++) {
+        kernel_buf[i] = user_str[i];
+        if (user_str[i] == '\0') break;
+    }
+    kernel_buf[i] = '\0';
+
+    // Strip trailing whitespace/newlines (common when userland passes raw tokens)
+    size_t n = strlen(kernel_buf);
+    while (n > 0) {
+        char c = kernel_buf[n - 1];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            kernel_buf[n - 1] = 0;
+            n--;
+        } else {
+            break;
+        }
+    }
+
+    return 0;
+}
 
 extern void syscall_entry(void);
 
 void syscall_init(void) {
     COM_LOG_INFO(COM1_PORT, "Initializing system calls");
-    idt_set_entry(0x80, syscall_entry, 0xEE);
+    /*
+     * Use a ring3 TRAP gate for syscalls so IF is not cleared on entry.
+     * Interrupt gates clear IF, which makes blocking syscalls (waiting for input/events)
+     * fragile and can lead to "random" keyboard deadlocks.
+     */
+    idt_set_entry(0x80, syscall_entry, 0xEF);
+
     fd_init();
     COM_LOG_OK(COM1_PORT, "System calls initialized (INT 0x80)");
 }
@@ -37,6 +82,90 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_WAIT:    return sys_wait((int*)arg1);
         case SYS_GETPID:  return sys_getpid();
         case SYS_GETPPID: return sys_getppid();
+        case SYS_GETUID: {
+            process_t *p = process_get_current();
+            return p ? (long)p->uid : 0;
+        }
+        case SYS_SETUID: {
+            process_t *p = process_get_current();
+            if (!p) return -1;
+            if (p->uid != 0) return -2; /* EPERM */
+            p->uid = (uint32_t)arg1;
+            return 0;
+        }
+
+        case SYS_GFX_BLIT: {
+            /* args:
+             *  arg1 = src_ptr
+             *  arg2 = packed (src_w<<16 | src_h)
+             *  arg3 = packed (dst_x<<16 | dst_y)
+             *  arg4 = packed (src_pitch_bytes<<16 | fmt)
+             */
+            const uint8_t *src = (const uint8_t*)arg1;
+            uint32_t wh = (uint32_t)arg2;
+            uint32_t xy = (uint32_t)arg3;
+            uint32_t pf = (uint32_t)arg4;
+
+            uint32_t src_w = (wh >> 16) & 0xFFFFu;
+            uint32_t src_h = (wh) & 0xFFFFu;
+            uint32_t dst_x = (xy >> 16) & 0xFFFFu;
+            uint32_t dst_y = (xy) & 0xFFFFu;
+            uint32_t src_pitch = (pf >> 16) & 0xFFFFu;
+            framebuffer_format_t fmt = (framebuffer_format_t)(pf & 0xFFFFu);
+
+            if (!src || src_w == 0 || src_h == 0) return -1;
+
+            framebuffer_t fb;
+            if (VGA_GetFrameBufferMode() != FB_MODE_GRAPHICS) return -2;
+            if (VGA_GetFrameBuffer(&fb) != 0 || !fb.addr) return -2;
+
+            /*
+             * Format negotiation:
+             * The blit is fundamentally determined by bytes-per-pixel.
+             * Some code paths may not initialize fb.fmt reliably, so validate against fb.bpp.
+             */
+            framebuffer_format_t expected_fmt = FB_FMT_UNKNOWN;
+            if (fb.bpp == 32) expected_fmt = FB_FMT_XRGB8888;
+            else if (fb.bpp == 16) expected_fmt = FB_FMT_RGB565;
+
+            if (expected_fmt == FB_FMT_UNKNOWN || fmt != expected_fmt) {
+                if (kernel_debug_is_on()) {
+                    /* Debug to COM1 to help diagnose real hardware mismatches */
+                    com_write_string(COM1_PORT, "[SYS_GFX_BLIT] fmt mismatch: user=");
+                    itoa((int)fmt, buf, 10); com_write_string(COM1_PORT, buf);
+                    com_write_string(COM1_PORT, " fb.bpp=");
+                    itoa((int)fb.bpp, buf, 10); com_write_string(COM1_PORT, buf);
+                    com_write_string(COM1_PORT, " fb.fmt=");
+                    itoa((int)fb.fmt, buf, 10); com_write_string(COM1_PORT, buf);
+                    com_write_string(COM1_PORT, " expected=");
+                    itoa((int)expected_fmt, buf, 10); com_write_string(COM1_PORT, buf);
+                    com_write_string(COM1_PORT, "\n");
+                }
+                return -3; /* format mismatch */
+            }
+
+            uint32_t bpp = (fb.bpp / 8u);
+            if (bpp != 2 && bpp != 4) return -4;
+
+            if (src_pitch == 0) {
+                src_pitch = src_w * bpp;
+            }
+
+            if (dst_x >= fb.width || dst_y >= fb.height) return -5;
+            if (dst_x + src_w > fb.width) src_w = fb.width - dst_x;
+            if (dst_y + src_h > fb.height) src_h = fb.height - dst_y;
+
+            uint8_t *dst_base = (uint8_t*)fb.addr + (uint64_t)dst_y * fb.pitch + (uint64_t)dst_x * bpp;
+            size_t row_bytes = (size_t)src_w * bpp;
+
+            for (uint32_t y = 0; y < src_h; y++) {
+                const uint8_t *srow = src + (uint64_t)y * src_pitch;
+                uint8_t *drow = dst_base + (uint64_t)y * fb.pitch;
+                memcpy(drow, srow, row_bytes);
+            }
+
+            return 0;
+        }
         case SYS_SLEEP:   return sys_sleep((unsigned int)arg1);
         case SYS_YIELD:   sys_yield(); return 0;
         case SYS_MALLOC:  return (uint64_t)sys_malloc((size_t)arg1);
@@ -44,14 +173,36 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_KILL:    return sys_kill((int)arg1, (int)arg2);
         case SYS_TIME:    return sys_time();
         case SYS_EXEC:    return sys_exec((const char*)arg1);
-        case SYS_INPUT:   return (uint64_t)sys_input();
+        case SYS_CHDIR:   return sys_chdir((const char*)arg1);
+        case SYS_GETCWD:  return (uint64_t)sys_getcwd((char*)arg1, (size_t)arg2);
+        case SYS_STAT:    return sys_stat((const char*)arg1, (void*)arg2, (size_t)arg3);
+        case SYS_LSEEK:   return (uint64_t)sys_lseek((int)arg1, (off_t)arg2, (int)arg3);
+        case SYS_MKDIR:   return sys_mkdir((const char*)arg1);
+        case SYS_RMDIR:   return sys_rmdir((const char*)arg1);
+        case SYS_UNLINK:  return sys_unlink((const char*)arg1);
+        case SYS_OPENDIR: return sys_opendir((const char*)arg1);
+        case SYS_READDIR: return sys_readdir((int)arg1, (char*)arg2, (size_t)arg3, (int*)arg4, (uint32_t*)arg5);
+        case SYS_CLOSEDIR: return sys_closedir((int)arg1);
+        case SYS_INPUT:   return (uint64_t)sys_input((char*)arg1, (size_t)arg2);
         case SYS_SSTATS:
             return (uint64_t)sys_get_sysinfo();
+
+        case SYS_VGA_SET_COLOR:
+            VGA_SetTextColor((uint8_t)arg1, (uint8_t)arg2);
+            return 0;
+        case SYS_VGA_GET_COLOR:
+            return (uint64_t)VGA_GetTextColor();
+        case SYS_VGA_RESET_COLOR:
+            VGA_ResetTextColor();
+            return 0;
+
         default:
-            com_write_string(COM1_PORT, "[SYSCALL] Unknown syscall: ");
-            itoa(syscall_num, buf, 10);
-            com_write_string(COM1_PORT, buf);
-            com_write_string(COM1_PORT, "\n");
+            if (kernel_debug_is_med()) {
+                com_write_string(COM1_PORT, "[SYSCALL] Unknown syscall: ");
+                itoa(syscall_num, buf, 10);
+                com_write_string(COM1_PORT, buf);
+                com_write_string(COM1_PORT, "\n");
+            }
             return (uint64_t)-1;
     }
 }
@@ -65,8 +216,15 @@ int sys_exit(int status) {
     if (proc) {
         fd_close_all(proc->pid);
     }
+
+    /*
+     * This syscall must never return to userspace.
+     * process_exit() switches away and halts.
+     */
     process_exit(status);
-    return 0;
+
+    /* Fallback: if process_exit ever returns, halt. */
+    for (;;) { __asm__ volatile("hlt"); }
 }
 
 int sys_fork(void) {
@@ -79,17 +237,19 @@ ssize_t sys_read(int fd, void *buf, size_t count) {
     ssize_t result = fd_read(fd, buf, count);
     
     // DEBUG
-    com_write_string(COM1_PORT, "[SYS_READ] fd=");
-    char dbuf[32];
-    itoa(fd, dbuf, 10);
-    com_write_string(COM1_PORT, dbuf);
-    com_write_string(COM1_PORT, " count=");
-    itoa(count, dbuf, 10);
-    com_write_string(COM1_PORT, dbuf);
-    com_write_string(COM1_PORT, " result=");
-    itoa(result, dbuf, 10);
-    com_write_string(COM1_PORT, dbuf);
-    com_write_string(COM1_PORT, "\n");
+    if (kernel_debug_is_on()) {
+        com_write_string(COM1_PORT, "[SYS_READ] fd=");
+        char dbuf[32];
+        itoa(fd, dbuf, 10);
+        com_write_string(COM1_PORT, dbuf);
+        com_write_string(COM1_PORT, " count=");
+        itoa(count, dbuf, 10);
+        com_write_string(COM1_PORT, dbuf);
+        com_write_string(COM1_PORT, " result=");
+        itoa(result, dbuf, 10);
+        com_write_string(COM1_PORT, dbuf);
+        com_write_string(COM1_PORT, "\n");
+    }
     
     return result;
 }
@@ -113,7 +273,9 @@ ssize_t sys_writefile(int fd, const char *str, size_t count) {
 
 int sys_write(const char *str) {
     if (!str) {
-        com_write_string(COM1_PORT, "[SYS_WRITE] NULL pointer!\n");
+        if (kernel_debug_is_med()) {
+            com_write_string(COM1_PORT, "[SYS_WRITE] NULL pointer!\n");
+        }
         return -1;
     }
     VGA_Write(str);
@@ -121,18 +283,76 @@ int sys_write(const char *str) {
     return 0;
 }
 
-char* sys_input() {
-    return input();
+ssize_t sys_input(char *user_buf, size_t max_len) {
+    if (!user_buf || max_len == 0) return -1;
+
+    char *line = input();
+    if (!line) {
+        user_buf[0] = 0;
+        return 0;
+    }
+
+    // Copy into user buffer (same address space in current design)
+    size_t n = strlen(line);
+    if (n >= max_len) n = max_len - 1;
+    memcpy(user_buf, line, n);
+    user_buf[n] = 0;
+    return (ssize_t)n;
 }
 
 int sys_exec(const char *str) {
-    exec(str);
+    if (!str) return -1;
+    
+    /* Copy command from userspace */
+    char kernel_cmd[256];
+    if (copy_string_from_user(str, kernel_cmd, sizeof(kernel_cmd)) != 0) {
+        return -1;
+    }
+    
+    exec(kernel_cmd);
     return 0;
 }
 
 int sys_open(const char *pathname, int flags, int mode) {
     if (!pathname) return -1;
-    return fd_open(0, pathname, flags, mode);
+
+    process_t *proc = process_get_current();
+    if (!proc) return -1;
+
+    // Resolve relative paths against process CWD (supports both / and $/ namespaces)
+    char full_path[256];
+    const char *p = pathname;
+    if (!(p[0] == '/' || (p[0] == '$' && p[1] == '/'))) {
+        const char *cwd = (proc->cwd[0] ? proc->cwd : "/");
+        strncpy(full_path, cwd, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = 0;
+        size_t len = strlen(full_path);
+        if (len == 0 || full_path[len - 1] != '/') {
+            strncat(full_path, "/", sizeof(full_path) - strlen(full_path) - 1);
+        }
+        strncat(full_path, p, sizeof(full_path) - strlen(full_path) - 1);
+        p = full_path;
+    }
+
+    fs_path_resolved_t r;
+    if (fs_resolve_path(proc, p, &r) != 0) return -1;
+
+    // DEVVFS: allow opening $/dev/<node> and $/dev/input/<node> as character devices
+    if (r.route == FS_ROUTE_DEVVFS) {
+        if (r.devvfs_kind != 2 && r.devvfs_kind != 3 && r.devvfs_kind != 4) return -1;
+        const char *node = r.rel_path;
+        while (*node == '/') node++;
+        if (!*node) return -1;
+
+        // For $/dev/input/<node>, map to the underlying devfs node name.
+        // (devfs currently registers "event0" and "kbd0")
+        return fd_open_devfs(node, flags);
+    }
+
+    int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;
+    if (slot < 0) return -1;
+
+    return fd_open(slot, r.rel_path, flags, mode);
 }
 
 int sys_close(int fd) { return fd_close(fd); }
@@ -171,4 +391,244 @@ int sys_kill(int pid, int sig) {
     return 0;
 }
 
-uint64_t sys_time(void) { return 0; }
+#include "moduos/arch/AMD64/interrupts/timer.h"
+
+// Time API: milliseconds since boot (PIT ticks). PIT runs at 100Hz by default.
+uint64_t sys_time(void) {
+    const uint64_t ticks = get_system_ticks();
+    return ticks * 10ULL; // 100Hz => 10ms per tick
+}
+int sys_stat(const char *path, void *out_info, size_t out_size) {
+    if (!path || !out_info || out_size < sizeof(fs_file_info_t)) return -1;
+
+    process_t *proc = process_get_current();
+    if (!proc) return -1;
+
+    char kpath[256];
+    if (copy_string_from_user(path, kpath, sizeof(kpath)) != 0) return -1;
+
+    // Resolve relative paths against CWD
+    const char *p = kpath;
+    char full_path[256];
+    if (!(p[0] == '/' || (p[0] == '$' && p[1] == '/'))) {
+        const char *cwd = (proc->cwd[0] ? proc->cwd : "/");
+        strncpy(full_path, cwd, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = 0;
+        size_t len = strlen(full_path);
+        if (len == 0 || full_path[len - 1] != '/') {
+            strncat(full_path, "/", sizeof(full_path) - strlen(full_path) - 1);
+        }
+        strncat(full_path, p, sizeof(full_path) - strlen(full_path) - 1);
+        p = full_path;
+    }
+
+    fs_path_resolved_t r;
+    if (fs_resolve_path(proc, p, &r) != 0) return -1;
+    if (r.route == FS_ROUTE_DEVVFS) {
+        return -1;
+    }
+
+    int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;
+    if (slot < 0) return -1;
+
+    fs_mount_t *mount = fs_get_mount(slot);
+    if (!mount || !mount->valid) return -1;
+
+    fs_file_info_t info;
+    int rc = fs_stat(mount, r.rel_path, &info);
+    if (rc != 0) return -1;
+
+    memcpy(out_info, &info, sizeof(info));
+    return 0;
+}
+
+off_t sys_lseek(int fd, off_t offset, int whence) {
+    return fd_lseek(fd, offset, whence);
+}
+
+int sys_mkdir(const char *path) {
+    (void)path;
+    // TODO: Implement via FAT32 write support
+    return -1;
+}
+
+int sys_rmdir(const char *path) {
+    (void)path;
+    // TODO: Implement via FAT32 write support
+    return -1;
+}
+
+int sys_unlink(const char *path) {
+    (void)path;
+    // TODO: Implement via FAT32 write support
+    return -1;
+}
+
+int sys_chdir(const char *path) {
+    if (!path) return -1;
+
+    process_t *proc = process_get_current();
+    if (!proc) return -1;
+
+    char kpath[256];
+    if (copy_string_from_user(path, kpath, sizeof(kpath)) != 0) return -1;
+
+    // Resolve relative paths against CWD for both / and $/ namespaces
+    const char *p = kpath;
+    char full_path[256];
+    if (!(p[0] == '/' || (p[0] == '$' && p[1] == '/'))) {
+        const char *cwd = (proc->cwd[0] ? proc->cwd : "/");
+        strncpy(full_path, cwd, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = 0;
+        size_t len = strlen(full_path);
+        if (len == 0 || full_path[len - 1] != '/') {
+            strncat(full_path, "/", sizeof(full_path) - strlen(full_path) - 1);
+        }
+        strncat(full_path, p, sizeof(full_path) - strlen(full_path) - 1);
+        p = full_path;
+    }
+
+    // DEVVFS routing: $/mnt/<drive>/... maps to a real mount
+    if (p[0] == '$' && p[1] == '/') {
+        // Normalize $/ paths so proc->cwd never contains /.. or /.
+        char norm[256];
+        strncpy(norm, p, sizeof(norm) - 1);
+        norm[sizeof(norm) - 1] = 0;
+        path_normalize_inplace(norm);
+        p = norm;
+        fs_path_resolved_t r;
+        if (fs_resolve_path(proc, p, &r) != 0) return -1;
+        if (r.route != FS_ROUTE_MOUNT) return -1;
+        fs_mount_t *mount = fs_get_mount(r.mount_slot);
+        if (!mount || !mount->valid) return -1;
+        if (!fs_directory_exists(mount, r.rel_path)) return -1;
+        strncpy(proc->cwd, p, sizeof(proc->cwd) - 1);
+        proc->cwd[sizeof(proc->cwd) - 1] = 0;
+        return 0;
+    }
+
+    // Normal FS chdir for / paths
+    // If no filesystem is mounted, can't change directory
+    if (proc->current_slot < 0) return -1;
+
+    // Get the mount
+    fs_mount_t* mount = fs_get_mount(proc->current_slot);
+    if (!mount || !mount->valid) return -1;
+
+    // Build absolute path
+    char new_path[256];
+    if (p[0] == '/') {
+        // Absolute path
+        strncpy(new_path, p, sizeof(new_path) - 1);
+        new_path[sizeof(new_path) - 1] = '\0';
+    } else {
+        // Relative path - join with current directory
+        if (strcmp(proc->cwd, "/") == 0) {
+            strcpy(new_path, "/");
+            strncat(new_path, p, sizeof(new_path) - strlen(new_path) - 1);
+        } else {
+            strcpy(new_path, proc->cwd);
+            strcat(new_path, "/");
+            strncat(new_path, p, sizeof(new_path) - strlen(new_path) - 1);
+        }
+    }
+    
+    // Handle special cases
+    if (strcmp(path, "..") == 0) {
+        // Go to parent directory
+        char *last_slash = NULL;
+        for (char *p = proc->cwd; *p; p++) {
+            if (*p == '/') last_slash = p;
+        }
+        if (last_slash == proc->cwd) {
+            strcpy(new_path, "/");
+        } else if (last_slash) {
+            strncpy(new_path, proc->cwd, last_slash - proc->cwd);
+            new_path[last_slash - proc->cwd] = '\0';
+        } else {
+            strcpy(new_path, "/");
+        }
+    } else if (strcmp(path, ".") == 0) {
+        // Stay in current directory
+        return 0;
+    }
+    
+    // Normalize path (remove trailing slashes)
+    size_t len = strlen(new_path);
+    if (len > 1 && new_path[len - 1] == '/') {
+        new_path[len - 1] = '\0';
+    }
+    
+    // Verify the directory exists
+    if (!fs_directory_exists(mount, new_path)) {
+        return -1;
+    }
+    
+    // Update process CWD
+    strncpy(proc->cwd, new_path, sizeof(proc->cwd) - 1);
+    proc->cwd[sizeof(proc->cwd) - 1] = '\0';
+    
+    return 0;
+}
+
+char* sys_getcwd(char *buf, size_t size) {
+    process_t *proc = process_get_current();
+    if (!proc) return NULL;
+    
+    if (buf && size > 0) {
+        strncpy(buf, proc->cwd, size - 1);
+        buf[size - 1] = '\0';
+        return buf;
+    }
+    
+    // Return pointer to process CWD (read-only)
+    return proc->cwd;
+}
+int sys_opendir(const char *path) {
+    if (!path) return -1;
+
+    /* Copy path from userspace */
+    char kernel_path[256];
+    if (copy_string_from_user(path, kernel_path, sizeof(kernel_path)) != 0) {
+        return -1;
+    }
+
+    process_t *proc = process_get_current();
+    if (!proc) return -1;
+
+    // Resolve relative paths against CWD
+    const char *p = kernel_path;
+    char full_path[256];
+    if (!(p[0] == '/' || (p[0] == '$' && p[1] == '/'))) {
+        const char *cwd = (proc->cwd[0] ? proc->cwd : "/");
+        strncpy(full_path, cwd, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = 0;
+        size_t len = strlen(full_path);
+        if (len == 0 || full_path[len - 1] != '/') {
+            strncat(full_path, "/", sizeof(full_path) - strlen(full_path) - 1);
+        }
+        strncat(full_path, p, sizeof(full_path) - strlen(full_path) - 1);
+        p = full_path;
+    }
+
+    fs_path_resolved_t r;
+    if (fs_resolve_path(proc, p, &r) != 0) return -1;
+    if (r.route == FS_ROUTE_DEVVFS) {
+        return fd_devvfs_opendir(r.devvfs_kind);
+    }
+
+    int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;
+    if (slot < 0) return -1;
+
+    return fd_opendir(slot, r.rel_path);
+}
+
+int sys_readdir(int fd, char *name_buf, size_t buf_size, int *is_dir, uint32_t *size) {
+    if (!name_buf || buf_size == 0) return -1;
+
+    return fd_readdir(fd, name_buf, buf_size, is_dir, size);
+}
+
+int sys_closedir(int fd) {
+    return fd_closedir(fd);
+}
