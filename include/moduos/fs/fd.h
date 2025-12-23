@@ -27,7 +27,8 @@ typedef int64_t ssize_t;
 #define O_RDWR    0x0002
 #define O_CREAT   0x0040
 #define O_APPEND  0x0400
-#define O_TRUNC   0x0200
+#define O_TRUNC    0x0200
+#define O_NONBLOCK 0x0800
 
 /* Seek positions */
 #define SEEK_SET 0
@@ -60,6 +61,10 @@ void fd_init(void);
  * @return: File descriptor number (>=0) on success, negative on error
  */
 int fd_open(int mount_slot, const char* path, int flags, int mode);
+
+// Open a DEVFS character device (e.g. "$\/dev\/kbd0")
+int fd_open_devfs(const char *node, int flags);
+
 
 /**
  * Close a file descriptor
@@ -128,5 +133,34 @@ void fd_close_all(int pid);
  * @return: Current position, or -1 on error
  */
 off_t fd_tell(int fd);
+
+/**
+ * Open directory for reading
+ * @param mount_slot: Filesystem mount slot (0-25)
+ * @param path: Directory path (NULL or "/" for root)
+ * @return: File descriptor number (>=0) on success, negative on error
+ */
+int fd_opendir(int mount_slot, const char* path);
+
+/**
+ * Read next directory entry
+ * @param fd: Directory file descriptor
+ * @param name_buf: Output buffer for entry name
+ * @param buf_size: Size of name buffer
+ * @param is_dir: Output - 1 if directory, 0 if file (can be NULL)
+ * @param size: Output - file size (can be NULL)
+ * @return: 1 on success, 0 at end of directory, -1 on error
+ */
+int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* size);
+
+/**
+ * Close directory file descriptor
+ * @param fd: Directory file descriptor
+ * @return: 0 on success, -1 on error
+ */
+int fd_closedir(int fd);
+
+/* Open DEVVFS pseudo directories (kind: 1=$/mnt, 2=$/dev) */
+int fd_devvfs_opendir(int kind);
 
 #endif /* FD_H */
