@@ -26,5 +26,24 @@
 #define SYS_MKDIR       20
 #define SYS_RMDIR       21
 #define SYS_UNLINK      22
+#define SYS_LSEEK       23
+#define SYS_WRITEFILE   24
+#define SYS_OPENDIR     25
+#define SYS_READDIR     26
+#define SYS_CLOSEDIR    27
+#define SYS_INPUT       28
+#define SYS_SSTATS      29
+
+/* User identity */
+#define SYS_GETUID      33
+#define SYS_SETUID      34
+
+/* Graphics blit */
+#define SYS_GFX_BLIT    35
+
+// VGA / Console
+#define SYS_VGA_SET_COLOR  30  // arg1=fg (0-15), arg2=bg (0-15)
+#define SYS_VGA_GET_COLOR  31  // returns (bg<<4)|fg
+#define SYS_VGA_RESET_COLOR 32 // reset to default (0x07 on 0x00)
 
 #endif
