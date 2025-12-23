@@ -64,10 +64,16 @@ $(arch_asm_object_files): build/arch/$(ARCH)/%.o : src/arch/$(ARCH)/%.asm
 # ========================
 .PHONY: build-$(ARCH)
 build-$(ARCH): $(kernel_object_files) $(drivers_object_files) $(fs_object_files) $(arch_object_files)
+	@echo Building kernel
 	mkdir -p dist/$(ARCH)
-	x86_64-elf-ld -n -o dist/$(ARCH)/mdsys.sqr -T targets/$(ARCH)/linker.ld \
-		$(kernel_object_files) $(drivers_object_files) $(fs_object_files) $(arch_object_files)
+	x86_64-elf-ld -n -o dist/$(ARCH)/mdsys.sqr -T targets/$(ARCH)/linker.ld -Map dist/AMD64/mdsys.map \
+		$(kernel_object_files) $(drivers_object_files) $(fs_object_files) $(arch_object_files) 
 	cp dist/$(ARCH)/mdsys.sqr targets/$(ARCH)/iso/ModuOS/System64/mdsys.sqr
+	@echo Building userland apps
+	chmod +x userland/build.sh
+	cd userland && ./build.sh
+	cp -f userland/dist/*.sqr targets/$(ARCH)/iso/Apps/
+	@echo Building ISO
 	grub-mkrescue -o dist/$(ARCH)/kernel.iso targets/$(ARCH)/iso
 
 # ========================
