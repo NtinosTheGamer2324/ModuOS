@@ -1,3 +1,5 @@
 gcc -ffreestanding -c echo.c -o echo.o -mno-red-zone -O2 -nostdlib
 
 ld echo.o -T user.ld -o echo.sqr
+ls
+tree
