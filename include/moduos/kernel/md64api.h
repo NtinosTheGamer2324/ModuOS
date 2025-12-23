@@ -81,4 +81,11 @@ typedef struct md64api_date_time
 md64api_sysinfo_data get_system_info(void);
 md64api_date_time get_date_time(void);
 
+// Kernel-internal helpers (also used by bootscreen)
+const char *md64api_get_smbios_system_manufacturer(void);
+const char *md64api_get_smbios_system_product(void);
+
+// Optional graphics sub-API (device-based)
+#include "moduos/kernel/md64api_grp.h"
+
 #endif /* MD64API_H */
