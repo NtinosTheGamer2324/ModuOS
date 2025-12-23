@@ -13,6 +13,8 @@ void phys_init(uint64_t total_mem, const void *usable_regions, size_t region_cou
 
 /* Basic physical frame alloc/free (returns physical address or 0 on OOM) */
 uint64_t phys_alloc_frame(void);
+/* Allocate a physical frame below max_phys (exclusive). Returns 0 on failure. */
+uint64_t phys_alloc_frame_below(uint64_t max_phys);
 void phys_free_frame(uint64_t paddr);
 
 /* Allocate contiguous frames (returns physical base addr) */
