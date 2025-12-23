@@ -3,6 +3,7 @@
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/multiboot2.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -63,27 +64,42 @@ void early_identity_map_all() {
     log_msg("\n");
     
     /* CRITICAL FIX: More conservative reserve */
-    uint64_t reserve_for_tables = 200;
+    // Reserve enough frames for page tables and early allocations.
+    // Rough sizing: mapping N bytes with 4KB pages needs ~N/2MB PT pages (one PT covers 2MB).
+    // Add headroom for split huge pages and other early allocations.
+    uint64_t max_addr_est = total_frames * PAGE_SIZE;
+    uint64_t pt_pages_needed = (max_addr_est + (2ULL * 1024 * 1024 - 1)) / (2ULL * 1024 * 1024);
+    uint64_t reserve_for_tables = pt_pages_needed + 2048;
     if (free_frames < reserve_for_tables) {
         log_msg("[MEM] ERROR: Not enough free frames!\n");
         return;
     }
     
-    /* Limit mapping to 512MB initially on real hardware */
+    // Map ALL usable RAM (identity map).
+    // Note: this is simple but not very memory-efficient; later you may want a high-half kernel.
     uint64_t max_addr = total_frames * PAGE_SIZE;
-    uint64_t safe_limit = 512 * 1024 * 1024; /* 512 MB */
-    
-    if (max_addr > safe_limit) {
-        log_msg("[MEM] Limiting to 512MB for stability\n");
-        max_addr = safe_limit;
-    }
     
     log_msg("[MEM] Mapping up to ");
-    print_dec64(max_addr / (1024 * 1024));
-    log_msg(" MB\n");
+    if (max_addr >= (1024ULL * 1024 * 1024)) {
+        // Print in GiB with 2 decimals
+        uint64_t gib_x100 = (max_addr * 100) / (1024ULL * 1024 * 1024);
+        print_dec64(gib_x100 / 100);
+        log_msg(".");
+        uint64_t frac = gib_x100 % 100;
+        if (frac < 10) log_msg("0");
+        print_dec64(frac);
+        log_msg(" GiB\n");
+    } else {
+        print_dec64(max_addr / (1024 * 1024));
+        log_msg(" MB\n");
+    }
+    log_msg("[MEM] Page-table reserve frames: ");
+    print_dec64(reserve_for_tables);
+    log_msg("\n");
     
-    uint64_t mapped_count = 0;
-    uint64_t progress_interval = 32 * 1024 * 1024; /* 32MB progress updates */
+    // Track mapped bytes for correct reporting with 2MB huge pages
+    uint64_t mapped_bytes = 0;
+    uint64_t progress_interval = 256 * 1024 * 1024; /* 256MB progress updates */
     
     /* CRITICAL FIX: Start from 64KB instead of 0 to avoid NULL page and BIOS area */
     uint64_t start_addr = 0x10000; /* 64 KB - skip BIOS data area and NULL page */
@@ -92,38 +108,68 @@ void early_identity_map_all() {
     print_hex64(start_addr);
     log_msg(" (skipping low memory)\n");
     
-    for (uint64_t addr = start_addr; addr < max_addr; addr += PAGE_SIZE) {
-        /* Check reserves every 32MB to avoid too frequent checks */
-        if ((addr % progress_interval) == 0) {
+    const uint64_t huge_sz = 2ULL * 1024 * 1024;
+
+    // 1) Map head until 2MB-aligned
+    uint64_t addr = start_addr;
+    while (addr < max_addr && (addr & (huge_sz - 1)) != 0) {
+        int result = paging_map_page(addr, addr, PFLAG_PRESENT | PFLAG_WRITABLE);
+        if (result == 0) mapped_bytes += PAGE_SIZE;
+        addr += PAGE_SIZE;
+    }
+
+    // 2) Map the bulk using 2MB pages
+    uint64_t bulk_start = addr;
+    uint64_t bulk_end = max_addr & ~(huge_sz - 1);
+
+    for (uint64_t haddr = bulk_start; haddr < bulk_end; haddr += huge_sz) {
+        if ((haddr % progress_interval) == 0) {
             if (phys_count_free_frames() < reserve_for_tables) {
                 log_msg("[MEM] Stopped at ");
-                print_dec64(addr / (1024 * 1024));
+                print_dec64(haddr / (1024 * 1024));
                 log_msg(" MB (reserve limit)\n");
                 break;
             }
-            
-            /* Progress update */
+
             log_msg("[MEM] ");
-            print_dec64(addr / (1024 * 1024));
-            log_msg(" MB, ");
+            if (haddr >= (1024ULL * 1024 * 1024)) {
+                uint64_t gib_x100 = (haddr * 100) / (1024ULL * 1024 * 1024);
+                print_dec64(gib_x100 / 100);
+                log_msg(".");
+                uint64_t frac = gib_x100 % 100;
+                if (frac < 10) log_msg("0");
+                print_dec64(frac);
+                log_msg(" GiB, ");
+            } else {
+                print_dec64(haddr / (1024 * 1024));
+                log_msg(" MB, ");
+            }
             print_dec64(phys_count_free_frames());
             log_msg(" frames free\n");
             memory_barrier();
         }
-        
-        /* Try to map - paging_map_page will detect if already present */
-        int result = paging_map_page(addr, addr, PFLAG_PRESENT | PFLAG_WRITABLE);
-        
-        if (result == 0) {
-            mapped_count++;
+
+        // Map 2MB page (much faster than 512x 4KB + invlpg each)
+        if (paging_map_2m_page(haddr, haddr, PFLAG_WRITABLE) != 0) {
+            // Fall back to 4KB pages for this 2MB chunk
+            for (uint64_t p = 0; p < huge_sz; p += PAGE_SIZE) {
+                int r = paging_map_page(haddr + p, haddr + p, PFLAG_PRESENT | PFLAG_WRITABLE);
+                if (r == 0) mapped_bytes += PAGE_SIZE;
+            }
+        } else {
+            mapped_bytes += huge_sz;
         }
-        /* Note: result != 0 could mean already mapped OR allocation failure
-         * We don't distinguish here - just continue trying next pages */
+    }
+
+    // 3) Map tail remainder with 4KB pages
+    for (uint64_t t = bulk_end; t < max_addr; t += PAGE_SIZE) {
+        int result = paging_map_page(t, t, PFLAG_PRESENT | PFLAG_WRITABLE);
+        if (result == 0) mapped_bytes += PAGE_SIZE;
     }
     
     log_msg("[MEM] Identity mapping complete!\n");
     log_msg("[MEM]   Successfully mapped: ");
-    print_dec64((mapped_count * PAGE_SIZE) / (1024 * 1024));
+    print_dec64(mapped_bytes / (1024 * 1024));
     log_msg(" MB\n");
     log_msg("[MEM]   Free frames remaining: ");
     print_dec64(phys_count_free_frames());
@@ -241,6 +287,9 @@ void memory_init(void *mb2_ptr) {
     
     int tags_found = 0;
 
+    // Framebuffer info (optional)
+    struct multiboot_tag_framebuffer *fb_tag = NULL;
+
     while (tagp + sizeof(struct mb2_tag) <= end) {
         /* CRITICAL FIX: Safe tag read */
         memory_barrier();
@@ -257,6 +306,10 @@ void memory_init(void *mb2_ptr) {
         }
 
         tags_found++;
+
+        if (tag->type == MULTIBOOT_TAG_TYPE_FRAMEBUFFER) {
+            fb_tag = (struct multiboot_tag_framebuffer *)tag;
+        }
 
         if (tag->type == 6) { /* Memory map tag */
             log_msg("[MEM] Found memory map tag!\n");
@@ -369,6 +422,20 @@ void memory_init(void *mb2_ptr) {
     log_msg("[MEM] Initializing physical allocator...\n");
     
     phys_init(total_usable, regions, rcount);
-    
+
+    // Reserve Multiboot2 info structure so it cannot be overwritten by the allocator.
+    // GRUB places it in usable RAM, and we still access tags later (e.g. framebuffer/cmdline).
+    uint64_t mb2_phys = (uint64_t)(uintptr_t)mb2_ptr; // identity mapped at this stage
+    uint64_t mb2_len = (uint64_t)total_size;
+    // round up to page size
+    mb2_len = (mb2_len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    phys_reserve_range(mb2_phys, mb2_len);
+    log_msg("[MEM] Reserved MB2 info at ");
+    print_hex64(mb2_phys);
+    log_msg(" len=");
+    print_dec64(mb2_len);
+    log_msg("\n");
+
     log_msg("[MEM] Physical allocator ready!\n");
+
 }
