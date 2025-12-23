@@ -3,6 +3,42 @@
 #include "moduos/drivers/graphics/VGA.h"
 #include <stdarg.h>
 
+static inline void ulltoa_pad(unsigned long long value, char *buf, int base, int upper, int width, int zero_pad) {
+    /* Convert to string first */
+    char tmp[64];
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+
+    int i = 0;
+    if (value == 0) {
+        tmp[i++] = '0';
+    } else {
+        while (value > 0 && i < (int)sizeof(tmp)) {
+            tmp[i++] = digits[value % (unsigned long long)base];
+            value /= (unsigned long long)base;
+        }
+    }
+
+    int len = i;
+    int pad = (width > len) ? (width - len) : 0;
+
+    int out = 0;
+    char pad_ch = zero_pad ? '0' : ' ';
+    while (pad-- > 0) buf[out++] = pad_ch;
+
+    while (i-- > 0) buf[out++] = tmp[i];
+    buf[out] = 0;
+}
+
+static inline void lltoa_dec(long long value, char *buf) {
+    if (value < 0) {
+        *buf++ = '-';
+        unsigned long long u = (unsigned long long)(-(value + 1)) + 1ULL;
+        ulltoa_pad(u, buf, 10, 0, 0, 0);
+    } else {
+        ulltoa_pad((unsigned long long)value, buf, 10, 0, 0, 0);
+    }
+}
+
 int snprintf(char *str, size_t size, const char *format, ...) {
     if (!str || !format || size == 0) {
         return 0;
@@ -19,6 +55,31 @@ int snprintf(char *str, size_t size, const char *format, ...) {
     while (*p && remaining > 0) {
         if (*p == '%') {
             p++;
+
+            /* length modifiers: l / ll */
+            int longmod = 0;
+            int longlongmod = 0;
+            if (*p == 'l') {
+                longmod = 1;
+                p++;
+                if (*p == 'l') {
+                    longlongmod = 1;
+                    p++;
+                }
+            }
+
+            /* Minimal width + zero padding support: e.g. %04X */
+            int zero_pad = 0;
+            int width = 0;
+            if (*p == '0') {
+                zero_pad = 1;
+                p++;
+            }
+            while (*p >= '0' && *p <= '9') {
+                width = (width * 10) + (*p - '0');
+                p++;
+            }
+
             switch (*p) {
                 case 's': {
                     const char *s = va_arg(args, const char *);
@@ -33,9 +94,18 @@ int snprintf(char *str, size_t size, const char *format, ...) {
 
                 case 'd':
                 case 'i': {
-                    int val = va_arg(args, int);
-                    char buf[32];
-                    itoa(val, buf, 10);
+                    char buf[64];
+                    if (longlongmod) {
+                        long long val = va_arg(args, long long);
+                        lltoa_dec(val, buf);
+                    } else if (longmod) {
+                        long val = va_arg(args, long);
+                        lltoa_dec((long long)val, buf);
+                    } else {
+                        int val = va_arg(args, int);
+                        itoa(val, buf, 10);
+                    }
+
                     const char *s = buf;
                     while (*s && remaining > 0) {
                         *out++ = *s++;
@@ -45,10 +115,40 @@ int snprintf(char *str, size_t size, const char *format, ...) {
                     break;
                 }
 
-                case 'x': {
-                    int val = va_arg(args, int);
-                    char buf[32];
-                    itoa(val, buf, 16);
+                case 'u': {
+                    char buf[64];
+                    unsigned long long val;
+                    if (longlongmod) {
+                        val = va_arg(args, unsigned long long);
+                    } else if (longmod) {
+                        val = (unsigned long long)va_arg(args, unsigned long);
+                    } else {
+                        val = (unsigned long long)va_arg(args, unsigned int);
+                    }
+                    ulltoa_pad(val, buf, 10, 0, width, zero_pad);
+
+                    const char *s = buf;
+                    while (*s && remaining > 0) {
+                        *out++ = *s++;
+                        written++;
+                        remaining--;
+                    }
+                    break;
+                }
+
+                case 'x':
+                case 'X': {
+                    char buf[64];
+                    unsigned long long val;
+                    if (longlongmod) {
+                        val = va_arg(args, unsigned long long);
+                    } else if (longmod) {
+                        val = (unsigned long long)va_arg(args, unsigned long);
+                    } else {
+                        val = (unsigned long long)va_arg(args, unsigned int);
+                    }
+                    ulltoa_pad(val, buf, 16, (*p == 'X'), width, zero_pad);
+
                     const char *s = buf;
                     while (*s && remaining > 0) {
                         *out++ = *s++;
@@ -78,7 +178,7 @@ int snprintf(char *str, size_t size, const char *format, ...) {
                 }
 
                 default: {
-                    // Unsupported format specifier — print literally
+                    /* Unsupported format specifier — print literally */
                     if (remaining > 0) {
                         *out++ = '%';
                         written++;
@@ -102,7 +202,7 @@ int snprintf(char *str, size_t size, const char *format, ...) {
 
     *out = '\0';
     va_end(args);
-    return written;  // total number of chars that would have been written (excluding null)
+    return written;
 }
 
 // Optimized memset function using word-sized accesses if possible
@@ -225,26 +325,52 @@ int memcmp(const void *s1, const void *s2, size_t n) {
     return 0;
 }
 
-// Optimized memmove function - handles overlapping memory regions
+// memmove - handles overlapping memory regions
+//
+// NOTE: This is performance-critical for framebuffer scrolling (multi-megabyte moves).
+// The simple byte loop can appear like a "hang" under emulation.
 void *memmove(void *dest, const void *src, size_t n) {
-    unsigned char *d = dest;
-    const unsigned char *s = src;
-    
+    if (dest == src || n == 0) return dest;
+
+#if defined(__x86_64__) || defined(__amd64__)
+    // Use rep movsb (handles any alignment; fast on modern CPUs and in QEMU).
+    // We must handle overlap direction correctly.
+    if ((uintptr_t)dest < (uintptr_t)src) {
+        __asm__ volatile(
+            "cld\n\t"
+            "rep movsb"
+            : "+D"(dest), "+S"(src), "+c"(n)
+            :
+            : "memory"
+        );
+        return dest;
+    }
+
+    // Backward copy: start from end, set DF, rep movsb, then clear DF.
+    const uint8_t *s = (const uint8_t*)src + n - 1;
+    uint8_t *d = (uint8_t*)dest + n - 1;
+    __asm__ volatile(
+        "std\n\t"
+        "rep movsb\n\t"
+        "cld"
+        : "+D"(d), "+S"(s), "+c"(n)
+        :
+        : "memory"
+    );
+    return dest;
+#else
+    unsigned char *d = (unsigned char*)dest;
+    const unsigned char *s = (const unsigned char*)src;
+
     if (d < s) {
-        // Copy forward
-        while (n--) {
-            *d++ = *s++;
-        }
-    } else if (d > s) {
-        // Copy backward to handle overlap
+        while (n--) *d++ = *s++;
+    } else {
         d += n;
         s += n;
-        while (n--) {
-            *--d = *--s;
-        }
+        while (n--) *--d = *--s;
     }
-    
     return dest;
+#endif
 }
 
 // strchr - find first occurrence of character in string
