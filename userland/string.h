@@ -3,6 +3,92 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Integer to string conversion
+static inline void itoa(int value, char *str, int base) {
+    char *ptr = str;
+    char *ptr1 = str;
+    char tmp_char;
+    int tmp_value;
+    
+    // Handle 0 explicitly
+    if (value == 0) {
+        *ptr++ = '0';
+        *ptr = '\0';
+        return;
+    }
+    
+    // Handle negative numbers for base 10
+    int is_negative = 0;
+    if (value < 0 && base == 10) {
+        is_negative = 1;
+        value = -value;
+    }
+    
+    // Process individual digits
+    while (value != 0) {
+        tmp_value = value;
+        value /= base;
+        *ptr++ = "0123456789abcdef"[tmp_value - value * base];
+    }
+    
+    // Add negative sign
+    if (is_negative) {
+        *ptr++ = '-';
+    }
+    
+    *ptr-- = '\0';
+    
+    // Reverse the string
+    while (ptr1 < ptr) {
+        tmp_char = *ptr;
+        *ptr-- = *ptr1;
+        *ptr1++ = tmp_char;
+    }
+}
+
+// Unsigned long long to string (base 10/16). Internal helper for snprintf.
+static inline void ulltoa(unsigned long long value, char *str, int base, int upper) {
+    char *ptr = str;
+    char *ptr1 = str;
+    char tmp_char;
+
+    if (base < 2) base = 10;
+
+    if (value == 0) {
+        *ptr++ = '0';
+        *ptr = '\0';
+        return;
+    }
+
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+
+    while (value != 0) {
+        unsigned long long tmp_value = value;
+        value /= (unsigned long long)base;
+        *ptr++ = digits[tmp_value - value * (unsigned long long)base];
+    }
+
+    *ptr-- = '\0';
+
+    while (ptr1 < ptr) {
+        tmp_char = *ptr;
+        *ptr-- = *ptr1;
+        *ptr1++ = tmp_char;
+    }
+}
+
+// Signed long long to string (base 10). Internal helper for snprintf.
+static inline void lltoa(long long value, char *str) {
+    if (value < 0) {
+        *str++ = '-';
+        /* careful with LLONG_MIN: cast to unsigned */
+        unsigned long long u = (unsigned long long)(-(value + 1)) + 1ULL;
+        ulltoa(u, str, 10, 0);
+    } else {
+        ulltoa((unsigned long long)value, str, 10, 0);
+    }
+}
+
 // Large/complex function — keep static
 static int snprintf(char *str, size_t size, const char *format, ...) {
     if (!str || !format || size == 0) return 0;
@@ -18,6 +104,18 @@ static int snprintf(char *str, size_t size, const char *format, ...) {
     while (*p && remaining > 0) {
         if (*p == '%') {
             p++;
+
+            int longmod = 0;
+            int longlongmod = 0;
+            if (*p == 'l') {
+                longmod = 1;
+                p++;
+                if (*p == 'l') {
+                    longlongmod = 1;
+                    p++;
+                }
+            }
+
             switch (*p) {
                 case 's': {
                     const char *s = va_arg(args, const char *);
@@ -25,32 +123,78 @@ static int snprintf(char *str, size_t size, const char *format, ...) {
                     while (*s && remaining > 0) { *out++ = *s++; written++; remaining--; }
                     break;
                 }
+
                 case 'd':
                 case 'i': {
-                    int val = va_arg(args, int);
-                    char buf[32]; itoa(val, buf, 10);
+                    char buf[64];
+                    if (longlongmod) {
+                        long long v = va_arg(args, long long);
+                        lltoa(v, buf);
+                    } else if (longmod) {
+                        long v = va_arg(args, long);
+                        /* long may be 64-bit here; handle with lltoa */
+                        lltoa((long long)v, buf);
+                    } else {
+                        int v = va_arg(args, int);
+                        itoa(v, buf, 10);
+                    }
                     const char *s = buf;
                     while (*s && remaining > 0) { *out++ = *s++; written++; remaining--; }
                     break;
                 }
-                case 'x': {
-                    int val = va_arg(args, int);
-                    char buf[32]; itoa(val, buf, 16);
+
+                case 'u': {
+                    char buf[64];
+                    if (longlongmod) {
+                        unsigned long long v = va_arg(args, unsigned long long);
+                        ulltoa(v, buf, 10, 0);
+                    } else if (longmod) {
+                        unsigned long v = va_arg(args, unsigned long);
+                        ulltoa((unsigned long long)v, buf, 10, 0);
+                    } else {
+                        unsigned int v = va_arg(args, unsigned int);
+                        ulltoa((unsigned long long)v, buf, 10, 0);
+                    }
                     const char *s = buf;
                     while (*s && remaining > 0) { *out++ = *s++; written++; remaining--; }
                     break;
                 }
+
+                case 'x':
+                case 'X': {
+                    int upper = (*p == 'X');
+                    char buf[64];
+                    if (longlongmod) {
+                        unsigned long long v = va_arg(args, unsigned long long);
+                        ulltoa(v, buf, 16, upper);
+                    } else if (longmod) {
+                        unsigned long v = va_arg(args, unsigned long);
+                        ulltoa((unsigned long long)v, buf, 16, upper);
+                    } else {
+                        unsigned int v = va_arg(args, unsigned int);
+                        ulltoa((unsigned long long)v, buf, 16, upper);
+                    }
+                    const char *s = buf;
+                    while (*s && remaining > 0) { *out++ = *s++; written++; remaining--; }
+                    break;
+                }
+
                 case 'c': {
                     char c = (char)va_arg(args, int);
                     if (remaining > 0) { *out++ = c; written++; remaining--; }
                     break;
                 }
+
                 case '%': {
                     if (remaining > 0) { *out++ = '%'; written++; remaining--; }
                     break;
                 }
+
                 default: {
+                    /* Unknown specifier: print it literally */
                     if (remaining > 0) { *out++ = '%'; written++; remaining--; }
+                    if (longmod && remaining > 0) { *out++ = 'l'; written++; remaining--; }
+                    if (longlongmod && remaining > 0) { *out++ = 'l'; written++; remaining--; }
                     if (remaining > 0) { *out++ = *p; written++; remaining--; }
                     break;
                 }
