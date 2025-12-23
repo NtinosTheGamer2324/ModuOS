@@ -4,6 +4,7 @@
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/macros.h"
+#include "moduos/kernel/debug.h"
 #include <stdint.h>
 
 #ifndef PAGE_SIZE
@@ -37,6 +38,7 @@ void process_exit(int exit_code);
 
 /* Debug helper to print ready queue */
 static void debug_print_ready_queue(void) {
+    if (!kernel_debug_is_on()) return;
     com_write_string(COM1_PORT, "[SCHED-DEBUG] Ready queue: ");
     if (!ready_queue_head) {
         com_write_string(COM1_PORT, "EMPTY\n");
@@ -193,6 +195,10 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
     strncpy(proc->name, name, PROCESS_NAME_MAX - 1);
     proc->state = PROCESS_STATE_READY;
     proc->priority = priority;
+
+    /* Inherit identity from parent (default root for PID 0/boot processes) */
+    proc->uid = current_process ? current_process->uid : 0;
+    proc->gid = current_process ? current_process->gid : 0;
     
     // Deep copy arguments - process now owns them
     if (argc > 0 && argv) {
@@ -281,13 +287,15 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
 void scheduler_add_process(process_t *proc) {
     if (!proc) return;
     
-    com_write_string(COM1_PORT, "[SCHED] Adding PID ");
-    char buf[12];
-    itoa(proc->pid, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, " (");
-    com_write_string(COM1_PORT, proc->name);
-    com_write_string(COM1_PORT, ") to ready queue\n");
+    if (kernel_debug_is_on()) {
+        com_write_string(COM1_PORT, "[SCHED] Adding PID ");
+        char buf[12];
+        itoa(proc->pid, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, " (");
+        com_write_string(COM1_PORT, proc->name);
+        com_write_string(COM1_PORT, ") to ready queue\n");
+    }
     
     proc->next = NULL;
 
@@ -316,11 +324,13 @@ void scheduler_add_process(process_t *proc) {
 void scheduler_remove_process(process_t *proc) {
     if (!proc || !ready_queue_head) return;
     
-    com_write_string(COM1_PORT, "[SCHED] Removing PID ");
-    char buf[12];
-    itoa(proc->pid, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, " from ready queue\n");
+    if (kernel_debug_is_on()) {
+        com_write_string(COM1_PORT, "[SCHED] Removing PID ");
+        char buf[12];
+        itoa(proc->pid, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, " from ready queue\n");
+    }
     
     if (ready_queue_head == proc) {
         ready_queue_head = proc->next;
@@ -339,15 +349,17 @@ void scheduler_remove_process(process_t *proc) {
 }
 
 static void do_switch_and_reap(process_t *old, process_t *newp) {
-    com_write_string(COM1_PORT, "[SWITCH] Calling context_switch asm...\n");
+    char buf[12];
+    if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[SWITCH] Calling context_switch asm...\n");
     context_switch(old ? &old->cpu_state : NULL, &newp->cpu_state);
 
     /* THIS LINE EXECUTES IN THE NEW PROCESS CONTEXT */
-    com_write_string(COM1_PORT, "[SWITCH] Back from asm, now in PID ");
-    char buf[12];
-    itoa(current_process->pid, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, "\n");
+    if (kernel_debug_is_on()) {
+        com_write_string(COM1_PORT, "[SWITCH] Back from asm, now in PID ");
+        itoa(current_process->pid, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, "\n");
+    }
 
     if (process_to_reap) {
         process_t *dead = process_to_reap;
@@ -371,11 +383,13 @@ static void do_switch_and_reap(process_t *old, process_t *newp) {
         }
     }
     
-    com_write_string(COM1_PORT, "[SWITCH] do_switch_and_reap returning to caller\n");
+    if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[SWITCH] do_switch_and_reap returning to caller\n");
 }
 
 void schedule(void) {
     if (!scheduler_enabled) return;
+
+    char buf[12];
 
     process_t *old = current_process;
     process_t *newp = ready_queue_head ? ready_queue_head : process_table[0];
@@ -389,60 +403,68 @@ void schedule(void) {
         return;
     }
 
-    com_write_string(COM1_PORT, "[SCHED] Switching from PID ");
-    char buf[12];
-    itoa(old->pid, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, " (");
-    com_write_string(COM1_PORT, old->name);
-    com_write_string(COM1_PORT, ", state=");
-    itoa(old->state, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, ") to PID ");
-    itoa(newp->pid, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, " (");
-    com_write_string(COM1_PORT, newp->name);
-    com_write_string(COM1_PORT, ")\n");
+    if (kernel_debug_is_on()) {
+        com_write_string(COM1_PORT, "[SCHED] Switching from PID ");
+        char buf[12];
+        itoa(old->pid, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, " (");
+        com_write_string(COM1_PORT, old->name);
+        com_write_string(COM1_PORT, ", state=");
+        itoa(old->state, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, ") to PID ");
+        itoa(newp->pid, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, " (");
+        com_write_string(COM1_PORT, newp->name);
+        com_write_string(COM1_PORT, ")\n");
+    }
 
     /* Dequeue the new process if it came from ready queue */
     if (ready_queue_head && newp == ready_queue_head) {
         ready_queue_head = newp->next;
         newp->next = NULL;
-        com_write_string(COM1_PORT, "[SCHED] Dequeued new process from ready queue\n");
+        if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[SCHED] Dequeued new process from ready queue\n");
         debug_print_ready_queue();
     }
 
     /* Re-enqueue old process if it's still RUNNING and NOT idle */
     if (old && old->state == PROCESS_STATE_RUNNING && old->pid != 0) {
-        com_write_string(COM1_PORT, "[SCHED] Re-queueing old process PID ");
-        itoa(old->pid, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, "\n");
+        if (kernel_debug_is_on()) {
+            com_write_string(COM1_PORT, "[SCHED] Re-queueing old process PID ");
+            itoa(old->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, "\n");
+        }
         old->state = PROCESS_STATE_READY;
         scheduler_add_process(old);
     } else if (old && old->pid == 0) {
-        com_write_string(COM1_PORT, "[SCHED] Not re-queueing idle process\n");
+        if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[SCHED] Not re-queueing idle process\n");
     } else if (old && old->state != PROCESS_STATE_RUNNING) {
-        com_write_string(COM1_PORT, "[SCHED] Not re-queueing (state != RUNNING): state=");
-        itoa(old->state, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, "\n");
+        if (kernel_debug_is_on()) {
+            com_write_string(COM1_PORT, "[SCHED] Not re-queueing (state != RUNNING): state=");
+            itoa(old->state, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, "\n");
+        }
     }
 
     newp->state = PROCESS_STATE_RUNNING;
     current_process = newp;
     
-    com_write_string(COM1_PORT, "[SCHED] About to context switch...\n");
+    if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[SCHED] About to context switch...\n");
     do_switch_and_reap(old, newp);
     
     // CRITICAL: Ensure interrupts are enabled after context switch
     __asm__ volatile("sti");
     
-    com_write_string(COM1_PORT, "[SCHED] Returned from context switch (now running PID ");
-    itoa(current_process->pid, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, ")\n");
+    if (kernel_debug_is_on()) {
+        com_write_string(COM1_PORT, "[SCHED] Returned from context switch (now running PID ");
+        itoa(current_process->pid, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, ")\n");
+    }
 }
 
 void scheduler_tick(void) {
@@ -535,28 +557,32 @@ void process_kill(uint32_t pid) {
 
 void process_yield(void) {
     if (!current_process) {
-        com_write_string(COM1_PORT, "[YIELD] Warning: no current process\n");
+        if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[YIELD] Warning: no current process\n");
         return;
     }
     
-    com_write_string(COM1_PORT, "[YIELD] Process ");
-    char buf[12];
-    itoa(current_process->pid, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, " (");
-    com_write_string(COM1_PORT, current_process->name);
-    com_write_string(COM1_PORT, ") yielding (state=");
-    itoa(current_process->state, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, ")\n");
-    debug_print_ready_queue();
-    
+    if (kernel_debug_is_on()) {
+        com_write_string(COM1_PORT, "[YIELD] Process ");
+        char buf[12];
+        itoa(current_process->pid, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, " (");
+        com_write_string(COM1_PORT, current_process->name);
+        com_write_string(COM1_PORT, ") yielding (state=");
+        itoa(current_process->state, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, ")\n");
+        debug_print_ready_queue();
+    }
     schedule();
-    
-    com_write_string(COM1_PORT, "[YIELD] Process ");
-    itoa(current_process->pid, buf, 10);
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, " resumed after yield\n");
+
+    if (kernel_debug_is_on()) {
+        com_write_string(COM1_PORT, "[YIELD] Process ");
+        char buf2[12];
+        itoa(current_process->pid, buf2, 10);
+        com_write_string(COM1_PORT, buf2);
+        com_write_string(COM1_PORT, " resumed after yield\n");
+    }
 }
 
 void process_sleep(uint64_t milliseconds) {
