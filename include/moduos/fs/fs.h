@@ -100,6 +100,17 @@ fs_mount_t* fs_get_mount(int slot);
  */
 int fs_get_mount_info(int slot, int* vdrive_id, uint32_t* partition_lba, fs_type_t* type);
 
+/*
+ * Get a stable human-readable mount label.
+ * Examples:
+ *  - "vDrive1" (whole-disk/superfloppy/ISO)
+ *  - "vDrive1-P1" (partitioned disk, partition #1)
+ */
+int fs_get_mount_label(int slot, char *out, size_t out_size);
+
+/* Return 0 if not a partitioned mount, otherwise 1..4 for MBR partitions. */
+int fs_get_mount_partition_index(int slot);
+
 /**
  * List all active mounts (prints to VGA)
  */
@@ -126,6 +137,18 @@ int fs_read_file(fs_mount_t* mount, const char* path, void* buffer,
                  size_t buffer_size, size_t* bytes_read);
 
 /**
+ * Write entire file from buffer.
+ * Currently supported for FAT32 only.
+ *
+ * @param mount: Mount handle (from fs_get_mount)
+ * @param path: File path (e.g., "/dir/file.txt")
+ * @param buffer: Input buffer
+ * @param size: Number of bytes to write
+ * @return: 0 on success, negative on error
+ */
+int fs_write_file(fs_mount_t* mount, const char* path, const void* buffer, size_t size);
+
+/**
  * Get file information
  * @param mount: Mount handle
  * @param path: File path
@@ -144,6 +167,22 @@ int fs_file_exists(fs_mount_t* mount, const char* path);
 
 /* --- DIRECTORY OPERATIONS --- */
 
+/* Directory entry structure for iteration */
+typedef struct {
+    char name[260];           /* Entry name */
+    uint32_t size;            /* File size in bytes */
+    int is_directory;         /* 1 if directory, 0 if file */
+    uint32_t reserved;        /* Reserved for future use */
+} fs_dirent_t;
+
+/* Directory handle for iteration */
+typedef struct {
+    fs_mount_t* mount;        /* Mount point */
+    char path[256];           /* Directory path */
+    size_t position;          /* Current position in directory */
+    void* fs_specific;        /* Filesystem-specific data */
+} fs_dir_t;
+
 /**
  * List directory contents
  * @param mount: Mount handle
@@ -159,6 +198,28 @@ int fs_list_directory(fs_mount_t* mount, const char* path);
  * @return: 1 if exists and is directory, 0 otherwise
  */
 int fs_directory_exists(fs_mount_t* mount, const char* path);
+
+/**
+ * Open directory for iteration
+ * @param mount: Mount handle
+ * @param path: Directory path (NULL or "/" for root)
+ * @return: Directory handle, or NULL on error
+ */
+fs_dir_t* fs_opendir(fs_mount_t* mount, const char* path);
+
+/**
+ * Read next directory entry
+ * @param dir: Directory handle
+ * @param entry: Output entry structure
+ * @return: 1 on success, 0 at end of directory, -1 on error
+ */
+int fs_readdir(fs_dir_t* dir, fs_dirent_t* entry);
+
+/**
+ * Close directory handle
+ * @param dir: Directory handle
+ */
+void fs_closedir(fs_dir_t* dir);
 
 /* --- UTILITY FUNCTIONS --- */
 
