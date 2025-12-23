@@ -7,13 +7,12 @@
 #include <stddef.h>
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/COM/com.h"
-#include "moduos/kernel/shell/zenith4.h"
+#include "moduos/fs/devfs.h"
 #include "moduos/kernel/events/events.h"
 #include "moduos/drivers/input/ps2/ps2.h"
 
 
 #define TIMEOUT_LIMIT 1000000
-#define INPUT_BUFFER_SIZE 256
 
 
 // Wait until output buffer has data or timeout
@@ -89,8 +88,14 @@ int ps2_init() {
 
     if (ps2_wait_output(&config) < 0 && !vm) config = 0;
 
-    config |= (1 << 1);   // Enable IRQ1
-    config &= ~(1 << 6);  // Disable translation
+    /* PS/2 controller config byte:
+     *  bit0 = IRQ1 enable (port1/keyboard)
+     *  bit1 = IRQ12 enable (port2/mouse)
+     *  bit6 = translation
+     */
+    config |= (1 << 0);    // Enable IRQ1 (keyboard)
+    config &= ~(1 << 1);   // Disable IRQ12 (mouse)
+    config &= ~(1 << 6);   // Disable translation
 
     if (ps2_wait_input() < 0 && !vm) return -1;
     outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_CONFIG);
@@ -119,9 +124,21 @@ int ps2_init() {
         if (ps2_wait_output(&response) == 0) {
             if (response == 0xFA) {
                 if (ps2_wait_output(&response) == 0 && response == 0xAA) {
-                    return 0; // ACK + self-test OK
+                    /* ok */
                 }
-                return 0; // got ACK, no self-test (VM)
+                /*
+                 * IMPORTANT (QEMU/strict PS/2): explicitly enable keyboard scanning.
+                 * Some emulators won't send scancodes/IRQ1 until 0xF4 is issued.
+                 */
+                if (ps2_wait_input() >= 0 || vm) {
+                    outb(PS2_DATA_PORT, 0xF4); // Enable scanning
+                    if (ps2_wait_output(&response) == 0) {
+                        if (response != 0xFA && !vm) return -1;
+                    } else if (!vm) {
+                        return -1;
+                    }
+                }
+                return 0;
             } else if (response == 0xAA) {
                 return 0; // self-test only
             } else if (vm) {
@@ -143,6 +160,11 @@ static bool extended = false;
 static bool break_code = false;
 static bool shifted = false;
 
+/* Legacy line-discipline code removed.
+ * Use input() from src/drivers/input/input.c (reads from $/dev/input/event0).
+ */
+
+#if 0
 // Made non-static so USB input can share the same buffer
 char input_buffer[INPUT_BUFFER_SIZE];
 size_t input_index = 0;
@@ -179,6 +201,7 @@ void replace_input_line(const char* new_text) {
         VGA_WriteChar(new_text[i]);
     }
 }
+#endif
 
 char scancode_to_char_extended(uint8_t scancode) {
     if (scancode >= 256) return 0;
@@ -232,45 +255,13 @@ void keyboard_irq_handler() {
     // Push event to queue
     event_push(&event);
 
+    // Mirror to DEVFS input devices ($/dev/input/event0 and kbd0)
+    devfs_input_push_event(&event);
+
     // --- Special Key Handling (only on make codes) ---
 
-    // Page Up key pressed
-    if (extended && !break_code && scancode == 0x7D) {
-        extended = false;
-        break_code = false;
-        pic_send_eoi(1);
-        return;
-    }
-
-    // Page Down key pressed
-    if (extended && !break_code && scancode == 0x7A) {
-        extended = false;
-        break_code = false;
-        pic_send_eoi(1);
-        return;
-    }
-
-    // UP ARROW (E0 75) - Navigate to previous command in history
-    if (extended && !break_code && scancode == 0x75) {
-        if (shell_state.running == 1) {
-            up_arrow_pressed();
-        }
-        extended = false;
-        break_code = false;
-        pic_send_eoi(1);
-        return;
-    }
-
-    // DOWN ARROW (E0 72) - Navigate to next command in history
-    if (extended && !break_code && scancode == 0x72) {
-        if (shell_state.running == 1) {
-            down_arrow_pressed();
-        }
-        extended = false;
-        break_code = false;
-        pic_send_eoi(1);
-        return;
-    }
+    // Navigation keys are delivered as normal KEY events to $/dev/input/event0.
+    // Shell history browsing is handled by the input() line discipline.
 
     // SHIFT (left = 0x12, right = 0x59)
     if (!extended && (scancode == 0x12 || scancode == 0x59)) {
@@ -292,36 +283,8 @@ void keyboard_irq_handler() {
     // Convert to char (if possible)
     char c = extended ? scancode_to_char_extended(scancode) : scancode_to_char(scancode);
 
-    // Normal input handling
-    if (c) {
-        // Exclude TAB from input buffer (already handled above)
-        if (c == '\t') {
-            if (input_index < INPUT_BUFFER_SIZE - 1) {
-                input_buffer[input_index++] = ' ';
-                input_buffer[input_index++] = ' ';
-                VGA_Write("  ");
-            }
-            extended = false;
-            pic_send_eoi(1);
-            return;
-        }
-
-        if (c == '\b') {
-            if (input_index > 0) {
-                input_index--;
-                input_buffer[input_index] = '\0';
-                VGA_Backspace();
-            }
-        } else if (c == '\n') {
-            VGA_WriteChar('\n');
-            input_ready = true;
-        } else {
-            if (input_index < INPUT_BUFFER_SIZE - 1) {
-                input_buffer[input_index++] = c;
-                VGA_WriteChar(c);
-            }
-        }
-    }
+    // Character/line editing is handled in input subsystem (via DEVFS).
+    (void)c;
     extended = false;
     pic_send_eoi(1);
 }
