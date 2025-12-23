@@ -18,6 +18,11 @@ int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 int paging_unmap_page(uint64_t virt);
 int paging_map_range(uint64_t virt_base, uint64_t phys_base, uint64_t size, uint64_t flags);
 
+// Fast mapping using 2MB huge pages (PS bit). virt/phys must be 2MB-aligned.
+int paging_map_2m_page(uint64_t virt, uint64_t phys, uint64_t flags);
+int paging_map_2m_range(uint64_t virt_base, uint64_t phys_base, uint64_t size, uint64_t flags);
+
+
 /* NEW: create per-process PML4 copying kernel high-half entries.
  * Returns physical address of new PML4 (non-zero on success).
  * The returned PML4 page is identity-mapped in your early boot convention.
@@ -36,5 +41,9 @@ void *phys_to_virt_kernel(uint64_t phys);
  * Returns virtual address on success, 0 on failure
  */
 void* ioremap(uint64_t phys_addr, uint64_t size);
+
+// Like ioremap(), but reserves one extra unmapped guard page after the mapping.
+// If callers write past the end of the mapped region they will fault immediately.
+void* ioremap_guarded(uint64_t phys_addr, uint64_t size);
 
 #endif /* PAGING_H */
