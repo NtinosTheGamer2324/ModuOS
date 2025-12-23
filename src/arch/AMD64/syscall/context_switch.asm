@@ -50,6 +50,9 @@ context_switch:
     
     ; Restore RFLAGS
     mov rdx, [rsi + 64]
+    ; Always ensure IF=1 while running scheduled processes.
+    ; This prevents "keyboard dead" scenarios if a saved context had IF=0.
+    or  rdx, 0x200
     push rdx
     popfq
     
