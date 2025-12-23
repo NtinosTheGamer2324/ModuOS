@@ -195,6 +195,7 @@ typedef struct hid_device {
 
 // HID Functions
 int hid_init(void);
+void hid_init_tick(void);
 int hid_probe(usb_device_t *dev);
 void hid_disconnect(usb_device_t *dev);
 
