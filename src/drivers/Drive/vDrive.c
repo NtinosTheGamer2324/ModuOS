@@ -458,12 +458,30 @@ int vdrive_read(uint8_t vdrive_id, uint64_t lba, uint32_t count, void *buffer) {
     if (!drive) {
         return VDRIVE_ERR_NO_DRIVE;
     }
-    
-    if (drive->status != VDRIVE_STATUS_READY) {
-        drive_last_error[vdrive_id] = VDRIVE_ERR_NOT_READY;
-        return VDRIVE_ERR_NOT_READY;
+
+    /*
+     * Optical drives (ATAPI/SATAPI) often report non-READY status until the first
+     * media access triggers spin-up. Treat "present" as readable for them.
+     */
+    int is_optical = (drive->type == VDRIVE_TYPE_ATA_ATAPI ||
+                      drive->type == VDRIVE_TYPE_SATA_OPTICAL);
+
+    if (!is_optical) {
+        if (drive->status != VDRIVE_STATUS_READY) {
+            drive_last_error[vdrive_id] = VDRIVE_ERR_NOT_READY;
+            return VDRIVE_ERR_NOT_READY;
+        }
+    } else {
+        if (!drive->present) {
+            drive_last_error[vdrive_id] = VDRIVE_ERR_NO_DRIVE;
+            return VDRIVE_ERR_NO_DRIVE;
+        }
+        /* If present but not marked READY yet, allow the read path to proceed. */
+        if (drive->status != VDRIVE_STATUS_READY) {
+            drive->status = VDRIVE_STATUS_READY;
+        }
     }
-    
+
     if (count == 0) {
         drive_last_error[vdrive_id] = VDRIVE_ERR_INVALID_COUNT;
         return VDRIVE_ERR_INVALID_COUNT;
