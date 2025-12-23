@@ -28,22 +28,16 @@ docker run --rm -it --privileged -v /dev:/dev -v "%cd%":/root/env modu-os /bin/b
 
 
 REM -----------------------------
-REM Boot the kernel ISO in QEMU (AHCI with proper SATAPI)
-REM -----------------------------
-echo. > com1.log
-echo. > com2.log
-timeout /t 1 /nobreak >nul
-
-REM -----------------------------
-REM Boot the kernel ISO in QEMU (AHCI with USB keyboard)
+REM Boot the kernel ISO in QEMU (AHCI with forced PS/2 keyboard)
 REM -----------------------------
 echo. > com1.log
 echo. > com2.log
 timeout /t 1 /nobreak >nul
 
 REM Start QEMU
-start "QEMU" qemu-system-x86_64 ^
-    -M pc-i440fx-6.2 ^
+qemu-system-x86_64 ^
+    -machine pc ^
+   -smbios type=1,manufacturer="ASRock",product="ASRock B450 Gaming" ^
     -m 1024M ^
     -smp 2 ^
     -serial file:com1.log ^
