@@ -318,11 +318,27 @@ void exec(const char *args) {
     com_write_string(COM1_PORT, "\n");
     
     com_write_string(COM1_PORT, "[EXEC] Shell yielding to scheduler...\n");
-    
-    // Yield to run the process
-    process_yield();
-    
-    // When we return here, the process has finished
+
+    /*
+     * Foreground exec: wait until the process exits.
+     *
+     * The previous behavior yielded only once, which allowed the shell to keep
+     * running concurrently with the launched process.
+     */
+    while (1) {
+        process_yield();
+
+        proc = process_get_by_pid(pid);
+        if (!proc) {
+            /* Reaped */
+            break;
+        }
+        if (proc->state == PROCESS_STATE_ZOMBIE || proc->state == PROCESS_STATE_TERMINATED) {
+            break;
+        }
+    }
+
+    // When we return here, the process has finished (or is a zombie)
     com_write_string(COM1_PORT, "[EXEC] Returned from yield - checking process status...\n");
     
     // Check if process still exists (use saved PID, not proc pointer!)
