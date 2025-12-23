@@ -27,13 +27,15 @@
 #define FAULT_SECURITY_EXCEPTION    30
 
 // Interrupt stack frame (pushed by CPU during interrupt)
+/* Note: When an exception occurs in ring0 (CPL0->CPL0), the CPU pushes only:
+ *   RIP, CS, RFLAGS
+ * The extended SS/RSP are pushed only on privilege change.
+ */
 typedef struct {
     uint64_t rip;
     uint64_t cs;
     uint64_t rflags;
-    uint64_t rsp;
-    uint64_t ss;
-} __attribute__((packed)) interrupt_frame_t;
+} interrupt_frame_t;
 
 // Full fault context (includes error code if applicable)
 typedef struct {
