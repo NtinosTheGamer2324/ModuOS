@@ -4,6 +4,7 @@
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/drivers/Time/RTC.h"
 #include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/debug.h"
 
 /* VGA logging macros (original, no COM) */
 #define LOG_INFO(text) do { \
@@ -90,6 +91,19 @@
     com_write_string(COM_PORT, "[LOG] "); \
     com_write_string(COM_PORT, text); \
     com_write_string(COM_PORT, "\n"); \
+} while(0)
+
+/* Debug-only COM logging (runtime toggle) */
+#define DBG_COM_LOG(COM_PORT, text) do { \
+    if (kernel_debug_get()) { \
+        COM_LOG(COM_PORT, text); \
+    } \
+} while(0)
+
+#define DBG_COM_PRINTF(COM_PORT, ...) do { \
+    if (kernel_debug_get()) { \
+        com_printf(COM_PORT, __VA_ARGS__); \
+    } \
 } while(0)
 
 /* VGA-only logging macros (no COM output) */
