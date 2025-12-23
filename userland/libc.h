@@ -6,33 +6,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Syscall numbers
-#define SYS_EXIT        0
-#define SYS_FORK        1
-#define SYS_READ        2
-#define SYS_WRITE       3       // NEW: write(str)
-#define SYS_OPEN        4
-#define SYS_CLOSE       5
-#define SYS_WAIT        6
-#define SYS_EXEC        7
-#define SYS_GETPID      8
-#define SYS_GETPPID     9
-#define SYS_SLEEP       10
-#define SYS_YIELD       11
-#define SYS_MALLOC      12
-#define SYS_FREE        13
-#define SYS_SBRK        14
-#define SYS_KILL        15
-#define SYS_TIME        16
-#define SYS_CHDIR       17 
-#define SYS_GETCWD      18
-#define SYS_STAT        19
-#define SYS_MKDIR       20
-#define SYS_RMDIR       21
-#define SYS_UNLINK      22
-#define SYS_INPUT       23
-#define SYS_SSTATS      24      // System statistics
-#define SYS_WRITEFILE   30     // NEW: fd-based writing
+// Syscall numbers (shared with kernel)
+#include "../include/moduos/kernel/syscall/syscall_numbers.h"
+// MD64API (userland-visible kernel interfaces)
+#include "../include/moduos/kernel/md64api_grp.h"
+// SYS_WRITEFILE is provided by syscall_numbers.h
 
 // File descriptor constants
 #define STDIN_FILENO    0
@@ -46,6 +24,7 @@
 #define O_CREAT     0x0100
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
+#define O_NONBLOCK  0x0800
 
 // Type definitions
 #ifndef _SSIZE_T_DEFINED
@@ -56,6 +35,9 @@ typedef long ssize_t;
 typedef const char* string;
 
 /* System Information Structure */
+
+// ---------------- MD64API SysInfo ----------------
+
 typedef struct md64api_sysinfo_data
 {
     /* --- Memory Info --- */
@@ -113,19 +95,42 @@ typedef struct md64api_sysinfo_data
 
 } md64api_sysinfo_data;
 
-// Syscall wrapper (3 args max)
+// Syscall wrapper (up to 3 args)
+// ABI: rax=syscall_num, rdi=arg1, rsi=arg2, rdx=arg3
 static inline long syscall(long num, long arg1, long arg2, long arg3) {
     long ret;
     __asm__ volatile (
         "mov %1, %%rax\n"
-        "mov %2, %%rbx\n"
-        "mov %3, %%rcx\n"
+        "mov %2, %%rdi\n"
+        "mov %3, %%rsi\n"
         "mov %4, %%rdx\n"
         "int $0x80\n"
         "mov %%rax, %0"
         : "=r"(ret)
         : "r"(num), "r"(arg1), "r"(arg2), "r"(arg3)
-        : "rax", "rbx", "rcx", "rdx", "memory"
+        : "rax", "rdi", "rsi", "rdx", "memory"
+    );
+    return ret;
+}
+
+/*
+ * 4-arg syscall wrapper
+ * Kernel ABI (see src/arch/AMD64/syscall/syscall_entry.asm):
+ *   rax=syscall_num, rdi=arg1, rsi=arg2, rdx=arg3, r10=arg4
+ */
+static inline long syscall4(long num, long arg1, long arg2, long arg3, long arg4) {
+    long ret;
+    __asm__ volatile (
+        "mov %1, %%rax\n"
+        "mov %2, %%rdi\n"
+        "mov %3, %%rsi\n"
+        "mov %4, %%rdx\n"
+        "mov %5, %%r10\n"
+        "int $0x80\n"
+        "mov %%rax, %0"
+        : "=r"(ret)
+        : "r"(num), "r"(arg1), "r"(arg2), "r"(arg3), "r"(arg4)
+        : "rax", "rdi", "rsi", "rdx", "r10", "rcx", "memory"
     );
     return ret;
 }
@@ -142,7 +147,7 @@ static inline void putc(char c) {
 
 // Writes a null-terminated string to VGA
 static inline void puts_raw(const char *s) {
-    if (!s) s = "(null)";
+    if (!s) s = " ";
     syscall(SYS_WRITE, (long)s, 0, 0);
 }
 
@@ -152,8 +157,50 @@ static inline void puts(const char *s) {
     putc('\n');
 }
 
+static inline ssize_t input_read(char *buf, size_t max_len) {
+    if (!buf || max_len == 0) return -1;
+    return (ssize_t)syscall(SYS_INPUT, (long)buf, (long)max_len, 0);
+}
+
+/* Forward declarations (input() uses file I/O wrappers declared later) */
+static inline int open(const char *pathname, int flags, int mode);
+static inline ssize_t read(int fd, void *buf, size_t count);
+static inline int close(int fd);
+
+// Convenience: returns pointer to a static buffer (blocking line read from kbd0)
 static inline char* input() {
-    return (char*)syscall(SYS_INPUT, 0, 0, 0);
+    static char input_buf[256];
+
+    int fd = open("$/dev/input/kbd0", O_RDONLY, 0);
+    if (fd < 0) {
+        input_buf[0] = 0;
+        return input_buf;
+    }
+
+    int n = 0;
+    for (;;) {
+        char c;
+        if (read(fd, &c, 1) != 1) continue;
+        if (c == '\r') continue;
+        if (c == '\n') {
+            input_buf[n] = 0;
+            close(fd);
+            return input_buf;
+        }
+        if ((c == '\b' || c == 127) && n > 0) {
+            n--;
+            input_buf[n] = 0;
+            /* echo erase */
+            puts_raw("\b \b");
+            continue;
+        }
+        if (n < (int)sizeof(input_buf) - 1 && c >= 32 && c < 127) {
+            input_buf[n++] = c;
+            input_buf[n] = 0;
+            char tmp[2] = {c, 0};
+            puts_raw(tmp);
+        }
+    }
 }
 
 /* ============================================================
@@ -163,6 +210,34 @@ static inline char* input() {
 static inline md64api_sysinfo_data* get_system_info(void) {
     return (md64api_sysinfo_data*)syscall(SYS_SSTATS, 0, 0, 0);
 }
+
+/* Time API: milliseconds since boot */
+static inline uint64_t time_ms(void) {
+    return (uint64_t)syscall(SYS_TIME, 0, 0, 0);
+}
+
+/* ============================================================
+   VGA / CONSOLE COLOR (Text Mode)
+   ============================================================ */
+
+/* Set VGA text colors: fg/bg are 0-15 (VGA attribute nibble) */
+static inline void vga_set_color(uint8_t fg, uint8_t bg) {
+    syscall(SYS_VGA_SET_COLOR, (long)fg, (long)bg, 0);
+}
+
+/* Get current color attribute: returns (bg<<4)|fg */
+static inline uint8_t vga_get_color(void) {
+    return (uint8_t)syscall(SYS_VGA_GET_COLOR, 0, 0, 0);
+}
+
+/* Reset to default 0x07 on 0x00 */
+static inline void vga_reset_color(void) {
+    syscall(SYS_VGA_RESET_COLOR, 0, 0, 0);
+}
+
+/* ANSI helpers (SGR). Works because kernel VGA driver parses ESC[...m. */
+#define ANSI_ESC "\x1b"
+#define ANSI_RESET ANSI_ESC "[0m"
 
 /* ============================================================
    FILE I/O OPERATIONS
@@ -178,9 +253,35 @@ static inline int close(int fd) {
     return (int)syscall(SYS_CLOSE, fd, 0, 0);
 }
 
+/* SYS_STAT: fills a kernel fs_file_info_t-like struct in userland */
+typedef struct {
+    char name[260];
+    uint32_t size;
+    int is_directory;
+    uint32_t cluster;
+} fs_file_info_t;
+
+static inline int stat(const char *path, fs_file_info_t *out_info) {
+    return (int)syscall(SYS_STAT, (long)path, (long)out_info, (long)sizeof(*out_info));
+}
+
+static inline long lseek(int fd, long offset, int whence) {
+    return syscall(SYS_LSEEK, (long)fd, (long)offset, (long)whence);
+}
+
 // Read from a file descriptor
 static inline ssize_t read(int fd, void *buf, size_t count) {
     return (ssize_t)syscall(SYS_READ, fd, (long)buf, count);
+}
+
+// MD64API GRP helper (must come after open/read/close)
+static inline int md64api_grp_get_video0_info(md64api_grp_video_info_t *out) {
+    if (!out) return -1;
+    int fd = open(MD64API_GRP_DEFAULT_DEVICE, O_RDONLY, 0);
+    if (fd < 0) return -2;
+    ssize_t r = read(fd, out, sizeof(*out));
+    close(fd);
+    return (r == (ssize_t)sizeof(*out)) ? 0 : -3;
 }
 
 // Write to a file descriptor (binary safe)
@@ -381,12 +482,14 @@ static inline void* sbrk(intptr_t inc) {
    PROCESS FUNCTIONS
    ============================================================ */
 
-static inline void exit(int status) {
+__attribute__((noreturn)) static inline void exit(int status) {
     syscall(SYS_EXIT, status, 0, 0);
+    /* SYS_EXIT must not return; if it does, halt here. */
+    for (;;) { __asm__ volatile("hlt"); }
 }
 
 static inline void exec(const char *str) {
-    syscall(SYS_EXEC, str, 0 , 0);
+    syscall(SYS_EXEC, (long)str, 0 , 0);
 }
 
 static inline int getpid(void) {
@@ -395,6 +498,28 @@ static inline int getpid(void) {
 
 static inline int getppid(void) {
     return (int)syscall(SYS_GETPPID, 0, 0, 0);
+}
+
+static inline int getuid(void) {
+    return (int)syscall(SYS_GETUID, 0, 0, 0);
+}
+
+static inline int setuid(int uid) {
+    return (int)syscall(SYS_SETUID, (long)uid, 0, 0);
+}
+
+/*
+ * Graphics blit: copy a user backbuffer into the framebuffer.
+ * fmt must match the current framebuffer format (no conversion).
+ */
+static inline int gfx_blit(const void *src, uint16_t w, uint16_t h,
+                           uint16_t dst_x, uint16_t dst_y,
+                           uint16_t src_pitch_bytes,
+                           uint16_t fmt) {
+    uint32_t wh = ((uint32_t)w << 16) | (uint32_t)h;
+    uint32_t xy = ((uint32_t)dst_x << 16) | (uint32_t)dst_y;
+    uint32_t pf = ((uint32_t)src_pitch_bytes << 16) | (uint32_t)fmt;
+    return (int)syscall4(SYS_GFX_BLIT, (long)src, (long)wh, (long)xy, (long)pf);
 }
 
 static inline void sleep(unsigned int sec) {
@@ -409,9 +534,37 @@ static inline int kill(int pid, int sig) {
     return (int)syscall(SYS_KILL, pid, sig, 0);
 }
 
+// Directory operations
+static inline int opendir(const char *path) {
+    return (int)syscall(SYS_OPENDIR, (uint64_t)path, 0, 0);
+}
+
+static inline int readdir(int fd, char *name_buf, size_t buf_size, int *is_dir, uint32_t *size) {
+    uint64_t ret;
+    __asm__ volatile (
+        "mov %1, %%rax\n"
+        "mov %2, %%rdi\n"
+        "mov %3, %%rsi\n"
+        "mov %4, %%rdx\n"
+        "mov %5, %%r10\n"
+        "mov %6, %%r8\n"
+        "int $0x80\n"
+        "mov %%rax, %0\n"
+        : "=r"(ret)
+        : "r"((uint64_t)SYS_READDIR), "r"((uint64_t)fd), "r"((uint64_t)name_buf),
+          "r"((uint64_t)buf_size), "r"((uint64_t)is_dir), "r"((uint64_t)size)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "memory"
+    );
+    return (int)ret;
+}
+
+static inline int closedir(int fd) {
+    return (int)syscall(SYS_CLOSEDIR, (uint64_t)fd, 0, 0);
+}
+
 int md_main(long argc, char** argv);
 
-void _start(long argc, char** argv)
+__attribute__((noreturn)) void _start(long argc, char** argv)
 {
     // ModuOS start wrapper / ABI
     int mdm = md_main(argc, argv);
@@ -421,5 +574,4 @@ void _start(long argc, char** argv)
     } else {
         exit(0);
     }
-    
 }
