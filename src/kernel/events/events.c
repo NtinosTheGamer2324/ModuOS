@@ -1,6 +1,8 @@
 #include "moduos/kernel/events/events.h"
 #include <stddef.h>
 #include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/interrupts/irq_lock.h"
+#include "moduos/kernel/interrupts/hlt_wait.h"
 
 // Global event queue
 EventQueue g_event_queue;
@@ -19,55 +21,69 @@ void event_init(void) {
 
 bool event_push(Event *event) {
     if (!event) return false;
-    
+
+    uint64_t f = irq_save();
+
     // Check if queue is full
     if (g_event_queue.count >= EVENT_QUEUE_SIZE) {
+        irq_restore(f);
         return false; // Queue full, drop event
     }
-    
+
     // Add event to queue
     g_event_queue.events[g_event_queue.write_index] = *event;
     g_event_queue.write_index = (g_event_queue.write_index + 1) % EVENT_QUEUE_SIZE;
     g_event_queue.count++;
-    
+
+    irq_restore(f);
     return true;
 }
 
 bool event_poll(Event *out_event) {
     if (!out_event) return false;
-    
+
+    uint64_t f = irq_save();
+
     // Check if queue is empty
     if (g_event_queue.count == 0) {
+        irq_restore(f);
         return false;
     }
-    
+
     // Get event from queue
     *out_event = g_event_queue.events[g_event_queue.read_index];
     g_event_queue.read_index = (g_event_queue.read_index + 1) % EVENT_QUEUE_SIZE;
     g_event_queue.count--;
-    
+
+    irq_restore(f);
     return true;
 }
 
 Event event_wait(void) {
     Event event;
     
-    // Wait until an event is available
+    // Wait until an event is available.
+    // Syscalls enter with IF=0 (interrupt gate), so a bare HLT would deadlock.
     while (!event_poll(&event)) {
-        asm volatile("hlt"); // Sleep until interrupt
+        hlt_wait_preserve_if();
     }
     
     return event;
 }
 
 bool event_pending(void) {
-    return g_event_queue.count > 0;
+    uint64_t f = irq_save();
+    bool pending = (g_event_queue.count > 0);
+    irq_restore(f);
+    return pending;
 }
 
 void event_clear(void) {
+    uint64_t f = irq_save();
     g_event_queue.read_index = 0;
     g_event_queue.write_index = 0;
     g_event_queue.count = 0;
+    irq_restore(f);
 }
 
 Event event_create_key_pressed(KeyCode keycode, uint8_t scancode, char ascii, uint8_t modifiers, bool extended) {
