@@ -6,6 +6,9 @@
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/process/process.h"
+#include "moduos/drivers/Drive/vDrive.h"
+#include "moduos/fs/path.h"
+#include "moduos/fs/devfs.h"
 
 /* Enhanced file descriptor structure with cached data */
 typedef struct {
@@ -16,7 +19,11 @@ typedef struct {
     int flags;                /* FD_FLAG_* flags */
     int in_use;               /* Is this FD active? */
     int pid;                  /* Owner process ID (0 for kernel) */
-    void* cached_data;        /* Cached file contents (for reading) */
+    void* cached_data;        /* Cached file contents (for reading) OR devfs handle */
+    int is_directory;         /* 1 if this is a directory descriptor */
+    void* dir_handle;         /* Directory handle (fs_dir_t*) or DEVVFS handle */
+    int is_devvfs;            /* 1 if dir_handle is a DEVVFS pseudo dir */
+    int is_devfs;             /* 1 if cached_data is a devfs handle */
 } file_descriptor_internal_t;
 
 /* Global file descriptor table */
@@ -36,6 +43,10 @@ void fd_init(void) {
         fd_table[i].flags = 0;
         fd_table[i].pid = 0;
         fd_table[i].cached_data = NULL;
+        fd_table[i].is_directory = 0;
+        fd_table[i].dir_handle = NULL;
+        fd_table[i].is_devvfs = 0;
+        fd_table[i].is_devfs = 0;
     }
     
     /* Reserve standard file descriptors */
@@ -67,6 +78,53 @@ static int find_free_fd(void) {
         }
     }
     return -1;
+}
+
+static int fd_open_devfs_internal(const char *node, int flags) {
+    fd_init();
+    if (!node || !*node) return -1;
+
+    void *h = devfs_open(node, flags);
+    if (!h) return -1;
+
+    int fd = find_free_fd();
+    if (fd < 0) {
+        devfs_close(h);
+        return -6;
+    }
+
+    // Convert flags
+    int fd_flags = 0;
+    if ((flags & O_RDWR) == O_RDWR) {
+        fd_flags = FD_FLAG_READ | FD_FLAG_WRITE;
+    } else if (flags & O_WRONLY) {
+        fd_flags = FD_FLAG_WRITE;
+    } else {
+        fd_flags = FD_FLAG_READ;
+    }
+
+    process_t* proc = process_get_current();
+    int pid = proc ? proc->pid : 0;
+
+    fd_table[fd].mount_slot = -1;
+    strncpy(fd_table[fd].path, node, sizeof(fd_table[fd].path) - 1);
+    fd_table[fd].path[sizeof(fd_table[fd].path) - 1] = 0;
+    fd_table[fd].position = 0;
+    fd_table[fd].file_size = 0;
+    fd_table[fd].flags = fd_flags;
+    fd_table[fd].pid = pid;
+    fd_table[fd].cached_data = h;
+    fd_table[fd].in_use = 1;
+    fd_table[fd].is_directory = 0;
+    fd_table[fd].dir_handle = NULL;
+    fd_table[fd].is_devvfs = 0;
+    fd_table[fd].is_devfs = 1;
+
+    return fd;
+}
+
+int fd_open_devfs(const char *node, int flags) {
+    return fd_open_devfs_internal(node, flags);
 }
 
 /* Open file - now uses HVFS to cache file contents */
@@ -172,9 +230,13 @@ int fd_close(int fd) {
         return -2;
     }
     
-    /* Free cached data if present */
+    /* Close devfs handle OR free cached file data */
     if (fd_table[fd].cached_data) {
-        kfree(fd_table[fd].cached_data);
+        if (fd_table[fd].is_devfs) {
+            devfs_close(fd_table[fd].cached_data);
+        } else {
+            kfree(fd_table[fd].cached_data);
+        }
         fd_table[fd].cached_data = NULL;
     }
     
@@ -190,6 +252,10 @@ int fd_close(int fd) {
     fd_table[fd].position = 0;
     fd_table[fd].file_size = 0;
     fd_table[fd].flags = 0;
+    fd_table[fd].is_directory = 0;
+    fd_table[fd].dir_handle = NULL;
+    fd_table[fd].is_devvfs = 0;
+    fd_table[fd].is_devfs = 0;
     
     return 0;
 }
@@ -212,7 +278,13 @@ ssize_t fd_read(int fd, void* buffer, size_t count) {
     if (fd == STDIN_FILENO) {
         return -3;
     }
-    
+
+    /* devfs-backed FD */
+    if (fd_table[fd].is_devfs) {
+        if (!fd_table[fd].cached_data) return -4;
+        return devfs_read(fd_table[fd].cached_data, buffer, count);
+    }
+
     /* Check if we have cached data */
     if (!fd_table[fd].cached_data) {
         com_write_string(COM1_PORT, "[FD] No cached data for reading\n");
@@ -385,4 +457,323 @@ off_t fd_tell(int fd) {
     }
     
     return fd_table[fd].position;
+}
+
+/* --- DIRECTORY OPERATIONS --- */
+
+int fd_opendir(int mount_slot, const char* path) {
+    fd_init();
+    
+    if (!path || mount_slot < 0) {
+        return -1;
+    }
+    
+    /* Get mount */
+    fs_mount_t* mount = fs_get_mount(mount_slot);
+    if (!mount || !mount->valid) {
+        return -1;
+    }
+    
+    /* Open directory using filesystem layer */
+    fs_dir_t* dir = fs_opendir(mount, path);
+    if (!dir) {
+        return -1;
+    }
+    
+    /* Find free FD slot */
+    int fd = -1;
+    for (int i = 3; i < MAX_FDS; i++) {
+        if (!fd_table[i].in_use) {
+            fd = i;
+            break;
+        }
+    }
+    
+    if (fd < 0) {
+        fs_closedir(dir);
+        return -1;
+    }
+    
+    /* Get current process PID */
+    process_t* proc = process_get_current();
+    int pid = proc ? proc->pid : 0;
+    
+    /* Set up FD entry */
+    fd_table[fd].in_use = 1;
+    fd_table[fd].mount_slot = mount_slot;
+    strncpy(fd_table[fd].path, path, sizeof(fd_table[fd].path) - 1);
+    fd_table[fd].path[sizeof(fd_table[fd].path) - 1] = '\0';
+    fd_table[fd].position = 0;
+    fd_table[fd].file_size = 0;
+    fd_table[fd].flags = FD_FLAG_READ;
+    fd_table[fd].pid = pid;
+    fd_table[fd].cached_data = NULL;
+    fd_table[fd].is_directory = 1;
+    fd_table[fd].dir_handle = dir;
+    
+    return fd;
+}
+
+typedef struct {
+    int kind;   /* 1=$/mnt, 2=$/dev, 3=$/dev/input, 4=$/dev/graphics */
+    int index;  /* current index */
+    int cookie; /* for devfs listing */
+} devvfs_dir_t;
+
+static void devvfs_sanitize(const char *in, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    size_t j = 0;
+    for (size_t i = 0; in && in[i] && j + 1 < out_sz; i++) {
+        char c = in[i];
+        if (c == ' ' || c == '\t') {
+            if (j == 0 || out[j - 1] == '-') continue;
+            out[j++] = '-';
+        } else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+            out[j++] = c;
+        } else {
+            if (j == 0 || out[j - 1] == '-') continue;
+            out[j++] = '-';
+        }
+    }
+    while (j > 0 && out[j - 1] == '-') j--;
+    out[j] = 0;
+}
+
+int fd_devvfs_opendir(int kind) {
+    fd_init();
+
+    if (kind != 0 && kind != 1 && kind != 2 && kind != 3 && kind != 4) return -1;
+
+    int fd = find_free_fd();
+    if (fd < 0) return -1;
+
+    devvfs_dir_t *h = (devvfs_dir_t*)kmalloc(sizeof(devvfs_dir_t));
+    if (!h) return -1;
+    h->kind = kind;
+    // kind=0 ($/) emits top-level dirs; kind=2 ($/dev) emits "input" dir first
+    if (kind == 0) h->index = 0;
+    else h->index = (kind == 2) ? -1 : 0;
+    h->cookie = 0;
+
+    process_t* proc = process_get_current();
+    int pid = proc ? proc->pid : 0;
+
+    fd_table[fd].in_use = 1;
+    fd_table[fd].mount_slot = -1;
+    fd_table[fd].path[0] = '\0';
+    fd_table[fd].position = 0;
+    fd_table[fd].file_size = 0;
+    fd_table[fd].flags = FD_FLAG_READ;
+    fd_table[fd].pid = pid;
+    fd_table[fd].cached_data = NULL;
+    fd_table[fd].is_directory = 1;
+    fd_table[fd].is_devvfs = 1;
+    fd_table[fd].dir_handle = h;
+
+    return fd;
+}
+
+int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* size) {
+    fd_init();
+
+    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
+        return -1;
+    }
+
+    if (!fd_table[fd].is_directory || !fd_table[fd].dir_handle) {
+        return -1;
+    }
+
+    if (!name_buf || buf_size == 0) {
+        return -1;
+    }
+
+    if (fd_table[fd].is_devvfs) {
+        devvfs_dir_t *h = (devvfs_dir_t*)fd_table[fd].dir_handle;
+
+        if (h->kind == 0) {
+            // $/: DEVVFS root
+            const char *names[] = {"dev", "mnt"};
+            const int n_names = 2;
+            if (h->index >= n_names) return 0;
+            strncpy(name_buf, names[h->index], buf_size - 1);
+            name_buf[buf_size - 1] = 0;
+            if (is_dir) *is_dir = 1;
+            if (size) *size = 0;
+            h->index++;
+            return 1;
+        }
+
+        if (h->kind == 1) {
+            // $/mnt: list mounted filesystems (one entry per mount slot).
+            // Names must be stable and non-colliding even for same-model drives and multi-partition mounts.
+            int produced = 0;
+            int seen = 0;
+
+            for (int slot = 0; slot < 26; slot++) {
+                int vdrive_id = -1;
+                uint32_t lba = 0;
+                fs_type_t type;
+                if (fs_get_mount_info(slot, &vdrive_id, &lba, &type) != 0) continue;
+                if (vdrive_id < 0) continue;
+
+                if (seen++ < h->index) continue;
+
+                char label[64];
+                if (fs_get_mount_label(slot, label, sizeof(label)) != 0) {
+                    strcpy(label, "vDrive");
+                    { char nbuf[16]; itoa(vdrive_id, nbuf, 10); strncat(label, nbuf, sizeof(label) - strlen(label) - 1); }
+                }
+
+                strncpy(name_buf, label, buf_size - 1);
+                name_buf[buf_size - 1] = 0;
+                if (is_dir) *is_dir = 1;
+                if (size) *size = 0;
+                h->index++;
+                produced = 1;
+                break;
+            }
+
+            return produced ? 1 : 0;
+        }
+
+        if (h->kind == 2) {
+            // $/dev: expose "input" + "graphics" directories, plus non-input devfs devices (e.g. vDrives)
+            if (h->index == -1) {
+                strncpy(name_buf, "input", buf_size - 1);
+                name_buf[buf_size - 1] = 0;
+                if (is_dir) *is_dir = 1;
+                if (size) *size = 0;
+                h->index = -2;
+                return 1;
+            }
+            if (h->index == -2) {
+                strncpy(name_buf, "graphics", buf_size - 1);
+                name_buf[buf_size - 1] = 0;
+                if (is_dir) *is_dir = 1;
+                if (size) *size = 0;
+                h->index = 0;
+                return 1;
+            }
+
+            // devfs devices (filter out input devices; they live under $/dev/input)
+            {
+                extern int devfs_list_next(int *cookie, char *name_buf, size_t buf_size);
+                for (;;) {
+                    int rc = devfs_list_next(&h->cookie, name_buf, buf_size);
+                    if (rc != 1) break;
+                    if (strcmp(name_buf, "event0") == 0) continue;
+                    if (strcmp(name_buf, "kbd0") == 0) continue;
+                    if (strcmp(name_buf, "video0") == 0) continue; // listed under $/dev/graphics
+                    if (is_dir) *is_dir = 0;
+                    if (size) *size = 0;
+                    return 1;
+                }
+            }
+
+            // then vDrives
+            int count = vdrive_get_count();
+            if (h->index >= count) return 0;
+            int vdrive_id = h->index;
+            vdrive_t *d = vdrive_get((uint8_t)vdrive_id);
+            char name[96];
+            strcpy(name, "vDrive");
+            char nbuf[8];
+            itoa(vdrive_id, nbuf, 10);
+            strncat(name, nbuf, sizeof(name) - strlen(name) - 1);
+            if (d) {
+                char san[64];
+                devvfs_sanitize(d->model, san, sizeof(san));
+                if (san[0]) {
+                    strncat(name, "-", sizeof(name) - strlen(name) - 1);
+                    strncat(name, san, sizeof(name) - strlen(name) - 1);
+                }
+            }
+
+            strncpy(name_buf, name, buf_size - 1);
+            name_buf[buf_size - 1] = 0;
+            if (is_dir) *is_dir = 0;
+            if (size) *size = 0;
+            h->index++;
+            return 1;
+        }
+
+        if (h->kind == 3) {
+            // $/dev/input: linux-like input directory
+            const char *names[] = {"event0", "kbd0"};
+            const int n_names = 2;
+            if (h->index >= n_names) return 0;
+            strncpy(name_buf, names[h->index], buf_size - 1);
+            name_buf[buf_size - 1] = 0;
+            if (is_dir) *is_dir = 0;
+            if (size) *size = 0;
+            h->index++;
+            return 1;
+        }
+
+        if (h->kind == 4) {
+            // $/dev/graphics: graphics directory
+            const char *names[] = {"video0"};
+            const int n_names = 1;
+            if (h->index >= n_names) return 0;
+            strncpy(name_buf, names[h->index], buf_size - 1);
+            name_buf[buf_size - 1] = 0;
+            if (is_dir) *is_dir = 0;
+            if (size) *size = 0;
+            h->index++;
+            return 1;
+        }
+
+        return 0;
+    }
+
+    fs_dir_t* dir = (fs_dir_t*)fd_table[fd].dir_handle;
+    fs_dirent_t entry;
+
+    int result = fs_readdir(dir, &entry);
+    if (result <= 0) {
+        return result; /* 0 = end of directory, -1 = error */
+    }
+
+    /* Copy data to output buffers */
+    strncpy(name_buf, entry.name, buf_size - 1);
+    name_buf[buf_size - 1] = '\0';
+
+    if (is_dir) {
+        *is_dir = entry.is_directory;
+    }
+
+    if (size) {
+        *size = entry.size;
+    }
+
+    fd_table[fd].position++;
+    return 1; /* Successfully read entry */
+}
+
+int fd_closedir(int fd) {
+    fd_init();
+    
+    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
+        return -1;
+    }
+    
+    if (!fd_table[fd].is_directory) {
+        return -1;
+    }
+
+    if (fd_table[fd].dir_handle) {
+        if (fd_table[fd].is_devvfs) {
+            kfree(fd_table[fd].dir_handle);
+        } else {
+            fs_closedir((fs_dir_t*)fd_table[fd].dir_handle);
+        }
+        fd_table[fd].dir_handle = NULL;
+    }
+
+    fd_table[fd].in_use = 0;
+    fd_table[fd].is_directory = 0;
+    fd_table[fd].is_devvfs = 0;
+
+    return 0;
 }
