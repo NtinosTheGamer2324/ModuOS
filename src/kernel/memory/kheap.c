@@ -2,6 +2,7 @@
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/debug.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -77,12 +78,15 @@ static void log_oom(size_t requested_size, const char *reason) {
 static void debug_log(const char *msg, uint64_t val, int is_hex) {
 #if KHEAP_DEBUG
     char buf[32];
-    com_write_string(COM1_PORT, "[KHEAP DEBUG] ");
-    com_write_string(COM1_PORT, msg);
-    if (is_hex) uint64_to_hex(val, buf, sizeof(buf));
-    else uint64_to_dec(val, buf, sizeof(buf));
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, "\n");
+    // KHEAP debug spam can stall the system under QEMU; only print at very verbose level.
+    if (kernel_debug_get_level() >= KDBG_ON) {
+        com_write_string(COM1_PORT, "[KHEAP DEBUG] ");
+        com_write_string(COM1_PORT, msg);
+        if (is_hex) uint64_to_hex(val, buf, sizeof(buf));
+        else uint64_to_dec(val, buf, sizeof(buf));
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, "\n");
+    }
 #endif
 }
 
@@ -155,12 +159,19 @@ void *kmalloc(size_t size) {
     uint64_t virt = find_and_remove_free_block(pages);
     int used_from_bump = 0;
 
+    /* Debug: log allocation source */
+    if (virt) {
+        debug_log("[KHEAP] alloc source=freelist virt=", virt, 1);
+    }
+
     if (!virt) {
         if (heap_alloc_next + pages * PAGE_SIZE > KHEAP_MAX) {
             log_oom(size, "Virtual limit reached"); return NULL;
         }
+        debug_log("[KHEAP] bump before heap_alloc_next=", heap_alloc_next, 1);
         virt = heap_alloc_next;
         heap_alloc_next += pages * PAGE_SIZE;
+        debug_log("[KHEAP] bump after  heap_alloc_next=", heap_alloc_next, 1);
         used_from_bump = 1;
     }
 
@@ -184,6 +195,19 @@ void *kmalloc(size_t size) {
         log_oom(size, "Paging failure"); return NULL;
     }
 
+    /* Debug: verify every mapped heap page is present in the page tables */
+    for (uint64_t i = 0; i < pages; ++i) {
+        uint64_t vaddr = virt + i * PAGE_SIZE;
+        uint64_t pa = paging_virt_to_phys(vaddr);
+        if (pa == 0) {
+            com_write_string(COM1_PORT, "[KHEAP] FATAL: paging_map_range reported success but page is not present. vaddr=");
+            char hb[32]; uint64_to_hex(vaddr, hb, sizeof(hb));
+            com_write_string(COM1_PORT, hb);
+            com_write_string(COM1_PORT, "\n");
+            for (;;) { __asm__ volatile("cli; hlt"); }
+        }
+    }
+
     __asm__ volatile("mov %%cr3, %%rax\n\tmov %%rax, %%cr3" ::: "rax", "memory");
 
     struct alloc_header *hdr = (struct alloc_header *)(uintptr_t)virt;
@@ -197,9 +221,30 @@ void *kmalloc(size_t size) {
 void kfree(void *ptr) {
     if (!ptr) return;
     struct alloc_header *hdr = (struct alloc_header *)((uintptr_t)ptr - sizeof(struct alloc_header));
-    if (hdr->magic != ALLOC_MAGIC) {
-        com_write_string(COM1_PORT, "[KHEAP] WARNING: Corrupt/Invalid Free!\n"); return;
+
+    /* Debug: log frees (helps detect unexpected frees/double frees) */
+    {
+        char hb[32]; uint64_to_hex((uint64_t)(uintptr_t)hdr, hb, sizeof(hb));
+        com_write_string(COM1_PORT, "[KHEAP] kfree ptr=");
+        char pb[32]; uint64_to_hex((uint64_t)(uintptr_t)ptr, pb, sizeof(pb));
+        com_write_string(COM1_PORT, pb);
+        com_write_string(COM1_PORT, " hdr=");
+        com_write_string(COM1_PORT, hb);
+        com_write_string(COM1_PORT, "\n");
     }
+
+    if (hdr->magic != ALLOC_MAGIC) {
+        com_write_string(COM1_PORT, "[KHEAP] WARNING: Corrupt/Invalid Free! magic=");
+        char mb[32]; uint64_to_hex(hdr->magic, mb, sizeof(mb));
+        com_write_string(COM1_PORT, mb);
+        com_write_string(COM1_PORT, "\n");
+        return;
+    }
+
+    com_printf(COM1_PORT, "[KHEAP]   size=%u pages=%u phys_base=0x%08x%08x\n",
+               (uint32_t)hdr->size, (uint32_t)hdr->pages,
+               (uint32_t)(hdr->phys_base >> 32), (uint32_t)(hdr->phys_base & 0xFFFFFFFFu));
+
     uint64_t phys_base = hdr->phys_base; uint64_t pages = hdr->pages; uint64_t virt = (uint64_t)(uintptr_t)hdr;
     hdr->magic = 0;
     for (uint64_t i = 0; i < pages; i++) phys_free_frame(phys_base + i * PAGE_SIZE);
