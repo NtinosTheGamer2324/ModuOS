@@ -35,7 +35,7 @@ echo. > com2.log
 timeout /t 1 /nobreak >nul
 
 REM Start QEMU
-qemu-system-x86_64 ^
+start "cmdQEMU" qemu-system-x86_64 ^
     -machine pc ^
    -smbios type=1,manufacturer="ASRock",product="ASRock B450 Gaming" ^
     -m 1024M ^
