@@ -4,6 +4,8 @@
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/shell/zenith4.h"
 #include "moduos/drivers/input/input.h"
+#include "moduos/drivers/input/ps2/ps2.h"
+#include "moduos/fs/devfs.h"
 #include "moduos/kernel/panic.h"
 #include "moduos/kernel/interrupts/idt.h"
 #include "moduos/kernel/interrupts/irq.h"
@@ -24,6 +26,10 @@
 #include "moduos/fs/fd.h" 
 #include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/drivers/USB/usb.h"
+#include "moduos/kernel/multiboot2.h"
+#include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/memory/paging.h"
+#include "moduos/kernel/bootscreen.h"
 #include <stdint.h>
 
 int acpi_initialized;
@@ -125,7 +131,11 @@ static int detect_boot_drive(void) {
             slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_ISO9660);
             
             if (slot < 0) {
-                com_write_string(COM1_PORT, "[INFO] ISO9660 mount failed (likely no media)\n");
+                com_write_string(COM1_PORT, "[INFO] ISO9660 mount failed (slot=");
+                char tmp[16];
+                itoa(slot, tmp, 10);
+                com_write_string(COM1_PORT, tmp);
+                com_write_string(COM1_PORT, ")\n");
                 continue;  // Skip this optical drive
             }
             com_write_string(COM1_PORT, "[INFO] ISO9660 mounted successfully\n");
@@ -139,7 +149,11 @@ static int detect_boot_drive(void) {
                 id_str[0] = '0' + vdrive_id;
                 id_str[1] = '\0';
                 com_write_string(COM1_PORT, id_str);
-                com_write_string(COM1_PORT, " mount failed (may be unformatted or unreadable)\n");
+                com_write_string(COM1_PORT, " mount failed (slot=");
+                char tmp[16];
+                itoa(slot, tmp, 10);
+                com_write_string(COM1_PORT, tmp);
+                com_write_string(COM1_PORT, ")\n");
                 continue;
             }
         }
@@ -204,6 +218,7 @@ static int detect_boot_drive(void) {
             boot_drive_slot = slot;
             
             // Keep mount active - don't unmount boot drive!
+            
             return vdrive_id;
         }
         
@@ -373,18 +388,15 @@ static void Interrupts_Init(void)
 }
 
 
-// ------------------ DEVICE INIT ------------------
-static void device_Init(void)
-{
-    COM_LOG_INFO(COM1_PORT, "Initializing input subsystem");
-    input_init();
-    irq_install_handler(1, keyboard_irq_handler);
+// ------------------ DEVICE INIT (split) ------------------
 
+// Storage stack needed for boot drive detection
+static void storage_early_init(void) {
     // PCI Initialization
     COM_LOG_INFO(COM1_PORT, "Initializing PCI subsystem");
     pci_init();
     COM_LOG_OK(COM1_PORT, "PCI subsystem initialized");
-    
+
     // AHCI Initialization
     COM_LOG_INFO(COM1_PORT, "Initializing AHCI");
     int ahci_status = ahci_init();
@@ -403,8 +415,6 @@ static void device_Init(void)
         COM_LOG_WARN(COM1_PORT, "SATA initialization failed");
     }
 
-    vdrive_debug_registration();
-    DEBUG_PAUSE(5);
 
     // ATA Initialization (fallback for older systems)
     COM_LOG_INFO(COM1_PORT, "Initializing ATA Controller / Drives");
@@ -420,13 +430,13 @@ static void device_Init(void)
     // vDrive Initialization - UNIFIES ALL STORAGE
     COM_LOG_INFO(COM1_PORT, "Initializing vDrive unified drive interface");
     int vdrive_status = vdrive_init();
-    
+
     if (vdrive_status == VDRIVE_SUCCESS || vdrive_status == VDRIVE_ERR_NO_DRIVES) {
         COM_LOG_OK(COM1_PORT, "vDrive subsystem initialized");
-        
+
         // Print nice table of all drives
         vdrive_print_table();
-        
+
         if (vdrive_get_count() == 0) {
             COM_LOG_WARN(COM1_PORT, "No storage drives available!");
             if (sata_status != SATA_SUCCESS && ata_status != 0) {
@@ -436,6 +446,19 @@ static void device_Init(void)
     } else {
         COM_LOG_ERROR(COM1_PORT, "vDrive initialization failed");
     }
+}
+
+// Late devices that are not required for boot drive detection
+static void devices_late_init(void) {
+    // DEVFS / $/dev devices
+    //  - input:    $/dev/input/kbd0, $/dev/input/event0
+    //  - graphics: $/dev/graphics/video0
+    devfs_input_init();
+    devfs_graphics_init();
+
+    COM_LOG_INFO(COM1_PORT, "Initializing input subsystem");
+    input_init();
+    irq_install_handler(1, keyboard_irq_handler);
 
     // USB Initialization
     COM_LOG_INFO(COM1_PORT, "Initializing USB subsystem");
@@ -516,6 +539,15 @@ static void init(uint64_t mb2_ptr_init)
 
     // Initialize memory system (phys allocator + paging + heap)
     memory_system_init((void*)(uintptr_t)mb2_ptr_init);
+
+    // If framebuffer is available already, show a splash early.
+    // NOTE: This may fail before boot drive is mounted; the real vendor BMP is loaded later.
+    if (VGA_GetFrameBufferMode() == FB_MODE_GRAPHICS) {
+        if (bootscreen_show((void*)(uintptr_t)mb2_ptr_init) == 0) {
+            bootscreen_overlay_set_enabled(1);
+        }
+        VGA_SetSplashLock(true);
+    }
     
     com_write_string(COM1_PORT, "[KERNEL] memory_system_init() returned!\n");
     com_write_string(COM1_PORT, "[KERNEL] Starting memory smoke tests...\n");
@@ -524,34 +556,19 @@ static void init(uint64_t mb2_ptr_init)
     memory_smoke_test();
     com_write_string(COM1_PORT, "=== MEMORY INITIALIZATION COMPLETE ===\n\n");
 
-    // Initialize devices (includes vDrive!)
-    device_Init();;
+    // Early storage stack (PCI/AHCI/SATA/ATA/vDrive) so boot drive can be found ASAP.
+    storage_early_init();
 
-    // Initialize filesystem layer
+    // Initialize filesystem layer (VFS)
     COM_LOG_INFO(COM1_PORT, "Initializing filesystem layer");
     fs_init();
     fd_init();
     COM_LOG_OK(COM1_PORT, "Filesystem layer initialized");
 
-    // Initialize ACPI
-    if (acpi_init() == 0) {
-        acpi_initialized = 1;
-        COM_LOG_OK(COM1_PORT, "ACPI initialized");
-    } else {
-        COM_LOG_WARN(COM1_PORT, "ACPI initialization failed");
-    }
-
-    // Initialize process management system
-    COM_LOG_INFO(COM1_PORT, "Initializing process management");
-    process_init();
-    scheduler_init();
-    syscall_init();
-    COM_LOG_OK(COM1_PORT, "Process management initialized");
-
-    // Detect boot drive using vDrive!
+    // Detect boot drive as soon as VFS is ready.
     com_write_string(COM1_PORT, "\n=== BOOT DRIVE DETECTION ===\n");
     boot_drive_index = detect_boot_drive();
-    
+
     if (boot_drive_index >= 0) {
         com_write_string(COM1_PORT, "\n[OK] Boot drive: vDrive ");
         char id[4];
@@ -562,12 +579,36 @@ static void init(uint64_t mb2_ptr_init)
     } else {
         COM_LOG_ERROR(COM1_PORT, "Failed to detect boot drive!");
     }
-    
+
     com_write_string(COM1_PORT, "=== BOOT DRIVE DETECTION COMPLETE ===\n\n");
-    
-    // Clear screen and show boot logo again
-    VGA_Clear();
-    loading();
+
+    // Redraw splash now that the boot ISO is mounted (vendor/CPU-specific BMP).
+    if (VGA_GetFrameBufferMode() == FB_MODE_GRAPHICS) {
+        if (bootscreen_show((void*)(uintptr_t)mb2_ptr_init) == 0) {
+            bootscreen_overlay_set_enabled(1);
+        }
+        VGA_SetSplashLock(true);
+    }
+
+    // Initialize ACPI
+    if (acpi_init() == 0) {
+        acpi_initialized = 1;
+        COM_LOG_OK(COM1_PORT, "ACPI initialized");
+    } else {
+        COM_LOG_WARN(COM1_PORT, "ACPI initialization failed");
+    }
+
+    // Late device init (PS/2/input/USB, etc)
+    devices_late_init();
+
+    // Initialize process management system
+    COM_LOG_INFO(COM1_PORT, "Initializing process management");
+    process_init();
+    scheduler_init();
+    syscall_init();
+    COM_LOG_OK(COM1_PORT, "Process management initialized");
+
+    DEBUG_PAUSE(5);
 }
 
 void shell_process_entry(void) {
@@ -583,34 +624,240 @@ void shell_process_entry(void) {
     process_exit(0);
 }
 
-// ------------------ KERNEL MAIN ------------------
-void kernel_main(uint64_t mb2_ptr)
-{
-    init(mb2_ptr);
-    
+static void kernel_post_init_run_shell(void) {
+    // Re-enable text output (we may have locked it while splash screen was visible).
+    VGA_SetSplashLock(false);
+    bootscreen_overlay_set_enabled(0);
+
+
     com_write_string(COM1_PORT, "\n=== BOOT COMPLETE ===\n");
+
     com_write_string(COM1_PORT, "[KERNEL] Creating shell as a process...\n");
-    
-    // CRITICAL FIX: Create shell as a real process instead of running it directly
+
     process_t *shell_proc = process_create("shell", shell_process_entry, 10);
-    
     if (!shell_proc) {
         COM_LOG_ERROR(COM1_PORT, "Failed to create shell process!");
         trigger_no_shell_panic();
     }
-    
+
     COM_LOG_OK(COM1_PORT, "Shell process created successfully");
-    
-    // Now just let the scheduler handle everything
-    // The idle process will run, and when timer ticks, shell will get scheduled
     com_write_string(COM1_PORT, "[KERNEL] Entering idle loop, scheduler will run shell...\n");
-    
-    // Enable interrupts and enter idle loop
+
     __asm__ volatile("sti");
-    
     while (1) {
-        // Let scheduler do its job
         schedule();
+        __asm__ volatile("hlt");
+    }
+}
+
+static void kernel_try_enable_framebuffer(uint64_t mb2_ptr) {
+    struct multiboot_tag *t = multiboot2_find_tag((void*)(uintptr_t)mb2_ptr, MULTIBOOT_TAG_TYPE_FRAMEBUFFER);
+    if (!t) {
+        com_write_string(COM1_PORT, "[FB] No MULTIBOOT_TAG_TYPE_FRAMEBUFFER tag found\n");
+        return;
+    }
+
+    // Parse tag with explicit offsets (Multiboot2 spec)
+    uint8_t *b = (uint8_t*)t;
+    uint64_t fb_phys = *(uint64_t*)(b + 8);
+    uint32_t pitch   = *(uint32_t*)(b + 16);
+    uint32_t width   = *(uint32_t*)(b + 20);
+    uint32_t height  = *(uint32_t*)(b + 24);
+    uint8_t  bpp     = *(uint8_t*)(b + 28);
+    uint8_t  fb_type = *(uint8_t*)(b + 29);
+
+    // Multiboot2 RGB field info (valid when framebuffer_type==RGB)
+    uint8_t red_pos    = *(uint8_t*)(b + 32);
+    uint8_t red_size   = *(uint8_t*)(b + 33);
+    uint8_t green_pos  = *(uint8_t*)(b + 34);
+    uint8_t green_size = *(uint8_t*)(b + 35);
+    uint8_t blue_pos   = *(uint8_t*)(b + 36);
+    uint8_t blue_size  = *(uint8_t*)(b + 37);
+
+    com_write_string(COM1_PORT, "[FB] Framebuffer tag:\n");
+    com_write_string(COM1_PORT, "[FB]   fb_phys="); com_print_hex64(fb_phys);
+    com_printf(COM1_PORT, " pitch=%u width=%u height=%u bpp=%u type=%u\n",
+               pitch, width, height, (unsigned)bpp, (unsigned)fb_type);
+    com_printf(COM1_PORT, "[FB]   RGB fields: r=%u/%u g=%u/%u b=%u/%u\n",
+               (unsigned)red_pos, (unsigned)red_size,
+               (unsigned)green_pos, (unsigned)green_size,
+               (unsigned)blue_pos, (unsigned)blue_size);
+
+    if (!fb_phys || !width || !height) {
+        com_write_string(COM1_PORT, "[FB] Reject: missing fb_phys/width/height\n");
+        return;
+    }
+    if (fb_type != MULTIBOOT_FRAMEBUFFER_TYPE_RGB) {
+        com_write_string(COM1_PORT, "[FB] Reject: framebuffer_type != RGB\n");
+        return;
+    }
+    if (pitch == 0) {
+        com_write_string(COM1_PORT, "[FB] Reject: pitch == 0\n");
+        return;
+    }
+    if (!(bpp == 16 || bpp == 24 || bpp == 32)) {
+        com_write_string(COM1_PORT, "[FB] Reject: unsupported bpp\n");
+        return;
+    }
+    if (pitch < (width * (uint32_t)(bpp / 8))) {
+        com_write_string(COM1_PORT, "[FB] Reject: pitch < width*(bpp/8)\n");
+        return;
+    }
+
+    uint64_t fb_size = (uint64_t)pitch * (uint64_t)height;
+    /* Map a page-aligned size so scrolling/memmove never hits an unmapped tail page. */
+    uint64_t fb_size_aligned = (fb_size + 4095ULL) & ~4095ULL;
+
+    com_write_string(COM1_PORT, "[FB] Mapping framebuffer via ioremap size=");
+    com_print_dec64(fb_size);
+    com_write_string(COM1_PORT, " bytes (aligned ");
+    com_print_dec64(fb_size_aligned);
+    com_write_string(COM1_PORT, ")\n");
+
+    void *fb_virt = ioremap(fb_phys, fb_size_aligned);
+    com_write_string(COM1_PORT, "[FB] ioremap returned fb_virt=");
+    com_print_hex64((uint64_t)(uintptr_t)fb_virt);
+    com_write_string(COM1_PORT, "\n");
+
+    if (!fb_virt) {
+        com_write_string(COM1_PORT, "[FB] Reject: ioremap failed\n");
+        return;
+    }
+
+    /* Sanity: framebuffer mapping must not land inside the kernel heap region. */
+    if ((uint64_t)(uintptr_t)fb_virt >= 0xFFFF800000000000ULL && (uint64_t)(uintptr_t)fb_virt < 0xFFFF900000000000ULL) {
+        com_write_string(COM1_PORT, "[FB] Reject: fb_virt is inside KHEAP range; disabling framebuffer\n");
+        return;
+    }
+
+    uint64_t vtophys = paging_virt_to_phys((uint64_t)(uintptr_t)fb_virt);
+    com_write_string(COM1_PORT, "[FB] ioremap virt_to_phys=");
+    com_print_hex64(vtophys);
+    com_write_string(COM1_PORT, "\n");
+
+    framebuffer_t fb;
+    memset(&fb, 0, sizeof(fb));
+    fb.addr = fb_virt;
+    fb.width = width;
+    fb.height = height;
+    fb.pitch = pitch;
+    fb.bpp = bpp;
+    fb.fmt = (bpp == 32) ? FB_FMT_XRGB8888 : (bpp == 16) ? FB_FMT_RGB565 : FB_FMT_UNKNOWN;
+
+    // Important: provide channel packing info so VGA_ClearFrameBuffer can pack correctly
+    fb.red_pos = red_pos; fb.red_mask_size = red_size;
+    fb.green_pos = green_pos; fb.green_mask_size = green_size;
+    fb.blue_pos = blue_pos; fb.blue_mask_size = blue_size;
+
+    VGA_SetFrameBuffer(&fb);
+    com_write_string(COM1_PORT, "[FB] VGA_SetFrameBuffer done\n");
+}
+
+static void gfx_sleep_ms(uint64_t ms) {
+    /* PIT runs at 100Hz (pit_init(100)), so 1 tick = 10ms */
+    const uint64_t start = get_system_ticks();
+    const uint64_t ticks = (ms + 9) / 10;
+    while ((get_system_ticks() - start) < ticks) {
+        __asm__ volatile("hlt");
+    }
+}
+
+static void kernel_post_init_graphics_test(uint64_t mb2_ptr) {
+    com_write_string(COM1_PORT, "\n=== GRAPHICS TEST MODE ===\n");
+
+    if (VGA_GetFrameBufferMode() != FB_MODE_GRAPHICS) {
+        kernel_try_enable_framebuffer(mb2_ptr);
+    }
+
+    if (VGA_GetFrameBufferMode() != FB_MODE_GRAPHICS) {
+        com_write_string(COM1_PORT, "[GFX] No framebuffer; continuing with text-mode shell\n");
+        kernel_post_init_run_shell();
+        return;
+    }
+
+    __asm__ volatile("sti");
+
+    /* Initialize graphics console and drop into the normal shell */
+    VGA_ResetTextColor();
+    VGA_Clear();
+    VGA_Write("\\cg[GRAPHICS] Framebuffer console enabled (bitmap font).\\rr\n");
+
+    kernel_post_init_run_shell();
+}
+
+static int cmdline_has_token(const char *cmdline, const char *token) {
+    if (!cmdline || !token || !token[0]) return 0;
+    size_t tlen = strlen(token);
+    for (size_t i = 0; cmdline[i]; i++) {
+        // token must start at beginning or after whitespace
+        if (i > 0 && cmdline[i-1] != ' ' && cmdline[i-1] != '\t') continue;
+        // match token
+        size_t j = 0;
+        while (j < tlen && cmdline[i + j] == token[j]) j++;
+        if (j != tlen) continue;
+        // token must end at end or whitespace
+        char end = cmdline[i + j];
+        if (end == 0 || end == ' ' || end == '\t') return 1;
+    }
+    return 0;
+}
+
+// ------------------ KERNEL MAIN (DISPATCH) ------------------
+void kernel_main(uint64_t mb2_ptr)
+{
+    // Boot arg selection:
+    //  - "gfx-test" => force graphics test path
+    //  - otherwise  => normal text-mode boot
+    const char *cmdline = NULL;
+    struct multiboot_tag *t = multiboot2_find_tag((void*)(uintptr_t)mb2_ptr, MULTIBOOT_TAG_TYPE_CMDLINE);
+    if (t) {
+        struct multiboot_tag_string *s = (struct multiboot_tag_string*)t;
+        cmdline = s->string;
+    }
+
+    com_write_string(COM1_PORT, "[BOOT] cmdline: ");
+    if (cmdline) {
+        // Print cmdline (bounded)
+        for (int i = 0; i < 160 && cmdline[i]; i++) {
+            char c[2] = { cmdline[i], 0 };
+            com_write_string(COM1_PORT, c);
+        }
+    } else {
+        com_write_string(COM1_PORT, "<none>");
+    }
+    com_write_string(COM1_PORT, "\n");
+
+    int want_gfx_test = (cmdline && cmdline_has_token(cmdline, "gfx-test")) ? 1 : 0;
+    if (want_gfx_test) com_write_string(COM1_PORT, "[BOOT] gfx-test requested\n");
+    else com_write_string(COM1_PORT, "[BOOT] normal boot\n");
+
+    // Run full init ONCE (running it twice corrupts the multiboot info area)
+    init(mb2_ptr);
+
+    // For gfx-test, try to (re)enable framebuffer after full init in case something reset VGA state.
+    if (want_gfx_test) {
+        com_write_string(COM1_PORT, "[BOOT] Enabling framebuffer for gfx-test...\n");
+        kernel_try_enable_framebuffer(mb2_ptr);
+        com_write_string(COM1_PORT, "[BOOT] VGA framebuffer mode right after enable: ");
+        com_write_string(COM1_PORT, (VGA_GetFrameBufferMode() == FB_MODE_GRAPHICS) ? "GRAPHICS\n" : "TEXT\n");
+    }
+
+    com_write_string(COM1_PORT, "[BOOT] VGA framebuffer mode after init: ");
+    com_write_string(COM1_PORT, (VGA_GetFrameBufferMode() == FB_MODE_GRAPHICS) ? "GRAPHICS\n" : "TEXT\n");
+
+    /*
+     * IMPORTANT: kernel_main must never return to the bootstrap.
+     * If we return, the 64-bit entry stub would resume execution after the call site
+     * and may run into undefined bytes, causing random exceptions.
+     */
+    if (want_gfx_test) {
+        kernel_post_init_graphics_test(mb2_ptr);
+    } else {
+        kernel_post_init_run_shell();
+    }
+
+    /* Should never be reached */
+    for (;;) {
         __asm__ volatile("hlt");
     }
 }
