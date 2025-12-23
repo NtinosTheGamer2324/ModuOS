@@ -21,4 +21,8 @@ long_mode_start:
 
     call kernel_main
 
+    ; kernel_main should never return, but if it does, don't run into garbage.
+.hang:
+    cli
     hlt
+    jmp .hang
