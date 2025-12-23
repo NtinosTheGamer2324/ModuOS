@@ -85,6 +85,26 @@ struct multiboot_tag_module {
     char cmdline[0];
 };
 
+/* Framebuffer tag (type 8)
+ * https://www.gnu.org/software/grub/manual/multiboot2/multiboot.html
+ */
+struct __attribute__((packed)) multiboot_tag_framebuffer {
+    uint32_t type;
+    uint32_t size;
+    uint64_t framebuffer_addr;
+    uint32_t framebuffer_pitch;
+    uint32_t framebuffer_width;
+    uint32_t framebuffer_height;
+    uint8_t  framebuffer_bpp;
+    uint8_t  framebuffer_type;
+    uint16_t reserved;
+    // followed by color info (ignored for now)
+};
+
+#define MULTIBOOT_FRAMEBUFFER_TYPE_INDEXED  0
+#define MULTIBOOT_FRAMEBUFFER_TYPE_RGB      1
+#define MULTIBOOT_FRAMEBUFFER_TYPE_EGA_TEXT 2
+
 /* Helper function to find tags */
 static inline struct multiboot_tag *multiboot2_find_tag(void *mboot_ptr, uint32_t tag_type) {
     if (!mboot_ptr) return NULL;
