@@ -1,128 +1,152 @@
 #include "moduos/drivers/input/input.h"
-#include "moduos/drivers/input/ps2/ps2.h"
+#include "moduos/drivers/input/ps2/ps2.h" // ps2_init(), keyboard_irq_handler()
+
 #include "moduos/drivers/USB/usb.h"
 #include "moduos/drivers/USB/Classes/hid.h"
 #include "moduos/drivers/USB/Controllers/uhci.h"
 #include "moduos/drivers/USB/Controllers/ohci.h"
 #include "moduos/drivers/USB/Controllers/ehci.h"
+
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/events/events.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/memory/string.h"
-#include <stdbool.h>
+#include "moduos/fs/devfs.h"
 
-// Input device tracking
-static bool ps2_available = false;
-static bool usb_available = false;
+#include <stdbool.h>
 
 // USB HID state tracking
 static hid_keyboard_report_t last_usb_kbd_report = {0};
-static bool usb_shift_pressed = false;
+
+// ---------------- Line discipline (POSIX-ish) ----------------
+
+static char g_line_buf[256];
+static size_t g_line_idx = 0;
+
+void replace_input_line(const char* new_text) {
+    if (!new_text) new_text = "";
+
+    // Erase current line visually
+    while (g_line_idx > 0) {
+        g_line_idx--;
+        VGA_Backspace();
+    }
+
+    // Copy + echo
+    size_t len = strlen(new_text);
+    if (len >= sizeof(g_line_buf)) len = sizeof(g_line_buf) - 1;
+
+    for (size_t i = 0; i < len; i++) {
+        g_line_buf[i] = new_text[i];
+        VGA_WriteChar(new_text[i]);
+    }
+
+    g_line_idx = len;
+    g_line_buf[g_line_idx] = 0;
+}
+
+// Read a line from $/dev/input/event0, echoing to VGA.
+// Arrow keys call shell hooks for history browsing.
+char* input(void) {
+    /*
+     * Ensure interrupts are enabled while we wait for input.
+     * Some call paths (or future scheduler changes) may enter with IF=0; without this,
+     * blocking reads can appear as "keyboard dead".
+     */
+    __asm__ volatile("sti" ::: "memory");
+
+    g_line_idx = 0;
+    g_line_buf[0] = 0;
+
+    void *h = devfs_open("event0", O_RDONLY);
+    if (!h) return g_line_buf;
+
+    for (;;) {
+        Event e;
+        ssize_t n = devfs_read(h, &e, sizeof(e));
+        if (n != (ssize_t)sizeof(e)) continue;
+        if (e.type != EVENT_KEY_PRESSED) continue;
+
+        // Shell history keys
+        if (e.data.keyboard.keycode == KEY_ARROW_UP) {
+            extern void up_arrow_pressed(void);
+            up_arrow_pressed();
+            continue;
+        }
+        if (e.data.keyboard.keycode == KEY_ARROW_DOWN) {
+            extern void down_arrow_pressed(void);
+            down_arrow_pressed();
+            continue;
+        }
+
+        if (e.data.keyboard.keycode == KEY_BACKSPACE) {
+            if (g_line_idx > 0) {
+                g_line_idx--;
+                g_line_buf[g_line_idx] = 0;
+                VGA_Backspace();
+            }
+            continue;
+        }
+
+        if (e.data.keyboard.keycode == KEY_TAB) {
+            // Keep old behavior: tab inserts 2 spaces
+            if (g_line_idx + 2 < sizeof(g_line_buf)) {
+                g_line_buf[g_line_idx++] = ' ';
+                g_line_buf[g_line_idx++] = ' ';
+                g_line_buf[g_line_idx] = 0;
+                VGA_Write("  ");
+            }
+            continue;
+        }
+
+        if (e.data.keyboard.keycode == KEY_ENTER) {
+            VGA_WriteChar('\n');
+            break;
+        }
+
+        char c = e.data.keyboard.ascii;
+        if (c && g_line_idx + 1 < sizeof(g_line_buf)) {
+            g_line_buf[g_line_idx++] = c;
+            g_line_buf[g_line_idx] = 0;
+            VGA_WriteChar(c);
+        }
+    }
+
+    devfs_close(h);
+    return g_line_buf;
+}
 
 // Initialize all input subsystems
 int input_init(void) {
     COM_LOG_INFO(COM1_PORT, "Initializing input subsystem");
-    
-    // Try PS/2 first
+
+    // PS/2
     COM_LOG_INFO(COM1_PORT, "Initializing PS/2 input");
     if (ps2_init() != 0) {
         COM_LOG_WARN(COM1_PORT, "PS/2 did not respond! (This happens on some VMs)");
-        ps2_available = false;
     } else {
         COM_LOG_OK(COM1_PORT, "PS/2 initialized");
-        ps2_available = true;
+
     }
-    
-    // Initialize USB input
+
+    // USB + HID
     COM_LOG_INFO(COM1_PORT, "Initializing USB input");
-    
-    // Initialize USB subsystem (this will automatically probe and initialize controllers)
     usb_init();
-    
-    // Initialize HID driver
     hid_init();
-    
-    usb_available = true;
     COM_LOG_OK(COM1_PORT, "USB input initialized");
-    
+
     COM_LOG_OK(COM1_PORT, "Input subsystem initialized");
     return 0;
 }
 
-// Process USB keyboard report (called from HID interrupt callback)
-void usb_process_keyboard_report(hid_device_t *hid) {
-    if (!hid) return;
-    
-    hid_keyboard_report_t *report = &hid->report.keyboard;
-    
-    // Track shift state
-    usb_shift_pressed = (report->modifiers & (HID_MOD_LEFT_SHIFT | HID_MOD_RIGHT_SHIFT)) != 0;
-    
-    // Process new key presses
-    for (int j = 0; j < 6; j++) {
-        uint8_t key = report->keys[j];
-        if (key == 0) continue;
-        
-        // Check if this is a new key press
-        bool is_new = true;
-        for (int k = 0; k < 6; k++) {
-            if (last_usb_kbd_report.keys[k] == key) {
-                is_new = false;
-                break;
-            }
-        }
-        
-        if (is_new) {
-            // Create keyboard event
-            KeyCode keycode = usb_hid_to_keycode(key);
-            char c = hid_keycode_to_ascii(key, report->modifiers);
-            
-            Event event = event_create_key_pressed(
-                keycode, 
-                key,
-                c, 
-                usb_get_event_modifiers(report->modifiers),
-                false
-            );
-            
-            event_push(&event);
-            
-            // Also feed to input buffer for compatibility
-            usb_handle_key_press(key, report->modifiers);
-        }
-    }
-    
-    // Process key releases
-    for (int j = 0; j < 6; j++) {
-        uint8_t old_key = last_usb_kbd_report.keys[j];
-        if (old_key == 0) continue;
-        
-        // Check if this key was released
-        bool still_pressed = false;
-        for (int k = 0; k < 6; k++) {
-            if (report->keys[k] == old_key) {
-                still_pressed = true;
-                break;
-            }
-        }
-        
-        if (!still_pressed) {
-            KeyCode keycode = usb_hid_to_keycode(old_key);
-            
-            Event event = event_create_key_released(
-                keycode,
-                old_key,
-                usb_get_event_modifiers(report->modifiers),
-                false
-            );
-            
-            event_push(&event);
-        }
-    }
-    
-    // Save current report
-    memcpy(&last_usb_kbd_report, report, sizeof(hid_keyboard_report_t));
+// Convert USB HID modifiers to event system modifiers
+uint8_t usb_get_event_modifiers(uint8_t hid_mods) {
+    uint8_t mods = 0;
+    if (hid_mods & (HID_MOD_LEFT_SHIFT | HID_MOD_RIGHT_SHIFT)) mods |= MOD_SHIFT;
+    if (hid_mods & (HID_MOD_LEFT_CTRL | HID_MOD_RIGHT_CTRL)) mods |= MOD_CTRL;
+    if (hid_mods & (HID_MOD_LEFT_ALT | HID_MOD_RIGHT_ALT)) mods |= MOD_ALT;
+    return mods;
 }
 
 // Convert USB HID keycode to internal KeyCode enum
@@ -160,71 +184,68 @@ KeyCode usb_hid_to_keycode(uint8_t hid_code) {
     }
 }
 
-// Convert USB HID modifiers to event system modifiers
-uint8_t usb_get_event_modifiers(uint8_t hid_mods) {
-    uint8_t mods = 0;
-    
-    if (hid_mods & (HID_MOD_LEFT_SHIFT | HID_MOD_RIGHT_SHIFT))
-        mods |= MOD_SHIFT;
-    if (hid_mods & (HID_MOD_LEFT_CTRL | HID_MOD_RIGHT_CTRL))
-        mods |= MOD_CTRL;
-    if (hid_mods & (HID_MOD_LEFT_ALT | HID_MOD_RIGHT_ALT))
-        mods |= MOD_ALT;
-    
-    return mods;
+// Process USB keyboard report (called from HID interrupt callback)
+void usb_process_keyboard_report(hid_device_t *hid) {
+    if (!hid) return;
+
+    hid_keyboard_report_t *report = &hid->report.keyboard;
+
+    // Process new key presses
+    for (int j = 0; j < 6; j++) {
+        uint8_t key = report->keys[j];
+        if (key == 0) continue;
+
+        bool is_new = true;
+        for (int k = 0; k < 6; k++) {
+            if (last_usb_kbd_report.keys[k] == key) { is_new = false; break; }
+        }
+
+        if (is_new) {
+            KeyCode keycode = usb_hid_to_keycode(key);
+            char c = hid_keycode_to_ascii(key, report->modifiers);
+
+            Event event = event_create_key_pressed(
+                keycode,
+                key,
+                c,
+                usb_get_event_modifiers(report->modifiers),
+                false
+            );
+
+            event_push(&event);
+            devfs_input_push_event(&event);
+        }
+    }
+
+    // Process key releases
+    for (int j = 0; j < 6; j++) {
+        uint8_t old_key = last_usb_kbd_report.keys[j];
+        if (old_key == 0) continue;
+
+        bool still_pressed = false;
+        for (int k = 0; k < 6; k++) {
+            if (report->keys[k] == old_key) { still_pressed = true; break; }
+        }
+
+        if (!still_pressed) {
+            KeyCode keycode = usb_hid_to_keycode(old_key);
+
+            Event event = event_create_key_released(
+                keycode,
+                old_key,
+                usb_get_event_modifiers(report->modifiers),
+                false
+            );
+
+            event_push(&event);
+            devfs_input_push_event(&event);
+        }
+    }
+
+    memcpy(&last_usb_kbd_report, report, sizeof(hid_keyboard_report_t));
 }
 
-// Handle USB key press for input buffer (compatibility with PS/2 input)
-void usb_handle_key_press(uint8_t hid_key, uint8_t modifiers) {
-    // Use shared input buffer from ps2.h
-    extern char input_buffer[256];
-    extern size_t input_index;
-    extern bool input_ready;
-    
-    char c = hid_keycode_to_ascii(hid_key, modifiers);
-    
-    // Handle special keys
-    if (hid_key == HID_KEY_UP_ARROW) {
-        extern void up_arrow_pressed(void);
-        up_arrow_pressed();
-        return;
-    }
-    
-    if (hid_key == HID_KEY_DOWN_ARROW) {
-        extern void down_arrow_pressed(void);
-        down_arrow_pressed();
-        return;
-    }
-    
-    if (hid_key == HID_KEY_TAB) {
-        if (input_index < 256 - 1) {
-            input_buffer[input_index++] = ' ';
-            input_buffer[input_index++] = ' ';
-            VGA_Write("  ");
-        }
-        return;
-    }
-    
-    if (hid_key == HID_KEY_BACKSPACE) {
-        if (input_index > 0) {
-            input_index--;
-            input_buffer[input_index] = '\0';
-            VGA_Backspace();
-        }
-        return;
-    }
-    
-    if (hid_key == HID_KEY_ENTER) {
-        VGA_WriteChar('\n');
-        input_ready = true;
-        return;
-    }
-    
-    // Regular character input
-    if (c) {
-        if (input_index < 256 - 1) {
-            input_buffer[input_index++] = c;
-            VGA_WriteChar(c);
-        }
-    }
+// Legacy polling function (USB is interrupt-driven)
+void usb_input_poll(void) {
+    // no-op
 }
