@@ -121,6 +121,33 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
             // Set up page flags
             uint64_t flags = PFLAG_PRESENT | PFLAG_WRITABLE;
             
+            /*
+             * Safety: if the target virtual range is already mapped (e.g. repeated exec),
+             * unmap it first. This prevents collisions with existing mappings, especially
+             * when reusing the same process address space template.
+             */
+            {
+                size_t pages = aligned_size / PAGE_SIZE;
+                int unmapped_any = 0;
+                for (size_t p = 0; p < pages; p++) {
+                    uint64_t vcheck = vaddr_aligned + (uint64_t)p * PAGE_SIZE;
+                    if (paging_virt_to_phys(vcheck) != 0) {
+                        if (!unmapped_any) {
+                            com_write_string(COM1_PORT, "[ELF] Warning: target vaddr range already mapped; unmapping first...\n");
+                            unmapped_any = 1;
+                        }
+                        paging_unmap_page(vcheck);
+                    }
+                }
+                if (unmapped_any) {
+                    __asm__ volatile(
+                        "mov %%cr3, %%rax\n"
+                        "mov %%rax, %%cr3\n"
+                        ::: "rax", "memory"
+                    );
+                }
+            }
+
             // Map the pages
             com_write_string(COM1_PORT, "[ELF] Mapping 0x");
             for (int j = 15; j >= 0; j--) {
