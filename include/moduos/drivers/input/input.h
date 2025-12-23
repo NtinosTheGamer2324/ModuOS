@@ -9,7 +9,11 @@
 int input_init(void);
 
 // Get a line of input from the keyboard (blocks until Enter is pressed)
+// Uses $/dev/event0 and provides basic line discipline (echo, backspace, history arrows).
 char* input(void);
+
+// Replace the current input line visually (used by shell history browsing)
+void replace_input_line(const char* new_text);
 
 // IRQ handler - called by the active keyboard driver
 void keyboard_irq_handler(void);
