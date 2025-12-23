@@ -247,8 +247,26 @@ uint64_t phys_alloc_frame(void) {
             return phys_from_idx(i);
         }
     }
-    
+
     return 0; /* Out of memory */
+}
+
+uint64_t phys_alloc_frame_below(uint64_t max_phys) {
+    if (!bitmap || frame_count == 0 || max_phys == 0)
+        return 0;
+
+    for (uint64_t i = 0; i < frame_count; i++) {
+        if (bm_test(i)) continue;
+
+        uint64_t phys = phys_from_idx(i);
+        if (phys == 0) continue;
+        if (phys >= max_phys) continue;
+
+        bm_set(i);
+        return phys;
+    }
+
+    return 0;
 }
 
 void phys_free_frame(uint64_t phys) {
