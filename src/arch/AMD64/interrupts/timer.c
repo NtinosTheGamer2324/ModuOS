@@ -1,8 +1,8 @@
 #include "moduos/arch/AMD64/interrupts/timer.h"
 #include "moduos/arch/AMD64/interrupts/irq.h"
+#include "moduos/arch/AMD64/interrupts/pic.h"
 #include "moduos/kernel/io/io.h"
 #include "moduos/kernel/process/process.h"
-
 #define PIT_CHANNEL0 0x40
 #define PIT_COMMAND  0x43
 
