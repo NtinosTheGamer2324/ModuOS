@@ -44,6 +44,10 @@ typedef struct process {
     uint32_t parent_pid;
     char name[PROCESS_NAME_MAX];
 
+    /* User identity */
+    uint32_t uid; /* 0 = mdman/root */
+    uint32_t gid;
+
     process_state_t state;
     int exit_code;
 
@@ -67,6 +71,10 @@ typedef struct process {
     // Arguments (Windows-style)
     int argc;
     char **argv;
+
+    // Filesystem context
+    char cwd[256];           // Current working directory
+    int current_slot;        // Currently active filesystem slot (-1 = none)
 
     // Linked list for scheduler
     struct process *next;
