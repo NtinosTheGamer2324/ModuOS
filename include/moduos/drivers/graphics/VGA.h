@@ -41,6 +41,10 @@ void VGA_EnableScrolling(bool enable);
 void VGA_ShowCursor(void);
 void VGA_HideCursor(void);
 
+/* Cursor position (TEXT mode only; in GRAPHICS mode this maps to fb_console cursor) */
+void VGA_GetCursorPosition(int *row, int *col);
+void VGA_SetCursorPosition(int row, int col);
+
 /* Text color control */
 void VGA_SetTextColor(uint8_t fg, uint8_t bg);
 uint8_t VGA_GetTextColor(void); /* returns (bg<<4)|fg */

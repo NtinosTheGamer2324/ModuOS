@@ -42,6 +42,11 @@ typedef struct {
     /* Cell size (pixels) */
     uint16_t cell_w;
     uint16_t cell_h;
+
+    /* Incremental UTF-8 decode state for fbcon_putc (so per-byte writes can still render UTF-8). */
+    uint8_t utf8_pending_len;   /* expected total bytes in sequence (0 if not in a sequence) */
+    uint8_t utf8_pending_used;  /* how many bytes collected so far */
+    uint8_t utf8_pending[4];    /* collected bytes */
 } fb_console_t;
 
 /* Initialize console for a given framebuffer using built-in bitmap font. */
@@ -66,6 +71,10 @@ void fbcon_write_at(fb_console_t *c, uint32_t row, uint32_t col, const char *s);
 
 /* Enable/disable a static cursor (non-blinking). */
 void fbcon_set_cursor_enabled(fb_console_t *c, bool enabled);
+
+/* Cursor position in character cells (row/col), derived from internal pixel cursor. */
+void fbcon_get_cursor_pos(const fb_console_t *c, uint32_t *row, uint32_t *col);
+void fbcon_set_cursor_pos(fb_console_t *c, uint32_t row, uint32_t col);
 
 #ifdef __cplusplus
 }

@@ -31,6 +31,7 @@ static bool g_splash_lock = false;
 static void *g_fbcon_font_bmp_buf = NULL;
 static size_t g_fbcon_font_bmp_size = 0;
 static int g_fbcon_font_bmp_loaded = 0;
+
 // Scrollback buffer
 static uint16_t scrollback_buffer[SCROLLBACK_LINES * WIDTH];
 static int scrollback_position = 0;
@@ -92,19 +93,19 @@ int VGA_GetFrameBuffer(framebuffer_t *out) {
 static void vga_try_init_fb_console(void) {
     if (g_fb_mode != FB_MODE_GRAPHICS) return;
 
-    /* If the console is already initialized, we may still be able to attach the BMP font later
+    /* If the console is already initialized, we may still be able to attach fonts later
      * once the boot filesystem is mounted.
      */
     if (g_fbcon_inited) {
-        if (!g_fbcon_font_bmp_loaded) {
-            int slot = kernel_get_boot_slot();
-            if (slot >= 0) {
+        int slot = kernel_get_boot_slot();
+        if (slot >= 0) {
+            /* Optional BMP atlas font */
+            if (!g_fbcon_font_bmp_loaded) {
                 const char *path = "/ModuOS/shared/fonts/ModuOSDEF.bmp";
                 int r = hvfs_read(slot, path, &g_fbcon_font_bmp_buf, &g_fbcon_font_bmp_size);
                 if (r == 0 && g_fbcon_font_bmp_buf && g_fbcon_font_bmp_size) {
                     int fr = fbcon_set_bmp_font_moduosdef(&g_fbcon, g_fbcon_font_bmp_buf, g_fbcon_font_bmp_size);
                     if (fr == 0) {
-                        g_fbcon_font_bmp_loaded = 1;
                         if (kernel_debug_is_med()) {
                             com_write_string(COM1_PORT, "[FBCON] Using BMP font: ");
                             com_write_string(COM1_PORT, path);
@@ -131,8 +132,8 @@ static void vga_try_init_fb_console(void) {
                         if (kernel_debug_is_med()) {
                             com_write_string(COM1_PORT, "[FBCON] BMP font parse failed; keeping built-in font\n");
                         }
-                        g_fbcon_font_bmp_loaded = 1; /* don't retry endlessly */
                     }
+                    g_fbcon_font_bmp_loaded = 1; /* don't retry endlessly */
                 } else {
                     if (kernel_debug_is_med()) {
                         com_write_string(COM1_PORT, "[FBCON] Could not read ModuOSDEF.bmp; keeping built-in font\n");
@@ -150,8 +151,6 @@ static void vga_try_init_fb_console(void) {
         }
         return;
     }
-
-    /* We'll attach ModuOSDEF.bmp later (after boot FS mount) if possible. */
 
     g_fbcon_inited = true;
     if (kernel_debug_is_med()) {
@@ -172,7 +171,7 @@ void VGA_SetFrameBuffer(const framebuffer_t *fb) {
     }
 
     // If invalid, ignore request (do NOT downgrade from graphics mode silently)
-    if (!fb->addr || fb->width == 0 || fb->height == 0 || fb->pitch == 0 || fb->bpp == 0) {
+    if (!fb->addr || fb->phys_addr == 0 || fb->size_bytes == 0 || fb->width == 0 || fb->height == 0 || fb->pitch == 0 || fb->bpp == 0) {
         return;
     }
 
@@ -286,11 +285,44 @@ void VGA_ResetTextColor(void) {
 }
 
 static void update_cursor(int row, int col) {
-    uint16_t pos = row * WIDTH + col;
+    uint16_t pos = (uint16_t)(row * WIDTH + col);
     outb(0x3D4, 0x0F);
     outb(0x3D5, (uint8_t)(pos & 0xFF));
     outb(0x3D4, 0x0E);
     outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
+}
+
+void VGA_GetCursorPosition(int *row, int *col) {
+    if (g_fb_mode == FB_MODE_GRAPHICS && g_fbcon_inited) {
+        uint32_t r = 0, c = 0;
+        fbcon_get_cursor_pos(&g_fbcon, &r, &c);
+        if (row) *row = (int)r;
+        if (col) *col = (int)c;
+        return;
+    }
+
+    if (row) *row = cursor_row;
+    if (col) *col = cursor_col;
+}
+
+void VGA_SetCursorPosition(int row, int col) {
+    if (row < 0) row = 0;
+    if (col < 0) col = 0;
+
+    if (g_fb_mode == FB_MODE_GRAPHICS && g_fbcon_inited) {
+        fbcon_set_cursor_pos(&g_fbcon, (uint32_t)row, (uint32_t)col);
+        /* keep text-mode bookkeeping roughly in sync */
+        cursor_row = row;
+        cursor_col = col;
+        return;
+    }
+
+    if (row >= HEIGHT) row = HEIGHT - 1;
+    if (col >= WIDTH) col = WIDTH - 1;
+
+    cursor_row = row;
+    cursor_col = col;
+    update_cursor(cursor_row, cursor_col);
 }
 
 static void save_line_to_scrollback(int row) {
@@ -688,11 +720,12 @@ void VGA_Write(const char* str) {
                 }
             }
 
+            /* Backslash-based legacy color/backspace codes */
             if (*str == '\\' && *(str + 1)) {
                 // Backspace
-                if (*(str + 1) == 'b' && (*(str + 2) == '\0' || 
-                    (*(str + 2) != 'b' && *(str + 2) != 'r' && *(str + 2) != 'g' && 
-                     *(str + 2) != 'y' && *(str + 2) != 'c' && *(str + 2) != 'p' && 
+                if (*(str + 1) == 'b' && (*(str + 2) == '\0' ||
+                    (*(str + 2) != 'b' && *(str + 2) != 'r' && *(str + 2) != 'g' &&
+                     *(str + 2) != 'y' && *(str + 2) != 'c' && *(str + 2) != 'p' &&
                      *(str + 2) != 'w' && *(str + 2) != 'k' && *(str + 2) != 'l'))) {
                     fbcon_backspace(&g_fbcon);
                     str += 2;
@@ -732,6 +765,18 @@ void VGA_Write(const char* str) {
                 }
             }
 
+            /* Fast path: write a run of normal bytes through fbcon_write_n so UTF-8 works. */
+            const char *start = str;
+            while (*str && (uint8_t)str[0] != 0x1B && str[0] != '\\') {
+                str++;
+            }
+            if (str > start) {
+                fbcon_set_text_color(&g_fbcon, vga_fg_color, vga_bg_color);
+                fbcon_write_n(&g_fbcon, start, (size_t)(str - start));
+                continue;
+            }
+
+            /* Fallback single char */
             fbcon_set_text_color(&g_fbcon, vga_fg_color, vga_bg_color);
             fbcon_putc(&g_fbcon, *str++);
         }
@@ -803,7 +848,8 @@ void VGA_WriteN(const char *buf, size_t count) {
         vga_try_init_fb_console();
         if (!g_fbcon_inited) return;
 
-        for (size_t i = 0; i < count; i++) {
+        size_t i = 0;
+        while (i < count) {
             char ch = buf[i];
 
             /* ANSI: ESC[...m */
@@ -862,8 +908,18 @@ void VGA_WriteN(const char *buf, size_t count) {
                 }
             }
 
+            /* Normal bytes run (UTF-8): feed into fbcon_write_n until next escape/backslash */
+            if ((uint8_t)ch != 0x1B && ch != '\\') {
+                size_t start = i;
+                while (i < count && (uint8_t)buf[i] != 0x1B && buf[i] != '\\') i++;
+                fbcon_set_text_color(&g_fbcon, vga_fg_color, vga_bg_color);
+                fbcon_write_n(&g_fbcon, &buf[start], i - start);
+                continue;
+            }
+
             fbcon_set_text_color(&g_fbcon, vga_fg_color, vga_bg_color);
             fbcon_putc(&g_fbcon, ch);
+            i++;
         }
         // Keep bootscreen/logo on top
         bootscreen_overlay_redraw();

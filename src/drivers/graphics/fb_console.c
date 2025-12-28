@@ -1,4 +1,5 @@
 #include "moduos/drivers/graphics/fb_console.h"
+#include "moduos/drivers/graphics/utf8_decode.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/memory/paging.h"
@@ -256,9 +257,49 @@ void fbcon_set_cursor_enabled(fb_console_t *c, bool enabled) {
     fbcon_cursor_show(c);
 }
 
+void fbcon_get_cursor_pos(const fb_console_t *c, uint32_t *row, uint32_t *col) {
+    if (!c || !c->ready) {
+        if (row) *row = 0;
+        if (col) *col = 0;
+        return;
+    }
+
+    uint32_t rx = (c->x > c->margin_left) ? (c->x - c->margin_left) : 0;
+    uint32_t ry = (c->y > c->margin_top)  ? (c->y - c->margin_top)  : 0;
+
+    uint32_t r = (c->cell_h ? (ry / c->cell_h) : 0);
+    uint32_t cl = (c->cell_w ? (rx / c->cell_w) : 0);
+
+    if (row) *row = r;
+    if (col) *col = cl;
+}
+
+void fbcon_set_cursor_pos(fb_console_t *c, uint32_t row, uint32_t col) {
+    if (!c || !c->ready) return;
+
+    fbcon_cursor_hide(c);
+
+    uint32_t px = c->margin_left + col * (uint32_t)c->cell_w;
+    uint32_t py = c->margin_top  + row * (uint32_t)c->cell_h;
+
+    /* clamp to framebuffer */
+    if (c->fb.width && px >= c->fb.width) {
+        px = c->fb.width - (c->cell_w ? c->cell_w : 1);
+    }
+    if (c->fb.height && py >= c->fb.height) {
+        py = c->fb.height - (c->cell_h ? c->cell_h : 1);
+    }
+
+    c->x = px;
+    c->y = py;
+    c->cursor_drawn = false;
+    fbcon_cursor_show(c);
+}
+
 int fbcon_init(fb_console_t *c, const framebuffer_t *fb) {
     if (!c || !fb || !fb->addr || fb->width == 0 || fb->height == 0 || fb->pitch == 0) return -1;
     memset(c, 0, sizeof(*c));
+    /* utf8_pending_* already zeroed */
 
     c->fb = *fb;
     c->ready = true;
@@ -273,6 +314,7 @@ int fbcon_init(fb_console_t *c, const framebuffer_t *fb) {
     c->bmp_font_ready = 0;
     c->bmp_render_w = 0;
     c->bmp_render_h = 0;
+
 
     /* Small margin helps avoid any top-edge glitches */
     c->margin_top = 2;
@@ -388,7 +430,8 @@ static void fbcon_draw_glyph(fb_console_t *c, uint8_t ch) {
     }
 }
 
-void fbcon_putc(fb_console_t *c, char ch) {
+static void fbcon_putc_raw(fb_console_t *c, char ch) {
+    /* Byte-oriented output used after UTF-8 has been decoded/mapped to CP437/ASCII. */
     if (!c || !c->ready) return;
 
     fbcon_cursor_hide(c);
@@ -402,6 +445,14 @@ void fbcon_putc(fb_console_t *c, char ch) {
         fbcon_cursor_show(c);
         return;
     }
+    if (ch == '\b') {
+        fbcon_backspace(c);
+        return;
+    }
+    if (ch == '\t') {
+        for (int i = 0; i < 4; i++) fbcon_putc_raw(c, ' ');
+        return;
+    }
 
     if (c->x + c->cell_w > c->fb.width) {
         fbcon_newline(c);
@@ -412,14 +463,270 @@ void fbcon_putc(fb_console_t *c, char ch) {
     fbcon_cursor_show(c);
 }
 
+/* Forward declarations for helpers used by UTF-8 emission */
+static const char *fbcon_unicode_to_ascii_fallback(uint32_t cp);
+static uint8_t fbcon_unicode_to_cp437(uint32_t cp);
+
+static size_t fbcon_utf8_encode(uint32_t cp, char out[4]) {
+    if (cp <= 0x7Fu) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp <= 0x7FFu) {
+        out[0] = (char)(0xC0u | ((cp >> 6) & 0x1Fu));
+        out[1] = (char)(0x80u | (cp & 0x3Fu));
+        return 2;
+    }
+    if (cp <= 0xFFFFu) {
+        /* skip surrogates */
+        if (cp >= 0xD800u && cp <= 0xDFFFu) {
+            out[0] = '?';
+            return 1;
+        }
+        out[0] = (char)(0xE0u | ((cp >> 12) & 0x0Fu));
+        out[1] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        out[2] = (char)(0x80u | (cp & 0x3Fu));
+        return 3;
+    }
+    if (cp <= 0x10FFFFu) {
+        out[0] = (char)(0xF0u | ((cp >> 18) & 0x07u));
+        out[1] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+        out[2] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        out[3] = (char)(0x80u | (cp & 0x3Fu));
+        return 4;
+    }
+    out[0] = '?';
+    return 1;
+}
+
+static void fbcon_emit_codepoint(fb_console_t *c, uint32_t cp) {
+    if (!c) return;
+
+    /* Skip variation selector */
+    if (cp == 0xFE0F) return;
+
+#if FBCON_DEBUG
+    if (cp >= 0x80) {
+        char enc[4] = {0,0,0,0};
+        size_t elen = fbcon_utf8_encode(cp, enc);
+        com_printf(COM1_PORT, "[FBCON][UTF8] cp=U+%04x bytes=", (unsigned)cp);
+        for (size_t i = 0; i < elen; i++) {
+            com_printf(COM1_PORT, "%02x", (unsigned)(uint8_t)enc[i]);
+            if (i + 1 < elen) com_write_string(COM1_PORT, " ");
+        }
+        com_write_string(COM1_PORT, " char='");
+        for (size_t i = 0; i < elen; i++) {
+            char tmp[2] = {enc[i], 0};
+            com_write_string(COM1_PORT, tmp);
+        }
+        com_write_string(COM1_PORT, "'\n");
+    }
+#endif
+
+    const char *exp = fbcon_unicode_to_ascii_fallback(cp);
+    if (exp) {
+        while (*exp) fbcon_putc_raw(c, *exp++);
+        return;
+    }
+
+    uint8_t ch = fbcon_unicode_to_cp437(cp);
+    fbcon_putc_raw(c, (char)ch);
+}
+
+void fbcon_putc(fb_console_t *c, char ch) {
+    if (!c || !c->ready) return;
+
+    /* Fast path for ASCII control chars: flush pending UTF-8 and handle immediately. */
+    if ((unsigned char)ch < 0x20 || ch == 0x7F) {
+        c->utf8_pending_len = 0;
+        c->utf8_pending_used = 0;
+        fbcon_putc_raw(c, ch);
+        return;
+    }
+
+    uint8_t b = (uint8_t)ch;
+
+    /* If not currently collecting a UTF-8 sequence, decide what to do. */
+    if (c->utf8_pending_len == 0) {
+        if (b < 0x80) {
+            fbcon_putc_raw(c, (char)b);
+            return;
+        }
+
+        /* Start sequence */
+        uint8_t need = 0;
+        if ((b & 0xE0) == 0xC0) need = 2;
+        else if ((b & 0xF0) == 0xE0) need = 3;
+        else if ((b & 0xF8) == 0xF0) need = 4;
+        else {
+            fbcon_putc_raw(c, '?');
+            return;
+        }
+
+        c->utf8_pending_len = need;
+        c->utf8_pending_used = 0;
+    }
+
+    /* Collect bytes */
+    if (c->utf8_pending_used < 4) {
+        c->utf8_pending[c->utf8_pending_used++] = b;
+    }
+
+    /* Validate continuation bytes if we're past the first byte */
+    if (c->utf8_pending_used > 1) {
+        if ((b & 0xC0) != 0x80) {
+            c->utf8_pending_len = 0;
+            c->utf8_pending_used = 0;
+            fbcon_putc_raw(c, '?');
+            return;
+        }
+    }
+
+    /* If complete, decode */
+    if (c->utf8_pending_used >= c->utf8_pending_len) {
+        uint32_t cp = 0;
+        size_t seq_len = c->utf8_pending_len;
+        uint8_t seq_bytes[4] = {0,0,0,0};
+        for (size_t bi = 0; bi < seq_len && bi < 4; bi++) seq_bytes[bi] = c->utf8_pending[bi];
+
+        size_t used = utf8_decode_one((const char*)seq_bytes, seq_len, &cp);
+        c->utf8_pending_len = 0;
+        c->utf8_pending_used = 0;
+
+        if (used == 0) {
+            fbcon_putc_raw(c, '?');
+            return;
+        }
+
+        /* Debug logging is handled in fbcon_emit_codepoint so buffered and bytewise output behave the same. */
+
+        fbcon_emit_codepoint(c, cp);
+    }
+}
+
+/* Map a subset of Unicode codepoints to CP437 glyph indices.
+ * This keeps rendering fast while supporting common UTF-8 text and box-drawing.
+ */
+/* If cp should expand to an ASCII string (emojis/checkmarks), return it; else NULL. */
+static const char *fbcon_unicode_to_ascii_fallback(uint32_t cp) {
+    switch (cp) {
+        /* Checkmarks */
+        case 0x2713: /* ✓ */ return "[OK]";
+        case 0x2714: /* ✔ */ return "[OK]";
+        case 0x2705: /* ✅ */ return "[OK]";
+        case 0x2611: /* ☑ */ return "[x]";
+        case 0x2610: /* ☐ */ return "[ ]";
+
+        /* Common emojis (fallbacks) */
+        case 0x1F600: /* 😀 */ return ":D";
+        case 0x1F603: /* 😃 */ return ":D";
+        case 0x1F604: /* 😄 */ return ":D";
+        case 0x1F642: /* 🙂 */ return ":)";
+        case 0x1F610: /* 😐 */ return ":|";
+        case 0x1F622: /* 😢 */ return ":'(";
+        case 0x1F62D: /* 😭 */ return ":'(";
+        case 0x1F602: /* 😂 */ return "xD";
+        case 0x1F525: /* 🔥 */ return "!!";
+        case 0x1F44D: /* 👍 */ return "+1";
+        case 0x1F44E: /* 👎 */ return "-1";
+        case 0x1F4A9: /* 💩 */ return "[poop]";
+        case 0x1F680: /* 🚀 */ return "->";
+        case 0x1F389: /* 🎉 */ return "*";
+        case 0x1F496: /* 💖 */ return "<3";
+        case 0x1F499: /* 💙 */ return "<3";
+        case 0x1F49A: /* 💚 */ return "<3";
+        case 0x1F49B: /* 💛 */ return "<3";
+        case 0x1F49C: /* 💜 */ return "<3";
+
+        /* Heart (sometimes comes as U+2764 U+FE0F) */
+        case 0x2764: /* ❤ */ return "<3";
+
+        default: return NULL;
+    }
+}
+
+static uint8_t fbcon_unicode_to_cp437(uint32_t cp) {
+    if (cp < 0x80) return (uint8_t)cp;
+
+    /* Latin-1 supplement (partial) */
+    switch (cp) {
+        case 0x00A0: return 0x20; /* NBSP -> space */
+        case 0x00A9: return 0xA9; /* © */
+        case 0x00AE: return 0xAE; /* ® */
+        case 0x00B0: return 0xF8; /* ° */
+        case 0x00B1: return 0xF1; /* ± */
+        case 0x00B5: return 0xE6; /* µ */
+        case 0x00D7: return 0xD9; /* × */
+        case 0x00F7: return 0xF6; /* ÷ */
+        default: break;
+    }
+
+    /* Box drawing (Unicode) -> CP437 */
+    switch (cp) {
+        case 0x2500: return 0xC4; /* ─ */
+        case 0x2502: return 0xB3; /* │ */
+        case 0x250C: return 0xDA; /* ┌ */
+        case 0x2510: return 0xBF; /* ┐ */
+        case 0x2514: return 0xC0; /* └ */
+        case 0x2518: return 0xD9; /* ┘ */
+        case 0x251C: return 0xC3; /* ├ */
+        case 0x2524: return 0xB4; /* ┤ */
+        case 0x252C: return 0xC2; /* ┬ */
+        case 0x2534: return 0xC1; /* ┴ */
+        case 0x253C: return 0xC5; /* ┼ */
+        case 0x2588: return 0xDB; /* █ */
+        case 0x2591: return 0xB0; /* ░ */
+        case 0x2592: return 0xB1; /* ▒ */
+        case 0x2593: return 0xB2; /* ▓ */
+        default: break;
+    }
+
+    /* Fallback */
+    return '?';
+}
+
 void fbcon_write(fb_console_t *c, const char *s) {
     if (!c || !s) return;
-    while (*s) fbcon_putc(c, *s++);
+
+    /* Ensure we don't mix buffered UTF-8 decoding with an in-progress bytewise sequence. */
+    c->utf8_pending_len = 0;
+    c->utf8_pending_used = 0;
+
+    size_t i = 0;
+    size_t n = strlen(s);
+    while (i < n) {
+        uint32_t cp = 0;
+        size_t used = utf8_decode_one(s + i, n - i, &cp);
+        if (used == 0) {
+            fbcon_putc_raw(c, '?');
+            i++;
+            continue;
+        }
+
+        fbcon_emit_codepoint(c, cp);
+        i += used;
+    }
 }
 
 void fbcon_write_n(fb_console_t *c, const char *s, size_t n) {
     if (!c || !s) return;
-    for (size_t i = 0; i < n; i++) fbcon_putc(c, s[i]);
+
+    c->utf8_pending_len = 0;
+    c->utf8_pending_used = 0;
+
+    size_t i = 0;
+    while (i < n) {
+        uint32_t cp = 0;
+        size_t used = utf8_decode_one(s + i, n - i, &cp);
+        if (used == 0) {
+            fbcon_putc_raw(c, '?');
+            i++;
+            continue;
+        }
+
+        fbcon_emit_codepoint(c, cp);
+        i += used;
+    }
 }
 
 void fbcon_write_at(fb_console_t *c, uint32_t row, uint32_t col, const char *s) {

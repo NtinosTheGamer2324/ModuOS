@@ -18,7 +18,10 @@ typedef enum {
 } framebuffer_format_t;
 
 typedef struct {
-    void *addr;             // linear framebuffer virtual address
+    void *addr;             // linear framebuffer virtual address (kernel)
+    uint64_t phys_addr;     // physical base address of the framebuffer
+    uint64_t size_bytes;    // mapped size in bytes
+
     uint32_t width;
     uint32_t height;
     uint32_t pitch;         // bytes per scanline
