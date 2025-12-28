@@ -162,5 +162,6 @@ int fd_closedir(int fd);
 
 /* Open DEVVFS pseudo directories (kind: 1=$/mnt, 2=$/dev) */
 int fd_devvfs_opendir(int kind);
+int fd_devvfs_opendir_dev(const char *dev_subdir);
 
 #endif /* FD_H */

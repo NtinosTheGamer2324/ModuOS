@@ -9,6 +9,7 @@
 #include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/fs/path.h"
 #include "moduos/fs/devfs.h"
+#include "moduos/drivers/graphics/VGA.h"
 
 /* Enhanced file descriptor structure with cached data */
 typedef struct {
@@ -84,7 +85,12 @@ static int fd_open_devfs_internal(const char *node, int flags) {
     fd_init();
     if (!node || !*node) return -1;
 
-    void *h = devfs_open(node, flags);
+    // Prefer tree-based open (supports subpaths like input/kbd0)
+    void *h = devfs_open_path(node, flags);
+    if (!h) {
+        // fallback legacy root-only
+        h = devfs_open(node, flags);
+    }
     if (!h) return -1;
 
     int fd = find_free_fd();
@@ -309,29 +315,40 @@ ssize_t fd_read(int fd, void* buffer, size_t count) {
     return (ssize_t)to_read;
 }
 
-/* Write to file descriptor (stub) */
+/* Write to file descriptor */
 ssize_t fd_write(int fd, const void* buffer, size_t count) {
-    (void)buffer;
-    
     fd_init();
-    
+
     if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
         return -1;
     }
-    
+
+    if (!buffer && count != 0) return -1;
+
     /* Check write permission */
     if (!(fd_table[fd].flags & FD_FLAG_WRITE)) {
         return -2;
     }
-    
+
     /* Handle stdout/stderr specially */
     if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
-        /* Would write to VGA here */
+        /* Userspace typically writes via SYS_WRITE (string) for console output.
+         * SYS_WRITEFILE is primarily used for binary-safe writes.
+         */
+        if (buffer && count) {
+            VGA_WriteN((const char*)buffer, count);
+        }
         return (ssize_t)count;
     }
-    
-    /* File writing not implemented yet */
-    com_write_string(COM1_PORT, "[FD] File writing not implemented\n");
+
+    /* devfs-backed FD: dispatch to devfs_write */
+    if (fd_table[fd].is_devfs) {
+        if (!fd_table[fd].cached_data) return -4;
+        return devfs_write(fd_table[fd].cached_data, buffer, count);
+    }
+
+    /* Regular file writing still not implemented */
+    com_write_string(COM1_PORT, "[FD] File writing not implemented (non-devfs)\n");
     return -3;
 }
 
@@ -515,9 +532,10 @@ int fd_opendir(int mount_slot, const char* path) {
 }
 
 typedef struct {
-    int kind;   /* 1=$/mnt, 2=$/dev, 3=$/dev/input, 4=$/dev/graphics */
+    int kind;   /* 0=$/, 1=$/mnt, 2=$/dev */
     int index;  /* current index */
-    int cookie; /* for devfs listing */
+    int cookie; /* for devfs directory listing */
+    char dev_path[128]; /* for kind=2: subdir path under $/dev ("" for root) */
 } devvfs_dir_t;
 
 static void devvfs_sanitize(const char *in, char *out, size_t out_sz) {
@@ -539,21 +557,57 @@ static void devvfs_sanitize(const char *in, char *out, size_t out_sz) {
     out[j] = 0;
 }
 
-int fd_devvfs_opendir(int kind) {
+int fd_devvfs_opendir_dev(const char *dev_subdir) {
     fd_init();
-
-    if (kind != 0 && kind != 1 && kind != 2 && kind != 3 && kind != 4) return -1;
 
     int fd = find_free_fd();
     if (fd < 0) return -1;
 
     devvfs_dir_t *h = (devvfs_dir_t*)kmalloc(sizeof(devvfs_dir_t));
     if (!h) return -1;
-    h->kind = kind;
-    // kind=0 ($/) emits top-level dirs; kind=2 ($/dev) emits "input" dir first
-    if (kind == 0) h->index = 0;
-    else h->index = (kind == 2) ? -1 : 0;
+    memset(h, 0, sizeof(*h));
+    h->kind = 2;
+    h->index = 0;
     h->cookie = 0;
+    if (dev_subdir) {
+        strncpy(h->dev_path, dev_subdir, sizeof(h->dev_path) - 1);
+        h->dev_path[sizeof(h->dev_path) - 1] = 0;
+    }
+
+    process_t* proc = process_get_current();
+    int pid = proc ? proc->pid : 0;
+
+    fd_table[fd].in_use = 1;
+    fd_table[fd].mount_slot = -1;
+    fd_table[fd].path[0] = '\0';
+    fd_table[fd].position = 0;
+    fd_table[fd].file_size = 0;
+    fd_table[fd].flags = FD_FLAG_READ;
+    fd_table[fd].pid = pid;
+    fd_table[fd].cached_data = NULL;
+    fd_table[fd].is_directory = 1;
+    fd_table[fd].is_devvfs = 1;
+    fd_table[fd].dir_handle = h;
+
+    return fd;
+}
+
+int fd_devvfs_opendir(int kind) {
+    fd_init();
+
+    if (kind != 0 && kind != 1) return -1;
+
+    int fd = find_free_fd();
+    if (fd < 0) return -1;
+
+    devvfs_dir_t *h = (devvfs_dir_t*)kmalloc(sizeof(devvfs_dir_t));
+    if (!h) return -1;
+    memset(h, 0, sizeof(*h));
+    h->kind = kind;
+    if (kind == 0) h->index = 0;
+    else h->index = 0;
+    h->cookie = 0;
+    h->dev_path[0] = 0;
 
     process_t* proc = process_get_current();
     int pid = proc ? proc->pid : 0;
@@ -638,40 +692,18 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
         }
 
         if (h->kind == 2) {
-            // $/dev: expose "input" + "graphics" directories, plus non-input devfs devices (e.g. vDrives)
-            if (h->index == -1) {
-                strncpy(name_buf, "input", buf_size - 1);
-                name_buf[buf_size - 1] = 0;
-                if (is_dir) *is_dir = 1;
+            // $/dev or $/dev/<subdir>: list DEVFS tree
+            int d_is_dir = 0;
+            int rc = devfs_list_dir_next(h->dev_path, &h->cookie, name_buf, buf_size, &d_is_dir);
+            if (rc == 1) {
+                if (is_dir) *is_dir = d_is_dir;
                 if (size) *size = 0;
-                h->index = -2;
-                return 1;
-            }
-            if (h->index == -2) {
-                strncpy(name_buf, "graphics", buf_size - 1);
-                name_buf[buf_size - 1] = 0;
-                if (is_dir) *is_dir = 1;
-                if (size) *size = 0;
-                h->index = 0;
                 return 1;
             }
 
-            // devfs devices (filter out input devices; they live under $/dev/input)
-            {
-                extern int devfs_list_next(int *cookie, char *name_buf, size_t buf_size);
-                for (;;) {
-                    int rc = devfs_list_next(&h->cookie, name_buf, buf_size);
-                    if (rc != 1) break;
-                    if (strcmp(name_buf, "event0") == 0) continue;
-                    if (strcmp(name_buf, "kbd0") == 0) continue;
-                    if (strcmp(name_buf, "video0") == 0) continue; // listed under $/dev/graphics
-                    if (is_dir) *is_dir = 0;
-                    if (size) *size = 0;
-                    return 1;
-                }
-            }
+            // After DEVFS entries, append vDrive devices only at $/dev root.
+            if (h->dev_path[0] != 0) return 0;
 
-            // then vDrives
             int count = vdrive_get_count();
             if (h->index >= count) return 0;
             int vdrive_id = h->index;
@@ -691,32 +723,6 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
             }
 
             strncpy(name_buf, name, buf_size - 1);
-            name_buf[buf_size - 1] = 0;
-            if (is_dir) *is_dir = 0;
-            if (size) *size = 0;
-            h->index++;
-            return 1;
-        }
-
-        if (h->kind == 3) {
-            // $/dev/input: linux-like input directory
-            const char *names[] = {"event0", "kbd0"};
-            const int n_names = 2;
-            if (h->index >= n_names) return 0;
-            strncpy(name_buf, names[h->index], buf_size - 1);
-            name_buf[buf_size - 1] = 0;
-            if (is_dir) *is_dir = 0;
-            if (size) *size = 0;
-            h->index++;
-            return 1;
-        }
-
-        if (h->kind == 4) {
-            // $/dev/graphics: graphics directory
-            const char *names[] = {"video0"};
-            const int n_names = 1;
-            if (h->index >= n_names) return 0;
-            strncpy(name_buf, names[h->index], buf_size - 1);
             name_buf[buf_size - 1] = 0;
             if (is_dir) *is_dir = 0;
             if (size) *size = 0;

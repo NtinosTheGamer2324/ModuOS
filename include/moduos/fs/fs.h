@@ -7,9 +7,10 @@
 
 /* Filesystem types */
 typedef enum {
-    FS_TYPE_UNKNOWN = 0,
-    FS_TYPE_FAT32   = 1,
-    FS_TYPE_ISO9660 = 2
+    FS_TYPE_UNKNOWN   = 0,
+    FS_TYPE_FAT32     = 1,
+    FS_TYPE_ISO9660   = 2,
+    FS_TYPE_EXTERNAL  = 3
 } fs_type_t;
 
 /* File information structure */
@@ -21,10 +22,17 @@ typedef struct {
 } fs_file_info_t;
 
 /* Mount handle - encapsulates filesystem-specific handle */
+struct fs_ext_driver_ops;
+
 typedef struct {
     fs_type_t type;           /* Filesystem type */
     int handle;               /* Filesystem-specific handle */
     int valid;                /* Is this mount valid? */
+
+    // External filesystem support (FS_TYPE_EXTERNAL)
+    const struct fs_ext_driver_ops *ext_ops;
+    void *ext_ctx;
+    char ext_name[16];
 } fs_mount_t;
 
 /* --- KERNEL MOUNT TABLE MANAGEMENT --- */
@@ -74,6 +82,48 @@ int fs_format(int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors,
  *          -5: Mount failed
  *          -6: vDrive not ready
  */
+// Forward declarations for external driver ops
+struct fs_dir;
+struct fs_dirent;
+typedef struct fs_dir fs_dir_t;
+typedef struct fs_dirent fs_dirent_t;
+
+// External FS driver ops (for third-party FS modules)
+typedef struct fs_ext_driver_ops {
+    // Return 1 if this FS recognizes the drive/partition, 0 otherwise.
+    int (*probe)(int vdrive_id, uint32_t partition_lba);
+
+    // Mount and populate mount->ext_ctx (and any other required fields).
+    // mount->ext_ops and mount->ext_name are filled by core.
+    int (*mount)(int vdrive_id, uint32_t partition_lba, fs_mount_t *mount);
+
+    // Optional unmount hook. If NULL, core will just drop the mount.
+    void (*unmount)(fs_mount_t *mount);
+
+    // Optional format/mkfs hook.
+    // vDrive-based; partition_lba is start of partition; partition_sectors is length.
+    // Returns 0 on success.
+    int (*mkfs)(int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors, const char *volume_label);
+
+    // Read-only v1 requires these
+    int (*read_file)(fs_mount_t *mount, const char *path, void *buffer, size_t buffer_size, size_t *bytes_read);
+    int (*stat)(fs_mount_t *mount, const char *path, fs_file_info_t *info);
+    int (*file_exists)(fs_mount_t *mount, const char *path);
+    int (*directory_exists)(fs_mount_t *mount, const char *path);
+    int (*list_directory)(fs_mount_t *mount, const char *path);
+
+    // Directory iteration
+    fs_dir_t* (*opendir)(fs_mount_t *mount, const char *path);
+    int (*readdir)(fs_dir_t *dir, fs_dirent_t *entry);
+    void (*closedir)(fs_dir_t *dir);
+} fs_ext_driver_ops_t;
+
+// Register external filesystem driver (string-based). Built-ins always win; external drivers are tried only after.
+int fs_register_driver(const char *name, const fs_ext_driver_ops_t *ops);
+
+// Invoke an external filesystem driver's mkfs callback (if provided).
+int fs_ext_mkfs(const char *driver_name, int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors, const char *volume_label);
+
 int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type);
 
 /**
@@ -168,7 +218,7 @@ int fs_file_exists(fs_mount_t* mount, const char* path);
 /* --- DIRECTORY OPERATIONS --- */
 
 /* Directory entry structure for iteration */
-typedef struct {
+typedef struct fs_dirent {
     char name[260];           /* Entry name */
     uint32_t size;            /* File size in bytes */
     int is_directory;         /* 1 if directory, 0 if file */
@@ -176,11 +226,14 @@ typedef struct {
 } fs_dirent_t;
 
 /* Directory handle for iteration */
-typedef struct {
+typedef struct fs_dir {
     fs_mount_t* mount;        /* Mount point */
     char path[256];           /* Directory path */
     size_t position;          /* Current position in directory */
     void* fs_specific;        /* Filesystem-specific data */
+
+    // External FS directory iteration
+    const fs_ext_driver_ops_t *ext_ops;
 } fs_dir_t;
 
 /**
@@ -229,5 +282,14 @@ void fs_closedir(fs_dir_t* dir);
  * @return: String name (e.g., "FAT32", "ISO9660")
  */
 const char* fs_type_name(fs_type_t type);
+
+// Rescan all ready vDrives and mount any new filesystems using FS_TYPE_UNKNOWN.
+// Intended to be called after SQRM modules register external filesystem drivers.
+void fs_rescan_all(void);
+
+// MBR partition lookup helper.
+// part_no: 1..4 (primary partitions)
+// Returns 0 on success.
+int fs_mbr_get_partition(int vdrive_id, int part_no, uint32_t *out_start_lba, uint32_t *out_sectors, uint8_t *out_type);
 
 #endif /* FS_H */

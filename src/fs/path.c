@@ -238,25 +238,7 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
             const char *subrest = rest + si;
             while (*subrest == '/') subrest++;
 
-            if (str_ieq(subc, "input")) {
-                out->devvfs_kind = 3;
-                out->rel_path[0] = '/';
-                out->rel_path[1] = 0;
-                if (*subrest) {
-                    strncat(out->rel_path, subrest, sizeof(out->rel_path) - 2);
-                }
-                return 0;
-            }
-
-            if (str_ieq(subc, "graphics")) {
-                out->devvfs_kind = 4;
-                out->rel_path[0] = '/';
-                out->rel_path[1] = 0;
-                if (*subrest) {
-                    strncat(out->rel_path, subrest, sizeof(out->rel_path) - 2);
-                }
-                return 0;
-            }
+            // DEVFS is now hierarchical; treat any $/dev/<subpath> uniformly.
         }
 
         out->devvfs_kind = 2;

@@ -2,6 +2,58 @@
 #include "moduos/fs/fs.h"
 #include "moduos/fs/DOS/FAT32/fat32.h"
 #include "moduos/fs/ISOFS/iso9660.h"
+#include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/memory/string.h"
+
+// External FS driver registry (third-party)
+#define FS_EXT_MAX_DRIVERS 16
+
+typedef struct {
+    int in_use;
+    char name[16];
+    const fs_ext_driver_ops_t *ops;
+} fs_ext_driver_entry_t;
+
+static fs_ext_driver_entry_t g_ext_drivers[FS_EXT_MAX_DRIVERS];
+
+int fs_register_driver(const char *name, const fs_ext_driver_ops_t *ops) {
+    fs_init();
+    if (!name || !name[0] || !ops || !ops->probe || !ops->mount) return -1;
+
+    for (int i = 0; i < FS_EXT_MAX_DRIVERS; i++) {
+        if (g_ext_drivers[i].in_use && strcmp(g_ext_drivers[i].name, name) == 0) return -2;
+    }
+
+    for (int i = 0; i < FS_EXT_MAX_DRIVERS; i++) {
+        if (!g_ext_drivers[i].in_use) {
+            g_ext_drivers[i].in_use = 1;
+            strncpy(g_ext_drivers[i].name, name, sizeof(g_ext_drivers[i].name) - 1);
+            g_ext_drivers[i].name[sizeof(g_ext_drivers[i].name) - 1] = 0;
+            g_ext_drivers[i].ops = ops;
+            com_write_string(COM1_PORT, "[FS] Registered external FS driver: ");
+            com_write_string(COM1_PORT, g_ext_drivers[i].name);
+            com_write_string(COM1_PORT, "\n");
+            return 0;
+        }
+    }
+
+    return -3;
+}
+
+int fs_ext_mkfs(const char *driver_name, int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors, const char *volume_label) {
+    fs_init();
+    if (!driver_name || !driver_name[0]) return -1;
+
+    for (int i = 0; i < FS_EXT_MAX_DRIVERS; i++) {
+        if (!g_ext_drivers[i].in_use || !g_ext_drivers[i].ops) continue;
+        if (strcmp(g_ext_drivers[i].name, driver_name) != 0) continue;
+        if (!g_ext_drivers[i].ops->mkfs) return -2;
+        return g_ext_drivers[i].ops->mkfs(vdrive_id, partition_lba, partition_sectors, volume_label);
+    }
+
+    return -3;
+}
+
 #include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/memory/string.h"
@@ -42,6 +94,114 @@ static int fs_mbr_partition_index_for_lba(int vdrive_id, uint32_t partition_lba)
         if (type == 0x00) continue;
         if (first_lba == partition_lba) return i + 1;
     }
+    return 0;
+}
+
+// Return number of valid MBR partitions (0..4) and fill arrays with first LBA/type.
+static int fs_mbr_list_partitions(int vdrive_id, uint32_t out_first_lba[4], uint8_t out_type[4]) {
+    if (out_first_lba) for (int i = 0; i < 4; i++) out_first_lba[i] = 0;
+    if (out_type) for (int i = 0; i < 4; i++) out_type[i] = 0;
+
+    vdrive_t *d = vdrive_get((uint8_t)vdrive_id);
+    if (!d || !d->present) return 0;
+    if (d->sector_size != 512) return 0;
+
+    static uint8_t mbr_page[4096] __attribute__((aligned(4096)));
+    uint8_t *mbr = mbr_page;
+
+    if (vdrive_read_sector((uint8_t)vdrive_id, 0, mbr) != VDRIVE_SUCCESS) return 0;
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) return 0;
+
+    int count = 0;
+    for (int i = 0; i < 4; i++) {
+        const uint8_t *e = mbr + MBR_PARTITION_TABLE_OFFSET + i * MBR_PARTITION_ENTRY_SIZE;
+        uint8_t type = e[4];
+        uint32_t first_lba = read_le32(e + 8);
+        if (type == 0x00 || first_lba == 0) continue;
+        if (out_first_lba) out_first_lba[i] = first_lba;
+        if (out_type) out_type[i] = type;
+        count++;
+    }
+    return count;
+}
+
+int fs_mbr_get_partition(int vdrive_id, int part_no, uint32_t *out_start_lba, uint32_t *out_sectors, uint8_t *out_type) {
+    fs_init();
+    if (out_start_lba) *out_start_lba = 0;
+    if (out_sectors) *out_sectors = 0;
+    if (out_type) *out_type = 0;
+
+    if (part_no < 1 || part_no > 4) return -1;
+
+    vdrive_t *d = vdrive_get((uint8_t)vdrive_id);
+    if (!d || !d->present) return -2;
+    if (d->sector_size != 512) return -3;
+
+    static uint8_t mbr_page[4096] __attribute__((aligned(4096)));
+    uint8_t *mbr = mbr_page;
+
+    if (vdrive_read_sector((uint8_t)vdrive_id, 0, mbr) != VDRIVE_SUCCESS) return -4;
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) return -5;
+
+    int idx = part_no - 1;
+    const uint8_t *e = mbr + MBR_PARTITION_TABLE_OFFSET + idx * MBR_PARTITION_ENTRY_SIZE;
+    uint8_t type = e[4];
+    uint32_t first_lba = read_le32(e + 8);
+    uint32_t sectors = read_le32(e + 12);
+
+    if (type == 0x00 || first_lba == 0 || sectors == 0) return -6;
+
+    if (out_start_lba) *out_start_lba = first_lba;
+    if (out_sectors) *out_sectors = sectors;
+    if (out_type) *out_type = type;
+    return 0;
+}
+
+static int fs_try_external_mount(int vdrive_id, uint32_t lba, fs_mount_t *mount, const char **out_name) {
+    if (out_name) *out_name = NULL;
+    if (!mount) return 0;
+
+    for (int i = 0; i < FS_EXT_MAX_DRIVERS; i++) {
+        if (!g_ext_drivers[i].in_use || !g_ext_drivers[i].ops) continue;
+
+#ifdef FS_EXT_DEBUG
+        // Debug: show probe address to verify SQRM relocations worked
+        {
+            uint64_t opsp = (uint64_t)g_ext_drivers[i].ops;
+            uint64_t probep = (uint64_t)g_ext_drivers[i].ops->probe;
+            com_printf(COM1_PORT,
+                       "[FS] ext probe %s ops=%08x%08x probe=%08x%08x lba=%u\n",
+                       g_ext_drivers[i].name,
+                       (unsigned)(opsp >> 32), (unsigned)(opsp & 0xFFFFFFFFu),
+                       (unsigned)(probep >> 32), (unsigned)(probep & 0xFFFFFFFFu),
+                       (unsigned)lba);
+        }
+#endif
+
+        int pr = g_ext_drivers[i].ops->probe(vdrive_id, lba);
+        if (pr != 1) continue;
+
+        // prepare external mount
+        mount->type = FS_TYPE_EXTERNAL;
+        mount->handle = -1;
+        mount->valid = 1;
+        mount->ext_ops = g_ext_drivers[i].ops;
+        mount->ext_ctx = NULL;
+        memset(mount->ext_name, 0, sizeof(mount->ext_name));
+        strncpy(mount->ext_name, g_ext_drivers[i].name, sizeof(mount->ext_name) - 1);
+
+        if (g_ext_drivers[i].ops->mount(vdrive_id, lba, mount) == 0) {
+            if (out_name) *out_name = mount->ext_name;
+            return 1;
+        }
+
+        // mount failed; clear and continue
+        mount->valid = 0;
+        mount->ext_ops = NULL;
+        mount->ext_ctx = NULL;
+        mount->ext_name[0] = 0;
+    }
+
     return 0;
 }
 
@@ -192,7 +352,7 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
 
     /* If partition_lba is 0, auto-detect. Otherwise, use specified LBA */
     if (partition_lba == 0 && type == FS_TYPE_UNKNOWN) {
-        /* Auto-detect filesystem AND partition */
+        /* Auto-detect filesystem AND partition (built-ins first) */
         fat_rc = fat32_mount_auto(vdrive_id);
         handle = fat_rc;
         if (handle >= 0) {
@@ -212,10 +372,44 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
                 /* Get actual LBA from mounted filesystem */
                 const iso9660_fs_t *fs = iso9660_get_fs(handle);
                 if (fs) partition_lba = fs->partition_lba;
+            } else {
+                // Try external filesystem drivers (after built-ins)
+                com_write_string(COM1_PORT, "[FS] Trying external FS drivers...\n");
+
+                // First try whole-disk (superfloppy) match at LBA 0.
+                const char *ext_name = NULL;
+                if (fs_try_external_mount(vdrive_id, 0, &mount, &ext_name)) {
+                    com_write_string(COM1_PORT, "[FS] External FS matched: ");
+                    com_write_string(COM1_PORT, ext_name);
+                    com_write_string(COM1_PORT, " (LBA 0)\n");
+                } else {
+                    // Then try MBR partitions.
+                    uint32_t first_lba[4];
+                    uint8_t ptype[4];
+                    (void)ptype;
+                    int pc = fs_mbr_list_partitions(vdrive_id, first_lba, ptype);
+                    if (pc > 0) {
+                        com_write_string(COM1_PORT, "[FS] Probing external drivers on MBR partitions...\n");
+                        for (int pi = 0; pi < 4; pi++) {
+                            if (first_lba[pi] == 0) continue;
+                            if (fs_try_external_mount(vdrive_id, first_lba[pi], &mount, &ext_name)) {
+                                com_write_string(COM1_PORT, "[FS] External FS matched: ");
+                                com_write_string(COM1_PORT, ext_name);
+                                com_write_string(COM1_PORT, " (LBA ");
+                                char lba_str[16];
+                                itoa(first_lba[pi], lba_str, 10);
+                                com_write_string(COM1_PORT, lba_str);
+                                com_write_string(COM1_PORT, ")\n");
+                                partition_lba = first_lba[pi];
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     } else if (type == FS_TYPE_UNKNOWN) {
-        /* User specified LBA, but unknown filesystem type - try both */
+        /* User specified LBA, but unknown filesystem type - try built-ins then external */
         fat_rc = fat32_mount(vdrive_id, partition_lba);
         handle = fat_rc;
         if (handle >= 0) {
@@ -229,6 +423,15 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
                 mount.type = FS_TYPE_ISO9660;
                 mount.handle = handle;
                 mount.valid = 1;
+            } else {
+                // external
+                com_write_string(COM1_PORT, "[FS] Trying external FS drivers...\n");
+                const char *ext_name = NULL;
+                if (fs_try_external_mount(vdrive_id, partition_lba, &mount, &ext_name)) {
+                    com_write_string(COM1_PORT, "[FS] External FS matched: ");
+                    com_write_string(COM1_PORT, ext_name);
+                    com_write_string(COM1_PORT, "\n");
+                }
             }
         }
     } else {
@@ -274,7 +477,11 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
     mount_table[slot].in_use = 1;
     
     com_write_string(COM1_PORT, "[FS] Mounted ");
-    com_write_string(COM1_PORT, fs_type_name(mount.type));
+    if (mount.type == FS_TYPE_EXTERNAL && mount.ext_name[0]) {
+        com_write_string(COM1_PORT, mount.ext_name);
+    } else {
+        com_write_string(COM1_PORT, fs_type_name(mount.type));
+    }
     com_write_string(COM1_PORT, " ");
     {
         char label[32];
@@ -317,6 +524,11 @@ int fs_unmount_slot(int slot) {
             break;
         case FS_TYPE_ISO9660:
             iso9660_unmount(mount->handle);
+            break;
+        case FS_TYPE_EXTERNAL:
+            if (mount->ext_ops && mount->ext_ops->unmount) {
+                mount->ext_ops->unmount(mount);
+            }
             break;
         default:
             break;
@@ -455,18 +667,22 @@ int fs_read_file(fs_mount_t* mount, const char* path, void* buffer,
     int result = -1;
     size_t size = 0;
     
-    switch (mount->type) {
-        case FS_TYPE_FAT32:
-            result = fat32_read_file_by_path(mount->handle, path, buffer, 
-                                            buffer_size, &size);
-            break;
-            
-        case FS_TYPE_ISO9660:
-            result = iso9660_read_file_by_path(mount->handle, path, buffer, buffer_size, &size);
-            break;
-            
-        default:
-            return -3;
+    if (mount->type == FS_TYPE_EXTERNAL && mount->ext_ops && mount->ext_ops->read_file) {
+        result = mount->ext_ops->read_file(mount, path, buffer, buffer_size, &size);
+    } else {
+        switch (mount->type) {
+            case FS_TYPE_FAT32:
+                result = fat32_read_file_by_path(mount->handle, path, buffer, 
+                                                buffer_size, &size);
+                break;
+
+            case FS_TYPE_ISO9660:
+                result = iso9660_read_file_by_path(mount->handle, path, buffer, buffer_size, &size);
+                break;
+
+            default:
+                return -3;
+        }
     }
     
     if (bytes_read) *bytes_read = size;
@@ -495,6 +711,10 @@ int fs_stat(fs_mount_t* mount, const char* path, fs_file_info_t* info) {
     
     memset(info, 0, sizeof(fs_file_info_t));
     
+    if (mount->type == FS_TYPE_EXTERNAL && mount->ext_ops && mount->ext_ops->stat) {
+        return mount->ext_ops->stat(mount, path, info);
+    }
+
     switch (mount->type) {
         case FS_TYPE_FAT32: {
             struct __attribute__((packed)) {
@@ -573,29 +793,41 @@ int fs_list_directory(fs_mount_t* mount, const char* path) {
         VGA_Write("FS: Invalid mount\n");
         return -1;
     }
-    
-    switch (mount->type) {
-        case FS_TYPE_FAT32:
-            return fat32_list_directory(mount->handle, path);
-            
-        case FS_TYPE_ISO9660:
-            return iso9660_list_directory(mount->handle, path);
-            
-        default:
-            return -2;
+
+    // Unified listing implementation for all filesystem types.
+    // Do not call filesystem-specific list_directory() printers (they emit different headers).
+    // Instead, always go through fs_opendir/fs_readdir and print here.
+    fs_dir_t *d = fs_opendir(mount, path ? path : "/");
+    if (!d) return -2;
+
+    fs_dirent_t e;
+    while (1) {
+        int rc = fs_readdir(d, &e);
+        if (rc <= 0) break;
+        VGA_Write(e.name);
+        if (e.is_directory) VGA_Write("/");
+        VGA_Write("  ");
     }
+    VGA_Write("\n");
+
+    fs_closedir(d);
+    return 0;
 }
 
 int fs_directory_exists(fs_mount_t* mount, const char* path) {
     if (!mount || !mount->valid) return 0;
     
+    if (mount->type == FS_TYPE_EXTERNAL && mount->ext_ops && mount->ext_ops->directory_exists) {
+        return mount->ext_ops->directory_exists(mount, path);
+    }
+
     switch (mount->type) {
         case FS_TYPE_FAT32:
             return fat32_directory_exists(mount->handle, path);
-            
+
         case FS_TYPE_ISO9660:
             return iso9660_directory_exists(mount->handle, path);
-            
+
         default:
             return 0;
     }
@@ -607,8 +839,34 @@ const char* fs_type_name(fs_type_t type) {
     switch (type) {
         case FS_TYPE_FAT32:   return "FAT32";
         case FS_TYPE_ISO9660: return "ISO9660";
+        case FS_TYPE_EXTERNAL:return "External";
         case FS_TYPE_UNKNOWN: return "Unknown";
         default:              return "Invalid";
+    }
+}
+
+void fs_rescan_all(void) {
+    fs_init();
+    int count = vdrive_get_count();
+    (void)count;
+
+    com_write_string(COM1_PORT, "[FS] Rescanning drives for new filesystems...\n");
+    for (int vdrive_id = 0; vdrive_id < VDRIVE_MAX_DRIVES; vdrive_id++) {
+        if (!vdrive_is_ready(vdrive_id)) continue;
+
+        // Try mount whole disk (auto-detect may choose a partition internally).
+        int existing = find_existing_mount(vdrive_id, 0);
+        if (existing >= 0) continue;
+
+        int slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_UNKNOWN);
+        if (slot >= 0) {
+            fs_mount_t *m = fs_get_mount(slot);
+            if (m && m->valid && m->type == FS_TYPE_EXTERNAL) {
+                com_write_string(COM1_PORT, "[FS] Rescan mounted external FS: ");
+                com_write_string(COM1_PORT, m->ext_name);
+                com_write_string(COM1_PORT, "\n");
+            }
+        }
     }
 }
 
@@ -676,7 +934,12 @@ fs_dir_t* fs_opendir(fs_mount_t* mount, const char* path) {
 
 
 
-    switch (mount->type) {
+    if (mount->type == FS_TYPE_EXTERNAL && mount->ext_ops && mount->ext_ops->opendir) {
+       dir->ext_ops = mount->ext_ops;
+       return mount->ext_ops->opendir(mount, path);
+   }
+
+   switch (mount->type) {
 
         case FS_TYPE_FAT32: {
 
@@ -760,7 +1023,11 @@ int fs_readdir(fs_dir_t* dir, fs_dirent_t* entry) {
 
 
 
-    switch (dir->mount->type) {
+    if (dir->mount->type == FS_TYPE_EXTERNAL && dir->mount->ext_ops && dir->mount->ext_ops->readdir) {
+       return dir->mount->ext_ops->readdir(dir, entry);
+   }
+
+   switch (dir->mount->type) {
 
         case FS_TYPE_FAT32: {
 
@@ -843,6 +1110,11 @@ void fs_closedir(fs_dir_t* dir) {
 
 
     if (dir->mount && dir->fs_specific) {
+
+        if (dir->mount->type == FS_TYPE_EXTERNAL && dir->mount->ext_ops && dir->mount->ext_ops->closedir) {
+            dir->mount->ext_ops->closedir(dir);
+            return;
+        }
 
         switch (dir->mount->type) {
 
