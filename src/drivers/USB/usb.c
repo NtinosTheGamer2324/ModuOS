@@ -15,6 +15,11 @@ static usb_controller_t *usb_controllers = NULL;
 static usb_driver_t *usb_drivers = NULL;
 static uint8_t next_device_address = 1;
 
+/* Guard against timer-driven usb_tick() running while usb_init() is still
+ * setting up global lists. Some emulators (QEMU) hit this race and can hang.
+ */
+static volatile int usb_initialized = 0;
+
 // PCI class codes for USB controllers
 #define PCI_CLASS_SERIAL_BUS    0x0C
 #define PCI_SUBCLASS_USB        0x03
@@ -54,7 +59,9 @@ static void usb_enumerate_all_ports(void);
 // Initialize entire USB subsystem
 void usb_init(void) {
     COM_LOG_INFO(COM1_PORT, "=== Initializing USB Subsystem ===");
-    
+
+    usb_initialized = 0;
+
     usb_controllers = NULL;
     usb_drivers = NULL;
     next_device_address = 1;
@@ -69,6 +76,7 @@ void usb_init(void) {
     // Enumerate devices on all ports
     usb_enumerate_all_ports();
     
+    usb_initialized = 1;
     COM_LOG_OK(COM1_PORT, "USB subsystem fully initialized");
 }
 
@@ -523,10 +531,18 @@ void usb_enumeration_tick(void) {
     }
 }
 
+int usb_has_controllers(void) {
+    return usb_controllers != NULL;
+}
+
 // Main USB tick function (called from timer)
 void usb_tick(void) {
+    if (!usb_initialized) return;
+
     usb_enumeration_tick();
-    
+
     // Also process HID initialization
-    hid_init_tick();
+    if (usb_controllers) {
+        hid_init_tick();
+    }
 }

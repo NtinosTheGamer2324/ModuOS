@@ -9,7 +9,8 @@
 int input_init(void);
 
 // Get a line of input from the keyboard (blocks until Enter is pressed)
-// Uses $/dev/event0 and provides basic line discipline (echo, backspace, history arrows).
+// libc/userland-compatible behavior: reads from $/dev/input/kbd0 (echo + backspace).
+// After Enter, it drains $/dev/input/event0 so the same keystrokes aren't replayed by other consumers.
 char* input(void);
 
 // Replace the current input line visually (used by shell history browsing)

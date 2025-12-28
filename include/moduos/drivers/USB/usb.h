@@ -263,6 +263,9 @@ int usb_submit_interrupt_transfer(usb_device_t *dev, uint8_t endpoint, void *buf
 int usb_cancel_transfer(usb_device_t *dev, usb_transfer_t *transfer);
 
 void usb_tick(void);
+
+/* True if at least one USB controller is registered. */
+int usb_has_controllers(void);
 void usb_enumeration_tick(void);
 
 // Async control transfer with callback
