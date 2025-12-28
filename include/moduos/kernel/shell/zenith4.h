@@ -8,6 +8,9 @@
 #define HISTORY_SIZE 50
 #define COMMAND_MAX_LEN 256
 
+/* Background jobs */
+#define JOBS_MAX 32
+
 /* Public shell type and functions used across translation units */
 typedef struct {
     int running;
@@ -26,6 +29,11 @@ typedef struct {
     int current_slot;        // Currently active filesystem slot (-1 = none)
     char cwd[256];           // Current working directory path
     int boot_slot;           // NEW: Slot where boot drive is mounted (-1 = none)
+
+    /* Background job tracking */
+    int jobs_pids[JOBS_MAX];
+    char jobs_cmd[JOBS_MAX][COMMAND_MAX_LEN];
+    int jobs_count;
 } shell_state_t;
 
 /* Global shell state */

@@ -88,7 +88,8 @@ static void free_argv(char **argv, int argc) {
     kfree(argv);
 }
 
-void exec(const char *args) {
+int exec_run(const char *args, int wait_for_exit) {
+
     com_write_string(COM1_PORT, "\n[EXEC] ===== START EXEC COMMAND =====\n");
     
     // Skip leading spaces
@@ -97,19 +98,29 @@ void exec(const char *args) {
     if (*args == '\0') {
         VGA_Write("Usage: exec <path> [args...]\n");
         VGA_Write("Example: exec /Apps/cat.sqr /file.txt\n");
-        return;
+        return -1;
     }
 
-    if (shell_state.current_slot < 0) {
+    int slot = shell_state.current_slot;
+    if (slot < 0) {
+        /* Early boot: shell hasn't selected a filesystem yet.
+         * Use the detected boot drive slot so we can exec /Apps/login.sqr immediately.
+         */
+        extern int boot_drive_slot;
+        slot = boot_drive_slot;
+        shell_state.current_slot = slot;
+    }
+
+    if (slot < 0) {
         VGA_Write("\\crError: No filesystem selected\\rr\n");
-        return;
+        return -1;
     }
 
     // Get mount from kernel mount table
-    fs_mount_t* mount = fs_get_mount(shell_state.current_slot);
+    fs_mount_t* mount = fs_get_mount(slot);
     if (!mount || !mount->valid) {
         VGA_Write("\\crError: Invalid filesystem mount\\rr\n");
-        return;
+        return -1;
     }
 
     // Parse arguments dynamically
@@ -118,13 +129,13 @@ void exec(const char *args) {
     
     if (argc < 0) {
         VGA_Write("\\crError: Failed to parse arguments\\rr\n");
-        return;
+        return -1;
     }
     
     if (argc == 0) {
         VGA_Write("\\crError: No program specified\\rr\n");
         free_argv(argv, argc);
-        return;
+        return -1;
     }
     
     com_write_string(COM1_PORT, "[EXEC] Parsed ");
@@ -154,7 +165,7 @@ void exec(const char *args) {
     if (!fs_file_exists(mount, exec_path)) {
         VGA_Write("\\crFile not found\\rr\n");
         free_argv(argv, argc);
-        return;
+        return -1;
     }
     com_write_string(COM1_PORT, "[EXEC] File exists\n");
 
@@ -165,14 +176,14 @@ void exec(const char *args) {
         VGA_Write("\\crFailed to get file info\\rr\n");
         com_write_string(COM1_PORT, "[EXEC] fs_stat failed\n");
         free_argv(argv, argc);
-        return;
+        return -1;
     }
     com_write_string(COM1_PORT, "[EXEC] Got file info\n");
 
     if (info.is_directory) {
         VGA_Write("\\crError: Cannot exec a directory\\rr\n");
         free_argv(argv, argc);
-        return;
+        return -1;
     }
 
     char size_str[16];
@@ -188,7 +199,7 @@ void exec(const char *args) {
         VGA_Write("\\crFailed to allocate memory\\rr\n");
         com_write_string(COM1_PORT, "[EXEC] kmalloc FAILED\n");
         free_argv(argv, argc);
-        return;
+        return -1;
     }
     
     com_write_string(COM1_PORT, "[EXEC] kmalloc succeeded, buffer at 0x");
@@ -208,7 +219,7 @@ void exec(const char *args) {
         com_write_string(COM1_PORT, "[EXEC] fs_read_file FAILED\n");
         kfree(buffer);
         free_argv(argv, argc);
-        return;
+        return -1;
     }
     
     com_write_string(COM1_PORT, "[EXEC] fs_read_file succeeded, read ");
@@ -216,8 +227,122 @@ void exec(const char *args) {
     com_write_string(COM1_PORT, size_str);
     com_write_string(COM1_PORT, " bytes\n");
 
+    /* PT_INTERP support: if the target ELF specifies an interpreter, launch it and pass
+     * the target path as argv[1].
+     */
+    char interp_path[256];
+    int has_interp = elf_get_interp_path(buffer, bytes_read, interp_path, sizeof(interp_path));
+    if (has_interp < 0) {
+        VGA_Write("\\crFailed to parse ELF interpreter\\rr\n");
+        kfree(buffer);
+        free_argv(argv, argc);
+        return -1;
+    }
+
+    if (has_interp == 1) {
+        com_write_string(COM1_PORT, "[EXEC] PT_INTERP detected: ");
+        com_write_string(COM1_PORT, interp_path);
+        com_write_string(COM1_PORT, "\n");
+
+        /* Build argv for interpreter: [interp, target, target_arg1, ...] */
+        int new_argc = argc + 1;
+        if (new_argc > MAX_ARGS - 1) new_argc = MAX_ARGS - 1;
+
+        char **new_argv = (char **)kmalloc((new_argc + 1) * sizeof(char *));
+        if (!new_argv) {
+            VGA_Write("\\crFailed to allocate interpreter argv\\rr\n");
+            kfree(buffer);
+            free_argv(argv, argc);
+            return -1;
+        }
+        memset(new_argv, 0, (new_argc + 1) * sizeof(char *));
+
+        size_t ilen = strlen(interp_path);
+        new_argv[0] = (char *)kmalloc(ilen + 1);
+        memcpy(new_argv[0], interp_path, ilen + 1);
+
+        size_t tlen = strlen(exec_path);
+        new_argv[1] = (char *)kmalloc(tlen + 1);
+        memcpy(new_argv[1], exec_path, tlen + 1);
+
+        int out_i = 2;
+        for (int i = 1; i < argc && out_i < new_argc; i++, out_i++) {
+            size_t alen = strlen(argv[i]);
+            new_argv[out_i] = (char *)kmalloc(alen + 1);
+            memcpy(new_argv[out_i], argv[i], alen + 1);
+        }
+        new_argv[out_i] = NULL;
+
+        kfree(buffer);
+        free_argv(argv, argc);
+
+        if (!fs_file_exists(mount, interp_path)) {
+            VGA_Write("\\crInterpreter not found\\rr\n");
+            free_argv(new_argv, new_argc);
+            return -1;
+        }
+
+        fs_file_info_t iinfo;
+        if (fs_stat(mount, interp_path, &iinfo) != 0 || iinfo.is_directory) {
+            VGA_Write("\\crInterpreter stat failed\\rr\n");
+            free_argv(new_argv, new_argc);
+            return -1;
+        }
+
+        void *ibuf = kmalloc(iinfo.size);
+        if (!ibuf) {
+            VGA_Write("\\crInterpreter alloc failed\\rr\n");
+            free_argv(new_argv, new_argc);
+            return -1;
+        }
+
+        size_t ibread = 0;
+        if (fs_read_file(mount, interp_path, ibuf, iinfo.size, &ibread) != 0) {
+            VGA_Write("\\crInterpreter read failed\\rr\n");
+            kfree(ibuf);
+            free_argv(new_argv, new_argc);
+            return -1;
+        }
+
+        uint64_t entry_point;
+        int elf_result = elf_load_with_args(ibuf, ibread, &entry_point, new_argc, new_argv);
+        kfree(ibuf);
+
+        if (elf_result != 0) {
+            VGA_Write("\\crFailed to load interpreter ELF\\rr\n");
+            free_argv(new_argv, new_argc);
+            return -1;
+        }
+
+        const char *ifn = interp_path;
+        for (const char *p = interp_path; *p; p++) if (*p == '/') ifn = p + 1;
+
+        process_t *proc = process_create_with_args(ifn, (void (*)(void))entry_point, 1, new_argc, new_argv);
+        /* process_create_with_args deep-copies argv, so we can free our temporary now. */
+        free_argv(new_argv, new_argc);
+
+        if (!proc) {
+            VGA_Write("\\crFailed to create interpreter process\\rr\\n");
+            return -1;
+        }
+
+        int pid = proc->pid;
+
+        if (wait_for_exit) {
+            while (1) {
+                process_yield();
+                proc = process_get_by_pid(pid);
+                if (!proc) break;
+                if (proc->state == PROCESS_STATE_ZOMBIE || proc->state == PROCESS_STATE_TERMINATED) break;
+            }
+        }
+
+        com_write_string(COM1_PORT, "[EXEC] ===== END EXEC COMMAND =====\n\n");
+        return pid;
+    }
+
     com_write_string(COM1_PORT, "[EXEC] About to call elf_load_with_args...\n");
-    
+
     // Load ELF with arguments
     uint64_t entry_point;
     int elf_result = elf_load_with_args(buffer, bytes_read, &entry_point, argc, argv);
@@ -232,7 +357,7 @@ void exec(const char *args) {
         com_write_string(COM1_PORT, "[EXEC] ELF load failed!\n");
         kfree(buffer);
         free_argv(argv, argc);
-        return;
+        return -1;
     }
     
     // The ELF loader has already copied the data to new physical pages
@@ -270,7 +395,7 @@ void exec(const char *args) {
         VGA_Write("\\crFailed to create process\\rr\n");
         free_argv(argv, argc); // Free on error
         com_write_string(COM1_PORT, "[EXEC] ===== END EXEC COMMAND =====\n\n");
-        return;
+        return -1;
     }
     
     // Save PID before yielding (proc may be freed after yield)
@@ -319,44 +444,44 @@ void exec(const char *args) {
     
     com_write_string(COM1_PORT, "[EXEC] Shell yielding to scheduler...\n");
 
-    /*
-     * Foreground exec: wait until the process exits.
-     *
-     * The previous behavior yielded only once, which allowed the shell to keep
-     * running concurrently with the launched process.
-     */
-    while (1) {
-        process_yield();
+    if (wait_for_exit) {
+        /* Foreground exec: wait until the process exits. */
+        while (1) {
+            process_yield();
 
+            proc = process_get_by_pid(pid);
+            if (!proc) {
+                /* Reaped */
+                break;
+            }
+            if (proc->state == PROCESS_STATE_ZOMBIE || proc->state == PROCESS_STATE_TERMINATED) {
+                break;
+            }
+        }
+    }
+
+    if (wait_for_exit) {
+        // When we return here, the process has finished (or is a zombie)
+        com_write_string(COM1_PORT, "[EXEC] Returned from yield - checking process status...\n");
+
+        // Check if process still exists (use saved PID, not proc pointer!)
         proc = process_get_by_pid(pid);
         if (!proc) {
-            /* Reaped */
-            break;
-        }
-        if (proc->state == PROCESS_STATE_ZOMBIE || proc->state == PROCESS_STATE_TERMINATED) {
-            break;
+            com_write_string(COM1_PORT, "[EXEC] Process was reaped\n");
+        } else {
+            com_write_string(COM1_PORT, "[EXEC] Process state: ");
+            itoa(proc->state, size_str, 10);
+            com_write_string(COM1_PORT, size_str);
+            if (proc->state == PROCESS_STATE_ZOMBIE) {
+                com_write_string(COM1_PORT, " (exit code: ");
+                itoa(proc->exit_code, size_str, 10);
+                com_write_string(COM1_PORT, size_str);
+                com_write_string(COM1_PORT, ")");
+            }
+            com_write_string(COM1_PORT, "\n");
         }
     }
 
-    // When we return here, the process has finished (or is a zombie)
-    com_write_string(COM1_PORT, "[EXEC] Returned from yield - checking process status...\n");
-    
-    // Check if process still exists (use saved PID, not proc pointer!)
-    proc = process_get_by_pid(pid);
-    if (!proc) {
-        com_write_string(COM1_PORT, "[EXEC] Process was reaped\n");
-    } else {
-        com_write_string(COM1_PORT, "[EXEC] Process state: ");
-        itoa(proc->state, size_str, 10);
-        com_write_string(COM1_PORT, size_str);
-        if (proc->state == PROCESS_STATE_ZOMBIE) {
-            com_write_string(COM1_PORT, " (exit code: ");
-            itoa(proc->exit_code, size_str, 10);
-            com_write_string(COM1_PORT, size_str);
-            com_write_string(COM1_PORT, ")");
-        }
-        com_write_string(COM1_PORT, "\n");
-    }
-    
     com_write_string(COM1_PORT, "[EXEC] ===== END EXEC COMMAND =====\n\n");
+    return pid;
 }

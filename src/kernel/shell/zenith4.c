@@ -1,5 +1,6 @@
 //shell.c
 #include "moduos/kernel/shell/zenith4.h"
+#include "moduos/kernel/sqrm.h"
 #include "moduos/kernel/shell/legacy/MSDOS.h"
 #include "moduos/fs/fs.h"
 #include "moduos/kernel/memory/memory.h"
@@ -24,6 +25,7 @@
 #include "moduos/drivers/Drive/vDrive.h"  // Changed from ATA to vDrive
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/exec.h"
+#include "moduos/kernel/bootscreen.h"
 #include "moduos/kernel/kernel.h"  // For boot_drive_index
 #include "moduos/kernel/games/game_menu.h"
 #include "moduos/drivers/power/ACPI.h"
@@ -47,8 +49,22 @@ shell_state_t shell_state = {
     .browsing_history = 0,
     .current_slot = -1,
     .cwd = "/",
-    .boot_slot = -1
+    .boot_slot = -1,
+
+    .jobs_pids = {0},
+    .jobs_cmd = {{0}},
+    .jobs_count = 0
 };
+
+// Keep the shell process' FS context in sync with shell_state, so userland apps
+// (cat/tree/etc.) can resolve relative paths using proc->cwd + proc->current_slot.
+static void shell_sync_proc_fsctx(void) {
+    process_t *pcur = process_get_current();
+    if (!pcur) return;
+    pcur->current_slot = shell_state.current_slot;
+    strncpy(pcur->cwd, shell_state.cwd, sizeof(pcur->cwd) - 1);
+    pcur->cwd[sizeof(pcur->cwd) - 1] = 0;
+}
 
 /* Convert slot number (0-25) to letter (A-Z) */
 static char slot_to_letter(int slot) {
@@ -472,6 +488,10 @@ void zenith4_start() {
     strcpy(shell_state.cwd, "/");
     update_shell_path();
 
+    /* Ensure any boot splash lock/overlay is disabled before interactive shell output. */
+    VGA_SetSplashLock(false);
+    bootscreen_overlay_set_enabled(0);
+
     VGA_Clear();
     zsbanner();
     VGA_Write("\\cc(c) New Technologies Software 2025. All Rights Reserved\\rr\n");
@@ -497,12 +517,16 @@ void zenith4_start() {
             } else {
                 VGA_Writef("\\cy%02u:%02u:%02u \\cg$ \\cp%s\\rr@\\cc%s \\rr%s>", timeSTMP.hour, timeSTMP.minute, timeSTMP.second, shell_state.user, shell_state.pcname, shell_state.path);
             }
+            /* Fallback visible separator (helps diagnose cases where VGA_Writef is suppressed). */
+            VGA_Write(" ");
         } else {
             if (strcmp(shell_state.user, "mdman") == 0) {
                 VGA_Writef("\\cr# \\cp%s\\rr@\\cc%s \\rr%s>", shell_state.user, shell_state.pcname, shell_state.path);
             } else {
                 VGA_Writef("\\cg$ \\cp%s\\rr@\\cc%s \\rr%s>", shell_state.user, shell_state.pcname, shell_state.path);
             }
+            /* Fallback visible separator (helps diagnose cases where VGA_Writef is suppressed). */
+            VGA_Write(" ");
         }
 
         // Reset history browsing when starting new input
@@ -533,7 +557,7 @@ void zenith4_start() {
 
         // --- Command dispatch ---
         if (strcmp(command, "help") == 0) {
-            VGA_Write("\\cydebug              Kernel debug level (debug off/med/on/status)\\rr\\n");
+            VGA_Write("\\cydebug              Kernel debug level (debug off/med/on/status)\\rr\n");
 
             VGA_Write("\\cyhelp                shows this message\\rr\n");
             VGA_Write("\\cyclear - cls         clears the screen\\rr\n");
@@ -542,11 +566,13 @@ void zenith4_start() {
             VGA_Write("\\cyzsfetch             Show System Stats\\rr\n");
             VGA_Write("\\cyhistory             Show command history\\rr\n");
             VGA_Write("\\cylsblk - dev         Shows all storage devices (ATA + SATA)\\rr\n");
-            VGA_Write("\\cymount               Mount filesystem (mount <drive> [lba] [type])\\rr\n");
-            VGA_Write("\\cyunmount             Unmount filesystem (unmount <slot>)\\rr\n");
+            VGA_Write("\\cymount               Mount filesystem (mount <drive> [lba|pN] [type])\\rr\n");
+
             VGA_Write("\\cymounts              List all mounted filesystems\\rr\n");
             VGA_Write("\\cybootinfo            Show boot drive information\\rr\n");
-            VGA_Write("\\cyls [path]           List directory (current fs or path)\\rr\n");
+            VGA_Write("\\cymkext2              Format partition as ext2 (mkext2 <vd> <lba|pN> <size_mb|sizeMB|sectorsS> [label])\\rr\n");
+            VGA_Write("\\cy                   Shortcut: mkext2 <vd> pN [label] (uses MBR size)\\rr\n");
+
             VGA_Write("\\cycd <path>           Change directory\\rr\n");
             VGA_Write("\\cypwd                 Print current directory\\rr\n");
             VGA_Write("\\cycat <path>          Display file contents\\rr\n");
@@ -565,7 +591,160 @@ void zenith4_start() {
             poweroff2();
         } else if (strcmp(command, "reboot") == 0 || strcmp(command, "restart") == 0) {
             reboot2();
+        } else if (strcmp(command, "mkext2") == 0) {
+            // Syntax:
+            //   mkext2 <vdrive_id> <partition_lba> <size_mb|sizeMB|sectorsS> [label]
+            //   mkext2 <vdrive_id> p<part_no> [label]    (use MBR partition start+size)
+            char vd_str[16] = {0};
+            char lba_str[32] = {0};
+            char sec_str[32] = {0};
+            char label_str[32] = {0};
+
+            const char *ptr = args;
+            int token = 0;
+            char *dest = vd_str;
+            int dest_idx = 0;
+            while (*ptr) {
+                if (*ptr == ' ' || *ptr == '\t') {
+                    if (dest_idx > 0) {
+                        *dest = 0;
+                        token++;
+                        dest_idx = 0;
+                        if (token == 1) dest = lba_str;
+                        else if (token == 2) dest = sec_str;
+                        else if (token == 3) dest = label_str;
+                        else break;
+                    }
+                    ptr++;
+                } else {
+                    if (dest_idx < 31) {
+                        *dest++ = *ptr;
+                        dest_idx++;
+                    }
+                    ptr++;
+                }
+            }
+            *dest = 0;
+
+            // If using pN form, allow third token to be label (mkext2 <vd> p1 LABEL)
+            if ((lba_str[0] == 'p' || lba_str[0] == 'P') && lba_str[1] >= '1' && lba_str[1] <= '4' && lba_str[2] == 0) {
+                if (strlen(sec_str) > 0 && strlen(label_str) == 0) {
+                    strncpy(label_str, sec_str, sizeof(label_str) - 1);
+                    label_str[sizeof(label_str) - 1] = 0;
+                    sec_str[0] = 0;
+                }
+            }
+
+            if (strlen(vd_str) == 0 || strlen(lba_str) == 0) {
+                VGA_Write("\\crUsage: mkext2 <vdrive_id> <partition_lba> <size_mb|sizeMB|sectorsS> [label]\\rr\n");
+                VGA_Write("\\cyUsage: mkext2 <vdrive_id> p<part_no> [label]\\rr\n");
+                VGA_Write("\\cyExample: mkext2 2 p1 EXT2MDOS              (auto size from MBR)\\rr\n");
+                VGA_Write("\\cyExample: mkext2 2 2048 127 EXT2MDOS        (MB by default)\\rr\n");
+                VGA_Write("\\cyExample: mkext2 2 2048 127MB EXT2MDOS      (explicit MB)\\rr\n");
+                VGA_Write("\\cyExample: mkext2 2 2048 260096s EXT2MDOS    (explicit sectors)\\rr\n");
+                VGA_Write("\\cyUse 'lsblk' to see partitions and sizes\\rr\n");
+                goto mkext2_done;
+            }
+
+            int vdid = -1;
+            int lba_i = -1;
+            int sec_i = -1;
+            int part_no = 0;
+            if (parse_int(vd_str, &vdid) != 0 || vdid < 0) {
+                VGA_Write("\\crError: Invalid vdrive id\\rr\n");
+                goto mkext2_done;
+            }
+            // LBA parsing: allow p1..p4 shorthand
+            if ((lba_str[0] == 'p' || lba_str[0] == 'P') && lba_str[1] >= '1' && lba_str[1] <= '4' && lba_str[2] == 0) {
+                part_no = lba_str[1] - '0';
+                uint32_t plba = 0, psectors = 0;
+                uint8_t ptype = 0;
+                int prc = fs_mbr_get_partition(vdid, part_no, &plba, &psectors, &ptype);
+                if (prc != 0) {
+                    VGA_Writef("\\crError: Could not read MBR partition p%d (rc=%d)\\rr\n", part_no, prc);
+                    goto mkext2_done;
+                }
+                lba_i = (int)plba;
+                sec_i = (int)psectors;
+            } else {
+                if (parse_int(lba_str, &lba_i) != 0 || lba_i < 0) {
+                    VGA_Write("\\crError: Invalid LBA (use number or p1..p4)\\rr\n");
+                    goto mkext2_done;
+                }
+            }
+            // Size parsing: default to MB (like your example `127`).
+            // Suffixes:
+            //   <n>MB / <n>mb => MB
+            //   <n>S  / <n>s  => sectors
+            uint32_t sectors = 0;
+            if (sec_i > 0) {
+                // came from MBR partition pN
+                sectors = (uint32_t)sec_i;
+            } else {
+                if (strlen(sec_str) == 0) {
+                    VGA_Write("\\crError: Missing size (or use p1..p4 form)\\rr\n");
+                    goto mkext2_done;
+                }
+
+                // parse size string
+                size_t sl = strlen(sec_str);
+                int as_sectors = 0;
+
+                if (sl >= 1 && (sec_str[sl - 1] == 's' || sec_str[sl - 1] == 'S')) {
+                    as_sectors = 1;
+                    sec_str[sl - 1] = 0;
+                } else if (sl >= 2) {
+                    char c1 = sec_str[sl - 2];
+                    char c2 = sec_str[sl - 1];
+                    if ((c1 == 'm' || c1 == 'M') && (c2 == 'b' || c2 == 'B')) {
+                        sec_str[sl - 2] = 0;
+                    }
+                }
+
+                int n = -1;
+                if (parse_int(sec_str, &n) != 0 || n <= 0) {
+                    VGA_Write("\\crError: Invalid size\\rr\n");
+                    goto mkext2_done;
+                }
+
+                if (as_sectors) {
+                    sectors = (uint32_t)n;
+                } else {
+                    sectors = (uint32_t)n * 2048u; // MB -> sectors
+                }
+            }
+
+            const char *label = (strlen(label_str) > 0) ? label_str : NULL;
+
+            VGA_Write("Formatting ext2...\n");
+            int rc = fs_ext_mkfs("ext2", vdid, (uint32_t)lba_i, sectors, label);
+
+            // If driver is not available, try auto-loading SQRM modules then retry.
+            if (rc == -3) {
+                VGA_Write("\\cyext2 driver not loaded; loading SQRM modules...\\rr\n");
+                sqrm_load_all();
+                rc = fs_ext_mkfs("ext2", vdid, (uint32_t)lba_i, sectors, label);
+            }
+
+            if (rc != 0) {
+                if (rc == -2) {
+                    VGA_Write("\\crmkext2 failed: ext2 driver does not provide mkfs()\\rr\n");
+                } else if (rc == -3) {
+                    VGA_Write("\\crmkext2 failed: ext2 driver not registered (ext2.sqrm missing?)\\rr\n");
+                } else {
+                    VGA_Writef("\\crmkext2 failed rc=%d\\rr\n", rc);
+                }
+                goto mkext2_done;
+            }
+
+            VGA_Write("\\cgmkext2 OK. Rescanning mounts...\\rr\n");
+            fs_rescan_all();
+
+        mkext2_done:
+            ;
         } else if (strcmp(command, "mount") == 0) {
+            // Syntax: mount <vdrive_id> <partition_lba|pN>
+            // Example: mount 2 p1
             /* Syntax: mount <drive_index> [partition_lba] [type] */
             char drive_str[16] = {0};
             char lba_str[32] = {0};
@@ -612,12 +791,25 @@ void zenith4_start() {
             }
         
             if (strlen(lba_str) > 0) {
-                int lba_int = 0;
-                if (parse_int(lba_str, &lba_int) != 0 || lba_int < 0) {
-                    VGA_Write("\\crError: Invalid LBA value\\rr\n");
-                    goto mount_done;
+                // Allow p1..p4 shorthand
+                if ((lba_str[0] == 'p' || lba_str[0] == 'P') && lba_str[1] >= '1' && lba_str[1] <= '4' && lba_str[2] == 0) {
+                    int part_no = lba_str[1] - '0';
+                    uint32_t plba = 0, psectors = 0;
+                    uint8_t ptype = 0;
+                    int prc = fs_mbr_get_partition(drive_index, part_no, &plba, &psectors, &ptype);
+                    if (prc != 0) {
+                        VGA_Writef("\\crError: Could not read MBR partition p%d (rc=%d)\\rr\n", part_no, prc);
+                        goto mount_done;
+                    }
+                    partition_lba = plba;
+                } else {
+                    int lba_int = 0;
+                    if (parse_int(lba_str, &lba_int) != 0 || lba_int < 0) {
+                        VGA_Write("\\crError: Invalid LBA value (use number or p1..p4)\\rr\n");
+                        goto mount_done;
+                    }
+                    partition_lba = (uint32_t)lba_int;
                 }
-                partition_lba = (uint32_t)lba_int;
             }
             
             fs_type_t fs_type = FS_TYPE_UNKNOWN;
@@ -627,7 +819,12 @@ void zenith4_start() {
                 } else if (strcmp(type_str, "iso9660") == 0 || strcmp(type_str, "ISO9660") == 0) {
                     fs_type = FS_TYPE_ISO9660;
                 } else {
-                    VGA_Write("\\crError: Unknown filesystem type\\rr\n");
+                    // Common mistake: users pass a size here (mkfs style)
+                    if (type_str[0] >= '0' && type_str[0] <= '9') {
+                        VGA_Write("\\crError: mount does not take a size argument. Use: mount <vd> <lba|pN> [type]\\rr\n");
+                    } else {
+                        VGA_Write("\\crError: Unknown filesystem type\\rr\n");
+                    }
                     goto mount_done;
                 }
             }
@@ -636,6 +833,9 @@ void zenith4_start() {
             int slot = fs_mount_drive(drive_index, partition_lba, fs_type);
             
             if (slot >= 0) {
+                // IMPORTANT: mounting must NOT change the root/current filesystem.
+                // The root filesystem is always shell_state.boot_slot (slot 0 for /).
+                // Other mounts are accessed via DEVFS: $/mnt/vDriveN-Px
                 fs_type_t type;
                 fs_get_mount_info(slot, NULL, NULL, &type);
                 const char* fs_name = fs_type_name(type);
@@ -688,10 +888,19 @@ void zenith4_start() {
                 } else {
                     const char* fs_name = fs_type_name(type);
 
+                    // Never allow unmounting the boot/root filesystem slot.
+                    if (slot == shell_state.boot_slot) {
+                        VGA_Write("\\crError: Cannot unmount the boot/root filesystem (slot 0)\\rr\n");
+                        goto unmount_done;
+                    }
+
+                    // Do not change the root/current slot when unmounting other drives.
+                    // If the user somehow had current_slot pointing to this slot, reset to boot_slot.
                     if (slot == shell_state.current_slot) {
-                        shell_state.current_slot = -1;
+                        shell_state.current_slot = shell_state.boot_slot;
                         strcpy(shell_state.cwd, "/");
                         update_shell_path();
+                        shell_sync_proc_fsctx();
                     }
 
                     fs_unmount_slot(slot);
@@ -727,76 +936,19 @@ void zenith4_start() {
              * Deprecated: drive-letter / slot based navigation (A:, B:, ...) is no longer part
              * of the user-facing interface. Keep the command as a stub for old users.
              */
-            VGA_Write("\\cy[DEPRECATED] 'use' is deprecated. Drive letters (A:, B:, C:) are no longer supported.\\rr\\n");
-            VGA_Write("\\cyUse POSIX paths like '/' and the $/mnt namespace (e.g. 'ls $/mnt', 'ls $/mnt/vDrive0').\\rr\\n");
+            VGA_Write("\\cy[DEPRECATED] 'use' is deprecated. Drive letters (A:, B:, C:) are no longer supported.\\rr\n");
+            VGA_Write("\\cyUse POSIX paths like '/' and the $/mnt namespace (e.g. 'ls $/mnt', 'ls $/mnt/vDrive0').\\rr\n");
             if (strlen(args) > 0) {
-                VGA_Write("\\cyNote: ignoring argument; filesystem selection is automatic.\\rr\\n");
+                VGA_Write("\\cyNote: ignoring argument; filesystem selection is automatic.\\rr\n");
             }
 
             /* Do nothing else. */
-        } else if (strcmp(command, "ls") == 0) {
-            char target_path[256];
-            if (strlen(args) == 0) {
-                strcpy(target_path, shell_state.cwd);
-            } else {
-                join_path(shell_state.cwd, args, target_path);
-            }
-
-            /* Support ModuOS virtual-root paths like $/dev and $/mnt */
-            if (target_path[0] == '$' && target_path[1] == '/') {
-                process_t *proc = process_get_current();
-                if (!proc) {
-                    VGA_Write("\\crError: No process context\\rr\n");
-                } else {
-                    fs_path_resolved_t r;
-                    if (fs_resolve_path(proc, target_path, &r) != 0) {
-                        VGA_Writef("\\crError: Invalid path '%s'\\rr\n", target_path);
-                    } else if (r.route == FS_ROUTE_DEVVFS) {
-                        int dfd = fd_devvfs_opendir(r.devvfs_kind);
-                        if (dfd < 0) {
-                            VGA_Write("\\crError: Cannot open DEVVFS directory\\rr\n");
-                        } else {
-                            char name[128];
-                            int is_dir = 0;
-                            uint32_t sz = 0;
-                            while (1) {
-                                int rc = fd_readdir(dfd, name, sizeof(name), &is_dir, &sz);
-                                if (rc <= 0) break;
-                                VGA_Write(name);
-                                if (is_dir) VGA_Write("/");
-                                VGA_Write("  ");
-                            }
-                            VGA_Write("\n");
-                            fd_closedir(dfd);
-                        }
-                    } else if (r.route == FS_ROUTE_MOUNT) {
-                        fs_mount_t *mnt = fs_get_mount(r.mount_slot);
-                        if (!mnt || !mnt->valid) {
-                            VGA_Write("\\crError: Invalid mount\\rr\n");
-                        } else {
-                            fs_list_directory(mnt, r.rel_path);
-                        }
-                    } else {
-                        VGA_Write("\\crError: Unsupported $/ path\\rr\n");
-                    }
-                }
-            } else {
-                if (shell_state.current_slot < 0) {
-                    VGA_Write("\\crError: No filesystem selected\\rr\n");
-                } else {
-                    fs_mount_t* mount = fs_get_mount(shell_state.current_slot);
-                    if (mount) {
-                        fs_list_directory(mount, target_path);
-                    } else {
-                        VGA_Write("\\crError: Invalid mount\\rr\n");
-                    }
-                }
-            }
         } else if (strcmp(command, "cd") == 0) {
             if (strlen(args) == 0) {
                 /* cd without args goes to root */
                 strcpy(shell_state.cwd, "/");
                 update_shell_path();
+                shell_sync_proc_fsctx();
             } else {
                 char new_path[256];
 
@@ -809,10 +961,54 @@ void zenith4_start() {
                     join_path(shell_state.cwd, args, new_path);
                 }
 
-                /* Allow switching into the virtual-root namespace ($/...) */
+                /* Allow switching into the virtual-root namespace ($/...), but validate */
                 if (new_path[0] == '$' && new_path[1] == '/') {
-                    strcpy(shell_state.cwd, new_path);
-                    update_shell_path();
+                    process_t *proc = process_get_current();
+                    if (!proc) {
+                        VGA_Write("\\crError: No process context\\rr\n");
+                    } else {
+                        fs_path_resolved_t r;
+                        if (fs_resolve_path(proc, new_path, &r) != 0) {
+                            VGA_Writef("\\crError: Invalid path '%s'\\rr\n", new_path);
+                        }
+
+                        if (r.route == FS_ROUTE_DEVVFS) {
+                            // DEVVFS roots ($/mnt, $/dev)
+                            if (r.devvfs_kind == 2) {
+                                // $/dev
+                                strcpy(shell_state.cwd, new_path);
+                                update_shell_path();
+                                shell_sync_proc_fsctx();
+                            } else {
+                                // $/mnt
+                                int dfd = fd_devvfs_opendir(r.devvfs_kind);
+                                if (dfd < 0) {
+                                    VGA_Writef("\crError: Directory '%s' does not exist\rr\n", args);
+                                } else {
+                                    fd_closedir(dfd);
+                                    strcpy(shell_state.cwd, new_path);
+                                    update_shell_path();
+                                    shell_sync_proc_fsctx();
+                                }
+                            }
+                        } else if (r.route == FS_ROUTE_MOUNT) {
+                            fs_mount_t *mnt = fs_get_mount(r.mount_slot);
+                            if (!mnt || !mnt->valid) {
+                                VGA_Write("\\crError: Invalid mount\\rr\n");
+                            } else {
+                                int exists = fs_directory_exists(mnt, r.rel_path);
+                                if (exists) {
+                                    strcpy(shell_state.cwd, new_path);
+                                    update_shell_path();
+                                    shell_sync_proc_fsctx();
+                                } else {
+                                    VGA_Writef("\\crError: Directory '%s' does not exist\\rr\n", args);
+                                }
+                            }
+                        } else {
+                            VGA_Write("\\crError: Unsupported $/ path\\rr\n");
+                        }
+                    }
                 } else {
                     if (shell_state.current_slot < 0) {
                         VGA_Write("\\crError: No filesystem selected\\rr\n");
@@ -825,6 +1021,7 @@ void zenith4_start() {
                             if (exists) {
                                 strcpy(shell_state.cwd, new_path);
                                 update_shell_path();
+                                shell_sync_proc_fsctx();
                             } else {
                                 VGA_Writef("\\crError: Directory '%s' does not exist\\rr\n", args);
                             }
@@ -1045,8 +1242,90 @@ void zenith4_start() {
             }
         } else if (strcmp(command, "process_list") == 0) {
             handle_ps_command();
+        } else if (strcmp(command, "jobs") == 0) {
+            /* List background jobs and prune finished ones */
+            if (shell_state.jobs_count == 0) {
+                VGA_Write("No jobs.\n");
+            } else {
+                VGA_Write("Jobs:\n");
+                VGA_Write("PID    STATE       CMD\n");
+                VGA_Write("---    -----       ---\n");
+
+                int out = 0;
+                for (int i = 0; i < shell_state.jobs_count; i++) {
+                    int pid = shell_state.jobs_pids[i];
+                    if (pid <= 0) continue;
+
+                    process_t *p = process_get_by_pid(pid);
+                    if (!p) {
+                        continue; /* already reaped */
+                    }
+                    if (p->state == PROCESS_STATE_ZOMBIE || p->state == PROCESS_STATE_TERMINATED) {
+                        continue; /* finished */
+                    }
+
+                    /* keep */
+                    shell_state.jobs_pids[out] = pid;
+                    strncpy(shell_state.jobs_cmd[out], shell_state.jobs_cmd[i], COMMAND_MAX_LEN - 1);
+                    shell_state.jobs_cmd[out][COMMAND_MAX_LEN - 1] = 0;
+
+                    char pid_str[12];
+                    itoa(pid, pid_str, 10);
+                    VGA_Write(pid_str);
+                    VGA_Write("    ");
+
+                    switch (p->state) {
+                        case PROCESS_STATE_READY:    VGA_Write("READY      "); break;
+                        case PROCESS_STATE_RUNNING:  VGA_Write("RUNNING    "); break;
+                        case PROCESS_STATE_BLOCKED:  VGA_Write("BLOCKED    "); break;
+                        case PROCESS_STATE_SLEEPING: VGA_Write("SLEEPING   "); break;
+                        default:                     VGA_Write("?         "); break;
+                    }
+
+                    VGA_Write(" ");
+                    VGA_Write(shell_state.jobs_cmd[out]);
+                    VGA_Write("\n");
+
+                    out++;
+                }
+                shell_state.jobs_count = out;
+            }
         } else if (strcmp(command, "exec") == 0) {
-            exec(args);
+            /* Support background execution: exec <path> [args...] & */
+            char tmp[192];
+            strncpy(tmp, args, sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = 0;
+
+            /* Trim trailing spaces */
+            size_t len = strlen(tmp);
+            while (len > 0 && (tmp[len - 1] == ' ' || tmp[len - 1] == '\t')) { tmp[len - 1] = 0; len--; }
+
+            int bg = 0;
+            if (len > 0 && tmp[len - 1] == '&') {
+                bg = 1;
+                tmp[len - 1] = 0;
+                len--;
+                while (len > 0 && (tmp[len - 1] == ' ' || tmp[len - 1] == '\t')) { tmp[len - 1] = 0; len--; }
+            }
+
+            if (bg) {
+                int pid = exec_async(tmp);
+                if (pid > 0) {
+                    /* Record job */
+                    if (shell_state.jobs_count < JOBS_MAX) {
+                        int idx = shell_state.jobs_count++;
+                        shell_state.jobs_pids[idx] = pid;
+                        strncpy(shell_state.jobs_cmd[idx], tmp, COMMAND_MAX_LEN - 1);
+                        shell_state.jobs_cmd[idx][COMMAND_MAX_LEN - 1] = 0;
+                    }
+
+                    VGA_Writef("\\cg[bg] started PID %d\\rr\\n", pid);
+                } else {
+                    VGA_Write("\\cr[bg] exec failed\\rr\\n");
+                }
+            } else {
+                exec(tmp);
+            }
         } else if (strcmp(command, "acpi") == 0) {
             acpi_print_info();
         } else if (strcmp(command, "exit") == 0) {
