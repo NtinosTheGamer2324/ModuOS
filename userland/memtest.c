@@ -6,7 +6,7 @@ void print_hex(unsigned int n) {
 }
 
 int md_main(long argc, char** argv) {
-    printf("=== ModuOS Memory Diagnostics ===\n\n");
+    printf("=== Memory Diagnostics ===\n\n");
 
     // Show initial program break
     void* initial_brk = sbrk(0);

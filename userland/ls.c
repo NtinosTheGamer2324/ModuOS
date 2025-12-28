@@ -1,77 +1,69 @@
-// ls.c - List directory contents
+// ls.c - Unix-like directory listing
 #include "libc.h"
 #include "string.h"
 
-void print_entry(const char* name, int is_dir, unsigned int size) {
-    if (is_dir) {
-        printf("[DIR]  ");
-    } else {
-        printf("[FILE] ");
-    }
-    
-    printf(name);
-    
-    if (!is_dir) {
-        printf("  (");
-        char size_str[32];
-        itoa(size, size_str, 10);
-        printf(size_str);
-        printf(" bytes)");
-    }
-    
-    printf("\n");
+static int is_dot_entry(const char *name) {
+    return (strcmp(name, ".") == 0) || (strcmp(name, "..") == 0);
+}
+
+static void print_name(const char *name, int is_dir) {
+    // Safe printing: never use printf(name)
+    printf("%s", name);
+    if (is_dir) printf("/");
 }
 
 int md_main(long argc, char** argv) {
-    const char* path = "/";
-    
-    // Use argument if provided
-    if (argc > 1) {
-        path = argv[1];
+    // Default to process CWD (Unix semantics)
+    const char *path = NULL;
+    int show_all = 0; // -a
+
+    // args: ls [-a] [path]
+    for (long i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!a) continue;
+        if (strcmp(a, "-a") == 0) {
+            show_all = 1;
+        } else {
+            path = a;
+        }
     }
-    
-    printf("Directory listing: ");
-    printf(path);
-    printf("\n\n");
-    
-    // Open directory
+
+    char cwd_buf[256];
+    if (!path) {
+        char *cwd = getcwd(cwd_buf, sizeof(cwd_buf));
+        path = (cwd && cwd[0]) ? cwd : ".";
+    }
+
     int dir_fd = opendir(path);
     if (dir_fd < 0) {
-        printf("Error: Could not open directory\n");
+        printf("ls: cannot open '%s'\n", path);
         return 1;
     }
-    
-    // Read entries
+
     char name_buf[260];
-    int is_dir;
-    unsigned int size;
-    int count = 0;
-    
+    int is_dir = 0;
+    unsigned int size = 0;
+
+    int first = 1;
     while (1) {
-        int result = readdir(dir_fd, name_buf, sizeof(name_buf), &is_dir, &size);
-        
-        if (result == 0) {
-            // End of directory
-            break;
-        } else if (result < 0) {
-            // Error
-            printf("Error reading directory\n");
+        int rc = readdir(dir_fd, name_buf, sizeof(name_buf), &is_dir, &size);
+        if (rc == 0) break;
+        if (rc < 0) {
+            printf("ls: error reading '%s'\n", path);
             closedir(dir_fd);
             return 1;
         }
-        
-        print_entry(name_buf, is_dir, size);
-        count++;
+
+        if (!show_all && is_dot_entry(name_buf)) {
+            continue;
+        }
+
+        if (!first) printf("  ");
+        first = 0;
+        print_name(name_buf, is_dir);
     }
-    
-    // Close directory
-    closedir(dir_fd);
-    
-    printf("\nTotal entries: ");
-    char count_str[32];
-    itoa(count, count_str, 10);
-    printf(count_str);
+
     printf("\n");
-    
+    closedir(dir_fd);
     return 0;
 }

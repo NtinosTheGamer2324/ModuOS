@@ -1,44 +1,89 @@
-#!/bin/bash
-# build.sh - organized build for ModuOS userland
+#!/bin/sh
+# build.sh - organized build for ModuOS userland (POSIX sh)
 
-set -euo pipefail  # strict mode
+# Avoid strict-mode flags here because some minimal /bin/sh builds behave differently.
+set -e
 
-# Colors
-GREEN="\033[0;32m"
-RED="\033[0;31m"
-NC="\033[0m"
+# Compiler/Linker
+CC=${CC:-x86_64-elf-gcc}
+LD=${LD:-x86_64-elf-ld}
 
-# Compiler/Linker flags
-GCC_FLAGS="-ffreestanding -c -mno-red-zone -O2 -nostdlib"
-LD_FLAGS="-T user.ld"
+# Common flags
+GCC_FLAGS_COMMON="-ffreestanding -c -mno-red-zone -O2 -nostdlib"
 
-# Directories
+# Linker scripts
+LD_SCRIPT_APP="user.ld"        # fixed 0x400000 (ET_EXEC)
+LD_SCRIPT_LD="ld_user.ld"      # interpreter (ET_EXEC)
+LD_SCRIPT_LIB="lib_user.ld"    # shared libs (ET_DYN)
+
 BUILD_DIR="build"
 DIST_DIR="dist"
 
-echo -e "${GREEN}[BUILD] Cleaning previous builds...${NC}"
 rm -rf "$BUILD_DIR" "$DIST_DIR"
 mkdir -p "$BUILD_DIR" "$DIST_DIR"
 
-# Find all C source files
-SRC_FILES=(*.c)
-if [ ${#SRC_FILES[@]} -eq 0 ]; then
-    echo -e "${RED}[BUILD] No C source files found!${NC}"
-    exit 1
-fi
-
-# Compile each .c file into build/
-for src in "${SRC_FILES[@]}"; do
+# Compile
+for src in *.c; do
+    [ -f "$src" ] || continue
     obj="$BUILD_DIR/${src%.c}.o"
-    echo -e "${GREEN}[BUILD] Compiling $src -> $obj${NC}"
-    gcc $GCC_FLAGS "$src" -o "$obj"
+    echo "[BUILD] CC $src -> $obj"
+
+    case "$src" in
+        lib_*.c)
+            "$CC" $GCC_FLAGS_COMMON -fPIC "$src" -o "$obj"
+            ;;
+        *)
+            "$CC" $GCC_FLAGS_COMMON "$src" -o "$obj"
+            ;;
+    esac
+
 done
 
-# Link each .o file from build/ into dist/
+# Link in two phases so libraries exist before apps that depend on them.
+
+# Phase 1: shared libs
+for obj in "$BUILD_DIR"/lib_*.o; do
+    [ -f "$obj" ] || continue
+    base=$(basename "${obj%.o}")
+    outname="${base#lib_}.sqrl"
+    bin="$DIST_DIR/$outname"
+    echo "[BUILD] LD(shared) $obj -> $bin"
+    "$LD" "$obj" -shared -T "$LD_SCRIPT_LIB" -o "$bin" --hash-style=sysv
+
+done
+
+# Phase 2: interpreter + apps
 for obj in "$BUILD_DIR"/*.o; do
-    bin="$DIST_DIR/$(basename "${obj%.o}.sqr")"
-    echo -e "${GREEN}[BUILD] Linking $obj -> $bin${NC}"
-    ld "$obj" $LD_FLAGS -o "$bin"
+    [ -f "$obj" ] || continue
+    base=$(basename "${obj%.o}")
+
+    case "$base" in
+        lib_*)
+            # already linked in phase 1
+            ;;
+        ld_moduos)
+            bin="$DIST_DIR/ld-moduos.sqr"
+            echo "[BUILD] LD(interp) $obj -> $bin"
+            "$LD" "$obj" -T "$LD_SCRIPT_LD" -o "$bin" --hash-style=sysv
+            ;;
+        demo_dyn)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app dyn-demo) $obj -> $bin"
+            "$LD" "$obj" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv \
+                --dynamic-linker /ModuOS/shared/usr/lib/ld-moduos.sqr \
+                --no-as-needed \
+                -L"$DIST_DIR" -l:demo_gfx.sqrl
+            ;;
+        *)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app) $obj -> $bin"
+            "$LD" "$obj" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv \
+                --dynamic-linker /ModuOS/shared/usr/lib/ld-moduos.sqr
+            ;;
+    esac
+
 done
 
-echo -e "${GREEN}[BUILD] Build complete! Binaries are in '$DIST_DIR'${NC}"
+echo "[BUILD] Done. Outputs in $DIST_DIR"

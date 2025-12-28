@@ -142,6 +142,18 @@ static uint16_t rgb565(uint8_t r,uint8_t g,uint8_t b){
     return (uint16_t)((rr<<11)|(gg<<5)|bb);
 }
 
+static void fb_put_px(Gfx *g, int x, int y, uint32_t c) {
+    if ((unsigned)x >= g->vi.width || (unsigned)y >= g->vi.height) return;
+
+    if (g->fmt == MD64API_GRP_FMT_RGB565) {
+        uint16_t *p = (uint16_t*)(g->bb + (uint32_t)y * g->bb_pitch + (uint32_t)x * 2u);
+        *p = (uint16_t)c;
+    } else {
+        uint32_t *p = (uint32_t*)(g->bb + (uint32_t)y * g->bb_pitch + (uint32_t)x * 4u);
+        *p = c;
+    }
+}
+
 static void fb_put_rect(Gfx *g, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t c) {
     if (!g || !g->bb) return;
     if (x >= g->vi.width || y >= g->vi.height) return;
@@ -208,6 +220,93 @@ static int gfx_present_cell(Gfx *g, int cx, int cy) {
                     (uint16_t)g->fmt);
 }
 
+/* HUD font: 3x5 glyphs rendered at SCALE (2x2 pixels per bit) so it's readable.
+ * Contains only the letters we need for snake HUD.
+ */
+#define HUD_SCALE 2
+
+static void hud_put_glyph(Gfx *g, int x, int y, char ch, uint32_t fg) {
+    uint8_t rows[5] = {0,0,0,0,0};
+
+    /* digits */
+    if (ch >= '0' && ch <= '9') {
+        static const uint8_t dig[10][5] = {
+            {0x7,0x5,0x5,0x5,0x7}, {0x2,0x6,0x2,0x2,0x7}, {0x7,0x1,0x7,0x4,0x7},
+            {0x7,0x1,0x7,0x1,0x7}, {0x5,0x5,0x7,0x1,0x1}, {0x7,0x4,0x7,0x1,0x7},
+            {0x7,0x4,0x7,0x5,0x7}, {0x7,0x1,0x1,0x1,0x1}, {0x7,0x5,0x7,0x5,0x7},
+            {0x7,0x5,0x7,0x1,0x7},
+        };
+        for (int i=0;i<5;i++) rows[i]=dig[ch-'0'][i];
+    } else if (ch == ':') {
+        rows[0]=0x0; rows[1]=0x2; rows[2]=0x0; rows[3]=0x2; rows[4]=0x0;
+    } else if (ch == ' ') {
+        return;
+    } else {
+        /* letters needed: P A U S E D G M O V R */
+        switch (ch) {
+            case 'P': rows[0]=0x7; rows[1]=0x5; rows[2]=0x7; rows[3]=0x4; rows[4]=0x4; break;
+            case 'A': rows[0]=0x2; rows[1]=0x5; rows[2]=0x7; rows[3]=0x5; rows[4]=0x5; break;
+            case 'U': rows[0]=0x5; rows[1]=0x5; rows[2]=0x5; rows[3]=0x5; rows[4]=0x7; break;
+            case 'S': rows[0]=0x7; rows[1]=0x4; rows[2]=0x7; rows[3]=0x1; rows[4]=0x7; break;
+            case 'E': rows[0]=0x7; rows[1]=0x4; rows[2]=0x7; rows[3]=0x4; rows[4]=0x7; break;
+            case 'D': rows[0]=0x6; rows[1]=0x5; rows[2]=0x5; rows[3]=0x5; rows[4]=0x6; break;
+            case 'G': rows[0]=0x7; rows[1]=0x4; rows[2]=0x6; rows[3]=0x5; rows[4]=0x7; break;
+            case 'M': rows[0]=0x5; rows[1]=0x7; rows[2]=0x7; rows[3]=0x5; rows[4]=0x5; break;
+            case 'O': rows[0]=0x7; rows[1]=0x5; rows[2]=0x5; rows[3]=0x5; rows[4]=0x7; break;
+            case 'V': rows[0]=0x5; rows[1]=0x5; rows[2]=0x5; rows[3]=0x5; rows[4]=0x2; break;
+            case 'R': rows[0]=0x6; rows[1]=0x5; rows[2]=0x6; rows[3]=0x5; rows[4]=0x5; break;
+            default:
+                rows[0]=0x7; rows[1]=0x1; rows[2]=0x1; rows[3]=0x1; rows[4]=0x7; break;
+        }
+    }
+
+    for (int yy=0; yy<5; yy++) {
+        for (int xx=0; xx<3; xx++) {
+            if (rows[yy] & (1<<(2-xx))) {
+                for (int sy=0; sy<HUD_SCALE; sy++)
+                    for (int sx=0; sx<HUD_SCALE; sx++)
+                        fb_put_px(g, x + xx*HUD_SCALE + sx, y + yy*HUD_SCALE + sy, fg);
+            }
+        }
+    }
+}
+
+static void hud_put_str(Gfx *g, int x, int y, const char *s, uint32_t fg) {
+    int cx = x;
+    for (int i=0; s[i]; i++) {
+        hud_put_glyph(g, cx, y, s[i], fg);
+        cx += (3*HUD_SCALE) + HUD_SCALE; /* glyph width + spacing */
+    }
+}
+
+static void hud_put_int(Gfx *g, int x, int y, int v, uint32_t fg) {
+    char buf[16];
+    itoa(v, buf, 10);
+    hud_put_str(g, x, y, buf, fg);
+}
+
+static void draw_hud(Gfx *g, const Game *game) {
+    uint32_t fg = (g->fmt == MD64API_GRP_FMT_RGB565) ? rgb565(255,255,255) : xrgb(255,255,255);
+    uint32_t fg2 = (g->fmt == MD64API_GRP_FMT_RGB565) ? rgb565(0,255,0) : xrgb(0,255,0);
+    uint32_t bg = (g->fmt == MD64API_GRP_FMT_RGB565) ? rgb565(0,0,0) : xrgb(0,0,0);
+
+    /* clear a HUD strip */
+    for (int y=0; y<28; y++) for (int x=0; x<220; x++) fb_put_px(g, x, y, bg);
+
+    hud_put_str(g, 2, 2, "SCORE:", fg);
+    hud_put_int(g, 2 + 7*((3*HUD_SCALE)+HUD_SCALE), 2, game->score, fg2);
+
+    hud_put_str(g, 2, 14, "LEN:", fg);
+    hud_put_int(g, 2 + 4*((3*HUD_SCALE)+HUD_SCALE), 14, game->s.len, fg2);
+
+    if (game->paused) {
+        hud_put_str(g, 110, 2, "PAUSED", fg);
+    }
+    if (game->over) {
+        hud_put_str(g, 110, 14, "GAME OVER", fg);
+    }
+}
+
 static void draw_init(Gfx *g, const Game *game) {
     fb_put_rect(g, 0, 0, g->vi.width, g->vi.height, col_bg(g));
     fb_put_rect(g, g->off_x, g->off_y, GAME_W * g->cell_px, GAME_H * g->cell_px, col_grid(g));
@@ -245,10 +344,8 @@ static void draw_update(Gfx *g, const Game *game, Pt old_head, Pt old_tail, Pt o
         (void)gfx_present_cell(g, game->food.x, game->food.y);
     }
 
-    /* HUD to console (optional) */
-    printf("\rscore=%d len=%d %s %s  ", game->score, game->s.len,
-           game->paused ? "[PAUSED]" : "        ",
-           game->over ? "[GAME OVER]" : "          ");
+    /* HUD drawn in framebuffer (see draw_hud). */
+    (void)game;
 }
 
 static int gfx_init(Gfx *g) {
@@ -345,9 +442,7 @@ int md_main(long argc, char **argv) {
         return 1;
     }
 
-    printf("snakegfx: video w=%u h=%u pitch=%u bpp=%u fmt=%u fb=0x%llx\n",
-           (unsigned)gfx.vi.width, (unsigned)gfx.vi.height, (unsigned)gfx.vi.pitch,
-           (unsigned)gfx.vi.bpp, (unsigned)gfx.fmt, (unsigned long long)gfx.vi.fb_addr);
+    /* Intentionally avoid printf() in graphics apps; draw text to framebuffer instead. */
 
     int efd = evt_open();
     if (efd < 0) {
@@ -394,11 +489,10 @@ int md_main(long argc, char **argv) {
             last_tick = now;
         }
 
-        /* throttle HUD refresh if paused/over */
+        /* throttle HUD refresh */
         if (now - last_draw >= 250) {
-            printf("\rscore=%d len=%d %s %s  ", g_game.score, g_game.s.len,
-                   g_game.paused ? "[PAUSED]" : "        ",
-                   g_game.over ? "[GAME OVER]" : "          ");
+            draw_hud(&gfx, &g_game);
+            gfx_present_full(&gfx);
             last_draw = now;
         }
 

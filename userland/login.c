@@ -1,5 +1,4 @@
 #include "libc.h"
-#include "../include/moduos/kernel/events/events.h"
 #include "string.h"
 
 /*
@@ -170,70 +169,25 @@ int md_main(long argc, char **argv) {
      * Flush any pending buffered keystrokes so login doesn't auto-consume previous shell input,
      * AND so the shell doesn't later replay the login keystrokes (shell reads event0).
      */
-    int kfd = open("$/dev/input/kbd0", O_RDONLY | O_NONBLOCK, 0);
-    if (kfd < 0) {
-        puts_raw("login: cannot open $/dev/input/kbd0\n");
-        return 1;
-    }
-    for (;;) {
-        char c;
-        ssize_t n = read(kfd, &c, 1);
-        if (n != 1) break;
-    }
-    close(kfd);
-
-    int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
-    if (efd >= 0) {
-        for (;;) {
-            Event e;
-            ssize_t n = read(efd, &e, sizeof(e));
-            if (n != (ssize_t)sizeof(e)) break;
-        }
-        close(efd);
-    }
-
-    /* Re-open in blocking mode for actual prompts */
-    kfd = open("$/dev/input/kbd0", O_RDONLY, 0);
-    if (kfd < 0) {
-        puts_raw("login: cannot open $/dev/input/kbd0\n");
-        return 1;
-    }
-
-    /* Simple line editor for kbd0 */
-    auto int read_line(int fd, char *out, int out_sz) {
-        int n = 0;
-        for (;;) {
-            char c;
-            if (read(fd, &c, 1) != 1) continue;
-            if (c == '\r') continue;
-            if (c == '\n') {
-                out[n] = 0;
-                puts_raw("\n");
-                return n;
-            }
-            if ((c == '\b' || c == 127) && n > 0) {
-                n--;
-                out[n] = 0;
-                puts_raw("\b \b");
-                continue;
-            }
-            if (n < out_sz - 1 && c >= 32 && c < 127) {
-                out[n++] = c;
-                out[n] = 0;
-                /* echo */
-                char tmp[2] = {c, 0};
-                puts_raw(tmp);
-            }
-        }
-    }
+    input_flush();
 
     puts_raw("Username: ");
-    read_line(kfd, username, (int)sizeof(username));
+    {
+        const char *in = input();
+        strncpy(username, in ? in : "", sizeof(username) - 1);
+        username[sizeof(username) - 1] = 0;
+    }
+    /* Zenith shell uses event0; drain any structured events generated while typing. */
+    input_flush();
 
-    puts_raw("Password: ");
-    read_line(kfd, password, (int)sizeof(password));
-
-    close(kfd);
+    puts_raw("\nPassword: ");
+    {
+        const char *in = input();
+        strncpy(password, in ? in : "", sizeof(password) - 1);
+        password[sizeof(password) - 1] = 0;
+    }
+    /* Drain again so password keystrokes aren't replayed as shell input. */
+    input_flush();
 
     /* hash password */
     sha256_t s;
@@ -290,7 +244,5 @@ int md_main(long argc, char **argv) {
 
     puts_raw("login ok\n");
 
-    /* Exec system shell */
-    exec("/Apps/sh.sqr");
     return 0;
 }

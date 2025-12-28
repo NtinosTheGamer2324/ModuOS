@@ -180,7 +180,12 @@ int md_main(long argc, char** argv) {
         else if (streq(a, "--help") || streq(a, "-h")) { usage(argv[0]); return 0; }
     }
 
-    md64api_sysinfo_data *info = get_system_info();
+    md64api_sysinfo_data_u info_s;
+    if (get_system_info_u(&info_s) != 0) {
+        printf("Failed to get system info\n");
+        return 1;
+    }
+    md64api_sysinfo_data_u *info = &info_s;
     if (!info) {
         puts("Error: Cannot get system info");
         return 1;
@@ -280,7 +285,27 @@ int md_main(long argc, char** argv) {
         print_kv_color(logo_on, logo, logo_lines, logo_width, line++, use_color, "OS", os_line);
     }
 
-    print_kv_color(logo_on, logo, logo_lines, logo_width, line++, use_color, "Kernel", safe_str(info->KernelVendor));
+    /* Kernel: single line "<version> <vendor>" */
+    {
+        char kernel_line[128];
+        kernel_line[0] = 0;
+
+        const char *kv = safe_str(info->KernelVersion);
+        const char *kven = safe_str(info->KernelVendor);
+
+        if (kv[0] && kven[0]) {
+            snprintf(kernel_line, sizeof(kernel_line), "\\ccVersion: %s \\rr- \\ccVendor: %s\\rr", kv, kven);
+        } else if (kv[0]) {
+            snprintf(kernel_line, sizeof(kernel_line), "\\ccVersion: %s \\rr", kv);
+        } else if (kven[0]) {
+            snprintf(kernel_line, sizeof(kernel_line), "\\ccVendor: %s \\rr", kven);
+        } else {
+            snprintf(kernel_line, sizeof(kernel_line), "\\crUnknown\\rr");
+        }
+
+        print_kv_color(logo_on, logo, logo_lines, logo_width, line++, use_color, "Kernel", kernel_line);
+    }
+
     print_kv_color(logo_on, logo, logo_lines, logo_width, line++, use_color, "Uptime", uptime_buf);
 
     if (safe_str(info->kconsole)[0]) print_kv_color(logo_on, logo, logo_lines, logo_width, line++, use_color, "Console", info->kconsole);

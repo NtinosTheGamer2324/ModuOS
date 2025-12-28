@@ -1,110 +1,87 @@
-// tree.c - Recursive directory tree viewer
 #include "libc.h"
 #include "string.h"
 
-#define MAX_DEPTH 10
+#define MAX_DEPTH 8
 #define MAX_PATH 256
 
-void print_indent(int depth) {
-    for (int i = 0; i < depth; i++) {
-        printf("  ");
-    }
-}
+// Visual markers
+const char* VLINE   = "│   ";
+const char* BRANCH  = "├── ";
+const char* LAST    = "└── ";
 
-void print_tree_entry(const char* name, int is_dir, int depth) {
-    print_indent(depth);
-    
-    if (is_dir) {
-        printf("[+] ");
-    } else {
-        printf("    ");
-    }
-    
-    printf(name);
-    printf("\n");
-}
+typedef struct {
+    int is_last[MAX_DEPTH];
+} TreeState;
 
-void list_directory_recursive(const char* path, int depth) {
-    if (depth >= MAX_DEPTH) {
-        print_indent(depth);
-        printf("(max depth reached)\n");
+void list_recursive(const char* path, int depth, TreeState state) {
+    if (depth >= MAX_DEPTH) return;
+
+    int fd = opendir(path);
+    if (fd < 0) {
+        printf(" [Error opening %s]\n", path);
         return;
     }
-    
-    int dir_fd = opendir(path);
-    if (dir_fd < 0) {
-        print_indent(depth);
-        printf("(error opening directory)\n");
-        return;
-    }
-    
-    char name_buf[260];
+
+    char name[256];
     int is_dir;
     unsigned int size;
-    
-    // First pass: list files
-    while (1) {
-        int result = readdir(dir_fd, name_buf, sizeof(name_buf), &is_dir, &size);
-        
-        if (result == 0) break;
-        if (result < 0) break;
-        
-        if (!is_dir) {
-            print_tree_entry(name_buf, 0, depth);
-        }
+
+    // Count number of entries to detect last
+    int entries = 0;
+    int temp_fd = opendir(path);
+    while (readdir(temp_fd, name, sizeof(name), &is_dir, &size) > 0) {
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        entries++;
     }
-    
-    closedir(dir_fd);
-    
-    // Second pass: recurse into directories
-    dir_fd = opendir(path);
-    if (dir_fd < 0) return;
-    
-    while (1) {
-        int result = readdir(dir_fd, name_buf, sizeof(name_buf), &is_dir, &size);
-        
-        if (result == 0) break;
-        if (result < 0) break;
-        
+    closedir(temp_fd);
+
+    int index = 0;
+    while (readdir(fd, name, sizeof(name), &is_dir, &size) > 0) {
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        index++;
+
+        // Print tree indentation
+        for (int i = 0; i < depth; i++) {
+            if (state.is_last[i])
+                printf("    ");
+            else
+                printf("%s", VLINE);
+        }
+
+        int last = (index == entries);
+        state.is_last[depth] = last;
+
+        printf("%s", last ? LAST : BRANCH);
+
         if (is_dir) {
-            print_tree_entry(name_buf, 1, depth);
-            
-            // Build new path
-            char new_path[MAX_PATH];
-            if (strcmp(path, "/") == 0) {
-                new_path[0] = '/';
-                strncpy(new_path + 1, name_buf, MAX_PATH - 2);
-            } else {
-                strncpy(new_path, path, MAX_PATH - 1);
-                int len = strlen(new_path);
-                if (len < MAX_PATH - 1) {
-                    new_path[len] = '/';
-                    strncpy(new_path + len + 1, name_buf, MAX_PATH - len - 2);
-                }
-            }
-            new_path[MAX_PATH - 1] = '\0';
-            
-            // Recurse
-            list_directory_recursive(new_path, depth + 1);
+            printf("%s/\n", name);
+
+            // Build next path
+            char next_path[MAX_PATH];
+            strcpy(next_path, path);
+            int len = strlen(next_path);
+            if (len > 0 && next_path[len-1] != '/')
+                strcat(next_path, "/");
+            strcat(next_path, name);
+
+            list_recursive(next_path, depth + 1, state);
+        } else {
+            printf("%s (%u bytes)\n", name, size);
         }
     }
-    
-    closedir(dir_fd);
+
+    closedir(fd);
 }
 
 int md_main(long argc, char** argv) {
-    const char* path = "/";
-    
-    if (argc > 1) {
-        path = argv[1];
-    }
-    
-    printf("Directory tree: ");
-    printf(path);
-    printf("\n\n");
-    
-    list_directory_recursive(path, 0);
-    
+    const char* root = (argc > 1) ? argv[1] : "/";
+
+    printf("Squirrel Tree View: %s\n", root);
+    printf("%s\n", root);
+
+    TreeState state = {0};
+    list_recursive(root, 0, state);
+
     printf("\nDone.\n");
     return 0;
 }

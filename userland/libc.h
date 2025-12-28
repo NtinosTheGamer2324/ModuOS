@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Local string helpers (strlen, strcmp, etc.) */
+#include "string.h"
+
 // Syscall numbers (shared with kernel)
 #include "../include/moduos/kernel/syscall/syscall_numbers.h"
 // MD64API (userland-visible kernel interfaces)
@@ -37,6 +40,12 @@ typedef const char* string;
 /* System Information Structure */
 
 // ---------------- MD64API SysInfo ----------------
+
+#include "../include/moduos/kernel/md64api_user.h"
+
+/* Legacy pointer-based struct kept for older apps (unsafe in ring3).
+ * Prefer md64api_sysinfo_data_u + SYS_SSTATS2.
+ */
 
 typedef struct md64api_sysinfo_data
 {
@@ -130,7 +139,7 @@ static inline long syscall4(long num, long arg1, long arg2, long arg3, long arg4
         "mov %%rax, %0"
         : "=r"(ret)
         : "r"(num), "r"(arg1), "r"(arg2), "r"(arg3), "r"(arg4)
-        : "rax", "rdi", "rsi", "rdx", "r10", "rcx", "memory"
+        : "rax", "rdi", "rsi", "rdx", "r10", "memory"
     );
     return ret;
 }
@@ -167,6 +176,37 @@ static inline int open(const char *pathname, int flags, int mode);
 static inline ssize_t read(int fd, void *buf, size_t count);
 static inline int close(int fd);
 
+// Drain the structured input queue ($/dev/input/event0).
+// Useful because the kernel shell and some apps consume event0, while libc's input() reads kbd0.
+static inline void input_flush_events(void) {
+    int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
+    if (efd >= 0) {
+        /* Events are opaque to libc; we just drain bytes. */
+        unsigned char buf[64];
+        for (;;) {
+            ssize_t n = read(efd, buf, sizeof(buf));
+            if (n <= 0) break;
+        }
+        close(efd);
+    }
+}
+
+// Flush any pending buffered input so the next line read doesn't auto-consume previous keystrokes.
+// This also drains the structured input queue ($/dev/input/event0) which the shell / games may use.
+static inline void input_flush(void) {
+    /* Drain raw keyboard chars */
+    int kfd = open("$/dev/input/kbd0", O_RDONLY | O_NONBLOCK, 0);
+    if (kfd >= 0) {
+        for (;;) {
+            char c;
+            if (read(kfd, &c, 1) != 1) break;
+        }
+        close(kfd);
+    }
+
+    input_flush_events();
+}
+
 // Convenience: returns pointer to a static buffer (blocking line read from kbd0)
 static inline char* input() {
     static char input_buf[256];
@@ -185,13 +225,15 @@ static inline char* input() {
         if (c == '\n') {
             input_buf[n] = 0;
             close(fd);
+            /* Prevent typed keys from being replayed later by event0 consumers. */
+            input_flush_events();
             return input_buf;
         }
         if ((c == '\b' || c == 127) && n > 0) {
             n--;
             input_buf[n] = 0;
             /* echo erase */
-            puts_raw("\b \b");
+            puts_raw("\b");
             continue;
         }
         if (n < (int)sizeof(input_buf) - 1 && c >= 32 && c < 127) {
@@ -207,8 +249,8 @@ static inline char* input() {
    SYSTEM INFO
    ============================================================ */
 
-static inline md64api_sysinfo_data* get_system_info(void) {
-    return (md64api_sysinfo_data*)syscall(SYS_SSTATS, 0, 0, 0);
+static inline int get_system_info_u(md64api_sysinfo_data_u *out) {
+    return (int)syscall(SYS_SSTATS2, (long)out, (long)sizeof(*out), 0);
 }
 
 /* Time API: milliseconds since boot */
@@ -375,36 +417,53 @@ int printf(const char *fmt, ...) {
     va_start(ap, fmt);
 
     while (*fmt) {
+        /* Fast path: write literal runs in one syscall (preserves UTF-8 bytes) */
+        if (*fmt != '%') {
+            const char *start = fmt;
+            while (*fmt && *fmt != '%') fmt++;
+            if (fmt > start) {
+                write(STDOUT_FILENO, start, (size_t)(fmt - start));
+                continue;
+            }
+        }
+
+        /* Format handling */
         if (*fmt == '%') {
             fmt++;
 
             int longmod = 0;
             int longlongmod = 0;
-            
+
             if (*fmt == 'l') {
                 longmod = 1;
                 fmt++;
-                if (*fmt == 'l') {  // 'll' for long long
+                if (*fmt == 'l') {
                     longlongmod = 1;
                     fmt++;
                 }
             }
 
             switch (*fmt) {
-                case 'c':
-                    putc((char)va_arg(ap, int));
+                case 'c': {
+                    char ch = (char)va_arg(ap, int);
+                    write(STDOUT_FILENO, &ch, 1);
                     break;
+                }
 
-                case 's':
-                    puts_raw(va_arg(ap, const char*));
+                case 's': {
+                    const char *s = va_arg(ap, const char*);
+                    if (!s) s = "(null)";
+                    write(STDOUT_FILENO, s, strlen(s));
                     break;
+                }
 
                 case 'd':
                 case 'i':
                     if (longlongmod) {
                         long long n = va_arg(ap, long long);
                         if (n < 0) {
-                            putc('-');
+                            char m = '-';
+                            write(STDOUT_FILENO, &m, 1);
                             n = -n;
                         }
                         print_ulonglong((unsigned long long)n, 10, 0);
@@ -442,18 +501,21 @@ int printf(const char *fmt, ...) {
                         print_uint(va_arg(ap, unsigned int), 16, 1);
                     break;
 
-                case '%':
-                    putc('%');
+                case '%': {
+                    char p = '%';
+                    write(STDOUT_FILENO, &p, 1);
                     break;
+                }
 
-                default:
-                    putc('%');
-                    putc(*fmt);
+                default: {
+                    char pct = '%';
+                    write(STDOUT_FILENO, &pct, 1);
+                    if (*fmt) write(STDOUT_FILENO, fmt, 1);
+                    break;
+                }
             }
 
-            fmt++;
-        } else {
-            putc(*fmt++);
+            if (*fmt) fmt++;
         }
     }
 
@@ -466,16 +528,149 @@ int printf(const char *fmt, ...) {
    MEMORY FUNCTIONS
    ============================================================ */
 
+/* sbrk must be declared before malloc() */
+static inline void* sbrk(intptr_t inc) {
+    return (void*)syscall(SYS_SBRK, inc, 0, 0);
+}
+
+/*
+ * Userland heap allocator (simple free-list malloc).
+ *
+ * This replaces the bump allocator so graphics apps and shells don't leak memory forever.
+ * It is NOT thread-safe (single-threaded userland).
+ */
+
+typedef struct uheap_hdr {
+    size_t size;              /* payload size */
+    struct uheap_hdr *next;   /* next free block */
+    uint32_t magic;
+    uint32_t free;
+} uheap_hdr_t;
+
+#define UHEAP_MAGIC 0xC0FFEE55u
+
+static uheap_hdr_t *g_uheap_free = NULL;
+
+static inline size_t uheap_align(size_t n) {
+    return (n + 15) & ~((size_t)15);
+}
+
+static inline void uheap_insert_free(uheap_hdr_t *b) {
+    b->free = 1;
+    b->next = g_uheap_free;
+    g_uheap_free = b;
+}
+
+static inline void uheap_remove_free(uheap_hdr_t *b) {
+    uheap_hdr_t **pp = &g_uheap_free;
+    while (*pp) {
+        if (*pp == b) {
+            *pp = b->next;
+            b->next = NULL;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+static inline uheap_hdr_t* uheap_request_from_kernel(size_t payload) {
+    size_t total = sizeof(uheap_hdr_t) + payload;
+    total = uheap_align(total);
+
+    void *mem = sbrk((intptr_t)total);
+    if ((intptr_t)mem == -1 || mem == NULL) return NULL;
+
+    uheap_hdr_t *h = (uheap_hdr_t*)mem;
+    h->size = total - sizeof(uheap_hdr_t);
+    h->next = NULL;
+    h->magic = UHEAP_MAGIC;
+    h->free = 0;
+    return h;
+}
+
+static inline void uheap_split_if_needed(uheap_hdr_t *h, size_t need) {
+    /* split only if we can create a useful remainder */
+    size_t remain = (h->size > need) ? (h->size - need) : 0;
+    if (remain < (sizeof(uheap_hdr_t) + 32)) return;
+
+    /* New block starts after allocated payload */
+    uint8_t *base = (uint8_t*)(h + 1);
+    uheap_hdr_t *nh = (uheap_hdr_t*)(base + need);
+    nh->size = remain - sizeof(uheap_hdr_t);
+    nh->next = NULL;
+    nh->magic = UHEAP_MAGIC;
+    nh->free = 1;
+
+    h->size = need;
+
+    uheap_insert_free(nh);
+}
+
 static inline void* malloc(size_t size) {
-    return (void*)syscall(SYS_MALLOC, size, 0, 0);
+    if (size == 0) return NULL;
+    size = uheap_align(size);
+
+    /* first-fit */
+    uheap_hdr_t *prev = NULL;
+    uheap_hdr_t *cur = g_uheap_free;
+    while (cur) {
+        if (cur->magic != UHEAP_MAGIC) return NULL;
+        if (cur->free && cur->size >= size) {
+            /* detach */
+            if (prev) prev->next = cur->next;
+            else g_uheap_free = cur->next;
+            cur->next = NULL;
+            cur->free = 0;
+
+            uheap_split_if_needed(cur, size);
+            return (void*)(cur + 1);
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+
+    uheap_hdr_t *h = uheap_request_from_kernel(size);
+    if (!h) return NULL;
+
+    uheap_split_if_needed(h, size);
+    return (void*)(h + 1);
 }
 
 static inline void free(void *ptr) {
-    syscall(SYS_FREE, (long)ptr, 0, 0);
+    if (!ptr) return;
+    uheap_hdr_t *h = ((uheap_hdr_t*)ptr) - 1;
+    if (h->magic != UHEAP_MAGIC) return;
+    if (h->free) return;
+
+    /* mark free and add to free list */
+    uheap_insert_free(h);
+
+    /* NOTE: simple allocator: no coalescing yet */
 }
 
-static inline void* sbrk(intptr_t inc) {
-    return (void*)syscall(SYS_SBRK, inc, 0, 0);
+static inline void* calloc(size_t nmemb, size_t size) {
+    size_t total = nmemb * size;
+    void *p = malloc(total);
+    if (!p) return NULL;
+    memset(p, 0, total);
+    return p;
+}
+
+static inline void* realloc(void *ptr, size_t size) {
+    if (!ptr) return malloc(size);
+    if (size == 0) { free(ptr); return NULL; }
+
+    uheap_hdr_t *h = ((uheap_hdr_t*)ptr) - 1;
+    if (h->magic != UHEAP_MAGIC) return NULL;
+
+    size_t new_sz = uheap_align(size);
+    if (h->size >= new_sz) return ptr;
+
+    void *n = malloc(new_sz);
+    if (!n) return NULL;
+    memcpy(n, ptr, h->size);
+    free(ptr);
+    return n;
 }
 
 /* ============================================================
@@ -539,6 +734,16 @@ static inline int opendir(const char *path) {
     return (int)syscall(SYS_OPENDIR, (uint64_t)path, 0, 0);
 }
 
+// Change current working directory
+static inline int chdir(const char *path) {
+    return (int)syscall(SYS_CHDIR, (uint64_t)path, 0, 0);
+}
+
+// Get current working directory
+static inline char *getcwd(char *buf, size_t size) {
+    return (char*)syscall(SYS_GETCWD, (uint64_t)buf, (uint64_t)size, 0);
+}
+
 static inline int readdir(int fd, char *name_buf, size_t buf_size, int *is_dir, uint32_t *size) {
     uint64_t ret;
     __asm__ volatile (
@@ -553,13 +758,24 @@ static inline int readdir(int fd, char *name_buf, size_t buf_size, int *is_dir, 
         : "=r"(ret)
         : "r"((uint64_t)SYS_READDIR), "r"((uint64_t)fd), "r"((uint64_t)name_buf),
           "r"((uint64_t)buf_size), "r"((uint64_t)is_dir), "r"((uint64_t)size)
-        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "memory"
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory"
     );
     return (int)ret;
 }
 
 static inline int closedir(int fd) {
     return (int)syscall(SYS_CLOSEDIR, (uint64_t)fd, 0, 0);
+}
+
+#include "../include/moduos/fs/mkfs.h"
+#include "../include/moduos/fs/part.h"
+
+static inline int vfs_mkfs(const vfs_mkfs_req_t *req) {
+    return (int)syscall(SYS_VFS_MKFS, (uint64_t)req, 0, 0);
+}
+
+static inline int vfs_getpart(const vfs_part_req_t *req, vfs_part_info_t *out) {
+    return (int)syscall(SYS_VFS_GETPART, (uint64_t)req, (uint64_t)out, 0);
 }
 
 int md_main(long argc, char** argv);

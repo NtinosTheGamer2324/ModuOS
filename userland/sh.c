@@ -18,7 +18,7 @@ void parse_command(char* input, char* command, char* args) {
 int md_main(long argc, char** argv) {
     while (sh_running) {
 
-        printf("someuser@pcnames> ");
+        printf("\nsomeuser@pcnames> ");
 
         char* user_input = input();
 
@@ -32,6 +32,13 @@ int md_main(long argc, char** argv) {
             sh_running = 0;
         } else if (strlen(command) == 0) {
             // Do nothing on empty command
+        } else {
+            printf(
+                "\\cr%s : The term '%s' is not recognized as the name of a klet, or operable program.\n"
+                "Check the spelling of the name and try again.\n"
+                "+ %s %s \n \\rr\\rr",
+                command, command, command, args
+            );
         }
 
         // Here you would read input and execute commands...

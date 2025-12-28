@@ -56,7 +56,9 @@ static int g_map[MAP_H][MAP_W] = {
     {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}
 };
 
-/* Kernel's sine table (scaled by 100) */
+/* Kernel's sine table (scaled by 100). We also expose float versions now that
+ * FPU/SSE is supported in userland.
+ */
 static const int sin_table[361] = {
     0, 2, 3, 5, 7, 9, 10, 12, 14, 16, 17, 19, 21, 22, 24, 26, 28, 29, 31, 33,
     34, 36, 37, 39, 41, 42, 44, 45, 47, 48, 50, 52, 53, 54, 56, 57, 59, 60, 62, 63,
@@ -81,9 +83,12 @@ static const int sin_table[361] = {
 static int isin(int a){ while(a<0)a+=360; while(a>=360)a-=360; return sin_table[a]; }
 static int icos(int a){ return isin(a+90); }
 
+static float fsin_deg(int a){ return (float)isin(a) / 100.0f; }
+static float fcos_deg(int a){ return (float)icos(a) / 100.0f; }
+
 typedef struct {
-    int x; /* scaled by 100 */
-    int y;
+    float x; /* scaled by 100 */
+    float y;
     int angle;
 } Player;
 
@@ -182,26 +187,32 @@ static int gfx_init(Gfx *g) {
 }
 
 /* Raycast like kernel (distance in 1/10th units) */
-static int cast_ray(int px, int py, int angle, int *hit_type) {
-    int dx = icos(angle);
-    int dy = isin(angle);
+static float cast_ray_f(float px, float py, int angle, int *hit_type) {
+    /* Keep same scaling semantics as the old integer raycast:
+     * - positions are scaled by 100
+     * - dx/dy are scaled by 100
+     * - dist is in "tenths" (MAX_DEPTH_TENTHS)
+     */
+    float dx = fcos_deg(angle) * 100.0f;
+    float dy = fsin_deg(angle) * 100.0f;
 
     for (int dist = 0; dist < MAX_DEPTH_TENTHS; dist += 2) {
-        int test_x = (px + (dx * dist / 100)) / 100;
-        int test_y = (py + (dy * dist / 100)) / 100;
+        float distf = (float)dist;
+        int test_x = (int)((px + (dx * distf / 100.0f)) / 100.0f);
+        int test_y = (int)((py + (dy * distf / 100.0f)) / 100.0f);
 
         if (test_x < 0 || test_x >= MAP_W || test_y < 0 || test_y >= MAP_H) {
             *hit_type = 1;
-            return dist;
+            return (float)dist;
         }
         if (g_map[test_y][test_x] != 0) {
             *hit_type = g_map[test_y][test_x];
-            return dist;
+            return (float)dist;
         }
     }
 
     *hit_type = 0;
-    return MAX_DEPTH_TENTHS;
+    return (float)MAX_DEPTH_TENTHS;
 }
 
 static uint32_t wall_color(Gfx *g, int hit_type, int dist) {
@@ -315,11 +326,11 @@ static void render_frame(Gfx *gfx, const Player *p, int fps) {
         while (ray_angle >= 360) ray_angle -= 360;
 
         int hit_type;
-        int dist = cast_ray(p->x, p->y, ray_angle, &hit_type);
+        float dist = cast_ray_f(p->x, p->y, ray_angle, &hit_type);
 
-        /* avoid div by 0 and fish-eye a bit */
-        int d = dist + 10;
-        int wall_h = (R_H * 120) / d;
+        /* avoid div by 0 */
+        float d = dist + 10.0f;
+        int wall_h = (int)((float)(R_H * 120) / d);
         if (wall_h > R_H) wall_h = R_H;
 
         int top = (R_H/2) - (wall_h/2);
@@ -327,7 +338,7 @@ static void render_frame(Gfx *gfx, const Player *p, int fps) {
         if (top < 0) top = 0;
         if (bot > R_H) bot = R_H;
 
-        uint32_t wc = wall_color(gfx, hit_type, dist);
+        uint32_t wc = wall_color(gfx, hit_type, (int)dist);
         for (int y=top; y<bot; y++) {
             fb_put_px(gfx, x, y, wc);
         }
@@ -345,11 +356,11 @@ static void render_frame(Gfx *gfx, const Player *p, int fps) {
 
     hud_put_digit(gfx, 2, 10, 'X', fg);
     hud_put_digit(gfx, 6, 10, ':', fg);
-    hud_put_int(gfx, 10, 10, p->x/100, fg2);
+    hud_put_int(gfx, 10, 10, (int)(p->x/100.0f), fg2);
 
     hud_put_digit(gfx, 2, 18, 'Y', fg);
     hud_put_digit(gfx, 6, 18, ':', fg);
-    hud_put_int(gfx, 10, 18, p->y/100, fg2);
+    hud_put_int(gfx, 10, 18, (int)(p->y/100.0f), fg2);
 
     hud_put_digit(gfx, 2, 26, 'A', fg);
     hud_put_digit(gfx, 6, 26, ':', fg);
@@ -389,20 +400,22 @@ static int input_handle(Player *p, Input *in, const Event *e) {
         return 1;
     }
 
-    int dx = icos(p->angle);
-    int dy = isin(p->angle);
+    /* Movement: keep same world scaling (pos*100). */
+    float dx = fcos_deg(p->angle) * 100.0f;
+    float dy = fsin_deg(p->angle) * 100.0f;
 
-    int nx = p->x;
-    int ny = p->y;
+    float nx = p->x;
+    float ny = p->y;
+    float step = ((float)MOVE_SPEED_TENTHS) / 10.0f;
 
-    if (c == 'w' || c == 'W') { nx += (dx * MOVE_SPEED_TENTHS) / 10; ny += (dy * MOVE_SPEED_TENTHS) / 10; }
-    else if (c == 's' || c == 'S') { nx -= (dx * MOVE_SPEED_TENTHS) / 10; ny -= (dy * MOVE_SPEED_TENTHS) / 10; }
-    else if (c == 'a' || c == 'A') { nx += (dy * MOVE_SPEED_TENTHS) / 10; ny -= (dx * MOVE_SPEED_TENTHS) / 10; }
-    else if (c == 'd' || c == 'D') { nx -= (dy * MOVE_SPEED_TENTHS) / 10; ny += (dx * MOVE_SPEED_TENTHS) / 10; }
+    if (c == 'w' || c == 'W') { nx += dx * step; ny += dy * step; }
+    else if (c == 's' || c == 'S') { nx -= dx * step; ny -= dy * step; }
+    else if (c == 'a' || c == 'A') { nx += dy * step; ny -= dx * step; }
+    else if (c == 'd' || c == 'D') { nx -= dy * step; ny += dx * step; }
     else return 0;
 
-    int mx = nx / 100;
-    int my = ny / 100;
+    int mx = (int)(nx / 100.0f);
+    int my = (int)(ny / 100.0f);
     if (mx >= 0 && mx < MAP_W && my >= 0 && my < MAP_H && g_map[my][mx] == 0) {
         p->x = nx;
         p->y = ny;
@@ -434,7 +447,7 @@ int md_main(long argc, char **argv) {
         return 2;
     }
 
-    Player p = { .x = 150, .y = 150, .angle = 0 };
+    Player p = { .x = 150.0f, .y = 150.0f, .angle = 0 };
     Input in;
     memset(&in, 0, sizeof(in));
 
