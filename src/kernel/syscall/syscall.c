@@ -1,10 +1,13 @@
 #include "moduos/kernel/syscall/syscall.h"
+#include "moduos/fs/mkfs.h"
+#include "moduos/fs/part.h"
 #include "moduos/fs/devfs.h"
 #include "moduos/kernel/syscall/syscall_numbers.h"
 #include "moduos/kernel/md64api.h"
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
+#include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/interrupts/idt.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/COM/com.h"
@@ -12,6 +15,7 @@
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/md64api_user.h"
 #include "moduos/fs/fs.h"
 #include "moduos/fs/fd.h"
 #include "moduos/fs/path.h"
@@ -19,24 +23,14 @@
 #include "moduos/kernel/exec.h"
 #include "moduos/drivers/input/input.h"
 
+#include "moduos/kernel/memory/usercopy.h"
+
 /* Helper: Copy string from userspace to kernel buffer */
 static int copy_string_from_user(const char *user_str, char *kernel_buf, size_t max_len) {
-    if (!user_str || !kernel_buf || max_len == 0) return -1;
-    
-    process_t *proc = process_get_current();
-    if (!proc) return -1;
-    
-    /* In ModuOS, all process virtual memory is mapped in the kernel's page table
-     * because processes share the kernel's page table. So we can directly access
-     * the virtual address. */
-    size_t i;
-    for (i = 0; i < max_len - 1; i++) {
-        kernel_buf[i] = user_str[i];
-        if (user_str[i] == '\0') break;
-    }
-    kernel_buf[i] = '\0';
+    int rc = usercopy_string_from_user(kernel_buf, user_str, max_len);
+    if (rc != 0) return -1;
 
-    // Strip trailing whitespace/newlines (common when userland passes raw tokens)
+    /* Strip trailing whitespace/newlines (common when userland passes raw tokens) */
     size_t n = strlen(kernel_buf);
     while (n > 0) {
         char c = kernel_buf[n - 1];
@@ -53,13 +47,13 @@ static int copy_string_from_user(const char *user_str, char *kernel_buf, size_t 
 
 extern void syscall_entry(void);
 
+static int sys_vfs_mkfs(const vfs_mkfs_req_t *user_req);
+static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user_out);
+
 void syscall_init(void) {
     COM_LOG_INFO(COM1_PORT, "Initializing system calls");
-    /*
-     * Use a ring3 TRAP gate for syscalls so IF is not cleared on entry.
-     * Interrupt gates clear IF, which makes blocking syscalls (waiting for input/events)
-     * fragile and can lead to "random" keyboard deadlocks.
-     */
+
+    /* Use INT 0x80 for now (SYSCALL/SYSRET needs more debugging) */
     idt_set_entry(0x80, syscall_entry, 0xEF);
 
     fd_init();
@@ -170,6 +164,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_YIELD:   sys_yield(); return 0;
         case SYS_MALLOC:  return (uint64_t)sys_malloc((size_t)arg1);
         case SYS_FREE:    sys_free((void*)arg1); return 0;
+        case SYS_SBRK:    return (uint64_t)sys_sbrk((intptr_t)arg1);
         case SYS_KILL:    return sys_kill((int)arg1, (int)arg2);
         case SYS_TIME:    return sys_time();
         case SYS_EXEC:    return sys_exec((const char*)arg1);
@@ -186,6 +181,13 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_INPUT:   return (uint64_t)sys_input((char*)arg1, (size_t)arg2);
         case SYS_SSTATS:
             return (uint64_t)sys_get_sysinfo();
+        case SYS_SSTATS2:
+            return (uint64_t)sys_get_sysinfo2((md64api_sysinfo_data_u*)arg1, (size_t)arg2);
+
+        case SYS_MMAP:
+            return (uint64_t)sys_mmap((void*)arg1, (size_t)arg2, (int)arg3, (int)arg4);
+        case SYS_MUNMAP:
+            return (uint64_t)sys_munmap((void*)arg1, (size_t)arg2);
 
         case SYS_VGA_SET_COLOR:
             VGA_SetTextColor((uint8_t)arg1, (uint8_t)arg2);
@@ -195,6 +197,11 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_VGA_RESET_COLOR:
             VGA_ResetTextColor();
             return 0;
+
+        case SYS_VFS_MKFS:
+            return (uint64_t)sys_vfs_mkfs((const vfs_mkfs_req_t*)arg1);
+        case SYS_VFS_GETPART:
+            return (uint64_t)sys_vfs_getpart((const vfs_part_req_t*)arg1, (vfs_part_info_t*)arg2);
 
         default:
             if (kernel_debug_is_med()) {
@@ -234,7 +241,18 @@ int sys_fork(void) {
 
 ssize_t sys_read(int fd, void *buf, size_t count) {
     if (!buf) return -1;
-    ssize_t result = fd_read(fd, buf, count);
+    if (count == 0) return 0;
+
+    /* Read into a kernel buffer, then copy_to_user.
+     * This prevents drivers/filesystems from accidentally treating user pointers as kernel pointers.
+     */
+    size_t tmp_sz = (count > 4096) ? 4096 : count;
+    char tmp[4096];
+
+    ssize_t result = fd_read(fd, tmp, tmp_sz);
+    if (result > 0) {
+        if (usercopy_to_user(buf, tmp, (size_t)result) != 0) return -1;
+    }
     
     // DEBUG
     if (kernel_debug_is_on()) {
@@ -255,20 +273,85 @@ ssize_t sys_read(int fd, void *buf, size_t count) {
 }
 
 md64api_sysinfo_data* sys_get_sysinfo(void) {
+    /* Legacy: returns a pointer to a kernel struct containing kernel pointers.
+     * Unsafe for ring3 userland. Use SYS_SSTATS2 instead.
+     */
     static md64api_sysinfo_data info;
-    info = get_system_info(); // populate the static struct
+    info = get_system_info();
     return &info;
+}
+
+static void safe_strcpy(char *dst, size_t dst_sz, const char *src) {
+    if (!dst || dst_sz == 0) return;
+    if (!src) src = "";
+    size_t i = 0;
+    for (; i + 1 < dst_sz && src[i]; i++) dst[i] = src[i];
+    dst[i] = 0;
+}
+
+int sys_get_sysinfo2(md64api_sysinfo_data_u *out, size_t out_size) {
+    if (!out) return -1;
+    if (out_size < sizeof(*out)) return -1;
+
+    md64api_sysinfo_data k = get_system_info();
+
+    /* Copy scalars */
+    out->sys_available_ram = k.sys_available_ram;
+    out->sys_total_ram = k.sys_total_ram;
+    /* Version strings (user-safe). */
+    safe_strcpy(out->SystemVersion, sizeof(out->SystemVersion), k.SystemVersion);
+    safe_strcpy(out->KernelVersion, sizeof(out->KernelVersion), k.KernelVersion);
+    out->cpu_cores = k.cpu_cores;
+    out->cpu_threads = k.cpu_threads;
+    out->cpu_hyperthreading_enabled = k.cpu_hyperthreading_enabled;
+    out->cpu_base_mhz = k.cpu_base_mhz;
+    out->cpu_max_mhz = k.cpu_max_mhz;
+    out->cpu_cache_l1_kb = k.cpu_cache_l1_kb;
+    out->cpu_cache_l2_kb = k.cpu_cache_l2_kb;
+    out->cpu_cache_l3_kb = k.cpu_cache_l3_kb;
+    out->is_virtual_machine = k.is_virtual_machine;
+    out->gpu_vram_mb = k.gpu_vram_mb;
+    out->storage_total_mb = k.storage_total_mb;
+    out->storage_free_mb = k.storage_free_mb;
+    out->secure_boot_enabled = k.secure_boot_enabled;
+    out->tpm_version = k.tpm_version;
+
+    /* Copy strings from kernel pointers into user buffer */
+    safe_strcpy(out->KernelVendor, sizeof(out->KernelVendor), k.KernelVendor);
+    safe_strcpy(out->os_name, sizeof(out->os_name), k.os_name);
+    safe_strcpy(out->os_arch, sizeof(out->os_arch), k.os_arch);
+    safe_strcpy(out->pcname, sizeof(out->pcname), k.pcname);
+    safe_strcpy(out->username, sizeof(out->username), k.username);
+    safe_strcpy(out->domain, sizeof(out->domain), k.domain);
+    safe_strcpy(out->kconsole, sizeof(out->kconsole), k.kconsole);
+    safe_strcpy(out->cpu, sizeof(out->cpu), k.cpu);
+    safe_strcpy(out->cpu_manufacturer, sizeof(out->cpu_manufacturer), k.cpu_manufacturer);
+    safe_strcpy(out->cpu_model, sizeof(out->cpu_model), k.cpu_model);
+    safe_strcpy(out->cpu_flags, sizeof(out->cpu_flags), k.cpu_flags);
+    safe_strcpy(out->virtualization_vendor, sizeof(out->virtualization_vendor), k.virtualization_vendor);
+    safe_strcpy(out->gpu_name, sizeof(out->gpu_name), k.gpu_name);
+    safe_strcpy(out->primary_disk_model, sizeof(out->primary_disk_model), k.primary_disk_model);
+    safe_strcpy(out->bios_vendor, sizeof(out->bios_vendor), k.bios_vendor);
+    safe_strcpy(out->bios_version, sizeof(out->bios_version), k.bios_version);
+    safe_strcpy(out->motherboard_model, sizeof(out->motherboard_model), k.motherboard_model);
+
+    return 0;
 }
 
 ssize_t sys_writefile(int fd, const char *str, size_t count) {
     if (!str) return -1;
 
+    /* Copy from user once, then write from kernel buffer */
+    if (count > 4096) count = 4096;
+    char tmp[4096];
+    if (count && usercopy_from_user(tmp, str, count) != 0) return -1;
+
     if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
-        VGA_WriteN(str, count);
+        VGA_WriteN(tmp, count);
         return (ssize_t)count;
     }
 
-    return fd_write(fd, str, count);
+    return fd_write(fd, tmp, count);
 }
 
 int sys_write(const char *str) {
@@ -278,8 +361,10 @@ int sys_write(const char *str) {
         }
         return -1;
     }
-    VGA_Write(str);
-    
+
+    char tmp[512];
+    if (usercopy_string_from_user(tmp, str, sizeof(tmp)) != 0) return -1;
+    VGA_Write(tmp);
     return 0;
 }
 
@@ -288,15 +373,16 @@ ssize_t sys_input(char *user_buf, size_t max_len) {
 
     char *line = input();
     if (!line) {
-        user_buf[0] = 0;
+        char z = 0;
+        usercopy_to_user(user_buf, &z, 1);
         return 0;
     }
 
-    // Copy into user buffer (same address space in current design)
     size_t n = strlen(line);
     if (n >= max_len) n = max_len - 1;
-    memcpy(user_buf, line, n);
-    user_buf[n] = 0;
+    if (usercopy_to_user(user_buf, line, n) != 0) return -1;
+    char z = 0;
+    if (usercopy_to_user(user_buf + n, &z, 1) != 0) return -1;
     return (ssize_t)n;
 }
 
@@ -339,13 +425,12 @@ int sys_open(const char *pathname, int flags, int mode) {
 
     // DEVVFS: allow opening $/dev/<node> and $/dev/input/<node> as character devices
     if (r.route == FS_ROUTE_DEVVFS) {
-        if (r.devvfs_kind != 2 && r.devvfs_kind != 3 && r.devvfs_kind != 4) return -1;
+        if (r.devvfs_kind != 2) return -1;
         const char *node = r.rel_path;
         while (*node == '/') node++;
         if (!*node) return -1;
 
-        // For $/dev/input/<node>, map to the underlying devfs node name.
-        // (devfs currently registers "event0" and "kbd0")
+        // DEVFS is hierarchical; node may contain slashes.
         return fd_open_devfs(node, flags);
     }
 
@@ -376,13 +461,120 @@ int sys_sleep(unsigned int seconds) {
 
 void sys_yield(void) { process_yield(); }
 
-void* sys_malloc(size_t size) { return kmalloc(size); }
+void* sys_malloc(size_t size) {
+    process_t *p = process_get_current();
+    if (p && p->is_user) {
+        /* Returning kernel pointers to ring3 userland will crash.
+         * Userland must use sbrk()/mmap() based allocators.
+         */
+        return (void*)0;
+    }
+    return kmalloc(size);
+}
 
-void sys_free(void *ptr) { kfree(ptr); }
+void sys_free(void *ptr) {
+    process_t *p = process_get_current();
+    if (p && p->is_user) {
+        /* Ignore: userland must not free kernel allocations. */
+        return;
+    }
+    kfree(ptr);
+}
 
 void* sys_sbrk(intptr_t increment) {
-    (void)increment;
-    return (void*)-1;
+    process_t *p = process_get_current();
+    if (!p) return (void*)-1;
+    if (!p->is_user) return (void*)-1;
+
+    /* Only support growing for now. */
+    if (increment < 0) return (void*)-1;
+
+    uint64_t old = p->user_heap_end;
+    uint64_t new_end = old + (uint64_t)increment;
+    if (p->user_heap_limit && new_end > p->user_heap_limit) return (void*)-1;
+
+    /* page-align mapping */
+    uint64_t map_start = (old + 0xFFFULL) & ~0xFFFULL;
+    uint64_t map_end = (new_end + 0xFFFULL) & ~0xFFFULL;
+
+    if (map_end > map_start) {
+        size_t pages = (size_t)((map_end - map_start) / 0x1000ULL);
+        uint64_t phys = phys_alloc_contiguous(pages);
+        if (!phys) return (void*)-1;
+        if (paging_map_range(map_start, phys, (uint64_t)pages * 0x1000ULL, PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
+            for (size_t i = 0; i < pages; i++) phys_free_frame(phys + (uint64_t)i * 0x1000ULL);
+            return (void*)-1;
+        }
+    }
+
+    p->user_heap_end = new_end;
+    return (void*)(uintptr_t)old;
+}
+
+/* VM mapping (MVP). prot: bit0=R bit1=W bit2=X (X currently ignored)
+ * flags: bit0=FIXED, bit1=ANON (only anon supported)
+ */
+void* sys_mmap(void *addr, size_t size, int prot, int flags) {
+    (void)flags;
+    process_t *p = process_get_current();
+    if (!p || !p->is_user) return (void*)-1;
+    if (size == 0) return (void*)-1;
+
+    uint64_t sz = ((uint64_t)size + 0xFFFULL) & ~0xFFFULL;
+
+    uint64_t v = (uint64_t)(uintptr_t)addr;
+    int fixed = (flags & 1) != 0;
+
+    if (fixed) {
+        if (v == 0 || (v & 0xFFFULL)) return (void*)-1;
+    } else {
+        v = (p->user_mmap_end + 0xFFFULL) & ~0xFFFULL;
+        if (v < p->user_mmap_base) v = p->user_mmap_base;
+        if (v + sz > p->user_mmap_limit) return (void*)-1;
+    }
+
+    size_t pages = (size_t)(sz / 0x1000ULL);
+    uint64_t phys = phys_alloc_contiguous(pages);
+    if (!phys) return (void*)-1;
+
+    uint64_t pflags = PFLAG_PRESENT | PFLAG_USER;
+    if (prot & 2) pflags |= PFLAG_WRITABLE;
+
+    if (paging_map_range(v, phys, sz, pflags) != 0) {
+        for (size_t i = 0; i < pages; i++) phys_free_frame(phys + (uint64_t)i * 0x1000ULL);
+        return (void*)-1;
+    }
+
+    memset((void*)(uintptr_t)v, 0, (size_t)sz);
+
+    if (!fixed) {
+        if (v + sz > p->user_mmap_end) p->user_mmap_end = v + sz;
+    }
+
+    return (void*)(uintptr_t)v;
+}
+
+int sys_munmap(void *addr, size_t size) {
+    process_t *p = process_get_current();
+    if (!p || !p->is_user) return -1;
+    if (!addr || size == 0) return -1;
+
+    uint64_t v = (uint64_t)(uintptr_t)addr;
+    if (v & 0xFFFULL) return -1;
+
+    uint64_t sz = ((uint64_t)size + 0xFFFULL) & ~0xFFFULL;
+    uint64_t end = v + sz;
+
+    for (uint64_t cur = v; cur < end; cur += 0x1000ULL) {
+        if (paging_virt_to_phys(cur) != 0) {
+            paging_unmap_page(cur);
+        }
+    }
+
+    /* NOTE: physical pages are currently leaked because we don't track phys per mapping.
+     * This is acceptable for an early ld.so MVP.
+     */
+    return 0;
 }
 
 int sys_kill(int pid, int sig) {
@@ -438,7 +630,7 @@ int sys_stat(const char *path, void *out_info, size_t out_size) {
     int rc = fs_stat(mount, r.rel_path, &info);
     if (rc != 0) return -1;
 
-    memcpy(out_info, &info, sizeof(info));
+    if (usercopy_to_user(out_info, &info, sizeof(info)) != 0) return -1;
     return 0;
 }
 
@@ -574,15 +766,23 @@ int sys_chdir(const char *path) {
 char* sys_getcwd(char *buf, size_t size) {
     process_t *proc = process_get_current();
     if (!proc) return NULL;
-    
-    if (buf && size > 0) {
-        strncpy(buf, proc->cwd, size - 1);
-        buf[size - 1] = '\0';
-        return buf;
-    }
-    
-    // Return pointer to process CWD (read-only)
-    return proc->cwd;
+
+    /* Never return a kernel pointer to userland.
+     * With proper ring3, user code cannot dereference kernel addresses.
+     */
+    if (!buf || size == 0) return NULL;
+
+    /* Copy into kernel temporary then into user buffer safely. */
+    char tmp[256];
+    strncpy(tmp, proc->cwd, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = 0;
+
+    size_t n = strlen(tmp);
+    if (n + 1 > size) n = size - 1;
+    tmp[n] = 0;
+
+    if (usercopy_to_user(buf, tmp, n + 1) != 0) return NULL;
+    return buf;
 }
 int sys_opendir(const char *path) {
     if (!path) return -1;
@@ -611,10 +811,27 @@ int sys_opendir(const char *path) {
         p = full_path;
     }
 
+    // Normalize both / and $/ paths so opendir(".") works reliably.
+    char norm[256];
+    if ((p[0] == '/') || (p[0] == '$' && p[1] == '/')) {
+        strncpy(norm, p, sizeof(norm) - 1);
+        norm[sizeof(norm) - 1] = 0;
+        path_normalize_inplace(norm);
+        p = norm;
+    }
+
     fs_path_resolved_t r;
     if (fs_resolve_path(proc, p, &r) != 0) return -1;
     if (r.route == FS_ROUTE_DEVVFS) {
-        return fd_devvfs_opendir(r.devvfs_kind);
+        if (r.devvfs_kind == 0 || r.devvfs_kind == 1) {
+            return fd_devvfs_opendir(r.devvfs_kind);
+        }
+        if (r.devvfs_kind == 2) {
+            const char *sub = r.rel_path;
+            while (*sub == '/') sub++;
+            return fd_devvfs_opendir_dev(sub);
+        }
+        return -1;
     }
 
     int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;
@@ -626,7 +843,84 @@ int sys_opendir(const char *path) {
 int sys_readdir(int fd, char *name_buf, size_t buf_size, int *is_dir, uint32_t *size) {
     if (!name_buf || buf_size == 0) return -1;
 
-    return fd_readdir(fd, name_buf, buf_size, is_dir, size);
+    /* Read into kernel temporaries, then copy to user */
+    if (buf_size > 256) buf_size = 256;
+    char kname[256];
+    int k_is_dir = 0;
+    uint32_t k_size = 0;
+
+    int rc = fd_readdir(fd, kname, buf_size, &k_is_dir, &k_size);
+    if (rc <= 0) {
+        /* 0=end of dir, <0=error */
+        return rc;
+    }
+
+    /* rc==1: we have a valid entry in kname/k_is_dir/k_size */
+    if (usercopy_to_user(name_buf, kname, buf_size) != 0) return -1;
+    if (is_dir && usercopy_to_user(is_dir, &k_is_dir, sizeof(k_is_dir)) != 0) return -1;
+    if (size && usercopy_to_user(size, &k_size, sizeof(k_size)) != 0) return -1;
+    return 1;
+}
+
+static int sys_vfs_mkfs(const vfs_mkfs_req_t *user_req) {
+    if (!user_req) return -1;
+
+    vfs_mkfs_req_t req;
+    if (usercopy_from_user(&req, user_req, sizeof(req)) != 0) return -1;
+    req.fs_name[sizeof(req.fs_name) - 1] = 0;
+    req.label[sizeof(req.label) - 1] = 0;
+
+    if (req.vdrive_id < 0) return -2;
+    if (req.sectors == 0) return -3;
+
+    const char *label = req.label[0] ? req.label : NULL;
+
+    if (strcmp(req.fs_name, "fat32") == 0) {
+        // Match Windows' typical FAT32 formatter limit (~32GiB): refuse unless forced.
+        if (req.sectors > 67108864u && (req.flags & VFS_MKFS_FLAG_FORCE) == 0) {
+            return -10;
+        }
+
+        uint32_t spc = req.fat32_sectors_per_cluster;
+        if (spc == 0) {
+            // Auto-pick sectors-per-cluster based on volume size (in 512B sectors).
+            uint32_t s = req.sectors;
+            if (s <= 532480u) spc = 1;            // <= ~260MiB => 512B clusters
+            else if (s <= 16777216u) spc = 8;     // <= 8GiB   => 4KiB clusters
+            else if (s <= 33554432u) spc = 16;    // <= 16GiB  => 8KiB clusters
+            else if (s <= 67108864u) spc = 32;    // <= 32GiB  => 16KiB clusters
+            else spc = 64;                        // > 32GiB   => 32KiB clusters
+        }
+
+        return fs_format(req.vdrive_id, req.start_lba, req.sectors, label, spc);
+    }
+
+    return fs_ext_mkfs(req.fs_name, req.vdrive_id, req.start_lba, req.sectors, label);
+}
+
+static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user_out) {
+    if (!user_req || !user_out) return -1;
+
+    vfs_part_req_t req;
+    if (usercopy_from_user(&req, user_req, sizeof(req)) != 0) return -1;
+
+    if (req.vdrive_id < 0) return -2;
+    if (req.part_no < 1 || req.part_no > 4) return -3;
+
+    vfs_part_info_t out;
+    memset(&out, 0, sizeof(out));
+
+    uint32_t lba = 0, secs = 0;
+    uint8_t type = 0;
+    int rc = fs_mbr_get_partition(req.vdrive_id, req.part_no, &lba, &secs, &type);
+    if (rc != 0) return -4;
+
+    out.start_lba = lba;
+    out.sectors = secs;
+    out.type = type;
+
+    if (usercopy_to_user(user_out, &out, sizeof(out)) != 0) return -1;
+    return 0;
 }
 
 int sys_closedir(int fd) {

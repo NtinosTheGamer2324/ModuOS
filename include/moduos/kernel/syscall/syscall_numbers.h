@@ -33,6 +33,11 @@
 #define SYS_CLOSEDIR    27
 #define SYS_INPUT       28
 #define SYS_SSTATS      29
+#define SYS_SSTATS2     38 /* fill user buffer with md64api_sysinfo_data_u */
+
+// VFS formatting / mkfs
+#define SYS_VFS_MKFS    36
+#define SYS_VFS_GETPART 37
 
 /* User identity */
 #define SYS_GETUID      33
@@ -45,5 +50,9 @@
 #define SYS_VGA_SET_COLOR  30  // arg1=fg (0-15), arg2=bg (0-15)
 #define SYS_VGA_GET_COLOR  31  // returns (bg<<4)|fg
 #define SYS_VGA_RESET_COLOR 32 // reset to default (0x07 on 0x00)
+
+/* Virtual memory mapping (userland dynamic linker support) */
+#define SYS_MMAP        39
+#define SYS_MUNMAP      40
 
 #endif

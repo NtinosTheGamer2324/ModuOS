@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "moduos/kernel/md64api.h"
+#include "moduos/kernel/md64api_user.h"
 #include "moduos/fs/fd.h"  // for off_t
 
 #ifndef _SSIZE_T_DEFINED
@@ -54,7 +55,12 @@ int sys_opendir(const char *path);
 int sys_readdir(int fd, char *name_buf, size_t buf_size, int *is_dir, uint32_t *size);
 int sys_closedir(int fd);
 
-md64api_sysinfo_data* sys_get_sysinfo(void);  // Changed to return pointer
+/* VM mapping (for userland ld.so) */
+void* sys_mmap(void *addr, size_t size, int prot, int flags);
+int   sys_munmap(void *addr, size_t size);
+
+md64api_sysinfo_data* sys_get_sysinfo(void);
+int sys_get_sysinfo2(md64api_sysinfo_data_u *out, size_t out_size);  // Changed to return pointer
 
 // VGA / Console
 // Note: currently implemented directly in syscall_handler() and VGA driver.
