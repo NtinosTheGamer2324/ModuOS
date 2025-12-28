@@ -1,5 +1,7 @@
 ; context_switch.asm - Context switching with argument passing
-; void context_switch(cpu_state_t *old_state, cpu_state_t *new_state)
+; context_switch.asm - Context switching with argument passing + FPU save/restore
+; void context_switch(cpu_state_t *old_state, cpu_state_t *new_state,
+;                    void *old_fpu_state, void *new_fpu_state)
 
 section .text
 global context_switch
@@ -7,10 +9,15 @@ global context_switch
 context_switch:
     ; RDI = old_state (or NULL for first switch)
     ; RSI = new_state
+    ; RDX = old_fpu_state (or NULL)
+    ; RCX = new_fpu_state
     
     ; Save current context if old_state is not NULL
     test rdi, rdi
     jz .restore
+
+    ; Lazy FPU switching: do NOT save here (too expensive).
+.save_gprs:
     
     ; Save callee-saved registers to old_state
     mov [rdi + 0], r15
@@ -34,6 +41,8 @@ context_switch:
     mov [rdi + 64], rax
     
 .restore:
+    ; Lazy FPU switching: FPU is restored on first use via #NM handler.
+
     ; Restore context from new_state (RSI)
     mov r15, [rsi + 0]
     mov r14, [rsi + 8]

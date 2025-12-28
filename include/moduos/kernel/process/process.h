@@ -53,10 +53,30 @@ typedef struct process {
 
     cpu_state_t cpu_state;
 
+    /* FPU/SSE state (FXSAVE/FXRSTOR).
+     * Must be 16-byte aligned for fxsave64/fxrstor64.
+     */
+    __attribute__((aligned(16))) uint8_t fpu_state[512];
+
     // Memory management - single global kernel page table for now
     uint64_t page_table;
     void *kernel_stack;
     void *user_stack;
+
+    /* User-mode launch context (used by amd64_enter_user_trampoline) */
+    uint64_t user_rip;
+    uint64_t user_rsp;
+    int is_user;
+
+    /* User heap (sbrk/brk) */
+    uint64_t user_heap_base;
+    uint64_t user_heap_end;
+    uint64_t user_heap_limit;
+
+    /* User mmap region (used by userland dynamic linker) */
+    uint64_t user_mmap_base;
+    uint64_t user_mmap_end;
+    uint64_t user_mmap_limit;
 
     // File descriptors
     void *fd_table[MAX_OPEN_FILES];
@@ -98,8 +118,20 @@ void scheduler_add_process(process_t *proc);
 void scheduler_remove_process(process_t *proc);
 void schedule(void);
 void scheduler_tick(void);
+void scheduler_request_reschedule(void);
+int  scheduler_take_reschedule(void);
 
 /* Context switching (assembly) */
-extern void context_switch(cpu_state_t *old_state, cpu_state_t *new_state);
+/* Context switching (assembly)
+ * void context_switch(cpu_state_t *old_state, cpu_state_t *new_state,
+ *                    void *old_fpu_state, void *new_fpu_state)
+ */
+extern void context_switch(cpu_state_t *old_state, cpu_state_t *new_state,
+                           void *old_fpu_state, void *new_fpu_state);
+
+/* Lazy FPU switching hooks */
+void fpu_lazy_on_context_switch(struct process *next);
+void fpu_lazy_on_process_exit(struct process *p);
+void fpu_lazy_handle_nm(void);
 
 #endif /* PROCESS_H */

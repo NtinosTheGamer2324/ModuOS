@@ -3,7 +3,7 @@
 #include "moduos/kernel/interrupts/idt.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/COM/com.h"
-#include "moduos/kernel/process/process.h"
+#include "moduos/kernel/process/process.h"  /* process_exit, schedule */
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/panic.h"
@@ -185,6 +185,20 @@ void fault_init(void) {
 // === EXCEPTION HANDLERS ===
 
 void fault_handler_divide_error(interrupt_frame_t *frame) {
+    /* If CPL=3, kill user process instead of panicking kernel. */
+    if ((frame->cs & 3) == 3) {
+        process_t *p = process_get_current();
+        if (p) {
+            com_write_string(COM1_PORT, "[FAULT] User-mode #DE (divide by zero) in PID ");
+            char buf[12];
+            itoa((int)p->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, " (killing process)\n");
+            process_exit(128 + 8);
+        }
+        process_exit(128 + 8);
+        for (;;) { __asm__ volatile("hlt"); }
+    }
     fault_panic("Divide by Zero Exception", 
                 "Attempted division by zero operation.", 
                 frame, "DIV_BY_ZERO");
@@ -212,12 +226,40 @@ void fault_handler_breakpoint(interrupt_frame_t *frame) {
 }
 
 void fault_handler_overflow(interrupt_frame_t *frame) {
+    /* If CPL=3, kill user process instead of panicking kernel. */
+    if ((frame->cs & 3) == 3) {
+        process_t *p = process_get_current();
+        if (p) {
+            com_write_string(COM1_PORT, "[FAULT] User-mode #OF (overflow) in PID ");
+            char buf[12];
+            itoa((int)p->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, " (killing process)\n");
+            process_exit(128 + 4);
+        }
+        process_exit(128 + 4);
+        for (;;) { __asm__ volatile("hlt"); }
+    }
     fault_panic("Overflow Exception", 
                 "INTO instruction detected overflow condition.", 
                 frame, "OVERFLOW");
 }
 
 void fault_handler_bound_range(interrupt_frame_t *frame) {
+    /* If CPL=3, kill user process instead of panicking kernel. */
+    if ((frame->cs & 3) == 3) {
+        process_t *p = process_get_current();
+        if (p) {
+            com_write_string(COM1_PORT, "[FAULT] User-mode #BR (bound range) in PID ");
+            char buf[12];
+            itoa((int)p->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, " (killing process)\n");
+            process_exit(128 + 5);
+        }
+        process_exit(128 + 5);
+        for (;;) { __asm__ volatile("hlt"); }
+    }
     fault_panic("BOUND Range Exceeded", 
                 "Array index out of bounds (BOUND instruction).", 
                 frame, "BOUND_RANGE");
@@ -245,15 +287,33 @@ static void fault_dump_rip_bytes(uint64_t rip) {
 
 void fault_handler_invalid_opcode(interrupt_frame_t *frame) {
     fault_dump_rip_bytes(frame->rip);
+
+    /* If CPL=3, treat as user process crash and terminate instead of panicking kernel. */
+    if ((frame->cs & 3) == 3) {
+        process_t *p = process_get_current();
+        if (p) {
+            com_write_string(COM1_PORT, "[FAULT] User-mode #UD in PID ");
+            char buf[12];
+            itoa((int)p->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, " (killing process)\n");
+            process_exit(128 + 6);
+        }
+        process_exit(128 + 6);
+        for (;;) { __asm__ volatile("hlt"); }
+    }
+
     fault_panic("Invalid Opcode", 
                 "CPU encountered an invalid or unsupported instruction.", 
                 frame, "INVALID_OPCODE");
 }
 
 void fault_handler_device_not_available(interrupt_frame_t *frame) {
-    fault_panic("Device Not Available", 
-                "FPU/SSE instruction executed without proper initialization.", 
-                frame, "NO_FPU");
+    (void)frame;
+    /* Lazy FPU switching: this exception (#NM) is expected when CR0.TS=1.
+     * Enable FPU for this process and restore its state.
+     */
+    fpu_lazy_handle_nm();
 }
 
 void fault_handler_double_fault(uint64_t error_code, interrupt_frame_t *frame) {
@@ -302,6 +362,56 @@ void fault_handler_stack_fault(uint64_t error_code, interrupt_frame_t *frame) {
 }
 
 void fault_handler_general_protection(uint64_t error_code, interrupt_frame_t *frame) {
+    /* If CPL=3, treat as user process crash and terminate instead of panicking kernel. */
+    if ((frame->cs & 3) == 3) {
+        process_t *p = process_get_current();
+        if (p) {
+            com_write_string(COM1_PORT, "[FAULT] User-mode #GP in PID ");
+            char buf[12];
+            itoa((int)p->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, " (killing process)\n");
+
+            /* More diagnostics for ring3 debugging */
+            char hexbuf[19];
+            com_write_string(COM1_PORT, "[FAULT]  error_code=0x");
+            format_hex64(error_code, hexbuf);
+            com_write_string(COM1_PORT, hexbuf);
+            com_write_string(COM1_PORT, "\n");
+
+            com_write_string(COM1_PORT, "[FAULT]  RIP=0x");
+            format_hex64(frame->rip, hexbuf);
+            com_write_string(COM1_PORT, hexbuf);
+            com_write_string(COM1_PORT, " CS=0x");
+            format_hex64(frame->cs, hexbuf);
+            com_write_string(COM1_PORT, hexbuf);
+            com_write_string(COM1_PORT, " RFLAGS=0x");
+            format_hex64(frame->rflags, hexbuf);
+            com_write_string(COM1_PORT, hexbuf);
+            com_write_string(COM1_PORT, "\n");
+
+            /* Best-effort instruction bytes */
+            uint8_t bytes[16];
+            memset(bytes, 0, sizeof(bytes));
+            memcpy(bytes, (const void*)(uintptr_t)frame->rip, sizeof(bytes));
+            com_write_string(COM1_PORT, "[FAULT]  bytes:");
+            for (int i = 0; i < 16; i++) {
+                static const char *hx = "0123456789abcdef";
+                char b[4];
+                b[0] = ' ';
+                b[1] = hx[(bytes[i] >> 4) & 0xF];
+                b[2] = hx[bytes[i] & 0xF];
+                b[3] = 0;
+                com_write_string(COM1_PORT, b);
+            }
+            com_write_string(COM1_PORT, "\n");
+
+            process_exit(128 + 13);
+        }
+        process_exit(128 + 13);
+        for (;;) { __asm__ volatile("hlt"); }
+    }
+
     char message[512];
     int pos = 0;
     
@@ -347,12 +457,41 @@ void fault_handler_general_protection(uint64_t error_code, interrupt_frame_t *fr
 
 void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame) {
     /* Reentrancy guard: if we fault while handling a page fault, stop immediately.
-     * This prevents misleading CR2 output from a secondary fault caused by the logger/panic path.
+     * For user-mode faults we can still recover by killing the process.
      */
     static volatile int in_pf = 0;
     if (in_pf) {
         uint64_t fa;
         __asm__ volatile("mov %%cr2, %0" : "=r"(fa));
+
+        if ((frame->cs & 3) == 3) {
+            process_t *p = process_get_current();
+            if (p) {
+                com_write_string(COM1_PORT, "\n[FAULT] Nested user #PF in PID ");
+                char buf[12];
+                itoa((int)p->pid, buf, 10);
+                com_write_string(COM1_PORT, buf);
+
+                com_write_string(COM1_PORT, " RIP=0x");
+                for (int i = 15; i >= 0; i--) {
+                    uint8_t nibble = (frame->rip >> (i * 4)) & 0xF;
+                    char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
+                    com_write_byte(COM1_PORT, hex);
+                }
+
+                com_write_string(COM1_PORT, " CR2=0x");
+                for (int i = 15; i >= 0; i--) {
+                    uint8_t nibble = (fa >> (i * 4)) & 0xF;
+                    char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
+                    com_write_byte(COM1_PORT, hex);
+                }
+                com_write_string(COM1_PORT, " (killing process)\n");
+            }
+            in_pf = 0;
+            process_exit(128 + 11);
+            for (;;) { __asm__ volatile("hlt"); }
+        }
+
         com_write_string(COM1_PORT, "\n[FAULT] DOUBLE PAGE FAULT while handling page fault. CR2=0x");
         for (int i = 15; i >= 0; i--) {
             uint8_t nibble = (fa >> (i * 4)) & 0xF;
@@ -367,6 +506,37 @@ void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame) {
     // Get faulting address from CR2
     uint64_t faulting_address;
     __asm__ volatile("mov %%cr2, %0" : "=r"(faulting_address));
+
+    /* Fast-path: user-mode faults should not run heavy debug printing/walking.
+     * Just kill the process to avoid recursive faults inside the handler.
+     */
+    if ((frame->cs & 3) == 3) {
+        process_t *p = process_get_current();
+        if (p) {
+            com_write_string(COM1_PORT, "\n[FAULT] User-mode #PF in PID ");
+            char buf[12];
+            itoa((int)p->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+
+            com_write_string(COM1_PORT, " RIP=0x");
+            for (int i = 15; i >= 0; i--) {
+                uint8_t nibble = (frame->rip >> (i * 4)) & 0xF;
+                char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
+                com_write_byte(COM1_PORT, hex);
+            }
+
+            com_write_string(COM1_PORT, " CR2=0x");
+            for (int i = 15; i >= 0; i--) {
+                uint8_t nibble = (faulting_address >> (i * 4)) & 0xF;
+                char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
+                com_write_byte(COM1_PORT, hex);
+            }
+            com_write_string(COM1_PORT, " (killing process)\n");
+        }
+        in_pf = 0;
+        process_exit(128 + 11);
+        for (;;) { __asm__ volatile("hlt"); }
+    }
 
     /* Kernel heap demand paging (fault-handler-safe):
      * For non-present faults in the heap range, allocate a frame and install the missing PTE
@@ -563,18 +733,63 @@ after_heap_demand: ;
     }
     com_write_string(COM1_PORT, "\n");
     
+    /* If CPL=3, treat as user process crash and terminate instead of panicking kernel.
+     * IMPORTANT: do not call schedule() here; process_exit() will context-switch away.
+     */
+    if ((frame->cs & 3) == 3) {
+        process_t *p = process_get_current();
+        if (p) {
+            com_write_string(COM1_PORT, "[FAULT] User-mode #PF in PID ");
+            char buf[12];
+            itoa((int)p->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, " (killing process)\n");
+        }
+        in_pf = 0;
+        process_exit(128 + 11);
+        for (;;) { __asm__ volatile("hlt"); }
+    }
+    
     /* Now behave like all other fatal faults: route through the unified panic UI. */
     in_pf = 0;
     fault_panic("Page Fault", message, frame, "PAGE_FAULT");
 }
 
 void fault_handler_x87_fpu(interrupt_frame_t *frame) {
+    /* If CPL=3, kill user process instead of panicking kernel. */
+    if ((frame->cs & 3) == 3) {
+        process_t *p = process_get_current();
+        if (p) {
+            com_write_string(COM1_PORT, "[FAULT] User-mode #MF (x87 FPU) in PID ");
+            char buf[12];
+            itoa((int)p->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, " (killing process)\n");
+            process_exit(128 + 16);
+        }
+        process_exit(128 + 16);
+        for (;;) { __asm__ volatile("hlt"); }
+    }
     fault_panic("x87 FPU Exception", 
                 "Floating point unit encountered an error.", 
                 frame, "FPU_ERROR");
 }
 
 void fault_handler_alignment_check(uint64_t error_code, interrupt_frame_t *frame) {
+    /* If CPL=3, kill user process instead of panicking kernel. */
+    if ((frame->cs & 3) == 3) {
+        process_t *p = process_get_current();
+        if (p) {
+            com_write_string(COM1_PORT, "[FAULT] User-mode #AC (alignment check) in PID ");
+            char buf[12];
+            itoa((int)p->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, " (killing process)\n");
+            process_exit(128 + 17);
+        }
+        process_exit(128 + 17);
+        for (;;) { __asm__ volatile("hlt"); }
+    }
     fault_panic("Alignment Check Exception", 
                 "Unaligned memory access detected with AC flag set.", 
                 frame, "ALIGNMENT");
@@ -587,6 +802,20 @@ void fault_handler_machine_check(interrupt_frame_t *frame) {
 }
 
 void fault_handler_simd_exception(interrupt_frame_t *frame) {
+    /* If CPL=3, kill user process instead of panicking kernel. */
+    if ((frame->cs & 3) == 3) {
+        process_t *p = process_get_current();
+        if (p) {
+            com_write_string(COM1_PORT, "[FAULT] User-mode #XF (SIMD FP) in PID ");
+            char buf[12];
+            itoa((int)p->pid, buf, 10);
+            com_write_string(COM1_PORT, buf);
+            com_write_string(COM1_PORT, " (killing process)\n");
+            process_exit(128 + 19);
+        }
+        process_exit(128 + 19);
+        for (;;) { __asm__ volatile("hlt"); }
+    }
     fault_panic("SIMD Floating Point Exception", 
                 "SSE/AVX instruction caused a floating point exception.", 
                 frame, "SIMD_FP");

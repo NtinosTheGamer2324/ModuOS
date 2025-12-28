@@ -2,9 +2,11 @@
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
+#include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/debug.h"
+#include "moduos/arch/AMD64/syscall/syscall64_stack.h"
 #include <stdint.h>
 
 #ifndef PAGE_SIZE
@@ -25,7 +27,8 @@ static int scheduler_enabled = 0;
 static process_t *process_to_reap = NULL;
 
 /* External context switch implemented in assembly */
-extern void context_switch(cpu_state_t *old_state, cpu_state_t *new_state);
+extern void context_switch(cpu_state_t *old_state, cpu_state_t *new_state,
+                           void *old_fpu_state, void *new_fpu_state);
 
 /* Helper: top of kernel stack pointer */
 static inline uint64_t stack_top(void *stack_base) {
@@ -83,6 +86,16 @@ void process_init(void) {
     idle->priority = 255;
     idle->argc = 0;
     idle->argv = NULL;
+    memset(idle->fpu_state, 0, sizeof(idle->fpu_state));
+
+    /* Default filesystem context:
+     * userland syscalls resolve normal / paths against proc->current_slot.
+     * If this is -1/uninitialized, early user programs like /Apps/login will fail to open files.
+     */
+    extern int boot_drive_slot;
+    idle->current_slot = boot_drive_slot;
+    strncpy(idle->cwd, "/", sizeof(idle->cwd) - 1);
+    idle->cwd[sizeof(idle->cwd) - 1] = 0;
 
     idle->kernel_stack = kmalloc(KERNEL_STACK_SIZE);
     if (!idle->kernel_stack) {
@@ -95,12 +108,16 @@ void process_init(void) {
     memset(&idle->cpu_state, 0, sizeof(cpu_state_t));
     idle->cpu_state.rip = (uint64_t)idle_entry;
     uint64_t top = (stack_top(idle->kernel_stack) - 16) & ~0xFULL;
+    amd64_syscall_set_kernel_stack(top);
     idle->cpu_state.rsp = top;
     idle->cpu_state.rbp = top;
     idle->cpu_state.rflags = 0x202;
 
     process_table[0] = idle;
     current_process = idle;
+
+    /* Lazy FPU switching: start with TS=1 so first FPU use traps and sets owner. */
+    fpu_lazy_on_context_switch(NULL);
 
     COM_LOG_OK(COM1_PORT, "Process manager initialized");
 }
@@ -177,6 +194,8 @@ process_t* process_create(const char *name, void (*entry_point)(void), int prior
     return process_create_with_args(name, entry_point, priority, 0, NULL);
 }
 
+extern void amd64_enter_user_trampoline(void);
+
 process_t* process_create_with_args(const char *name, void (*entry_point)(void), int priority, int argc, char **argv) {
     uint32_t pid = next_pid++;
     if (pid >= MAX_PROCESSES) {
@@ -234,9 +253,117 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
     proc->page_table = kernel_cr3;
 
     memset(&proc->cpu_state, 0, sizeof(cpu_state_t));
-    proc->cpu_state.rip = (uint64_t)entry_point;
+
+    proc->is_user = 0;
+    proc->user_rip = 0;
+    proc->user_rsp = 0;
+
+    /* If entry point is in typical userland range (>=0x400000), launch it in ring3.
+     * (Kernel code is around 0x0010xxxx in this build.)
+     */
+    uint64_t ep = (uint64_t)entry_point;
+    if (ep >= 0x0000000000400000ULL && ep < 0x0000800000000000ULL) {
+        proc->is_user = 1;
+        proc->user_rip = ep;
+
+        /* Map a user stack near top of canonical low half. */
+        const uint64_t user_stack_top = 0x00007FFFFFF00000ULL;
+        const uint64_t user_stack_base = user_stack_top - USER_STACK_SIZE;
+
+        size_t pages = USER_STACK_SIZE / PAGE_SIZE;
+        uint64_t phys_base = phys_alloc_contiguous(pages);
+        if (!phys_base) {
+            COM_LOG_ERROR(COM1_PORT, "Failed to allocate user stack");
+            if (proc->argv) free_argv(proc->argc, proc->argv);
+            kfree(proc->kernel_stack);
+            kfree(proc);
+            return NULL;
+        }
+
+        if (paging_map_range(user_stack_base, phys_base, USER_STACK_SIZE, PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
+            COM_LOG_ERROR(COM1_PORT, "Failed to map user stack");
+            for (size_t p = 0; p < pages; p++) phys_free_frame(phys_base + p * PAGE_SIZE);
+            if (proc->argv) free_argv(proc->argc, proc->argv);
+            kfree(proc->kernel_stack);
+            kfree(proc);
+            return NULL;
+        }
+
+        proc->user_stack = (void*)(uintptr_t)user_stack_base;
+        proc->user_rsp = user_stack_top - 16;
+
+        /* Initialize user heap region (simple sbrk). */
+        proc->user_heap_base = 0x0000005000000000ULL;
+        proc->user_heap_end = proc->user_heap_base;
+        proc->user_heap_limit = proc->user_heap_base + 64ULL * 1024ULL * 1024ULL; /* 64 MiB per process */
+
+        /* Initialize user mmap region (for dl/ld.so). Keep far from heap/stack. */
+        proc->user_mmap_base  = 0x0000006000000000ULL;
+        proc->user_mmap_end   = proc->user_mmap_base;
+        proc->user_mmap_limit = proc->user_mmap_base + 256ULL * 1024ULL * 1024ULL; /* 256 MiB */
+
+        /*
+         * Copy argv strings into USER memory.
+         * Previously we passed kernel pointers to user mode (0xffff8000...), which causes
+         * user #PF when apps dereference argv. We instead build argv on the user stack.
+         */
+        if (proc->argc > 0 && proc->argv) {
+            uint64_t sp = proc->user_rsp;
+
+            /* Copy strings from high to low */
+            uint64_t user_str_ptrs[64];
+            if (proc->argc > 64) {
+                COM_LOG_ERROR(COM1_PORT, "Too many argv items for user stack copy");
+                proc->argc = 64;
+            }
+
+            for (int i = proc->argc - 1; i >= 0; i--) {
+                const char *s = proc->argv[i] ? proc->argv[i] : "";
+                size_t len = strlen(s) + 1;
+                sp -= len;
+                memcpy((void*)(uintptr_t)sp, s, len);
+                user_str_ptrs[i] = sp;
+            }
+
+            /* Align for argv array */
+            sp &= ~0xFULL;
+
+            /* argv pointers array (argc+1) */
+            sp -= (uint64_t)(proc->argc + 1) * sizeof(uint64_t);
+            uint64_t *user_argv = (uint64_t*)(uintptr_t)sp;
+            for (int i = 0; i < proc->argc; i++) {
+                user_argv[i] = user_str_ptrs[i];
+            }
+            user_argv[proc->argc] = 0;
+
+            /* Ensure SysV AMD64 stack alignment for userland.
+             * GCC assumes on function entry: (%rsp + 8) % 16 == 0.
+             * Since we enter userland via iretq (no CALL pushing a return address),
+             * we must bias the initial stack by 8 bytes.
+             */
+            sp -= 8;
+            *(uint64_t*)(uintptr_t)sp = 0; /* fake return address */
+
+            proc->user_rsp = sp;
+
+            /* Pass user-mode argc/argv via r12/r13 (callee-saved, restored by context_switch). */
+            proc->cpu_state.r12 = (uint64_t)proc->argc;
+            proc->cpu_state.r13 = (uint64_t)(uintptr_t)user_argv;
+        }
+
+        /* Use r14/r15 to pass user RIP/RSP to the trampoline via context_switch restore. */
+        proc->cpu_state.r14 = proc->user_rip;
+        proc->cpu_state.r15 = proc->user_rsp;
+
+        proc->cpu_state.rip = (uint64_t)(uintptr_t)amd64_enter_user_trampoline;
+    } else {
+        proc->cpu_state.rip = ep;
+    }
 
     uint64_t top = (stack_top(proc->kernel_stack) - 16) & ~0xFULL;
+    /* Keep syscall/interrupt RSP0 in sync (single CPU). */
+    amd64_syscall_set_kernel_stack(top);
+
     uint64_t initial_rsp = top - 8;
     uint64_t *ret_slot = (uint64_t *)initial_rsp;
     *ret_slot = (uint64_t)process_return_trampoline;
@@ -244,27 +371,39 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
     proc->cpu_state.rsp = initial_rsp;
     proc->cpu_state.rbp = initial_rsp;
     proc->cpu_state.rflags = 0x202;
+
+    /* Initialize FPU state image for this process.
+     * Zero is acceptable; fxrstor will load a clean state.
+     */
+    memset(proc->fpu_state, 0, sizeof(proc->fpu_state));
     
-    // Store argc and argv in callee-saved registers for context switch
-    if (proc->argc > 0 && proc->argv) {
-        proc->cpu_state.r12 = (uint64_t)proc->argc;
-        proc->cpu_state.r13 = (uint64_t)proc->argv;
-        
-        com_write_string(COM1_PORT, "[PROC] Set up args: argc=");
-        char buf[12];
-        itoa(proc->argc, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, ", argv=0x");
-        for (int j = 15; j >= 0; j--) {
-            uint64_t addr = (uint64_t)proc->argv;
-            uint8_t nibble = (addr >> (j * 4)) & 0xF;
-            char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
-            com_write_byte(COM1_PORT, hex);
+    /*
+     * For kernel processes, we keep argc/argv in r12/r13 as kernel pointers.
+     * For user processes, we already built argv on the user stack and set r12/r13 above.
+     */
+    if (!proc->is_user) {
+        if (proc->argc > 0 && proc->argv) {
+            proc->cpu_state.r12 = (uint64_t)proc->argc;
+            proc->cpu_state.r13 = (uint64_t)proc->argv;
+        } else {
+            proc->cpu_state.r12 = 0;
+            proc->cpu_state.r13 = 0;
         }
-        com_write_string(COM1_PORT, "\n");
     } else {
-        proc->cpu_state.r12 = 0;
-        proc->cpu_state.r13 = 0;
+        if (proc->argc <= 0) {
+            proc->cpu_state.r12 = 0;
+            proc->cpu_state.r13 = 0;
+        }
+    }
+
+    // Inherit filesystem context from parent/current process so relative paths work in userland.
+    if (current_process) {
+        proc->current_slot = current_process->current_slot;
+        strncpy(proc->cwd, current_process->cwd, sizeof(proc->cwd) - 1);
+        proc->cwd[sizeof(proc->cwd) - 1] = 0;
+    } else {
+        proc->current_slot = -1;
+        proc->cwd[0] = 0;
     }
 
     proc->time_slice = 0;
@@ -350,8 +489,19 @@ void scheduler_remove_process(process_t *proc) {
 
 static void do_switch_and_reap(process_t *old, process_t *newp) {
     char buf[12];
+
+    /* Sanity: never jump to NULL/low memory. */
+    if (newp && newp->cpu_state.rip < 0x100000) {
+        COM_LOG_ERROR(COM1_PORT, "Refusing to context_switch: suspicious RIP");
+        for(;;) { __asm__ volatile("hlt"); }
+    }
+
     if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[SWITCH] Calling context_switch asm...\n");
-    context_switch(old ? &old->cpu_state : NULL, &newp->cpu_state);
+    /* Lazy FPU switching: set TS depending on whether the next process owns the live FPU state. */
+    fpu_lazy_on_context_switch(newp);
+
+    context_switch(old ? &old->cpu_state : NULL, &newp->cpu_state,
+                  old ? (void*)old->fpu_state : NULL, (void*)newp->fpu_state);
 
     /* THIS LINE EXECUTES IN THE NEW PROCESS CONTEXT */
     if (kernel_debug_is_on()) {
@@ -452,6 +602,12 @@ void schedule(void) {
 
     newp->state = PROCESS_STATE_RUNNING;
     current_process = newp;
+
+    /* Update syscall/interrupt RSP0 to the new process kernel stack (single CPU). */
+    if (newp && newp->kernel_stack) {
+        uint64_t top = ((uint64_t)(uintptr_t)newp->kernel_stack + KERNEL_STACK_SIZE - 16) & ~0xFULL;
+        amd64_syscall_set_kernel_stack(top);
+    }
     
     if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[SCHED] About to context switch...\n");
     do_switch_and_reap(old, newp);
@@ -466,6 +622,11 @@ void schedule(void) {
         com_write_string(COM1_PORT, ")\n");
     }
 }
+
+static volatile int g_resched_requested = 0;
+
+void scheduler_request_reschedule(void) { g_resched_requested = 1; }
+int scheduler_take_reschedule(void) { int v = g_resched_requested; g_resched_requested = 0; return v; }
 
 void scheduler_tick(void) {
     if (!scheduler_enabled) return;
@@ -487,6 +648,8 @@ process_t* process_get_by_pid(uint32_t pid) {
 }
 
 void process_exit(int exit_code) {
+    /* If this process currently owns the FPU state, drop ownership. */
+    fpu_lazy_on_process_exit(current_process);
     if (!current_process) return;
 
     current_process->state = PROCESS_STATE_ZOMBIE;
@@ -556,6 +719,10 @@ void process_kill(uint32_t pid) {
 }
 
 void process_yield(void) {
+    if (scheduler_take_reschedule()) {
+        /* fall through to schedule() */
+    }
+
     if (!current_process) {
         if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[YIELD] Warning: no current process\n");
         return;

@@ -26,17 +26,22 @@ void timer_irq_handler(void) {
     
     in_timer_handler = 1;
     system_ticks++;
-    
-    uint64_t rflags;
-    __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
-    
-    if (rflags & (1 << 9)) {
-        scheduler_tick();
-        usb_tick();  // Process async USB operations
-    }
-    
+
+    /* IMPORTANT:
+     * scheduler_tick() may context-switch away from the current process.
+     * If we don't send EOI first, the PIC will keep IRQ0 in-service and we will
+     * effectively deadlock further interrupts (keyboard appears "dead").
+     */
     pic_send_eoi(0);
     in_timer_handler = 0;
+
+    /* Do not context-switch inside the timer IRQ.
+     * Our IRQ stubs are not designed for switching stacks mid-stub.
+     * Instead, just request a reschedule and let safe points (yield/syscalls) run it.
+     */
+    scheduler_request_reschedule();
+
+    usb_tick();  // Process async USB operations
 }
 
 uint64_t get_system_ticks(void) {
