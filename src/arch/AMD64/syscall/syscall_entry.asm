@@ -7,6 +7,12 @@ global syscall_entry
 
 section .text
 syscall_entry:
+    ; Syscalls currently execute in CPL0 in this kernel.
+    ; Avoid being preempted by timer IRQ in the middle of the syscall prologue/epilogue,
+    ; otherwise the interrupt handler may schedule/context-switch and corrupt our iret frame.
+    ; iretq will restore IF from the saved RFLAGS automatically.
+    cli
+
     push r15
     push r14
     push r13

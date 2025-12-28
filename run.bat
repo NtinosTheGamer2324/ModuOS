@@ -37,18 +37,22 @@ timeout /t 1 /nobreak >nul
 REM Start QEMU
 start "cmdQEMU" qemu-system-x86_64 ^
     -machine pc ^
-   -smbios type=1,manufacturer="ASRock",product="ASRock B450 Gaming" ^
+    -smbios type=1,manufacturer="ASUS",product="ROG",version="1.0",serial="MDMDMDMDMDMD" ^
     -m 1024M ^
     -smp 2 ^
+    -vga qxl ^
     -serial file:com1.log ^
     -serial file:com2.log ^
+    -audiodev dsound,id=snd0 ^
+    -device AC97,audiodev=snd0 ^
     -drive file=dist\AMD64\kernel.iso,format=raw,media=cdrom,if=none,id=cdrom0 ^
     -drive file=.\disk.img,format=raw,media=disk,if=none,id=disk0 ^
+    -drive file=.\ext2.img,format=raw,media=disk,if=none,id=disk1 ^
     -device ahci,id=ahci0 ^
     -device ide-cd,drive=cdrom0,bus=ahci0.0 ^
     -device ide-hd,drive=disk0,bus=ahci0.1 ^
+    -device ide-hd,drive=disk1,bus=ahci0.2 ^
     -boot d
-
 
 timeout /t 1 /nobreak >nul
 

@@ -1,8 +1,7 @@
 #############################################
 # Disk images and generated dumps
 #############################################
-disk.img
-diskog.img
+*.img
 dump.txt
 file_dump.bat
 
@@ -28,7 +27,7 @@ file_dump.bat
 /userland/dist/
 
 #############################################
-# ISO files and logs
+# ISO files, Disk files and logs
 #############################################
 *.iso
 *.log
@@ -43,3 +42,10 @@ file_dump.bat
 #############################################
 Thumbs.db
 .DS_Store
+
+#####################################################
+# Squirrel Executable and Linkable Programms (.SQR)
+#####################################################
+*.sqr
+*.sqrm
+*.sqrl
