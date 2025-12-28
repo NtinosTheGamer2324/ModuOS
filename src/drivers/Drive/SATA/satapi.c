@@ -21,6 +21,7 @@
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
 #include <stddef.h>
+#include <string.h>
 
 // SATAPI devices (one per AHCI port)
 static satapi_device_t satapi_devices[AHCI_MAX_PORTS];
@@ -98,13 +99,35 @@ static int satapi_send_packet(uint8_t port_num, uint8_t *scsi_cmd,
         ((uint32_t*)cmdtbl)[i] = 0;
     }
     
-    // Setup PRDT if we have data to transfer
+    /*
+     * DMA SAFETY:
+     * cmdtbl PRDT expects a physical address. The pointer passed in might not be physically
+     * contiguous (kheap) and virt_to_phys may return 0 for some mappings.
+     *
+     * Use a single-page, physically contiguous bounce buffer (identity-mapped) for transfers
+     * up to 4KiB, then memcpy to the caller buffer.
+     */
+    static uint8_t satapi_bounce_page[4096] __attribute__((aligned(4096)));
+    void *dma_buf = NULL;
+    uint64_t dma_phys = 0;
+
     if (buffer && buffer_len > 0) {
-        uint64_t buf_phys = paging_virt_to_phys((uint64_t)buffer);
-        cmdtbl->prdt_entry[0].dba = (uint32_t)buf_phys;
-        cmdtbl->prdt_entry[0].dbau = (uint32_t)(buf_phys >> 32);
-        cmdtbl->prdt_entry[0].dbc = buffer_len - 1;  // 0-based
-        cmdtbl->prdt_entry[0].i = 0;  // No interrupt
+        if (buffer_len > sizeof(satapi_bounce_page)) {
+            COM_LOG_ERROR(COM1_PORT, "SATAPI: transfer too large for bounce buffer");
+            return SATAPI_ERR_HARDWARE;
+        }
+
+        dma_buf = satapi_bounce_page;
+        dma_phys = (uint64_t)(uintptr_t)satapi_bounce_page; /* identity */
+
+        if (is_write) {
+            memcpy(dma_buf, buffer, buffer_len);
+        }
+
+        cmdtbl->prdt_entry[0].dba = (uint32_t)dma_phys;
+        cmdtbl->prdt_entry[0].dbau = (uint32_t)(dma_phys >> 32);
+        cmdtbl->prdt_entry[0].dbc = buffer_len - 1;
+        cmdtbl->prdt_entry[0].i = 0;
     }
     
     // Setup command FIS for PACKET command
@@ -154,6 +177,9 @@ static int satapi_send_packet(uint8_t port_num, uint8_t *scsi_cmd,
     while (spin < SATAPI_TIMEOUT_MS) {
         if ((port->ci & (1 << slot)) == 0) {
             // Command completed
+            if (buffer && buffer_len > 0 && !is_write) {
+                memcpy(buffer, satapi_bounce_page, buffer_len);
+            }
             return SATAPI_SUCCESS;
         }
         if (port->is & HBA_PxIS_TFES) {
@@ -235,6 +261,11 @@ int satapi_read_capacity(uint8_t port_num, uint32_t *total_blocks, uint32_t *blo
                            ((uint32_t)capacity_data[5] << 16) |
                            ((uint32_t)capacity_data[6] << 8) |
                            ((uint32_t)capacity_data[7]);
+
+        /* Some emulators/firmware paths can return 0 here; ISO9660 requires 2048-byte sectors. */
+        if (blk_size == 0) {
+            blk_size = SATAPI_SECTOR_SIZE;
+        }
         
         if (total_blocks) {
             *total_blocks = last_lba + 1;  // Last LBA + 1 = total blocks

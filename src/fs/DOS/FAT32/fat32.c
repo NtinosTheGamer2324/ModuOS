@@ -1,4 +1,5 @@
 #include "moduos/fs/DOS/FAT32/fat32.h"
+#include "moduos/kernel/COM/com.h"
 #include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/memory/string.h"
@@ -132,7 +133,7 @@ int fat32_format(int vdrive_id, uint32_t partition_lba, uint32_t partition_secto
     /* Calculate cluster size if not specified */
     if (sectors_per_cluster == 0) {
         sectors_per_cluster = calculate_cluster_size(partition_sectors);
-        VGA_Writef("FAT32: Using %u sectors per cluster\n", sectors_per_cluster);
+        com_printf(COM1_PORT, "FAT32: Using %u sectors per cluster\n", sectors_per_cluster);
     }
     
     /* Validate cluster size */
@@ -165,9 +166,9 @@ int fat32_format(int vdrive_id, uint32_t partition_lba, uint32_t partition_secto
         return -4;
     }
     
-    VGA_Writef("FAT32: Reserved sectors: %u\n", reserved_sectors);
-    VGA_Writef("FAT32: FAT size: %u sectors\n", fat_size_sectors);
-    VGA_Writef("FAT32: First data sector: %u\n", first_data_sector);
+    com_printf(COM1_PORT, "FAT32: Reserved sectors: %u\n", reserved_sectors);
+    com_printf(COM1_PORT, "FAT32: FAT size: %u sectors\n", fat_size_sectors);
+    com_printf(COM1_PORT, "FAT32: First data sector: %u\n", first_data_sector);
     
     /* Allocate buffer for boot sector */
     uint8_t boot_sector[512];
@@ -357,7 +358,7 @@ int fat32_format(int vdrive_id, uint32_t partition_lba, uint32_t partition_secto
         
         /* Write first FAT sector */
         if (vdrive_write_sector(vdrive_id, fat_start, fat_sector) != 0) {
-            VGA_Writef("FAT32: Failed to write FAT %u first sector\n", fat_num);
+            com_printf(COM1_PORT, "FAT32: Failed to write FAT %u first sector\n", fat_num);
             return -8;
         }
         
@@ -365,7 +366,7 @@ int fat32_format(int vdrive_id, uint32_t partition_lba, uint32_t partition_secto
         memset(fat_sector, 0, 512);
         for (uint32_t i = 1; i < fat_size_sectors; i++) {
             if (vdrive_write_sector(vdrive_id, fat_start + i, fat_sector) != 0) {
-                VGA_Writef("FAT32: Failed to write FAT %u sector %u\n", fat_num, i);
+                com_printf(COM1_PORT, "FAT32: Failed to write FAT %u sector %u\n", fat_num, i);
                 return -9;
             }
         }
@@ -382,9 +383,9 @@ int fat32_format(int vdrive_id, uint32_t partition_lba, uint32_t partition_secto
     }
     
     VGA_Write("FAT32: Format complete!\n");
-    VGA_Writef("FAT32: Volume label: %s\n", volume_label ? volume_label : "NO NAME");
-    VGA_Writef("FAT32: Cluster size: %u KB\n", (sectors_per_cluster * 512) / 1024);
-    VGA_Writef("FAT32: Total clusters: %u\n", total_clusters);
+    com_printf(COM1_PORT, "FAT32: Volume label: %s\n", volume_label ? volume_label : "NO NAME");
+    com_printf(COM1_PORT, "FAT32: Cluster size: %u KB\n", (sectors_per_cluster * 512) / 1024);
+    com_printf(COM1_PORT, "FAT32: Total clusters: %u\n", total_clusters);
     
     return 0;
 }
@@ -411,7 +412,7 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
     fs->vdrive_id = vdrive_id;  
     fs->partition_lba = partition_lba;
 
-    VGA_Writef("FAT32: attempting mount vdrive=%d, LBA=%u -> handle=%d\n", 
+    com_printf(COM1_PORT, "FAT32: attempting mount vdrive=%d, LBA=%u -> handle=%d\n", 
                vdrive_id, partition_lba, handle);  
 
 
@@ -421,7 +422,7 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
     }
 
     if (sector[510] != 0x55 || sector[511] != 0xAA) {
-        VGA_Writef("FAT32: invalid boot signature (got 0x%x 0x%x)\n", sector[510], sector[511]);
+        com_printf(COM1_PORT, "FAT32: invalid boot signature (got 0x%x 0x%x)\n", sector[510], sector[511]);
         return -3;
     }
 
@@ -439,12 +440,12 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
 
     if (fs->bytes_per_sector != 512 && fs->bytes_per_sector != 1024 && 
         fs->bytes_per_sector != 2048 && fs->bytes_per_sector != 4096) {
-        VGA_Writef("FAT32: unusual bytes_per_sector=%u\n", fs->bytes_per_sector);
+        com_printf(COM1_PORT, "FAT32: unusual bytes_per_sector=%u\n", fs->bytes_per_sector);
         return -5;
     }
 
     if (fs->sectors_per_cluster > 128) {
-        VGA_Writef("FAT32: suspiciously large sectors_per_cluster=%u\n", fs->sectors_per_cluster);
+        com_printf(COM1_PORT, "FAT32: suspiciously large sectors_per_cluster=%u\n", fs->sectors_per_cluster);
         return -6;
     }
 
@@ -470,7 +471,7 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
                        ((uint32_t)sector[46] << 16) | ((uint32_t)sector[47] << 24);
 
     if (fs->root_cluster < 2) {
-        VGA_Writef("FAT32: invalid root_cluster=%u (must be >= 2)\n", fs->root_cluster);
+        com_printf(COM1_PORT, "FAT32: invalid root_cluster=%u (must be >= 2)\n", fs->root_cluster);
         return -8;
     }
 
@@ -481,14 +482,14 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
     /* Check cluster size */
     uint32_t clus_size = (uint32_t)fs->bytes_per_sector * (uint32_t)fs->sectors_per_cluster;
     if (clus_size > FAT32_MAX_CLUSTER_SIZE) {
-        VGA_Writef("FAT32: cluster size %u > max %u\n", clus_size, FAT32_MAX_CLUSTER_SIZE);
+        com_printf(COM1_PORT, "FAT32: cluster size %u > max %u\n", clus_size, FAT32_MAX_CLUSTER_SIZE);
         return -9;
     }
 
     /* Mark as active */
     fs->active = 1;
     
-    VGA_Writef("FAT32: mount successful! handle=%d, root_cluster=%u\n", handle, fs->root_cluster);
+    com_printf(COM1_PORT, "FAT32: mount successful! handle=%d, root_cluster=%u\n", handle, fs->root_cluster);
     return handle;
 }
 
@@ -511,11 +512,11 @@ int fat32_mount_auto(int vdrive_id) {
             continue;
         }
         
-        VGA_Writef("FAT32: checking vDrive %d\n", d);
+        com_printf(COM1_PORT, "FAT32: checking vDrive %d\n", d);
         
         // CHANGED: Use vDrive
         if (vdrive_read_sector(d, 0, mbr) != VDRIVE_SUCCESS) {
-            VGA_Writef("FAT32: cannot read vDrive %d\n", d);
+            com_printf(COM1_PORT, "FAT32: cannot read vDrive %d\n", d);
             continue;
         }
 
@@ -531,7 +532,7 @@ int fat32_mount_auto(int vdrive_id) {
                            ((uint32_t)mbr[off + 10] << 16) | ((uint32_t)mbr[off + 11] << 24);
             
             if ((type == FAT32_TYPE_B || type == FAT32_TYPE_C) && lba > 0) {
-                VGA_Writef("FAT32: found partition %d, type=0x%x, LBA=%u\n", i, type, lba);
+                com_printf(COM1_PORT, "FAT32: found partition %d, type=0x%x, LBA=%u\n", i, type, lba);
                 int handle = fat32_mount(d, lba);
                 if (handle >= 0) {
                     return handle;
@@ -552,7 +553,7 @@ int fat32_mount_auto(int vdrive_id) {
 
 void fat32_unmount(int handle) {
     if (fat32_valid_handle(handle)) {
-        VGA_Writef("FAT32: unmounting handle %d\n", handle);
+        com_printf(COM1_PORT, "FAT32: unmounting handle %d\n", handle);
         memset(&fat32_mounts[handle], 0, sizeof(fat32_fs_t));
     }
 }
@@ -887,7 +888,7 @@ static int list_directory_cluster(int handle, uint32_t dir_cluster) {
                 name_buf[idx] = '\0';
             }
 
-            VGA_Writef("  %s %s size=%u\n",
+            com_printf(COM1_PORT, "  %s %s size=%u\n",
                        name_buf,
                        (e->attr & 0x10) ? "<DIR>" : "",
                        e->filesize);
@@ -920,7 +921,7 @@ int fat32_list_directory(int handle, const char* path) {
     /* Handle root or empty path */
     if (path == NULL || path[0] == '\0' ||
         (path[0] == '/' && path[1] == '\0')) {
-        VGA_Writef("FAT32 root directory (handle %d):\n", handle);
+        com_printf(COM1_PORT, "FAT32 root directory (handle %d):\n", handle);
         return list_directory_cluster(handle, fs->root_cluster);
     }
 
@@ -957,7 +958,7 @@ int fat32_list_directory(int handle, const char* path) {
 
         while (cluster >= 2 && cluster < 0x0FFFFFF8) {
             if (fat32_read_cluster(handle, cluster, buf) != 0) {
-                VGA_Writef("FAT32: failed to read cluster %u\n", cluster);
+                com_printf(COM1_PORT, "FAT32: failed to read cluster %u\n", cluster);
                 return -4;
             }
 
@@ -975,13 +976,13 @@ int fat32_list_directory(int handle, const char* path) {
         }
 
         if (!found) {
-            VGA_Writef("FAT32: path component '%s' not found\n", component);
+            com_printf(COM1_PORT, "FAT32: path component '%s' not found\n", component);
             return -2;
         }
 
         /* If it’s not a directory but more path remains → invalid */
         if (!(entry.attr & 0x10) && path[path_idx] != '\0') {
-            VGA_Writef("FAT32: '%s' is not a directory\n", component);
+            com_printf(COM1_PORT, "FAT32: '%s' is not a directory\n", component);
             return -3;
         }
 
@@ -994,7 +995,7 @@ int fat32_list_directory(int handle, const char* path) {
     }
 
     /* List the final directory */
-    VGA_Writef("FAT32 directory '%s' (handle %d):\n", path, handle);
+    com_printf(COM1_PORT, "FAT32 directory '%s' (handle %d):\n", path, handle);
     return list_directory_cluster(handle, current_cluster);
 }
 
@@ -1407,13 +1408,13 @@ int fat32_list_root(int handle) {
     uint32_t clus_size = (uint32_t)fs->bytes_per_sector * (uint32_t)fs->sectors_per_cluster;
 
     if (clus_size == 0 || clus_size > FAT32_MAX_CLUSTER_SIZE) {
-        VGA_Writef("FAT32: invalid cluster size %u\n", clus_size);
+        com_printf(COM1_PORT, "FAT32: invalid cluster size %u\n", clus_size);
         return -2;
     }
 
     static uint8_t buf[FAT32_MAX_CLUSTER_SIZE];
 
-    VGA_Writef("FAT32 root directory (handle %d):\n", handle);
+    com_printf(COM1_PORT, "FAT32 root directory (handle %d):\n", handle);
 
     int iterations = 0;
     while (cluster >= 2 && cluster < 0x0FFFFFF8) {
@@ -1423,7 +1424,7 @@ int fat32_list_root(int handle) {
         }
 
         if (fat32_read_cluster(handle, cluster, buf) != 0) {
-            VGA_Writef("FAT32: failed to read cluster %u\n", cluster);
+            com_printf(COM1_PORT, "FAT32: failed to read cluster %u\n", cluster);
             return -4;
         }
 
@@ -1499,7 +1500,7 @@ int fat32_list_root(int handle) {
                 name[idx] = '\0';
             }
 
-            VGA_Writef("  %s %s size=%u\n",
+            com_printf(COM1_PORT, "  %s %s size=%u\n",
                        name,
                        (e->attr & 0x10) ? "<DIR>" : "",
                        e->filesize);
@@ -1563,13 +1564,13 @@ int fat32_read_file_by_path(int handle, const char* path, void* out_buf, size_t 
         /* Find entry in current directory */
         struct fat_dir_entry entry;
         if (find_dir_entry(handle, current_cluster, component, &entry) != 0) {
-            VGA_Writef("FAT32: file not found: %s\n", component);
+            com_printf(COM1_PORT, "FAT32: file not found: %s\n", component);
             return -2;
         }
 
         /* More path left? Must be directory */
         if (path[path_idx] == '/' && !(entry.attr & 0x10)) {
-            VGA_Writef("FAT32: %s is not a directory\n", component);
+            com_printf(COM1_PORT, "FAT32: %s is not a directory\n", component);
             return -3;
         }
 
@@ -1590,7 +1591,7 @@ int fat32_read_file_by_path(int handle, const char* path, void* out_buf, size_t 
 
             while (file_cluster >= 2 && file_cluster < 0x0FFFFFF8 && remaining > 0) {
                 if (fat32_read_cluster(handle, file_cluster, cluster_buf) != 0) {
-                    VGA_Writef("FAT32: failed to read cluster %u\n", file_cluster);
+                    com_printf(COM1_PORT, "FAT32: failed to read cluster %u\n", file_cluster);
                     return -4;
                 }
 
@@ -1615,7 +1616,7 @@ int fat32_read_file_by_path(int handle, const char* path, void* out_buf, size_t 
             }
 
             if (out_size) *out_size = total_read;
-            // VGA_Writef("FAT32: read file '%s', %u bytes\n", component, (unsigned)total_read);
+            // com_printf(COM1_PORT, "FAT32: read file '%s', %u bytes\n", component, (unsigned)total_read);
             return 0;
         }
     }

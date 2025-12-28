@@ -1,29 +1,5 @@
-/*
- * atapi.c
- *
- * Robust ATAPI PIO reader for CD/DVD (2048-byte logical blocks).
- *
- * Uses legacy ATA I/O ports (from ata.h) and kernel I/O primitives:
- *   - inb/outb/inw/outw
- *   - insw/outsw
- *   - rtc_wait_seconds(...) for multi-second waits when needed
- *
- * Behavior highlights:
- *  - TEST UNIT READY before read, with retries & spin-up wait
- *  - Sends SCSI READ(10) via ATA PACKET (0xA0)
- *  - Uses alt-status reads as short delays to avoid busy-wait hogging the bus
- *  - On packet failures attempts REQUEST SENSE to log sense codes
- *  - Reads data with word (16-bit) transfers (insw) — required by ATA/ATAPI
- *
- * Return codes:
- *   0 = success
- *  -1 = invalid args / no device
- *  -2 = PACKET not accepted / timeout
- *  -3 = data read timeout / DRQ never asserted
- *  -4 = request sense / device reported error
- */
-
 #include "moduos/drivers/Drive/ATA/ata.h"
+#include "moduos/kernel/COM/com.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/drivers/Time/RTC.h"
 #include "moduos/kernel/memory/string.h"
@@ -80,7 +56,7 @@ static int atapi_send_packet(uint16_t base, uint16_t ctrl, uint8_t drive_sel, ui
     outb(base + REG_DRIVE, drive_sel);
     for (int i=0;i<4;i++) atapi_io_delay(ctrl);
 
-    /* CRITICAL FIX: Set byte count limit in CYLINDER registers (LBA_MID/HI)
+    /* Set byte count limit in CYLINDER registers (LBA_MID/HI)
      * NOT in sector count! ATAPI uses these to know max bytes per DRQ block.
      * Typical value is 0xF000 (or the actual transfer size if smaller) */
     uint16_t byte_count = (expected_bytes > 0xF000) ? 0xF000 : (uint16_t)expected_bytes;
@@ -198,7 +174,7 @@ int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* o
         int tur = atapi_test_unit_ready_simple(base, ctrl, drive_sel);
         if (tur != 0) {
             /* Not ready: wait a second to let drive spin up, retry */
-            VGA_Writef("ATAPI: drive %d not ready (attempt %d) tur=%d - waiting\n", drive_index, attempt+1, tur);
+            com_printf(COM1_PORT, "ATAPI: drive %d not ready (attempt %d) tur=%d - waiting\n", drive_index, attempt+1, tur);
             rtc_wait_seconds(ATAPI_SPINUP_WAIT_SECONDS);
             continue;
         }
@@ -206,7 +182,7 @@ int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* o
         /* send the READ(10) packet */
         int s = atapi_send_packet(base, ctrl, drive_sel, packet, total_bytes);
         if (s != 0) {
-            VGA_Writef("ATAPI: PACKET not accepted on drive %d (attempt %d)\n", drive_index, attempt+1);
+            com_printf(COM1_PORT, "ATAPI: PACKET not accepted on drive %d (attempt %d)\n", drive_index, attempt+1);
             rtc_wait_seconds(ATAPI_SPINUP_WAIT_SECONDS);
             continue;
         }
@@ -218,7 +194,7 @@ int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* o
 
         while (blocks_left > 0) {
             if (atapi_poll_status(base, ctrl, 1, ATAPI_DRQ_POLL_LOOPS) != 0) {
-                VGA_Writef("ATAPI: data DRQ timeout drive %d (block %u)\n", drive_index, block_idx);
+                com_printf(COM1_PORT, "ATAPI: data DRQ timeout drive %d (block %u)\n", drive_index, block_idx);
                 failed = 1;
                 break;
             }
@@ -240,15 +216,15 @@ int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* o
         /* If failed, request sense to log and then retry after a wait */
         uint8_t sense[18];
         if (atapi_request_sense(base, ctrl, drive_sel, sense, sizeof(sense)) == 0) {
-            VGA_Writef("ATAPI: REQUEST SENSE (drive %d): key=%02x asc=%02x ascq=%02x\n",
+            com_printf(COM1_PORT, "ATAPI: REQUEST SENSE (drive %d): key=%02x asc=%02x ascq=%02x\n",
                        drive_index, sense[2] & 0x0F, sense[12], sense[13]);
         } else {
-            VGA_Writef("ATAPI: REQUEST SENSE failed (drive %d)\n", drive_index);
+            com_printf(COM1_PORT, "ATAPI: REQUEST SENSE failed (drive %d)\n", drive_index);
         }
         rtc_wait_seconds(ATAPI_SPINUP_WAIT_SECONDS);
     }
 
-    VGA_Writef("ATAPI: read failed permanently (drive %d, lba=%u, count=%u)\n", drive_index, lba, count);
+    com_printf(COM1_PORT, "ATAPI: read failed permanently (drive %d, lba=%u, count=%u)\n", drive_index, lba, count);
     return -3;
 }
 

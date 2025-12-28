@@ -1,4 +1,5 @@
 #include "moduos/fs/ISOFS/iso9660.h"
+#include "moduos/kernel/COM/com.h"
 #include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/memory/string.h"
@@ -162,7 +163,7 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
     iso9660_init_once();
     
     if (!vdrive_is_ready(vdrive_id)) {
-        VGA_Writef("ISO9660: vDrive %d not ready\n", vdrive_id);
+        com_printf(COM1_PORT, "ISO9660: vDrive %d not ready\n", vdrive_id);
         return -1;
     }
 
@@ -199,7 +200,7 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
         // For optical drives (ATAPI or SATAPI), read 2048-byte blocks via vDrive
         int r = vdrive_read(vdrive_id, ISO9660_PVD_SECTOR, 1, pvd_buf);
         if (r != VDRIVE_SUCCESS) {
-            VGA_Writef("ISO9660: optical drive read failed (error %d)\n", r);
+            com_printf(COM1_PORT, "ISO9660: optical drive read failed (error %d)\n", r);
             return -3;
         }
     } else {
@@ -207,12 +208,17 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
         uint32_t pvd_lba = partition_lba + (ISO9660_PVD_SECTOR * 4);
         int r = vdrive_read(vdrive_id, pvd_lba, 4, pvd_buf);
         if (r != VDRIVE_SUCCESS) {
-            VGA_Writef("ISO9660: failed to read PVD from vDrive %d\n", vdrive_id);
+            com_printf(COM1_PORT, "ISO9660: failed to read PVD from vDrive %d\n", vdrive_id);
             return -3;
         }
     }
 
     if (pvd_buf[0] != 1 || memcmp(&pvd_buf[1], ISO9660_ID, ISO9660_ID_LEN) != 0 || pvd_buf[6] != 1) {
+        com_write_string(COM1_PORT, "[ISO9660] Invalid PVD bytes: ");
+        for (int i = 0; i < 8; i++) {
+            com_printf(COM1_PORT, "%02x ", (uint8_t)pvd_buf[i]);
+        }
+        com_write_string(COM1_PORT, "\n");
         VGA_Write("ISO9660: invalid Primary Volume Descriptor\n");
         return -4;
     }
@@ -229,7 +235,7 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
     fs->root_size = rd[10] | (rd[11] << 8) | (rd[12] << 16) | (rd[13] << 24);
     fs->active = 1;
 
-    VGA_Writef("ISO9660: mounted handle=%d, vdrive=%d, lbs=%u, root_extent=%u (with Rock Ridge LFN support)\n",
+    com_printf("ISO9660: mounted handle=%d, vdrive=%d, lbs=%u, root_extent=%u (with Rock Ridge LFN support)\n",
                handle, vdrive_id, fs->logical_block_size, fs->root_extent_lba);
     return handle;
 }
@@ -272,7 +278,7 @@ int iso9660_mount_auto(int vdrive_id) {
 
 void iso9660_unmount(int handle) {
     if (iso9660_valid_handle(handle)) {
-        VGA_Writef("ISO9660: unmounting handle %d\n", handle);
+        com_printf(COM1_PORT, "ISO9660: unmounting handle %d\n", handle);
         memset(&iso_mounts[handle], 0, sizeof(iso9660_fs_t));
     }
 }
@@ -414,7 +420,7 @@ static int list_extent_entries(int handle, uint32_t extent_lba, uint32_t extent_
         
         /* Skip . and .. entries */
         if (!(strlen(name) == 1 && (name[0] == 0 || name[0] == 1))) {
-            VGA_Writef("  %s %s size=%u extent=%u\n", 
+            com_printf(COM1_PORT, "  %s %s size=%u extent=%u\n", 
                        name, 
                        (flags & 0x02) ? "<DIR>" : "", 
                        size, extent);
@@ -525,24 +531,24 @@ int iso9660_read_file_by_path(int handle, const char* path, void* out_buf,
         
         if (find_entry_in_extent(handle, current_extent, current_size,
                                  component, &next_extent, &next_size, &flags) != 0) {
-            VGA_Writef("ISO9660: path component '%s' not found\n", component);
+            com_printf(COM1_PORT, "ISO9660: path component '%s' not found\n", component);
             return -4;
         }
         
         if (path[path_idx] == '\0') {
             if (flags & 0x02) {
-                VGA_Writef("ISO9660: '%s' is a directory, not a file\n", component);
+                com_printf(COM1_PORT, "ISO9660: '%s' is a directory, not a file\n", component);
                 return -5;
             }
             
             if (next_size > buf_size) {
-                VGA_Writef("ISO9660: file size (%u) exceeds buffer size (%zu)\n", 
+                com_printf(COM1_PORT, "ISO9660: file size (%u) exceeds buffer size (%zu)\n", 
                           next_size, buf_size);
                 return -6;
             }
             
             if (iso9660_read_extent(handle, next_extent, next_size, out_buf) != 0) {
-                VGA_Writef("ISO9660: failed to read file '%s'\n", path);
+                com_printf(COM1_PORT, "ISO9660: failed to read file '%s'\n", path);
                 return -7;
             }
             
@@ -554,7 +560,7 @@ int iso9660_read_file_by_path(int handle, const char* path, void* out_buf,
         }
         
         if (!(flags & 0x02)) {
-            VGA_Writef("ISO9660: '%s' is not a directory\n", component);
+            com_printf(COM1_PORT, "ISO9660: '%s' is not a directory\n", component);
             return -8;
         }
         
@@ -575,7 +581,7 @@ int iso9660_list_directory(int handle, const char* path) {
     
     if (path == NULL || path[0] == '\0' || 
         (path[0] == '/' && path[1] == '\0')) {
-        VGA_Writef("ISO9660 root directory (handle %d):\n", handle);
+        com_printf(COM1_PORT, "ISO9660 root directory (handle %d):\n", handle);
         return list_extent_entries(handle, fs->root_extent_lba, fs->root_size);
     }
     
@@ -604,12 +610,12 @@ int iso9660_list_directory(int handle, const char* path) {
         
         if (find_entry_in_extent(handle, current_extent, current_size,
                                  component, &next_extent, &next_size, &flags) != 0) {
-            VGA_Writef("ISO9660: path component '%s' not found\n", component);
+            com_printf(COM1_PORT, "ISO9660: path component '%s' not found\n", component);
             return -2;
         }
         
         if (!(flags & 0x02)) {
-            VGA_Writef("ISO9660: '%s' is not a directory\n", component);
+            com_printf(COM1_PORT, "ISO9660: '%s' is not a directory\n", component);
             return -3;
         }
         
@@ -619,7 +625,7 @@ int iso9660_list_directory(int handle, const char* path) {
         if (path[path_idx] == '/') path_idx++;
     }
     
-    VGA_Writef("ISO9660 directory '%s' (handle %d):\n", path, handle);
+    com_printf(COM1_PORT, "ISO9660 directory '%s' (handle %d):\n", path, handle);
     return list_extent_entries(handle, current_extent, current_size);
 }
 

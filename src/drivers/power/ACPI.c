@@ -27,11 +27,10 @@ static void* map_acpi_memory(uint64_t phys_addr, size_t min_size) {
     
     /* Otherwise, use ioremap to map it */
     COM_LOG(COM1_PORT, "Mapping high ACPI memory");
-    VGA_Writef("  Mapping ACPI region at 0x%x (size=%d)\n", (uint32_t)phys_addr, (int)min_size);
+    com_printf(COM1_PORT, "[ACPI]:  Mapping ACPI region at 0x%x (size=%d)\n", (uint32_t)phys_addr, (int)min_size);
     void* mapped = ioremap(phys_addr, min_size);
     if (!mapped) {
         COM_LOG_ERROR(COM1_PORT, "Failed to map ACPI memory");
-        VGA_Write("  \\crFailed to map ACPI memory!\\rr\n");
     }
     return mapped;
 }
@@ -156,11 +155,11 @@ int acpi_init(void) {
     }
 
     COM_LOG_OK(COM1_PORT, "RSDP found");
-    VGA_Writef("  ACPI Revision: %d\n", rsdp->revision);
+    com_printf(COM1_PORT, "  ACPI Revision: %d\n", rsdp->revision);
 
     /* Get RSDT or XSDT - these might be in high memory! */
     if (rsdp->revision >= 2 && rsdp->xsdt_address) {
-        VGA_Writef("  XSDT at physical address: 0x%x\n", (uint32_t)rsdp->xsdt_address);
+        com_printf(COM1_PORT, "  XSDT at physical address: 0x%x\n", (uint32_t)rsdp->xsdt_address);
         
         /* Map XSDT header first to get its size */
         xsdt_t* xsdt_header = (xsdt_t*)map_acpi_memory(rsdp->xsdt_address, sizeof(acpi_sdt_header_t));
@@ -180,7 +179,7 @@ int acpi_init(void) {
     }
 
     if (!xsdt) {
-        VGA_Writef("  RSDT at physical address: 0x%x\n", rsdp->rsdt_address);
+        com_printf(COM1_PORT, "  RSDT at physical address: 0x%x\n", rsdp->rsdt_address);
         
         /* Map RSDT header first to get its size */
         rsdt_t* rsdt_header = (rsdt_t*)map_acpi_memory(rsdp->rsdt_address, sizeof(acpi_sdt_header_t));
@@ -205,13 +204,13 @@ int acpi_init(void) {
         COM_LOG_OK(COM1_PORT, "FADT found");
         /* Print FADT reset register info for debugging */
         if (fadt->header.length >= 129) {
-            VGA_Writef("  FADT Length: %d, Reset Reg: 0x%x, Space: %d, Value: 0x%x\n",
+            com_printf(COM1_PORT, "  FADT Length: %d, Reset Reg: 0x%x, Space: %d, Value: 0x%x\n",
                        fadt->header.length,
                        (uint32_t)fadt->reset_reg.address,
                        fadt->reset_reg.address_space,
                        fadt->reset_value);
         } else {
-            VGA_Writef("  FADT Length: %d (too short for reset register)\n", fadt->header.length);
+            com_printf(COM1_PORT, "  FADT Length: %d (too short for reset register)\n", fadt->header.length);
         }
     } else {
         COM_LOG_WARN(COM1_PORT, "FADT not found");
