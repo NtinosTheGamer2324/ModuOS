@@ -10,6 +10,9 @@
 #define PFLAG_PWT 0x8
 #define PFLAG_PCD 0x10
 
+/* amd64 PTE NX bit is handled elsewhere; for now we only need the USER bit */
+
+
 /* Existing prototypes... */
 void paging_init(void);
 uint64_t *paging_get_pml4(void);

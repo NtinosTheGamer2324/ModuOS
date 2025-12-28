@@ -121,6 +121,8 @@ void memory_system_init(void *mb2)
                 if (fb_virt) {
                     framebuffer_t fb;
                     fb.addr = fb_virt;
+                    fb.phys_addr = fb_phys;
+                    fb.size_bytes = fb_size_aligned;
                     fb.width = width;
                     fb.height = height;
                     fb.pitch = pitch;

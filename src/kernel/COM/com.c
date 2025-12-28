@@ -353,6 +353,16 @@ int com_write_hex(uint16_t port, uint8_t value) {
     return 2;  // Two characters written
 }
 
+int com_write_hex64(uint16_t port, uint64_t value) {
+    // Print as 16 hex chars, high nibble first.
+    const char hex_chars[] = "0123456789ABCDEF";
+    for (int i = 15; i >= 0; i--) {
+        uint8_t nib = (uint8_t)((value >> (i * 4)) & 0x0Fu);
+        if (com_write_byte(port, hex_chars[nib]) != 0) return -1;
+    }
+    return 16;
+}
+
 /* Helper function to convert integer to string */
 static int int_to_string(int value, char *buf, int base) {
     if (base < 2 || base > 16) return 0;

@@ -16,7 +16,7 @@ static void log_msg(const char* msg) {
 static void print_hex64(uint64_t v);
 static void print_dec64(uint64_t v);
 
-/* CRITICAL FIX: Validate multiboot pointer before dereferencing */
+/*  Validate multiboot pointer before dereferencing */
 static int validate_mb2_pointer(void *mb2_ptr) {
     if (!mb2_ptr) {
         log_msg("[MEM] ERROR: NULL multiboot pointer\n");
@@ -40,7 +40,7 @@ static int validate_mb2_pointer(void *mb2_ptr) {
     return 1;
 }
 
-/* CRITICAL FIX: Add memory barriers and cache flushes for real hardware */
+/*  Add memory barriers and cache flushes for real hardware */
 static inline void memory_barrier(void) {
     __asm__ volatile("mfence" ::: "memory");
 }
@@ -63,7 +63,7 @@ void early_identity_map_all() {
     print_dec64(free_frames);
     log_msg("\n");
     
-    /* CRITICAL FIX: More conservative reserve */
+    /*  More conservative reserve */
     // Reserve enough frames for page tables and early allocations.
     // Rough sizing: mapping N bytes with 4KB pages needs ~N/2MB PT pages (one PT covers 2MB).
     // Add headroom for split huge pages and other early allocations.
@@ -101,7 +101,7 @@ void early_identity_map_all() {
     uint64_t mapped_bytes = 0;
     uint64_t progress_interval = 256 * 1024 * 1024; /* 256MB progress updates */
     
-    /* CRITICAL FIX: Start from 64KB instead of 0 to avoid NULL page and BIOS area */
+    /*  Start from 64KB instead of 0 to avoid NULL page and BIOS area */
     uint64_t start_addr = 0x10000; /* 64 KB - skip BIOS data area and NULL page */
     
     log_msg("[MEM] Starting identity mapping from ");
@@ -244,13 +244,13 @@ void memory_init(void *mb2_ptr) {
     print_hex64((uint64_t)(uintptr_t)mb2_ptr);
     log_msg("\n");
 
-    /* CRITICAL FIX: Add memory barrier before reading multiboot data */
+    /*  Add memory barrier before reading multiboot data */
     memory_barrier();
 
     uint8_t *base = (uint8_t *)mb2_ptr;
     uint32_t total_size;
     
-    /* CRITICAL FIX: Safe read with bounds check */
+    /*  Safe read with bounds check */
     __asm__ volatile("" ::: "memory"); /* Compiler barrier */
     total_size = *(volatile uint32_t *)(base + 0);
     
@@ -291,7 +291,7 @@ void memory_init(void *mb2_ptr) {
     struct multiboot_tag_framebuffer *fb_tag = NULL;
 
     while (tagp + sizeof(struct mb2_tag) <= end) {
-        /* CRITICAL FIX: Safe tag read */
+        /*  Safe tag read */
         memory_barrier();
         struct mb2_tag *tag = (struct mb2_tag *)tagp;
 
@@ -416,7 +416,7 @@ void memory_init(void *mb2_ptr) {
     print_dec64(total_usable / (1024 * 1024));
     log_msg(" MB\n");
 
-    /* CRITICAL FIX: Memory barrier before initializing physical allocator */
+    /*  Memory barrier before initializing physical allocator */
     memory_barrier();
     
     log_msg("[MEM] Initializing physical allocator...\n");

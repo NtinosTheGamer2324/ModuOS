@@ -1,4 +1,5 @@
 #include "moduos/kernel/bootscreen.h"
+#include "moduos/kernel/burninimg/boot.h"
 
 #include "moduos/kernel/multiboot2.h"
 #include "moduos/kernel/md64api.h"
@@ -219,6 +220,7 @@ const char *bootscreen_pick_bmp_basename(void *mb2) {
 }
 
 static uint32_t fb_pack_rgb888(const framebuffer_t *fb, uint8_t r, uint8_t g, uint8_t b) {
+    if (!fb) return 0;
     if (fb->red_mask_size && fb->green_mask_size && fb->blue_mask_size) {
         uint32_t rp = fb->red_pos;
         uint32_t gp = fb->green_pos;
@@ -265,6 +267,31 @@ static void fb_put_pixel(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32
 }
 
 static void bootscreen_blit_bmp(const framebuffer_t *fb, const bmp_image_t *img);
+static void bootscreen_blit_burnin(const framebuffer_t *fb);
+
+static int bootscreen_is_qemu(void) {
+    /*
+     * Detect virtualized environments. QEMU often reports:
+     *  - "TCGTCGTCG" (software emulation)
+     *  - "KVMKVMKVM" (KVM acceleration)
+     * We treat both as "QEMU" for bootscreen stability/perf heuristics.
+     */
+    uint32_t eax=0, ebx=0, ecx=0, edx=0;
+
+    /* Hypervisor present bit */
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
+    int hv_present = (ecx >> 31) & 1;
+    if (!hv_present) return 0;
+
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0x40000000));
+    char hv[13];
+    ((uint32_t*)hv)[0] = ebx;
+    ((uint32_t*)hv)[1] = ecx;
+    ((uint32_t*)hv)[2] = edx;
+    hv[12] = 0;
+
+    return str_ieq_ascii(hv, "TCGTCGTCG") || str_ieq_ascii(hv, "KVMKVMKVM") || str_ieq_ascii(hv, "QEMU");
+}
 
 static int g_overlay_enabled = 0;
 static bmp_image_t g_overlay_img;
@@ -273,21 +300,62 @@ static size_t g_overlay_bmp_size = 0;
 static int g_overlay_ready = 0;
 
 void bootscreen_overlay_set_enabled(int enabled) {
-    g_overlay_enabled = enabled ? 1 : 0;
+    (void)enabled;
+    /*
+     * TEMPORARILY DISABLED:
+     * Overlay redraw has caused intermittent early-boot page faults.
+     * Keep bootscreen rendering as a one-shot draw only.
+     */
+    g_overlay_enabled = 0;
 }
 
 void bootscreen_overlay_redraw(void) {
-    if (!g_overlay_enabled || !g_overlay_ready) return;
-    if (VGA_GetFrameBufferMode() != FB_MODE_GRAPHICS) return;
+    /* Overlay disabled (see bootscreen_overlay_set_enabled). */
+}
 
-    framebuffer_t fb;
-    if (VGA_GetFrameBuffer(&fb) != 0 || !fb.addr) return;
+static void bootscreen_blit_burnin(const framebuffer_t *fb) {
+    if (!fb || !fb->addr) return;
 
-    bootscreen_blit_bmp(&fb, &g_overlay_img);
+    /* burn-in image is stored as 0xRRGGBB values */
+    const uint32_t src_w = GENERIC_BOOTIMG_WIDTH;
+    const uint32_t src_h = GENERIC_BOOTIMG_HEIGHT;
+
+    uint32_t dst_w = src_w;
+    uint32_t dst_h = src_h;
+
+    if (dst_w > fb->width || dst_h > fb->height) {
+        uint32_t sx = (uint32_t)(((uint64_t)fb->width << 16) / dst_w);
+        uint32_t sy = (uint32_t)(((uint64_t)fb->height << 16) / dst_h);
+        uint32_t s = (sx < sy) ? sx : sy;
+        if (s == 0) s = 1;
+        dst_w = (uint32_t)(((uint64_t)dst_w * s) >> 16);
+        dst_h = (uint32_t)(((uint64_t)dst_h * s) >> 16);
+        if (dst_w == 0) dst_w = 1;
+        if (dst_h == 0) dst_h = 1;
+    }
+
+    uint32_t off_x = (fb->width > dst_w) ? (fb->width - dst_w) / 2u : 0;
+    uint32_t off_y = (fb->height > dst_h) ? (fb->height - dst_h) / 2u : 0;
+
+    for (uint32_t y = 0; y < dst_h; y++) {
+        uint32_t src_y = (uint32_t)(((uint64_t)y * src_h) / dst_h);
+        for (uint32_t x = 0; x < dst_w; x++) {
+            uint32_t src_x = (uint32_t)(((uint64_t)x * src_w) / dst_w);
+            uint32_t rgb = (uint32_t)Generic_bootimg[src_y * src_w + src_x];
+            uint8_t r = (uint8_t)((rgb >> 16) & 0xFF);
+            uint8_t g = (uint8_t)((rgb >> 8) & 0xFF);
+            uint8_t b = (uint8_t)(rgb & 0xFF);
+            uint32_t px = fb_pack_rgb888(fb, r, g, b);
+            fb_put_pixel(fb, off_x + x, off_y + y, px);
+        }
+    }
 }
 
 static void bootscreen_blit_bmp(const framebuffer_t *fb, const bmp_image_t *img) {
+    if (!fb || !fb->addr) return;
     if (!fb || !fb->addr || !img || !img->pixel_data) return;
+
+    int qemu_env = bootscreen_is_qemu();
 
     // Scale down if needed (nearest-neighbor). Always keep centered.
     uint32_t src_w = img->width;
@@ -314,6 +382,10 @@ static void bootscreen_blit_bmp(const framebuffer_t *fb, const bmp_image_t *img)
     uint32_t off_y = (fb->height > dst_h) ? (fb->height - dst_h) / 2u : 0;
 
     for (uint32_t y = 0; y < dst_h; y++) {
+        /* In QEMU this can be very slow; print progress so it doesn't look like a hang. */
+        if (qemu_env && (y % 64u) == 0u) {
+            com_write_string(COM1_PORT, ".");
+        }
         uint32_t src_y = (uint32_t)(((uint64_t)y * src_h) / dst_h);
         for (uint32_t x = 0; x < dst_w; x++) {
             uint32_t src_x = (uint32_t)(((uint64_t)x * src_w) / dst_w);
@@ -324,6 +396,19 @@ static void bootscreen_blit_bmp(const framebuffer_t *fb, const bmp_image_t *img)
             fb_put_pixel(fb, off_x + x, off_y + y, px);
         }
     }
+    if (qemu_env) com_write_string(COM1_PORT, "\n");
+}
+
+int bootscreen_show_early(void) {
+    if (VGA_GetFrameBufferMode() != FB_MODE_GRAPHICS) return -1;
+
+    framebuffer_t fb;
+    if (VGA_GetFrameBuffer(&fb) != 0 || !fb.addr) return -2;
+
+    bootscreen_blit_burnin(&fb);
+
+    /* Do not enable overlay here; overlay is for the later BMP-based logo caching. */
+    return 0;
 }
 
 int bootscreen_show(void *mb2) {
@@ -367,7 +452,7 @@ int bootscreen_show(void *mb2) {
 
     size_t bytes_read = 0;
     if (fs_read_file(mnt, path, file_buf, info.size, &bytes_read) != 0 || bytes_read < 64) {
-        kfree(file_buf);
+        /* Avoid kfree() here during early boot stability issues (QEMU). */
         return -5;
     }
 
@@ -383,7 +468,7 @@ int bootscreen_show(void *mb2) {
         com_write_string(COM1_PORT, "\n");
 
         // If the selected image parses fail, fall back to Generic_bootimg.bmp.
-        kfree(file_buf);
+        /* Avoid kfree() here during early boot stability issues (QEMU). */
 
         char gpath[256];
         gpath[0] = 0;
@@ -401,7 +486,6 @@ int bootscreen_show(void *mb2) {
 
         bytes_read = 0;
         if (fs_read_file(mnt, gpath, file_buf, info.size, &bytes_read) != 0 || bytes_read < 64) {
-            kfree(file_buf);
             return -5;
         }
 
@@ -413,7 +497,6 @@ int bootscreen_show(void *mb2) {
             itoa(pr, tmp, 10);
             com_write_string(COM1_PORT, tmp);
             com_write_string(COM1_PORT, "\n");
-            kfree(file_buf);
             return -4;
         }
     }
@@ -428,20 +511,42 @@ int bootscreen_show(void *mb2) {
     itoa((int)img.bpp, n, 10); com_write_string(COM1_PORT, n);
     com_write_string(COM1_PORT, "\n");
 
-    // Cache as overlay so we can redraw it on top of later VGA output.
-    if (g_overlay_bmp_buf) {
-        kfree(g_overlay_bmp_buf);
-        g_overlay_bmp_buf = NULL;
-        g_overlay_bmp_size = 0;
-        memset(&g_overlay_img, 0, sizeof(g_overlay_img));
-        g_overlay_ready = 0;
+    com_write_string(COM1_PORT, "[BOOTSCREEN] About to blit BMP\n");
+
+    /* QEMU-only stability: occasionally the first blit after a cold start faults.
+     * Instead of skipping permanently, do a small delay then try once.
+     */
+    int qemu_env = bootscreen_is_qemu();
+    if (qemu_env) {
+        com_write_string(COM1_PORT, "[BOOTSCREEN] QEMU/KVM detected; delaying then attempting BMP blit once\n");
+        for (volatile uint64_t i = 0; i < 5000000ULL; i++) {
+            __asm__ volatile("pause");
+        }
     }
-    g_overlay_bmp_buf = file_buf;
-    g_overlay_bmp_size = file_sz;
-    g_overlay_img = img;
-    g_overlay_ready = 1;
 
-    bootscreen_blit_bmp(&fb, &g_overlay_img);
+    /* Sanity-check BMP pointers (they must point inside file_buf).
+     * We have seen intermittent QEMU-only early-boot faults where these pointers become
+     * invalid; if that happens, fall back to the built-in boot image instead of crashing.
+     */
+    const uint8_t *fbase = file_buf;
+    const uint8_t *fend = file_buf + file_sz;
+    int bmp_ptrs_ok = 1;
+    if (!img.pixel_data || img.pixel_data < fbase || img.pixel_data >= fend) bmp_ptrs_ok = 0;
+    if (img.palette && (img.palette < fbase || img.palette >= fend)) bmp_ptrs_ok = 0;
+    if (img.width == 0 || img.height == 0) bmp_ptrs_ok = 0;
+    if (img.row_stride == 0 || img.pixel_data_size < img.row_stride) bmp_ptrs_ok = 0;
+    if (img.bpp != 8 && img.bpp != 16 && img.bpp != 24 && img.bpp != 32) bmp_ptrs_ok = 0;
 
+    if (!bmp_ptrs_ok) {
+        com_write_string(COM1_PORT, "[BOOTSCREEN] WARNING: BMP pointers out of range; falling back to burn-in image\n");
+        bootscreen_blit_burnin(&fb);
+    } else {
+        /* One-shot draw: blit directly. */
+        bootscreen_blit_bmp(&fb, &img);
+    }
+
+    /* NOTE: In QEMU we have seen intermittent early-boot faults around kfree() here.
+     * Keep the BMP buffer allocated (small leak) to prioritize boot stability.
+     */
     return 0;
 }

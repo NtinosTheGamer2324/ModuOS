@@ -195,6 +195,7 @@ int com_is_initialized(uint16_t port);
  * @return Number of characters written, -1 on failure
  */
 int com_write_hex(uint16_t port, uint8_t value);
+int com_write_hex64(uint16_t port, uint64_t value);
 
 /**
  * Write formatted output to a COM port (printf-style)

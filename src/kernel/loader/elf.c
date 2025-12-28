@@ -119,7 +119,12 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
             com_write_string(COM1_PORT, "\n");
             
             // Set up page flags
-            uint64_t flags = PFLAG_PRESENT | PFLAG_WRITABLE;
+            // User programs execute in CPL=3, so their pages MUST be mapped with PFLAG_USER.
+            // Also respect ELF segment writability.
+            uint64_t flags = PFLAG_PRESENT | PFLAG_USER;
+            if (phdr[i].p_flags & PF_W) {
+                flags |= PFLAG_WRITABLE;
+            }
             
             /*
              * Safety: if the target virtual range is already mapped (e.g. repeated exec),
@@ -219,6 +224,38 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
 void elf_get_saved_args(int *argc, char ***argv) {
     *argc = g_saved_argc;
     *argv = g_saved_argv;
+}
+
+int elf_get_interp_path(const void *elf_data, size_t size, char *out, size_t out_size) {
+    if (!elf_data || size < sizeof(elf64_ehdr_t) || !out || out_size == 0) return -1;
+    if (elf_validate(elf_data) != 0) return -1;
+
+    elf64_ehdr_t *ehdr = (elf64_ehdr_t *)elf_data;
+    if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) return 0;
+
+    uint64_t ph_end = ehdr->e_phoff + (uint64_t)ehdr->e_phnum * (uint64_t)sizeof(elf64_phdr_t);
+    if (ph_end > size) return -1;
+
+    elf64_phdr_t *phdr = (elf64_phdr_t *)((uint8_t *)elf_data + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type != PT_INTERP) continue;
+        if (phdr[i].p_offset + phdr[i].p_filesz > size) return -1;
+
+        size_t n = (size_t)phdr[i].p_filesz;
+        if (n == 0) return -1;
+        if (n > out_size) n = out_size;
+
+        memcpy(out, (const uint8_t*)elf_data + phdr[i].p_offset, n);
+        out[out_size - 1] = 0;
+
+        for (size_t j = 0; j < out_size; j++) {
+            if (out[j] == 0) return 1;
+        }
+        out[out_size - 1] = 0;
+        return 1;
+    }
+
+    return 0;
 }
 
 int elf_load_process(const char *path, char *const argv[]) {

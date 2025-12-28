@@ -106,6 +106,12 @@ typedef struct {
 int elf_validate(const void *elf_data);
 int elf_load(const void *elf_data, size_t size, uint64_t *entry_point);
 int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point, int argc, char **argv);
+
+/* If ELF contains PT_INTERP, copies interpreter path to out and returns 1.
+ * If no PT_INTERP, returns 0. On error, returns -1.
+ */
+int elf_get_interp_path(const void *elf_data, size_t size, char *out, size_t out_size);
+
 int elf_load_process(const char *path, char *const argv[]);
 
 #endif

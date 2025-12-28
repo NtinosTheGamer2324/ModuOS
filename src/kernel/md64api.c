@@ -6,6 +6,8 @@
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/drivers/PCI/pci.h"
 #include "moduos/fs/fd.h"
+#include "moduos/kernel/multiboot2.h"
+#include "moduos/kernel/COM/com.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -40,47 +42,133 @@ struct smbios_header {
 } __attribute__((packed));
 
 /* SMBIOS structure addresses (cached after first scan) */
-static uint32_t smbios_table_addr = 0;
+static uintptr_t smbios_table_addr = 0;
 static uint16_t smbios_table_length = 0;
 static int smbios_initialized = 0;
 
-/* Find SMBIOS entry point in memory */
+struct __attribute__((packed)) multiboot_tag_smbios {
+    uint32_t type;
+    uint32_t size;
+    uint8_t major;
+    uint8_t minor;
+    uint8_t reserved[6];
+    uint8_t tables[0];
+};
+
+static void com_print_dec64(uint64_t v) {
+    char tmp[32];
+    int pos = 0;
+    if (v == 0) { 
+        com_write_string(COM1_PORT, "0"); 
+        return; 
+    }
+    while (v > 0 && pos < 31) {
+        tmp[pos++] = '0' + (v % 10);
+        v /= 10;
+    }
+    for (int i = pos - 1; i >= 0; i--) {
+        char c[2] = { tmp[i], 0 };
+        com_write_string(COM1_PORT, c);
+    }
+}
+
+void md64api_init_smbios_from_mb2(void *mb2) {
+    if (!mb2) return;
+
+    struct multiboot_tag *t = multiboot2_find_tag(mb2, MULTIBOOT_TAG_TYPE_SMBIOS);
+    if (!t) {
+        com_write_string(COM1_PORT, "[SMBIOS] MB2 SMBIOS tag not found; using legacy scan\n");
+        return;
+    }
+
+    com_write_string(COM1_PORT, "[SMBIOS] MB2 SMBIOS tag found\n");
+
+    struct multiboot_tag_smbios *st = (struct multiboot_tag_smbios*)t;
+    const uint8_t *base = st->tables;
+    size_t avail = (size_t)st->size;
+    if (avail < sizeof(*st) + 0x20) {
+        com_write_string(COM1_PORT, "[SMBIOS] MB2 SMBIOS tag too small\n");
+        return;
+    }
+    avail -= sizeof(*st);
+
+    /* SMBIOS 2.x entry point starts with "_SM_" */
+    if (avail >= sizeof(struct smbios_entry) && memcmp(base, "_SM_", 4) == 0) {
+        const struct smbios_entry *ep = (const struct smbios_entry*)base;
+        size_t ep_len = ep->length;
+        if (ep_len < 0x10 || ep_len > avail) {
+            com_write_string(COM1_PORT, "[SMBIOS] Invalid SMBIOS entry point length\n");
+            return;
+        }
+
+        /* In MB2 tag, tables are copied; structure table follows entry point. */
+        smbios_table_addr = (uintptr_t)(base + ep_len);
+        smbios_table_length = ep->structure_table_length;
+        smbios_initialized = 1;
+
+        /* Reset pcname cache so get_system_info can rebuild if it used old SMBIOS. */
+        pcname[0] = 0;
+
+        com_write_string(COM1_PORT, "[SMBIOS] Initialized from MB2 tag: ver=");
+        com_printf(COM1_PORT, "%u.%u", (unsigned)st->major, (unsigned)st->minor);
+        com_write_string(COM1_PORT, " len=");
+        com_print_dec64((uint64_t)smbios_table_length);
+        com_write_string(COM1_PORT, "\n");
+        return;
+    }
+
+    com_write_string(COM1_PORT, "[SMBIOS] MB2 SMBIOS tag present but unsupported format; using legacy scan\n");
+}
+
+/* SMBIOS 3.x Entry Point structure (_SM3_) */
+struct smbios3_entry {
+    char anchor[5];           /* "_SM3_" */
+    uint8_t checksum;
+    uint8_t length;
+    uint8_t major;
+    uint8_t minor;
+    uint8_t docrev;
+    uint8_t entry_point_rev;
+    uint8_t reserved;
+    uint32_t structure_table_max_size;
+    uint64_t structure_table_address;
+} __attribute__((packed));
+
+static int checksum_ok(const uint8_t *p, size_t len) {
+    uint8_t sum = 0;
+    for (size_t i = 0; i < len; i++) sum = (uint8_t)(sum + p[i]);
+    return sum == 0;
+}
+
+/* Find SMBIOS entry point in memory (supports SMBIOS2 and SMBIOS3) */
 static int find_smbios_entry(void) {
     if (smbios_initialized) return smbios_table_addr != 0;
     
     smbios_initialized = 1; /* Mark as attempted */
     
-    /* CRITICAL FIX: Limit scan to safe BIOS area only */
-    /* Search for SMBIOS in BIOS area 0xF0000-0xFFFFF */
+    /* Search for SMBIOS entry point in BIOS area 0xF0000-0xFFFFF */
     for (uint32_t addr = 0xF0000; addr < 0x100000; addr += 16) {
-        /* SAFETY CHECK: Skip if address not identity mapped */
-        if (addr < 0xF0000 || addr >= 0x100000) continue;
-        
-        struct smbios_entry *entry = (struct smbios_entry *)(uintptr_t)addr;
-        
-        /* Check for "_SM_" anchor */
-        if (entry->anchor[0] == '_' && entry->anchor[1] == 'S' && 
-            entry->anchor[2] == 'M' && entry->anchor[3] == '_') {
-            
-            /* Validate length is reasonable */
-            if (entry->length < 16 || entry->length > 64) continue;
-            
-            /* Validate checksum */
-            uint8_t sum = 0;
-            uint8_t *ptr = (uint8_t *)entry;
-            for (int i = 0; i < entry->length; i++) {
-                sum += ptr[i];
+        /* SMBIOS3 (_SM3_) */
+        struct smbios3_entry *e3 = (struct smbios3_entry *)(uintptr_t)addr;
+        if (memcmp(e3->anchor, "_SM3_", 5) == 0 && e3->length >= sizeof(struct smbios3_entry) && e3->length < 0x80) {
+            if (checksum_ok((const uint8_t*)e3, e3->length)) {
+                if (e3->structure_table_address && e3->structure_table_max_size && e3->structure_table_max_size < 0x100000) {
+                    smbios_table_addr = (uintptr_t)e3->structure_table_address;
+                    smbios_table_length = (uint16_t)e3->structure_table_max_size;
+                    com_write_string(COM1_PORT, "[SMBIOS] Legacy scan found SMBIOS3 entry\n");
+                    return 1;
+                }
             }
-            
-            if (sum == 0) {
-                /* Additional safety: verify table address is reasonable */
-                if (entry->structure_table_address >= 0x100000 && 
-                    entry->structure_table_address < 0x100000000ULL &&
-                    entry->structure_table_length > 0 &&
-                    entry->structure_table_length < 0x10000) {
-                    
-                    smbios_table_addr = entry->structure_table_address;
-                    smbios_table_length = entry->structure_table_length;
+        }
+
+        /* SMBIOS2 (_SM_) */
+        struct smbios_entry *e2 = (struct smbios_entry *)(uintptr_t)addr;
+        if (memcmp(e2->anchor, "_SM_", 4) == 0) {
+            if (e2->length >= 16 && e2->length < 0x80 && checksum_ok((const uint8_t*)e2, e2->length)) {
+                if (e2->structure_table_address && e2->structure_table_length > 0 && e2->structure_table_length < 0x10000) {
+                    smbios_table_addr = (uintptr_t)e2->structure_table_address;
+                    smbios_table_length = e2->structure_table_length;
+                    com_write_string(COM1_PORT, "[SMBIOS] Legacy scan found SMBIOS2 entry\n");
                     return 1;
                 }
             }
@@ -144,7 +232,7 @@ struct smbios_baseboard_info {
 static void *find_smbios_structure(uint8_t type) {
     if (!find_smbios_entry()) return NULL;
     
-    uint8_t *ptr = (uint8_t *)(uintptr_t)smbios_table_addr;
+    uint8_t *ptr = (uint8_t *)smbios_table_addr;
     uint8_t *end = ptr + smbios_table_length;
     
     while (ptr < end) {
@@ -453,9 +541,9 @@ md64api_sysinfo_data get_system_info(void)
     info.sys_available_ram = (free_frames * PAGE_SIZE) / (1024 * 1024);
 
     /* --- OS / Kernel Info --- */
-    info.SystemVersion = 0;
-    info.KernelVersion = 0;
-    info.KernelVendor = "New Technologies Software";
+    info.SystemVersion = "0.5.5";
+    info.KernelVersion = "mdsys.sqr 0.5.5";
+    info.KernelVendor = "NTSoftware";
     info.os_name = "ModuOS";
     info.os_arch = "AMD64";
 
@@ -463,7 +551,7 @@ md64api_sysinfo_data get_system_info(void)
     info.pcname = pcname;
     info.username = "mdman";
     info.domain = "SYSTEM";
-    info.kconsole = "VGA Konsole";
+    info.kconsole = "VBE Text Konsole";
 
     /* --- CPU Info --- */
     info.cpu = cpu_vendor[0] ? cpu_vendor : "";

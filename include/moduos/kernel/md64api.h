@@ -16,8 +16,8 @@ typedef struct md64api_sysinfo_data
     uint64_t sys_total_ram;         /* Total system RAM in MB */
 
     /* --- OS / Kernel Info --- */
-    int SystemVersion;              /* OS major version */
-    int KernelVersion;              /* Kernel version number */
+    string SystemVersion;           /* OS version string (e.g. \"0.5.5\") */
+    string KernelVersion;           /* Kernel version string (e.g. \"0.5.5\") */
     string KernelVendor;            /* NTSoftware / New Technologies Software */
     string os_name;                 /* ModuOS */
     string os_arch;                 /* AMD64 only (ARM version not implemented) */
@@ -84,6 +84,9 @@ md64api_date_time get_date_time(void);
 // Kernel-internal helpers (also used by bootscreen)
 const char *md64api_get_smbios_system_manufacturer(void);
 const char *md64api_get_smbios_system_product(void);
+
+/* Initialize SMBIOS table pointers from Multiboot2 tag (type 13) if present. */
+void md64api_init_smbios_from_mb2(void *mb2);
 
 // Optional graphics sub-API (device-based)
 #include "moduos/kernel/md64api_grp.h"

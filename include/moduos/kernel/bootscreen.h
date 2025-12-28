@@ -14,6 +14,11 @@ extern "C" {
 // Returns pointer to a static string (never NULL).
 const char *bootscreen_pick_bmp_basename(void *mb2);
 
+// Show an early boot splash using a built-in (burn-in) image.
+// This does not require the boot filesystem to be mounted.
+// Returns 0 on success, <0 on failure.
+int bootscreen_show_early(void);
+
 // Try to load and display the bootscreen BMP (centered) if in graphics mode.
 // Returns 0 on success, <0 on failure.
 int bootscreen_show(void *mb2);

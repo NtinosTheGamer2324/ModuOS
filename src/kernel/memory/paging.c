@@ -114,7 +114,7 @@ void paging_init(void) {
     com_write_string(COM1_PORT, tmpbuf);
     com_write_string(COM1_PORT, "\n");
 
-    // CRITICAL FIX: Just use the bootloader's PML4 directly!
+    //  Just use the bootloader's PML4 directly!
     // Don't try to create a new one - that requires allocating memory
     // which itself needs page tables to access!
     pml4_phys = old_cr3 & PAGE_MASK;
@@ -274,6 +274,11 @@ int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
         return -1;
     }
 
+    /* If mapping a user page, all paging levels must have the USER bit set. */
+    if (flags & PFLAG_USER) {
+        pml4[i4] |= PFLAG_USER;
+    }
+
     /* Split 1GB huge page at PDPT level if present */
     uint64_t ent3 = pdpt[i3];
     if ((ent3 & PFLAG_PRESENT) && (ent3 & (1ULL << 7))) {
@@ -291,6 +296,10 @@ int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
 
         pdpt[i3] = (new_pd_phys & PAGE_MASK) | PFLAG_PRESENT | PFLAG_WRITABLE;
         __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    }
+
+    if (flags & PFLAG_USER) {
+        pdpt[i3] |= PFLAG_USER;
     }
 
     uint64_t *pd = get_or_create(pdpt, i3);
@@ -312,6 +321,10 @@ int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
 
         pd[i2] = (new_pt_phys & PAGE_MASK) | PFLAG_PRESENT | PFLAG_WRITABLE;
         __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    }
+
+    if (flags & PFLAG_USER) {
+        pd[i2] |= PFLAG_USER;
     }
 
     uint64_t *pt = get_or_create(pd, i2);
@@ -488,6 +501,11 @@ int paging_map_range_to_pml4(uint64_t *pml4_virt, uint64_t virt_base, uint64_t p
 
         uint64_t entry = (paddr & PAGE_MASK) | (flags & 0xFFFULL) | PFLAG_PRESENT;
         pt[i1] = entry;
+
+        /* Ensure user bit is visible at PT level too (redundant but explicit). */
+        if (flags & PFLAG_USER) {
+            pt[i1] |= PFLAG_USER;
+        }
     }
     return 0;
 }
