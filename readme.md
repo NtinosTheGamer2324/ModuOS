@@ -7,7 +7,10 @@
   <img src="https://img.shields.io/badge/Language-C%20%2B%20Assembly-yellow" alt="Language">
 </p>
 
-**ModuOS** is a hobby operating system written in C and x86-64 assembly, designed for learning and experimentation. It features a custom kernel with interrupt handling, memory management (paging, physical memory allocator), multitasking with process management, and support for multiple file systems (FAT32, ISO9660).
+ **ModuOS** is a hobby operating system written in C and x86-64 assembly, designed for learning and experimentation. It features a custom kernel with interrupt handling, memory management (paging, physical memory allocator), multitasking with process management, and support for multiple file systems (FAT32, ISO9660).
+
+> [!IMPORTANT]
+> **Main Branch Notice**: This branch and its builds are currently **less stable** than the `experimental` branch. For the latest features (MDFS v2, updated POSIX compliance, and bug fixes), please switch to the **[experimental branch](https://github.com/NtinosTheGamer2324/ModuOS/tree/experimental)**!
 
 ## ✨ Features
 
