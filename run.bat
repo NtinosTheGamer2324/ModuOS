@@ -2,6 +2,8 @@
 setlocal
 cls
 
+echo made in greece :)
+
 REM -----------------------------
 REM Check if Docker is running
 REM -----------------------------
@@ -37,7 +39,7 @@ timeout /t 1 /nobreak >nul
 REM Start QEMU
 start "cmdQEMU" qemu-system-x86_64 ^
     -machine pc ^
-    -smbios type=1,manufacturer="ASUS",product="ROG",version="1.0",serial="MDMDMDMDMDMD" ^
+    -smbios type=1,manufacturer="NTLLC",product="DevmanPC",version="1.0",serial="MDMDMDMDMDMD" ^
     -m 1024M ^
     -smp 2 ^
     -vga qxl ^

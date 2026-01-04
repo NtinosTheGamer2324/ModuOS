@@ -14,6 +14,7 @@ SECTIONS
     .text :
     {
         *(.text*)
+        _text_end = .;
     }
 
     .rodata :
