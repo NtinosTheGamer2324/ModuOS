@@ -32,8 +32,6 @@ int sys_getpid(void);
 int sys_getppid(void);
 int sys_sleep(unsigned int seconds);
 void sys_yield(void);
-void* sys_malloc(size_t size);
-void sys_free(void *ptr);
 void* sys_sbrk(intptr_t increment);
 int sys_kill(int pid, int sig);
 uint64_t sys_time(void);
