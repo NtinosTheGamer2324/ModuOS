@@ -3,8 +3,4 @@
 # Generate hash in WSL:  printf "%s" "PASSWORD" | sha256sum | awk '{print $1}'
 
 #the ROOT/MDMAN Password is 0000
-#the Unix password is password
-#the ntinosthegamer password is 1234
 mdman:0:9af15b336e6a9619928537df30b2e6a2376569fcf9d7e773eccede65606529a0
-unix:1:5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8
-ntinosthegamer:2:03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4
