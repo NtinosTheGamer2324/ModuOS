@@ -185,6 +185,14 @@ static int ext2_read_super(ext2_mount_ctx_t *m, ext2_superblock_t *out) {
     return bdev_read_bytes(m, EXT2_SUPERBLOCK_OFF, out, sizeof(*out));
 }
 
+// Forward declarations for functions used by probe/mount helpers
+static int ext2_read_inode(ext2_mount_ctx_t *m, uint32_t ino, ext2_inode_t *out);
+static int ext2_read_block(ext2_mount_ctx_t *m, uint32_t blk, void *buf);
+static int ext2_write_block(ext2_mount_ctx_t *m, uint32_t blk, const void *buf);
+static int ext2_alloc_block0(ext2_mount_ctx_t *m, uint32_t *out_block);
+static int ext2_alloc_inode0(ext2_mount_ctx_t *m, uint32_t *out_ino);
+static int ext2_set_block_ptr(ext2_mount_ctx_t *m, ext2_inode_t *in, uint32_t lbn, uint32_t pblk);
+
 static void u16_to_hex4(char out[5], uint16_t v) {
     static const char h[] = "0123456789ABCDEF";
     out[0] = h[(v >> 12) & 0xF];
@@ -233,7 +241,60 @@ static int ext2_probe(int vdrive_id, uint32_t partition_lba) {
 #endif
 
     if (rr != 0) return 0;
-    return (sb.s_magic == EXT2_MAGIC) ? 1 : 0;
+
+    // Stricter probe: require more than just the magic, to avoid false-positives
+    // when probing non-ext volumes.
+    if (sb.s_magic != EXT2_MAGIC) return 0;
+
+    // Basic sanity checks based on ext2 superblock layout.
+    if (sb.s_inodes_count == 0) return 0;
+    if (sb.s_blocks_count == 0) return 0;
+    if (sb.s_blocks_per_group == 0) return 0;
+    if (sb.s_inodes_per_group == 0) return 0;
+
+    // block size = 1024 << s_log_block_size (valid typical range: 1KiB..64KiB)
+    if (sb.s_log_block_size > 6) return 0;
+    uint32_t bs = 1024u << sb.s_log_block_size;
+    if (bs < 1024u || bs > 65536u) return 0;
+
+    // inode size must be >= 128 and a power-of-two multiple of 128 (ext2/ext3/ext4).
+    if (sb.s_inode_size < 128) return 0;
+    if ((sb.s_inode_size & (sb.s_inode_size - 1)) != 0) return 0;
+    if ((sb.s_inode_size % 128) != 0) return 0;
+
+    // First data block is usually 0 for >1KiB block sizes, or 1 for 1KiB.
+    if (bs == 1024u) {
+        if (sb.s_first_data_block != 1) return 0;
+    } else {
+        if (sb.s_first_data_block != 0) return 0;
+    }
+
+    // Revision level should be 0 (original) or 1 (dynamic).
+    if (sb.s_rev_level != 0 && sb.s_rev_level != 1) return 0;
+
+    // Filesystem state sanity: 1=valid, 2=errors.
+    if (sb.s_state != 1 && sb.s_state != 2) return 0;
+
+    // Deep probe: validate that inode 2 (root) looks like a directory.
+    // This is still reasonably cheap (a couple of reads) but eliminates
+    // accidental matches on other filesystem data.
+    ext2_mount_ctx_t chk;
+    m_memset(&chk, 0, sizeof(chk));
+    chk.bdev = bdev;
+    chk.part_lba = partition_lba;
+    chk.sb = sb;
+    chk.block_size = bs;
+    chk.inode_size = sb.s_inode_size;
+    chk.bgdt_block = (bs == 1024u) ? 2u : 1u;
+
+    ext2_inode_t root;
+    if (ext2_read_inode(&chk, 2, &root) != 0) return 0;
+
+    // i_mode high bits: 0x4000 = directory.
+    if ((root.i_mode & 0xF000) != 0x4000) return 0;
+    if (root.i_links_count < 2) return 0;
+
+    return 1;
 }
 
 static int ext2_read_bgdt(ext2_mount_ctx_t *m, uint32_t group, ext2_bgdt_t *out) {
@@ -258,9 +319,58 @@ static int ext2_read_inode(ext2_mount_ctx_t *m, uint32_t ino, ext2_inode_t *out)
     return bdev_read_bytes(m, off, out, rd);
 }
 
+static int ext2_write_inode(ext2_mount_ctx_t *m, uint32_t ino, const ext2_inode_t *in) {
+    if (ino == 0) return -1;
+    if (m->block_size != 4096 || m->groups != 1) return -2; // minimal support for ModuOS-formatted ext2
+
+    uint32_t idx = ino - 1;
+    uint32_t group = idx / m->sb.s_inodes_per_group;
+    uint32_t in_group = idx % m->sb.s_inodes_per_group;
+
+    ext2_bgdt_t bg;
+    if (ext2_read_bgdt(m, group, &bg) != 0) return -3;
+
+    uint64_t inode_off = (uint64_t)bg.bg_inode_table * m->block_size + (uint64_t)in_group * m->inode_size;
+    uint32_t blk = (uint32_t)(inode_off / m->block_size);
+    uint32_t off_in_blk = (uint32_t)(inode_off % m->block_size);
+
+    uint8_t *buf = (uint8_t*)g_api->kmalloc(m->block_size);
+    if (!buf) return -4;
+    if (ext2_read_block(m, blk, buf) != 0) { g_api->kfree(buf); return -5; }
+
+    m_memcpy(buf + off_in_blk, in, sizeof(*in));
+    int rc = ext2_write_block(m, blk, buf);
+    g_api->kfree(buf);
+    return rc;
+}
+
 static int ext2_read_block(ext2_mount_ctx_t *m, uint32_t blk, void *buf) {
     uint64_t off = (uint64_t)blk * m->block_size;
     return bdev_read_bytes(m, off, buf, m->block_size);
+}
+
+static int bdev_write_bytes(ext2_mount_ctx_t *m, uint64_t off, const void *buf, size_t sz) {
+    if (!g_api || !g_api->block_write) return -1;
+    if (sz == 0) return 0;
+
+    uint32_t sector_sz = 512;
+    if (g_api->block_get_info) {
+        blockdev_info_t info;
+        if (g_api->block_get_info(m->bdev, &info) == 0 && info.sector_size) sector_sz = info.sector_size;
+    }
+
+    uint64_t lba0 = (uint64_t)m->part_lba + (off / sector_sz);
+    uint32_t count = (uint32_t)((sz + sector_sz - 1) / sector_sz);
+
+    // Require sector alignment for now.
+    if ((off % sector_sz) != 0) return -2;
+
+    return g_api->block_write(m->bdev, lba0, count, buf, sz);
+}
+
+static int ext2_write_block(ext2_mount_ctx_t *m, uint32_t blk, const void *buf) {
+    uint64_t off = (uint64_t)blk * m->block_size;
+    return bdev_write_bytes(m, off, buf, m->block_size);
 }
 
 static uint32_t ext2_get_block_ptr(ext2_mount_ctx_t *m, const ext2_inode_t *in, uint32_t lbn) {
@@ -494,6 +604,662 @@ static int ext2_read_file(fs_mount_t *mount, const char *path, void *buffer, siz
     return 0;
 }
 
+static int ext2_add_dirent_root_typed(ext2_mount_ctx_t *m, uint32_t ino, const char *name, uint8_t ftype) {
+    // Minimal: add to root directory only (inode 2), single-block directories from ModuOS mkfs.
+    ext2_inode_t root;
+    if (ext2_read_inode(m, 2, &root) != 0) return -1;
+    if ((root.i_mode & 0xF000) != 0x4000) return -2;
+
+    uint32_t bs = m->block_size;
+    uint32_t pblk = root.i_block[0];
+    if (!pblk) return -3;
+
+    uint8_t *blk = (uint8_t*)g_api->kmalloc(bs);
+    if (!blk) return -4;
+    if (ext2_read_block(m, pblk, blk) != 0) { g_api->kfree(blk); return -5; }
+
+    size_t nlen = m_strlen(name);
+    if (nlen == 0 || nlen > 255) { g_api->kfree(blk); return -6; }
+
+    // Find last entry in block to see if it has slack.
+    uint32_t off = 0;
+    ext2_dirent_t *last = NULL;
+    while (off + sizeof(ext2_dirent_t) <= bs) {
+        ext2_dirent_t *de = (ext2_dirent_t*)(blk + off);
+        if (de->rec_len == 0) break;
+        last = de;
+        off += de->rec_len;
+        if (off >= bs) break;
+    }
+    if (!last) { g_api->kfree(blk); return -7; }
+
+    uint32_t last_name = last->name_len;
+    uint32_t last_used = (uint32_t)((8 + last_name + 3) & ~3u);
+    uint32_t last_slack = last->rec_len - last_used;
+
+    uint32_t need = (uint32_t)((8 + nlen + 3) & ~3u);
+    if (last_slack < need) { g_api->kfree(blk); return -8; }
+
+    // Shrink last and place new entry after it.
+    last->rec_len = (uint16_t)last_used;
+    ext2_dirent_t *ne = (ext2_dirent_t*)((uint8_t*)last + last_used);
+    m_memset(ne, 0, sizeof(ext2_dirent_t));
+    ne->inode = ino;
+    ne->name_len = (uint8_t)nlen;
+    ne->file_type = ftype;
+    ne->rec_len = (uint16_t)last_slack;
+    m_memcpy(ne->name, name, nlen);
+
+    int rc = ext2_write_block(m, pblk, blk);
+    g_api->kfree(blk);
+    return rc;
+}
+
+static int ext2_add_dirent_root(ext2_mount_ctx_t *m, uint32_t file_ino, const char *name) {
+    return ext2_add_dirent_root_typed(m, file_ino, name, 1);
+}
+
+static int ext2_free_block0(ext2_mount_ctx_t *m, uint32_t blk) {
+    if (!g_api) return -1;
+    if (m->groups != 1 || m->block_size != 4096) return -2;
+
+    ext2_bgdt_t bg;
+    if (ext2_read_bgdt(m, 0, &bg) != 0) return -3;
+
+    uint8_t *bmp = (uint8_t*)g_api->kmalloc(m->block_size);
+    if (!bmp) return -4;
+    if (ext2_read_block(m, bg.bg_block_bitmap, bmp) != 0) { g_api->kfree(bmp); return -5; }
+
+    // Clear bit
+    bmp[blk / 8] &= (uint8_t)~(1u << (blk % 8));
+    int rc = ext2_write_block(m, bg.bg_block_bitmap, bmp);
+    g_api->kfree(bmp);
+    return rc;
+}
+
+static int ext2_free_inode0(ext2_mount_ctx_t *m, uint32_t ino) {
+    if (!g_api) return -1;
+    if (m->groups != 1 || m->block_size != 4096) return -2;
+    if (ino == 0) return -3;
+
+    ext2_bgdt_t bg;
+    if (ext2_read_bgdt(m, 0, &bg) != 0) return -4;
+
+    uint8_t *bmp = (uint8_t*)g_api->kmalloc(m->block_size);
+    if (!bmp) return -5;
+    if (ext2_read_block(m, bg.bg_inode_bitmap, bmp) != 0) { g_api->kfree(bmp); return -6; }
+
+    uint32_t idx = ino - 1;
+    bmp[idx / 8] &= (uint8_t)~(1u << (idx % 8));
+    int rc = ext2_write_block(m, bg.bg_inode_bitmap, bmp);
+    g_api->kfree(bmp);
+    return rc;
+}
+
+static int ext2_remove_dirent_root(ext2_mount_ctx_t *m, const char *name) {
+    // Minimal: root only, one-block directory. We just mark inode=0.
+    ext2_inode_t root;
+    if (ext2_read_inode(m, 2, &root) != 0) return -1;
+    if ((root.i_mode & 0xF000) != 0x4000) return -2;
+
+    uint32_t bs = m->block_size;
+    uint32_t pblk = root.i_block[0];
+    if (!pblk) return -3;
+
+    uint8_t *blk = (uint8_t*)g_api->kmalloc(bs);
+    if (!blk) return -4;
+    if (ext2_read_block(m, pblk, blk) != 0) { g_api->kfree(blk); return -5; }
+
+    size_t nlen = m_strlen(name);
+    if (nlen == 0 || nlen > 255) { g_api->kfree(blk); return -6; }
+
+    uint32_t off = 0;
+    while (off + sizeof(ext2_dirent_t) <= bs) {
+        ext2_dirent_t *de = (ext2_dirent_t*)(blk + off);
+        if (de->rec_len == 0) break;
+        if (de->inode != 0 && de->name_len == nlen) {
+            // compare
+            int match = 1;
+            for (size_t i = 0; i < nlen; i++) {
+                if (((const char*)de->name)[i] != name[i]) { match = 0; break; }
+            }
+            if (match) {
+                de->inode = 0;
+                int rc = ext2_write_block(m, pblk, blk);
+                g_api->kfree(blk);
+                return rc;
+            }
+        }
+        off += de->rec_len;
+        if (off >= bs) break;
+    }
+
+    g_api->kfree(blk);
+    return -7;
+}
+
+static uint16_t ext2_dirent_min_rec_len(uint8_t name_len) {
+    return (uint16_t)((8u + (uint32_t)name_len + 3u) & ~3u);
+}
+
+static int ext2_dirent_match(const ext2_dirent_t *de, const char *name, size_t nlen) {
+    if (!de || !name) return 0;
+    if (de->inode == 0) return 0;
+    if (de->name_len != nlen) return 0;
+    for (size_t i = 0; i < nlen; i++) {
+        if (((const char*)de->name)[i] != name[i]) return 0;
+    }
+    return 1;
+}
+
+static int ext2_dir_add_entry(ext2_mount_ctx_t *m, uint32_t dir_ino, const char *name, uint32_t ino, uint8_t ftype) {
+    if (!m || !name || !*name) return -1;
+    if (m->block_size != 4096 || m->groups != 1) return -2;
+
+    size_t nlen = m_strlen(name);
+    if (nlen == 0 || nlen > 255) return -3;
+
+    ext2_inode_t dir;
+    if (ext2_read_inode(m, dir_ino, &dir) != 0) return -4;
+    if ((dir.i_mode & 0xF000) != 0x4000) return -5;
+
+    // Must not already exist
+    uint32_t exists_ino = 0;
+    if (ext2_lookup_in_dir(m, &dir, name, &exists_ino) == 0) return -6;
+
+    uint32_t bs = m->block_size;
+    uint8_t *blk = (uint8_t*)g_api->kmalloc(bs);
+    if (!blk) return -7;
+
+    uint16_t need = ext2_dirent_min_rec_len((uint8_t)nlen);
+
+    // Scan existing blocks for space.
+    uint32_t blocks = (dir.i_size + bs - 1) / bs;
+    if (blocks == 0) blocks = 1;
+
+    for (uint32_t lbn = 0; lbn < blocks; lbn++) {
+        uint32_t pblk = ext2_get_block_ptr(m, &dir, lbn);
+        if (!pblk) continue;
+        if (ext2_read_block(m, pblk, blk) != 0) continue;
+
+        uint32_t off = 0;
+        while (off + sizeof(ext2_dirent_t) <= bs) {
+            ext2_dirent_t *de = (ext2_dirent_t*)(blk + off);
+            if (de->rec_len == 0) break;
+
+            // Reuse a free entry
+            if (de->inode == 0) {
+                if (de->rec_len >= need) {
+                    uint16_t old = de->rec_len;
+                    de->inode = ino;
+                    de->name_len = (uint8_t)nlen;
+                    de->file_type = ftype;
+                    de->rec_len = need;
+                    m_memcpy(de->name, name, nlen);
+
+                    uint16_t rem = (uint16_t)(old - need);
+                    if (rem >= 8) {
+                        ext2_dirent_t *ne = (ext2_dirent_t*)((uint8_t*)de + need);
+                        m_memset(ne, 0, sizeof(*ne));
+                        ne->inode = 0;
+                        ne->rec_len = rem;
+                        ne->name_len = 0;
+                        ne->file_type = 0;
+                    } else {
+                        // just consume the whole record
+                        de->rec_len = old;
+                    }
+
+                    int rc = ext2_write_block(m, pblk, blk);
+                    g_api->kfree(blk);
+                    return rc;
+                }
+            } else {
+                uint16_t used = ext2_dirent_min_rec_len(de->name_len);
+                if (de->rec_len > used) {
+                    uint16_t slack = (uint16_t)(de->rec_len - used);
+                    if (slack >= need) {
+                        // shrink current and insert new
+                        de->rec_len = used;
+                        ext2_dirent_t *ins = (ext2_dirent_t*)((uint8_t*)de + used);
+                        m_memset(ins, 0, sizeof(*ins));
+                        ins->inode = ino;
+                        ins->name_len = (uint8_t)nlen;
+                        ins->file_type = ftype;
+                        ins->rec_len = slack;
+                        m_memcpy(ins->name, name, nlen);
+
+                        int rc = ext2_write_block(m, pblk, blk);
+                        g_api->kfree(blk);
+                        return rc;
+                    }
+                }
+            }
+
+            off += de->rec_len;
+            if (off >= bs) break;
+        }
+    }
+
+    // Need a new directory block (direct blocks only via ext2_set_block_ptr)
+    uint32_t newblk = 0;
+    if (ext2_alloc_block0(m, &newblk) != 0) { g_api->kfree(blk); return -8; }
+
+    // Initialize the new block as one big free record.
+    m_memset(blk, 0, bs);
+    ext2_dirent_t *fre = (ext2_dirent_t*)blk;
+    fre->inode = 0;
+    fre->rec_len = (uint16_t)bs;
+    fre->name_len = 0;
+    fre->file_type = 0;
+    (void)ext2_write_block(m, newblk, blk);
+
+    uint32_t new_lbn = blocks; // append
+    if (ext2_set_block_ptr(m, &dir, new_lbn, newblk) != 0) { g_api->kfree(blk); return -9; }
+
+    dir.i_size += bs;
+    dir.i_blocks += (bs / 512u);
+    (void)ext2_write_inode(m, dir_ino, &dir);
+
+    // Now insert into the new block (reuse logic: write directly)
+    if (ext2_read_block(m, newblk, blk) != 0) { g_api->kfree(blk); return -10; }
+    ext2_dirent_t *de = (ext2_dirent_t*)blk;
+    de->inode = ino;
+    de->name_len = (uint8_t)nlen;
+    de->file_type = ftype;
+    de->rec_len = (uint16_t)bs;
+    m_memcpy(de->name, name, nlen);
+
+    int wrc = ext2_write_block(m, newblk, blk);
+    g_api->kfree(blk);
+    return wrc;
+}
+
+static int ext2_dir_remove_entry(ext2_mount_ctx_t *m, uint32_t dir_ino, const char *name) {
+    if (!m || !name || !*name) return -1;
+    if (m->block_size != 4096 || m->groups != 1) return -2;
+
+    size_t nlen = m_strlen(name);
+    if (nlen == 0 || nlen > 255) return -3;
+
+    ext2_inode_t dir;
+    if (ext2_read_inode(m, dir_ino, &dir) != 0) return -4;
+    if ((dir.i_mode & 0xF000) != 0x4000) return -5;
+
+    uint32_t bs = m->block_size;
+    uint8_t *blk = (uint8_t*)g_api->kmalloc(bs);
+    if (!blk) return -6;
+
+    uint32_t blocks = (dir.i_size + bs - 1) / bs;
+    for (uint32_t lbn = 0; lbn < blocks; lbn++) {
+        uint32_t pblk = ext2_get_block_ptr(m, &dir, lbn);
+        if (!pblk) continue;
+        if (ext2_read_block(m, pblk, blk) != 0) continue;
+
+        uint32_t off = 0;
+        while (off + sizeof(ext2_dirent_t) <= bs) {
+            ext2_dirent_t *de = (ext2_dirent_t*)(blk + off);
+            if (de->rec_len == 0) break;
+            if (ext2_dirent_match(de, name, nlen)) {
+                de->inode = 0;
+                int rc = ext2_write_block(m, pblk, blk);
+                g_api->kfree(blk);
+                return rc;
+            }
+            off += de->rec_len;
+            if (off >= bs) break;
+        }
+    }
+
+    g_api->kfree(blk);
+    return -7;
+}
+
+static int ext2_split_parent(const char *path, char *parent, size_t parent_sz, const char **out_name) {
+    if (!path || !parent || parent_sz == 0 || !out_name) return -1;
+    *out_name = NULL;
+    parent[0] = 0;
+
+    if (path[0] != '/') return -2;
+
+    // strip trailing slashes
+    size_t len = m_strlen(path);
+    while (len > 1 && path[len - 1] == '/') len--;
+
+    // find last slash
+    size_t last = 0;
+    for (size_t i = 0; i < len; i++) if (path[i] == '/') last = i;
+
+    if (last == 0) {
+        // parent is root
+        m_strncpy(parent, "/", parent_sz);
+        *out_name = path + 1;
+        return 0;
+    }
+
+    // copy parent substring
+    size_t plen = last;
+    if (plen >= parent_sz) plen = parent_sz - 1;
+    for (size_t i = 0; i < plen; i++) parent[i] = path[i];
+    parent[plen] = 0;
+
+    *out_name = path + last + 1;
+    return 0;
+}
+
+static int ext2_mkdir(fs_mount_t *mount, const char *path) {
+    ext2_mount_ctx_t *m = (ext2_mount_ctx_t*)mount->ext_ctx;
+    if (!m || !g_api || !g_api->block_write) return -1;
+    if (!path || path[0] != '/') return -2;
+
+    // Already exists?
+    uint32_t existing = 0;
+    if (ext2_resolve_path(m, path, &existing, 0) == 0) return -3;
+
+    char parent_path[512];
+    const char *name = NULL;
+    if (ext2_split_parent(path, parent_path, sizeof(parent_path), &name) != 0) return -4;
+    if (!name || !*name) return -5;
+
+    uint32_t parent_ino = 0;
+    if (ext2_resolve_path(m, parent_path, &parent_ino, 0) != 0) return -6;
+
+    ext2_inode_t pin;
+    if (ext2_read_inode(m, parent_ino, &pin) != 0) return -7;
+    if ((pin.i_mode & 0xF000) != 0x4000) return -8;
+
+    uint32_t ino = 0;
+    if (ext2_alloc_inode0(m, &ino) != 0) return -9;
+
+    uint32_t blkno = 0;
+    if (ext2_alloc_block0(m, &blkno) != 0) return -10;
+
+    // Add entry into parent directory
+    if (ext2_dir_add_entry(m, parent_ino, name, ino, 2) != 0) return -11;
+
+    // Create inode
+    ext2_inode_t din;
+    m_memset(&din, 0, sizeof(din));
+    din.i_mode = (uint16_t)(0x4000 | 0755);
+    din.i_size = m->block_size;
+    din.i_links_count = 2; // '.' and parent link
+    din.i_blocks = (m->block_size / 512u);
+    din.i_block[0] = blkno;
+
+    if (ext2_write_inode(m, ino, &din) != 0) return -12;
+
+    // Write directory block with '.' and '..'
+    uint32_t bs = m->block_size;
+    uint8_t *blk = (uint8_t*)g_api->kmalloc(bs);
+    if (!blk) return -13;
+    m_memset(blk, 0, bs);
+
+    ext2_dirent_t *de1 = (ext2_dirent_t*)blk;
+    de1->inode = ino;
+    de1->name_len = 1;
+    de1->file_type = 2;
+    de1->rec_len = 12;
+    ((char*)blk)[8] = '.';
+
+    ext2_dirent_t *de2 = (ext2_dirent_t*)(blk + de1->rec_len);
+    de2->inode = parent_ino;
+    de2->name_len = 2;
+    de2->file_type = 2;
+    de2->rec_len = (uint16_t)(bs - de1->rec_len);
+    ((char*)blk)[de1->rec_len + 8] = '.';
+    ((char*)blk)[de1->rec_len + 9] = '.';
+
+    if (ext2_write_block(m, blkno, blk) != 0) { g_api->kfree(blk); return -14; }
+    g_api->kfree(blk);
+
+    // Update parent link count (best-effort)
+    pin.i_links_count++;
+    (void)ext2_write_inode(m, parent_ino, &pin);
+
+    return 0;
+}
+
+static int ext2_free_indirect_chain(ext2_mount_ctx_t *m, uint32_t ind_blk, int level) {
+    if (!m || !g_api) return -1;
+    if (!ind_blk) return 0;
+    if (level < 1 || level > 2) return -2;
+
+    uint32_t bs = m->block_size;
+    uint32_t ppb = bs / 4;
+    uint32_t *tbl = (uint32_t*)g_api->kmalloc(bs);
+    if (!tbl) return -3;
+    if (ext2_read_block(m, ind_blk, tbl) != 0) { g_api->kfree(tbl); return -4; }
+
+    for (uint32_t i = 0; i < ppb; i++) {
+        uint32_t v = tbl[i];
+        if (!v) continue;
+        if (level == 1) {
+            (void)ext2_free_block0(m, v);
+        } else {
+            (void)ext2_free_indirect_chain(m, v, level - 1);
+        }
+    }
+
+    g_api->kfree(tbl);
+    (void)ext2_free_block0(m, ind_blk);
+    return 0;
+}
+
+static int ext2_unlink(fs_mount_t *mount, const char *path) {
+    ext2_mount_ctx_t *m = (ext2_mount_ctx_t*)mount->ext_ctx;
+    if (!m || !g_api || !g_api->block_write) return -1;
+    if (!path || path[0] != '/') return -2;
+
+    // refuse root
+    if (path[0] == '/' && path[1] == 0) return -3;
+
+    char parent_path[512];
+    const char *name = NULL;
+    if (ext2_split_parent(path, parent_path, sizeof(parent_path), &name) != 0) return -4;
+    if (!name || !*name) return -5;
+
+    uint32_t parent_ino = 0;
+    if (ext2_resolve_path(m, parent_path, &parent_ino, 0) != 0) return -6;
+
+    uint32_t ino = 0;
+    if (ext2_resolve_path(m, path, &ino, 0) != 0) return -7;
+
+    ext2_inode_t pin;
+    if (ext2_read_inode(m, parent_ino, &pin) != 0) return -8;
+    if ((pin.i_mode & 0xF000) != 0x4000) return -9;
+
+    ext2_inode_t in;
+    if (ext2_read_inode(m, ino, &in) != 0) return -10;
+
+    // Only regular files for now
+    if ((in.i_mode & 0xF000) == 0x4000) return -11; // directory
+
+    // Remove entry from parent directory
+    if (ext2_dir_remove_entry(m, parent_ino, name) != 0) return -12;
+
+    // Free data blocks (direct)
+    for (int i = 0; i < 12; i++) {
+        if (in.i_block[i]) (void)ext2_free_block0(m, in.i_block[i]);
+    }
+
+    // Free single-indirect and double-indirect blocks
+    if (in.i_block[12]) (void)ext2_free_indirect_chain(m, in.i_block[12], 1);
+    if (in.i_block[13]) (void)ext2_free_indirect_chain(m, in.i_block[13], 2);
+
+    // Clear inode and free inode bitmap
+    ext2_inode_t z;
+    m_memset(&z, 0, sizeof(z));
+    (void)ext2_write_inode(m, ino, &z);
+    (void)ext2_free_inode0(m, ino);
+
+    return 0;
+}
+
+static int ext2_rmdir(fs_mount_t *mount, const char *path) {
+    ext2_mount_ctx_t *m = (ext2_mount_ctx_t*)mount->ext_ctx;
+    if (!m || !g_api || !g_api->block_write) return -1;
+    if (!path || path[0] != '/') return -2;
+
+    // refuse root
+    if (path[0] == '/' && path[1] == 0) return -3;
+
+    char parent_path[512];
+    const char *name = NULL;
+    if (ext2_split_parent(path, parent_path, sizeof(parent_path), &name) != 0) return -4;
+    if (!name || !*name) return -5;
+
+    uint32_t parent_ino = 0;
+    if (ext2_resolve_path(m, parent_path, &parent_ino, 0) != 0) return -6;
+
+    uint32_t ino = 0;
+    if (ext2_resolve_path(m, path, &ino, 0) != 0) return -7;
+
+    ext2_inode_t pin;
+    if (ext2_read_inode(m, parent_ino, &pin) != 0) return -8;
+    if ((pin.i_mode & 0xF000) != 0x4000) return -9;
+
+    ext2_inode_t din;
+    if (ext2_read_inode(m, ino, &din) != 0) return -10;
+    if ((din.i_mode & 0xF000) != 0x4000) return -11;
+
+    uint32_t bs = m->block_size;
+
+    // Ensure empty across all blocks (only '.' and '..')
+    uint8_t *blk = (uint8_t*)g_api->kmalloc(bs);
+    if (!blk) return -12;
+
+    uint32_t blocks = (din.i_size + bs - 1) / bs;
+    int ok_empty = 1;
+
+    for (uint32_t lbn = 0; lbn < blocks; lbn++) {
+        uint32_t pblk = ext2_get_block_ptr(m, &din, lbn);
+        if (!pblk) continue;
+        if (ext2_read_block(m, pblk, blk) != 0) continue;
+
+        uint32_t off = 0;
+        while (off + sizeof(ext2_dirent_t) <= bs) {
+            ext2_dirent_t *de = (ext2_dirent_t*)(blk + off);
+            if (de->rec_len == 0) break;
+            if (de->inode != 0 && de->name_len > 0) {
+                if (!(de->name_len == 1 && de->name[0] == '.') && !(de->name_len == 2 && de->name[0] == '.' && de->name[1] == '.')) {
+                    ok_empty = 0;
+                    break;
+                }
+            }
+            off += de->rec_len;
+            if (off >= bs) break;
+        }
+        if (!ok_empty) break;
+    }
+
+    g_api->kfree(blk);
+    if (!ok_empty) return -13;
+
+    // Remove dirent from parent
+    if (ext2_dir_remove_entry(m, parent_ino, name) != 0) return -14;
+
+    // Free directory data blocks (direct blocks only; best-effort)
+    for (int i = 0; i < 12; i++) {
+        if (din.i_block[i]) (void)ext2_free_block0(m, din.i_block[i]);
+    }
+
+    ext2_inode_t z;
+    m_memset(&z, 0, sizeof(z));
+    (void)ext2_write_inode(m, ino, &z);
+    (void)ext2_free_inode0(m, ino);
+
+    // Update parent link count (best-effort)
+    if (pin.i_links_count > 2) pin.i_links_count--;
+    (void)ext2_write_inode(m, parent_ino, &pin);
+
+    return 0;
+}
+
+static int ext2_write_file(fs_mount_t *mount, const char *path, const void *buffer, size_t size) {
+    ext2_mount_ctx_t *m = (ext2_mount_ctx_t*)mount->ext_ctx;
+    if (!m || !g_api || !g_api->block_write) return -1;
+
+    // minimal: ModuOS mkfs ext2 only (single group, 4KiB blocks)
+    if (m->block_size != 4096 || m->groups != 1) return -2;
+
+    if (!path || path[0] != '/') return -3;
+
+    // Resolve existing?
+    uint32_t ino = 0;
+    int exists = (ext2_resolve_path(m, path, &ino, 0) == 0);
+
+    // Split parent + leaf
+    char parent_path[512];
+    const char *name = NULL;
+    if (ext2_split_parent(path, parent_path, sizeof(parent_path), &name) != 0) return -4;
+    if (!name || !*name) return -5;
+
+    uint32_t parent_ino = 0;
+    if (ext2_resolve_path(m, parent_path, &parent_ino, 0) != 0) return -6;
+
+    ext2_inode_t pin;
+    if (ext2_read_inode(m, parent_ino, &pin) != 0) return -7;
+    if ((pin.i_mode & 0xF000) != 0x4000) return -8;
+
+    ext2_inode_t in;
+    if (exists) {
+        if (ext2_read_inode(m, ino, &in) != 0) return -9;
+        if ((in.i_mode & 0xF000) != 0x8000) return -10;
+
+        // Full overwrite semantics: free existing blocks (direct + indirect) and reset pointers.
+        for (int i = 0; i < 12; i++) {
+            if (in.i_block[i]) { (void)ext2_free_block0(m, in.i_block[i]); in.i_block[i] = 0; }
+        }
+        if (in.i_block[12]) { (void)ext2_free_indirect_chain(m, in.i_block[12], 1); in.i_block[12] = 0; }
+        if (in.i_block[13]) { (void)ext2_free_indirect_chain(m, in.i_block[13], 2); in.i_block[13] = 0; }
+        // no triple-indirect support
+
+        in.i_size = 0;
+        in.i_blocks = 0;
+    } else {
+        if (ext2_alloc_inode0(m, &ino) != 0) return -11;
+        m_memset(&in, 0, sizeof(in));
+        in.i_mode = (uint16_t)(0x8000 | 0644);
+        in.i_links_count = 1;
+        in.i_size = 0;
+
+        // Insert into parent directory
+        if (ext2_dir_add_entry(m, parent_ino, name, ino, 1) != 0) return -12;
+    }
+
+    // Write data blocks (direct + indirect via ext2_set_block_ptr)
+    uint32_t bs = m->block_size;
+    uint32_t blocks_needed = (uint32_t)((size + bs - 1) / bs);
+
+    const uint8_t *src = (const uint8_t*)buffer;
+    uint8_t *blkbuf = (uint8_t*)g_api->kmalloc(bs);
+    if (!blkbuf) return -13;
+
+    for (uint32_t lbn = 0; lbn < blocks_needed; lbn++) {
+        uint32_t pblk = ext2_get_block_ptr(m, &in, lbn);
+        if (pblk == 0) {
+            if (ext2_alloc_block0(m, &pblk) != 0) { g_api->kfree(blkbuf); return -14; }
+            if (ext2_set_block_ptr(m, &in, lbn, pblk) != 0) { g_api->kfree(blkbuf); return -15; }
+        }
+        m_memset(blkbuf, 0, bs);
+        size_t off = (size_t)lbn * bs;
+        size_t chunk = bs;
+        if (off + chunk > size) chunk = size - off;
+        if (chunk) m_memcpy(blkbuf, src + off, chunk);
+        if (ext2_write_block(m, pblk, blkbuf) != 0) { g_api->kfree(blkbuf); return -16; }
+    }
+
+    g_api->kfree(blkbuf);
+
+    in.i_size = (uint32_t)size;
+    // EXT2 counts 512-byte sectors; minimal approximation.
+    in.i_blocks = (uint32_t)((blocks_needed * bs) / 512u);
+
+    if (ext2_write_inode(m, ino, &in) != 0) return -17;
+
+    return 0;
+}
+
 typedef struct {
     ext2_mount_ctx_t *m;
     ext2_inode_t dir_inode;
@@ -648,6 +1414,94 @@ static void ext2_unmount(fs_mount_t *mount) {
 
 static void set_bit(uint8_t *bmp, uint32_t bit) {
     bmp[bit / 8] |= (uint8_t)(1u << (bit % 8));
+}
+static int test_bit(uint8_t *bmp, uint32_t bit) {
+    return (bmp[bit / 8] & (uint8_t)(1u << (bit % 8))) != 0;
+}
+
+static int ext2_alloc_block0(ext2_mount_ctx_t *m, uint32_t *out_block) {
+    if (!g_api || !out_block) return -1;
+    if (m->groups != 1 || m->block_size != 4096) return -2;
+
+    ext2_bgdt_t bg;
+    if (ext2_read_bgdt(m, 0, &bg) != 0) return -3;
+
+    uint8_t *bmp = (uint8_t*)g_api->kmalloc(m->block_size);
+    if (!bmp) return -4;
+    if (ext2_read_block(m, bg.bg_block_bitmap, bmp) != 0) { g_api->kfree(bmp); return -5; }
+
+    // Scan blocks (relative to filesystem block numbers)
+    for (uint32_t b = 0; b < m->sb.s_blocks_count; b++) {
+        if (!test_bit(bmp, b)) {
+            set_bit(bmp, b);
+            if (ext2_write_block(m, bg.bg_block_bitmap, bmp) != 0) { g_api->kfree(bmp); return -6; }
+            g_api->kfree(bmp);
+            *out_block = b;
+            return 0;
+        }
+    }
+
+    g_api->kfree(bmp);
+    return -7;
+}
+
+static int ext2_alloc_inode0(ext2_mount_ctx_t *m, uint32_t *out_ino) {
+    if (!g_api || !out_ino) return -1;
+    if (m->groups != 1 || m->block_size != 4096) return -2;
+
+    ext2_bgdt_t bg;
+    if (ext2_read_bgdt(m, 0, &bg) != 0) return -3;
+
+    uint8_t *bmp = (uint8_t*)g_api->kmalloc(m->block_size);
+    if (!bmp) return -4;
+    if (ext2_read_block(m, bg.bg_inode_bitmap, bmp) != 0) { g_api->kfree(bmp); return -5; }
+
+    for (uint32_t i = 0; i < m->sb.s_inodes_per_group; i++) {
+        uint32_t ino = i + 1;
+        // skip reserved inodes 1..11
+        if (ino <= 11) continue;
+        if (!test_bit(bmp, i)) {
+            set_bit(bmp, i);
+            if (ext2_write_block(m, bg.bg_inode_bitmap, bmp) != 0) { g_api->kfree(bmp); return -6; }
+            g_api->kfree(bmp);
+            *out_ino = ino;
+            return 0;
+        }
+    }
+
+    g_api->kfree(bmp);
+    return -7;
+}
+
+static int ext2_set_block_ptr(ext2_mount_ctx_t *m, ext2_inode_t *in, uint32_t lbn, uint32_t pblk) {
+    uint32_t ppb = m->block_size / 4;
+    if (lbn < 12) {
+        in->i_block[lbn] = pblk;
+        return 0;
+    }
+
+    lbn -= 12;
+    if (lbn < ppb) {
+        if (in->i_block[12] == 0) {
+            uint32_t ind = 0;
+            if (ext2_alloc_block0(m, &ind) != 0) return -1;
+            in->i_block[12] = ind;
+            uint8_t *z = (uint8_t*)g_api->kmalloc(m->block_size);
+            if (!z) return -2;
+            m_memset(z, 0, m->block_size);
+            (void)ext2_write_block(m, ind, z);
+            g_api->kfree(z);
+        }
+        uint32_t *tbl = (uint32_t*)g_api->kmalloc(m->block_size);
+        if (!tbl) return -3;
+        if (ext2_read_block(m, in->i_block[12], tbl) != 0) { g_api->kfree(tbl); return -4; }
+        tbl[lbn] = pblk;
+        int rc = ext2_write_block(m, in->i_block[12], tbl);
+        g_api->kfree(tbl);
+        return rc;
+    }
+
+    return -5; // no double-indirect in write path yet
 }
 
 static int ext2_mkfs(int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors, const char *volume_label) {
@@ -884,10 +1738,14 @@ static const fs_ext_driver_ops_t g_ext2_ops = {
     .unmount = ext2_unmount,
     .mkfs = ext2_mkfs,
     .read_file = ext2_read_file,
+    .write_file = ext2_write_file,
     .stat = ext2_stat,
     .file_exists = ext2_file_exists,
     .directory_exists = ext2_dir_exists,
     .list_directory = ext2_list_directory,
+    .mkdir = ext2_mkdir,
+    .rmdir = ext2_rmdir,
+    .unlink = ext2_unlink,
     .opendir = ext2_opendir,
     .readdir = ext2_readdir,
     .closedir = ext2_closedir,
