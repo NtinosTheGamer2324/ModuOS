@@ -27,10 +27,19 @@ static int sk_read_file(fs_mount_t *m, const char *path, void *buf, size_t buf_s
     return -1;
 }
 
+static int sk_write_file(fs_mount_t *m, const char *path, const void *buffer, size_t size) {
+    (void)m; (void)path; (void)buffer; (void)size;
+    return -1;
+}
+
 static int sk_stat(fs_mount_t *m, const char *path, fs_file_info_t *info) {
     (void)m; (void)path; (void)info;
     return -1;
 }
+
+static int sk_mkdir(fs_mount_t *m, const char *path) { (void)m; (void)path; return -1; }
+static int sk_rmdir(fs_mount_t *m, const char *path) { (void)m; (void)path; return -1; }
+static int sk_unlink(fs_mount_t *m, const char *path) { (void)m; (void)path; return -1; }
 
 static int sk_file_exists(fs_mount_t *m, const char *path) { (void)m; (void)path; return 0; }
 static int sk_dir_exists(fs_mount_t *m, const char *path) { (void)m; (void)path; return 0; }
@@ -45,10 +54,16 @@ static const fs_ext_driver_ops_t sk_ops = {
     .unmount = NULL,
     .mkfs = NULL,
     .read_file = sk_read_file,
+    .write_file = sk_write_file,
     .stat = sk_stat,
     .file_exists = sk_file_exists,
     .directory_exists = sk_dir_exists,
     .list_directory = sk_list_dir,
+
+    .mkdir = sk_mkdir,
+    .rmdir = sk_rmdir,
+    .unlink = sk_unlink,
+
     .opendir = sk_opendir,
     .readdir = sk_readdir,
     .closedir = sk_closedir,
