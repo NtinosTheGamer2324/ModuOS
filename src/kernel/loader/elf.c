@@ -8,13 +8,13 @@
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/macros.h"
 
-// Storage for arguments (Windows-style: argc and argv[] on stack)
-#define ARG_STACK_BASE 0x7FFFFFFFE000ULL  // Just below user stack
-#define ARG_STACK_SIZE 0x2000              // 8KB for arguments
-
-static uint64_t g_saved_entry = 0;
-static int g_saved_argc = 0;
-static char **g_saved_argv = NULL;
+/*
+ * NOTE:
+ * Argument passing is handled by process creation (see process_create_with_args)
+ * which constructs argv on the user stack and passes argc/argv in registers.
+ *
+ * Keep the ELF loader focused on mapping segments and returning the entry point.
+ */
 
 int elf_validate(const void *elf_data) {
     if (!elf_data) return -1;
@@ -199,31 +199,12 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
     
     *entry_point = ehdr->e_entry;
     
-    // If we have arguments, set them up
-    if (argc > 0 && argv) {
-        com_write_string(COM1_PORT, "[ELF] Setting up arguments (argc=");
-        itoa(argc, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, ")\n");
-        
-        // Save for process initialization
-        g_saved_entry = ehdr->e_entry;
-        g_saved_argc = argc;
-        g_saved_argv = argv;
-    } else {
-        g_saved_argc = 0;
-        g_saved_argv = NULL;
-    }
+    (void)argc;
+    (void)argv;
     
     COM_LOG_OK(COM1_PORT, "ELF loaded successfully");
     
     return 0;
-}
-
-// Call this after process creation to get the saved args
-void elf_get_saved_args(int *argc, char ***argv) {
-    *argc = g_saved_argc;
-    *argv = g_saved_argv;
 }
 
 int elf_get_interp_path(const void *elf_data, size_t size, char *out, size_t out_size) {

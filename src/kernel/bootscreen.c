@@ -132,6 +132,7 @@ const char *bootscreen_pick_bmp_basename(void *mb2) {
         {"MacBook", "Apple_bootimg.bmp"},
         {"iMac", "Apple_bootimg.bmp"},
         {"Mac", "Apple_bootimg.bmp"},
+        {"DevmanPC", "devmanpc_bootimg.bmp"}
     };
     for (size_t i = 0; i < sizeof(branding)/sizeof(branding[0]); i++) {
         if (str_any_icontains(manu, prod, branding[i].needle)) return branding[i].bmp;
@@ -174,6 +175,9 @@ const char *bootscreen_pick_bmp_basename(void *mb2) {
 
         // Microsoft hardware (Surface etc.)
         {"Microsoft", "Microsoft_bootimg.bmp"},
+
+        //NTSoftware - NTLLC (idk man.)
+        {"NTLLC", "ntllc_bootimg.bmp"}
     };
     for (size_t i = 0; i < sizeof(vendors)/sizeof(vendors[0]); i++) {
         if (str_any_icontains(manu, prod, vendors[i].needle)) return vendors[i].bmp;

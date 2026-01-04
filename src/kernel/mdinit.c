@@ -210,19 +210,19 @@ static void devices_late_init(void) {
     irq_install_handler(1, keyboard_irq_handler);
 
     // USB Initialization
-    COM_LOG_INFO(COM1_PORT, "Initializing USB subsystem");
-    usb_init();
+    COM_LOG_INFO(COM1_PORT, "Initializing USB subsystem (USB Disabled)");
+    //usb_init();
 
-    if (usb_has_controllers()) {
+    //if (usb_has_controllers()) {
         /* Register HID class driver only if USB controllers exist.
          * On some emulators, running HID init with no controllers has triggered early faults.
          */
         // hid_init();
-    } else {
-        COM_LOG_INFO(COM1_PORT, "[HID] Skipping HID init (no USB controllers)");
-    }
+    //} else {
+        //COM_LOG_INFO(COM1_PORT, "[HID] Skipping HID init (no USB controllers)");
+    //}
 
-    COM_LOG_OK(COM1_PORT, "USB subsystem initialized");
+    //COM_LOG_OK(COM1_PORT, "USB subsystem initialized");
 }
 
 // ------------------ VGA TEXT MODE BOOT SCREEN ------------------
