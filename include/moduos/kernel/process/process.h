@@ -78,6 +78,11 @@ typedef struct process {
     uint64_t user_mmap_end;
     uint64_t user_mmap_limit;
 
+    /* User image range (ELF PT_LOAD segments) so we can cleanly free on exit
+     * without touching kernel identity-mapped RAM.
+     */
+    uint64_t user_image_base;
+    uint64_t user_image_end;
     // File descriptors
     void *fd_table[MAX_OPEN_FILES];
 

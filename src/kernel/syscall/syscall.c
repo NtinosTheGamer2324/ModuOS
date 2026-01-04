@@ -164,8 +164,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         }
         case SYS_SLEEP:   return sys_sleep((unsigned int)arg1);
         case SYS_YIELD:   sys_yield(); return 0;
-        case SYS_MALLOC:  return (uint64_t)sys_malloc((size_t)arg1);
-        case SYS_FREE:    sys_free((void*)arg1); return 0;
+        case SYS_MALLOC:  return (uint64_t)-1;
+        case SYS_FREE:    return (uint64_t)-1;
         case SYS_SBRK:    return (uint64_t)sys_sbrk((intptr_t)arg1);
         case SYS_KILL:    return sys_kill((int)arg1, (int)arg2);
         case SYS_TIME:    return sys_time();
@@ -485,26 +485,6 @@ int sys_sleep(unsigned int seconds) {
 
 void sys_yield(void) { process_yield(); }
 
-void* sys_malloc(size_t size) {
-    process_t *p = process_get_current();
-    if (p && p->is_user) {
-        /* Returning kernel pointers to ring3 userland will crash.
-         * Userland must use sbrk()/mmap() based allocators.
-         */
-        return (void*)0;
-    }
-    return kmalloc(size);
-}
-
-void sys_free(void *ptr) {
-    process_t *p = process_get_current();
-    if (p && p->is_user) {
-        /* Ignore: userland must not free kernel allocations. */
-        return;
-    }
-    kfree(ptr);
-}
-
 void* sys_sbrk(intptr_t increment) {
     process_t *p = process_get_current();
     if (!p) return (void*)-1;
@@ -590,14 +570,13 @@ int sys_munmap(void *addr, size_t size) {
     uint64_t end = v + sz;
 
     for (uint64_t cur = v; cur < end; cur += 0x1000ULL) {
-        if (paging_virt_to_phys(cur) != 0) {
+        uint64_t phys = paging_virt_to_phys(cur);
+        if (phys != 0) {
             paging_unmap_page(cur);
+            phys_free_frame(phys & ~0xFFFULL);
         }
     }
 
-    /* NOTE: physical pages are currently leaked because we don't track phys per mapping.
-     * This is acceptable for an early ld.so MVP.
-     */
     return 0;
 }
 

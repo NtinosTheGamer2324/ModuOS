@@ -105,7 +105,11 @@ typedef struct {
 // ELF loader functions
 int elf_validate(const void *elf_data);
 int elf_load(const void *elf_data, size_t size, uint64_t *entry_point);
-int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point, int argc, char **argv);
+
+/* Helper: load ELF and also return the mapped user image range (min/max vaddr)
+ * covering PT_LOAD segments. */
+int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point, int argc, char **argv,
+                      uint64_t *out_image_base, uint64_t *out_image_end);
 
 /* If ELF contains PT_INTERP, copies interpreter path to out and returns 1.
  * If no PT_INTERP, returns 0. On error, returns -1.

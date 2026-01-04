@@ -305,7 +305,8 @@ int exec_run(const char *args, int wait_for_exit) {
         }
 
         uint64_t entry_point;
-        int elf_result = elf_load_with_args(ibuf, ibread, &entry_point, new_argc, new_argv);
+        uint64_t img_base = 0, img_end = 0;
+        int elf_result = elf_load_with_args(ibuf, ibread, &entry_point, new_argc, new_argv, &img_base, &img_end);
         kfree(ibuf);
 
         if (elf_result != 0) {
@@ -318,6 +319,7 @@ int exec_run(const char *args, int wait_for_exit) {
         for (const char *p = interp_path; *p; p++) if (*p == '/') ifn = p + 1;
 
         process_t *proc = process_create_with_args(ifn, (void (*)(void))entry_point, 1, new_argc, new_argv);
+        if (proc) { proc->user_image_base = img_base; proc->user_image_end = img_end; }
         /* process_create_with_args deep-copies argv, so we can free our temporary now. */
         free_argv(new_argv, new_argc);
 
@@ -345,7 +347,8 @@ int exec_run(const char *args, int wait_for_exit) {
 
     // Load ELF with arguments
     uint64_t entry_point;
-    int elf_result = elf_load_with_args(buffer, bytes_read, &entry_point, argc, argv);
+    uint64_t img_base = 0, img_end = 0;
+    int elf_result = elf_load_with_args(buffer, bytes_read, &entry_point, argc, argv, &img_base, &img_end);
     
     com_write_string(COM1_PORT, "[EXEC] elf_load_with_args returned: ");
     itoa(elf_result, size_str, 10);
@@ -385,6 +388,7 @@ int exec_run(const char *args, int wait_for_exit) {
     process_t *proc;
     if (argc > 0) {
         proc = process_create_with_args(filename, (void(*)(void))entry_point, 1, argc, argv);
+        if (proc) { proc->user_image_base = img_base; proc->user_image_end = img_end; }
     } else {
         proc = process_create(filename, (void(*)(void))entry_point, 1);
         free_argv(argv, argc); // Only free if not passed to process

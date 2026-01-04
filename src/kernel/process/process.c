@@ -508,6 +508,46 @@ void scheduler_remove_process(process_t *proc) {
     }
 }
 
+static void free_user_range(uint64_t start, uint64_t end) {
+    if (end <= start) return;
+    start &= ~0xFFFULL;
+    end = (end + 0xFFFULL) & ~0xFFFULL;
+
+    for (uint64_t cur = start; cur < end; cur += 0x1000ULL) {
+        uint64_t phys = paging_virt_to_phys(cur);
+        if (phys != 0) {
+            paging_unmap_page(cur);
+            phys_free_frame(phys & ~0xFFFULL);
+        }
+    }
+}
+
+static void process_free_user_memory(process_t *p) {
+    if (!p || !p->is_user) return;
+
+    /* ELF image and user-space allocations: free only user half ranges.
+     * We currently use a single global page table, so we must explicitly clean up
+     * the ranges we hand out to ring3.
+     */
+
+    /* Program image mapped by ELF loader (precise range recorded at exec time). */
+    if (p->user_image_base && p->user_image_end && p->user_image_end > p->user_image_base) {
+        free_user_range(p->user_image_base, p->user_image_end);
+    }
+
+    /* User heap mappings created by sys_sbrk() */
+    free_user_range(p->user_heap_base, p->user_heap_end);
+
+    /* User mmap mappings created by sys_mmap() */
+    free_user_range(p->user_mmap_base, p->user_mmap_end);
+
+    /* User stack region */
+    if (p->user_stack) {
+        uint64_t base = (uint64_t)(uintptr_t)p->user_stack;
+        free_user_range(base, base + USER_STACK_SIZE);
+    }
+}
+
 static void do_switch_and_reap(process_t *old, process_t *newp) {
     char buf[12];
 
@@ -543,13 +583,17 @@ static void do_switch_and_reap(process_t *old, process_t *newp) {
             com_write_string(COM1_PORT, "\n");
             
             process_table[dead->pid] = NULL;
+
+            /* Free all user address space mappings and physical pages */
+            process_free_user_memory(dead);
+
             if (dead->kernel_stack) kfree(dead->kernel_stack);
-            
+
             // Free process-owned arguments
             if (dead->argv) {
                 free_argv(dead->argc, dead->argv);
             }
-            
+
             kfree(dead);
         }
     }
@@ -731,9 +775,10 @@ void process_kill(uint32_t pid) {
         p->state = PROCESS_STATE_TERMINATED;
         scheduler_remove_process(p);
 
+        process_free_user_memory(p);
         if (p->kernel_stack) kfree(p->kernel_stack);
         if (p->argv) free_argv(p->argc, p->argv);
-        
+
         process_table[pid] = NULL;
         kfree(p);
     }

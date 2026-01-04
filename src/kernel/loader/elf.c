@@ -53,10 +53,14 @@ int elf_validate(const void *elf_data) {
 }
 
 int elf_load(const void *elf_data, size_t size, uint64_t *entry_point) {
-    return elf_load_with_args(elf_data, size, entry_point, 0, NULL);
+    return elf_load_with_args(elf_data, size, entry_point, 0, NULL, NULL, NULL);
 }
 
-int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point, int argc, char **argv) {
+int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point, int argc, char **argv,
+                      uint64_t *out_image_base, uint64_t *out_image_end) {
+    if (out_image_base) *out_image_base = 0;
+    if (out_image_end) *out_image_end = 0;
+
     if (elf_validate(elf_data) != 0) {
         return -1;
     }
@@ -70,8 +74,15 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
     com_write_string(COM1_PORT, buf);
     com_write_string(COM1_PORT, " program headers\n");
     
+    uint64_t img_base = 0;
+    uint64_t img_end = 0;
+
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_LOAD) {
+            uint64_t seg_start = phdr[i].p_vaddr & ~0xFFFULL;
+            uint64_t seg_end = (phdr[i].p_vaddr + phdr[i].p_memsz + 0xFFFULL) & ~0xFFFULL;
+            if (img_base == 0 || seg_start < img_base) img_base = seg_start;
+            if (seg_end > img_end) img_end = seg_end;
             com_write_string(COM1_PORT, "[ELF] Loading segment ");
             itoa(i, buf, 10);
             com_write_string(COM1_PORT, buf);
@@ -198,12 +209,15 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
     }
     
     *entry_point = ehdr->e_entry;
-    
+
+    if (out_image_base) *out_image_base = img_base;
+    if (out_image_end) *out_image_end = img_end;
+
     (void)argc;
     (void)argv;
-    
+
     COM_LOG_OK(COM1_PORT, "ELF loaded successfully");
-    
+
     return 0;
 }
 
