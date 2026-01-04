@@ -165,7 +165,7 @@ Once booted, you can run:
 - `echo <text>` - Print text to console
 - `sh` - Simple shell
 - `memtest` - Memory testing utility
-- `zsfetch` - System information display
+- `neofetch` - System information display
 
 ### Games
 - **Raycaster FPS** - First-person perspective game
