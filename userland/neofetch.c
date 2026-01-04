@@ -191,7 +191,7 @@ int md_main(long argc, char** argv) {
         return 1;
     }
 
-    /* ASCII logo (kept simple for VGA text mode) */
+    /* ASCII logo */
     static const char *logo[] = {
         "\\cp      $$\\      $$\\                 $$\\            $$$$$$\\   $$$$$$\\  \\rr",
         "\\cp      $$$\\    $$$ |                $$ |          $$  __$$\\ $$  __$$\\ \\rr",
@@ -294,13 +294,13 @@ int md_main(long argc, char** argv) {
         const char *kven = safe_str(info->KernelVendor);
 
         if (kv[0] && kven[0]) {
-            snprintf(kernel_line, sizeof(kernel_line), "\\ccVersion: %s \\rr- \\ccVendor: %s\\rr", kv, kven);
+            snprintf(kernel_line, sizeof(kernel_line), "Version: %s - Vendor: %s", kv, kven);
         } else if (kv[0]) {
-            snprintf(kernel_line, sizeof(kernel_line), "\\ccVersion: %s \\rr", kv);
+            snprintf(kernel_line, sizeof(kernel_line), "Version: %s ", kv);
         } else if (kven[0]) {
-            snprintf(kernel_line, sizeof(kernel_line), "\\ccVendor: %s \\rr", kven);
+            snprintf(kernel_line, sizeof(kernel_line), "Vendor: %s ", kven);
         } else {
-            snprintf(kernel_line, sizeof(kernel_line), "\\crUnknown\\rr");
+            snprintf(kernel_line, sizeof(kernel_line), "Unknown");
         }
 
         print_kv_color(logo_on, logo, logo_lines, logo_width, line++, use_color, "Kernel", kernel_line);

@@ -242,7 +242,9 @@ int md_main(long argc, char **argv) {
         return 3;
     }
 
-    puts_raw("login ok\n");
+    puts_raw("\nlogin ok\n");
+
+    exec("/Apps/sh.sqr");
 
     return 0;
 }

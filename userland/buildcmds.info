@@ -1,5 +1,13 @@
 gcc -ffreestanding -c echo.c -o echo.o -mno-red-zone -O2 -nostdlib
 
+gcc -ffreestanding -c mkdir.c -o mkdir.o -mno-red-zone -O2 -nostdlib
+gcc -ffreestanding -c rmdir.c -o rmdir.o -mno-red-zone -O2 -nostdlib
+gcc -ffreestanding -c rm.c -o rm.o -mno-red-zone -O2 -nostdlib
+
 ld echo.o -T user.ld -o echo.sqr
+ld mkdir.o -T user.ld -o mkdir.sqr
+ld rmdir.o -T user.ld -o rmdir.sqr
+ld rm.o -T user.ld -o rm.sqr
+
 ls
 tree

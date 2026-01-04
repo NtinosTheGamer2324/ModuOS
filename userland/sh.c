@@ -30,6 +30,10 @@ int md_main(long argc, char** argv) {
             printf("aaaaa\n");
         } else if (strcmp(command, "exit") == 0) {
             sh_running = 0;
+        } else if (strcmp(command, "whoami") == 0) {
+            int uid = getuid();
+
+            printf("\nYou are UID: %d\n", uid);
         } else if (strlen(command) == 0) {
             // Do nothing on empty command
         } else {

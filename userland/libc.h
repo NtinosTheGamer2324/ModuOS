@@ -767,9 +767,23 @@ static inline int closedir(int fd) {
     return (int)syscall(SYS_CLOSEDIR, (uint64_t)fd, 0, 0);
 }
 
+// Create a directory. NOTE: kernel rejects DEVFS paths.
+static inline int mkdir(const char *path) {
+    return (int)syscall(SYS_MKDIR, (uint64_t)path, 0, 0);
+}
+
+// Remove a directory. NOTE: kernel rejects DEVFS paths.
+static inline int rmdir(const char *path) {
+    return (int)syscall(SYS_RMDIR, (uint64_t)path, 0, 0);
+}
+
+// Remove a file. NOTE: kernel rejects DEVFS paths.
+static inline int unlink(const char *path) {
+    return (int)syscall(SYS_UNLINK, (uint64_t)path, 0, 0);
+}
+
 #include "../include/moduos/fs/mkfs.h"
 #include "../include/moduos/fs/part.h"
-
 static inline int vfs_mkfs(const vfs_mkfs_req_t *req) {
     return (int)syscall(SYS_VFS_MKFS, (uint64_t)req, 0, 0);
 }

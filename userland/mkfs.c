@@ -62,14 +62,19 @@ int md_main(long argc, char **argv) {
     uint32_t start_lba = 0;
     uint32_t sectors = 0;
 
+    int using_part_no = 0;
+    int part_no = 0;
+
     // Resolve partition
     if ((part_s[0] == 'p' || part_s[0] == 'P') && part_s[1] >= '1' && part_s[1] <= '4' && part_s[2] == 0) {
+        using_part_no = 1;
+        part_no = (int)(part_s[1] - '0');
         vfs_part_req_t preq;
         vfs_part_info_t pinfo;
         memset(&preq, 0, sizeof(preq));
         memset(&pinfo, 0, sizeof(pinfo));
         preq.vdrive_id = (int32_t)vdrive_id_u;
-        preq.part_no = (int32_t)(part_s[1] - '0');
+        preq.part_no = (int32_t)part_no;
 
         int prc = vfs_getpart(&preq, &pinfo);
         if (prc != 0) {
