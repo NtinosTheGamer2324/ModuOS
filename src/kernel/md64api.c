@@ -542,7 +542,7 @@ md64api_sysinfo_data get_system_info(void)
 
     /* --- OS / Kernel Info --- */
     info.SystemVersion = "0.5.5";
-    info.KernelVersion = "mdsys.sqr 0.5.5";
+    info.KernelVersion = "MDKernel 0.5.5";
     info.KernelVendor = "NTSoftware";
     info.os_name = "ModuOS";
     info.os_arch = "AMD64";

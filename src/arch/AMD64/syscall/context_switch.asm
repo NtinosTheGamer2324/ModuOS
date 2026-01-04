@@ -65,24 +65,14 @@ context_switch:
     push rdx
     popfq
     
-    ; Before switching stacks, check if we have arguments
-    ; Arguments are in r12 (argc) and r13 (argv)
-    ; If r12 != 0, move them to RDI and RSI
-    test r12, r12
-    jz .no_args
-    
-    ; We have arguments - move them to proper registers
-    mov rdi, r12  ; argc -> RDI
-    mov rsi, r13  ; argv -> RSI
-    xor r12, r12  ; Clear r12 so we don't pass args again
-    xor r13, r13  ; Clear r13
-    jmp .switch_stack
-    
-.no_args:
-    ; No arguments - clear RDI and RSI
-    xor rdi, rdi
-    xor rsi, rsi
-    
+    ; NOTE:
+    ; User-mode entry goes through amd64_enter_user_trampoline.
+    ; That trampoline expects argc/argv in r12/r13 (callee-saved), not rdi/rsi.
+    ; So do NOT move/clear r12/r13 here.
+    ;
+    ; For kernel threads (non-user), r12/r13 may be used for other purposes,
+    ; and rdi/rsi are not part of the saved cpu_state.
+
 .switch_stack:
     ; Switch to new stack
     mov rsp, rcx

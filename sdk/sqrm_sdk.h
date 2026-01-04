@@ -119,6 +119,7 @@ typedef struct fs_ext_driver_ops {
     int (*mkfs)(int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors, const char *volume_label);
 
     int (*read_file)(fs_mount_t *mount, const char *path, void *buffer, size_t buffer_size, size_t *bytes_read);
+    int (*write_file)(fs_mount_t *mount, const char *path, const void *buffer, size_t size);
     int (*stat)(fs_mount_t *mount, const char *path, fs_file_info_t *info);
     int (*file_exists)(fs_mount_t *mount, const char *path);
     int (*directory_exists)(fs_mount_t *mount, const char *path);

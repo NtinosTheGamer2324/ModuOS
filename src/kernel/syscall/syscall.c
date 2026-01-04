@@ -1,6 +1,7 @@
 #include "moduos/kernel/syscall/syscall.h"
 #include "moduos/fs/mkfs.h"
 #include "moduos/fs/part.h"
+#include "moduos/fs/MDFS/mdfs.h"
 #include "moduos/fs/devfs.h"
 #include "moduos/kernel/syscall/syscall_numbers.h"
 #include "moduos/kernel/md64api.h"
@@ -48,6 +49,7 @@ static int copy_string_from_user(const char *user_str, char *kernel_buf, size_t 
 extern void syscall_entry(void);
 
 static int sys_vfs_mkfs(const vfs_mkfs_req_t *user_req);
+static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user_out);
 static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user_out);
 
 void syscall_init(void) {
@@ -202,7 +204,6 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             return (uint64_t)sys_vfs_mkfs((const vfs_mkfs_req_t*)arg1);
         case SYS_VFS_GETPART:
             return (uint64_t)sys_vfs_getpart((const vfs_part_req_t*)arg1, (vfs_part_info_t*)arg2);
-
         default:
             if (kernel_debug_is_med()) {
                 com_write_string(COM1_PORT, "[SYSCALL] Unknown syscall: ");
@@ -338,20 +339,43 @@ int sys_get_sysinfo2(md64api_sysinfo_data_u *out, size_t out_size) {
     return 0;
 }
 
-ssize_t sys_writefile(int fd, const char *str, size_t count) {
-    if (!str) return -1;
+ssize_t sys_writefile(int fd, const char *user_buf, size_t count) {
+    if (!user_buf) return -1;
 
-    /* Copy from user once, then write from kernel buffer */
-    if (count > 4096) count = 4096;
-    char tmp[4096];
-    if (count && usercopy_from_user(tmp, str, count) != 0) return -1;
+    // Write to console: still copy from user, but chunk it.
+    // Write to files: MUST use kmalloc() buffer (DMA-safe) and chunked copyin.
+    const size_t CHUNK = 4096;
+    char *kbuf = (char*)kmalloc(CHUNK);
+    if (!kbuf) return -1;
 
-    if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
-        VGA_WriteN(tmp, count);
-        return (ssize_t)count;
+    size_t total = 0;
+    while (total < count) {
+        size_t n = count - total;
+        if (n > CHUNK) n = CHUNK;
+
+        if (n && usercopy_from_user(kbuf, user_buf + total, n) != 0) {
+            kfree(kbuf);
+            return -1;
+        }
+
+        if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
+            VGA_WriteN(kbuf, n);
+            total += n;
+            continue;
+        }
+
+        ssize_t wr = fd_write(fd, kbuf, n);
+        if (wr < 0) {
+            kfree(kbuf);
+            return wr;
+        }
+        if ((size_t)wr == 0) break;
+        total += (size_t)wr;
+        if ((size_t)wr < n) break;
     }
 
-    return fd_write(fd, tmp, count);
+    kfree(kbuf);
+    return (ssize_t)total;
 }
 
 int sys_write(const char *str) {
@@ -639,21 +663,147 @@ off_t sys_lseek(int fd, off_t offset, int whence) {
 }
 
 int sys_mkdir(const char *path) {
-    (void)path;
-    // TODO: Implement via FAT32 write support
-    return -1;
+    if (!path) return -1;
+
+    process_t *proc = process_get_current();
+    if (!proc) return -1;
+
+    char kpath[256];
+    if (copy_string_from_user(path, kpath, sizeof(kpath)) != 0) return -1;
+
+    // Resolve relative paths against CWD (supports both / and $/ namespaces)
+    const char *p = kpath;
+    char full_path[256];
+    if (!(p[0] == '/' || (p[0] == '$' && p[1] == '/'))) {
+        const char *cwd = (proc->cwd[0] ? proc->cwd : "/");
+        strncpy(full_path, cwd, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = 0;
+        size_t len = strlen(full_path);
+        if (len == 0 || full_path[len - 1] != '/') {
+            strncat(full_path, "/", sizeof(full_path) - strlen(full_path) - 1);
+        }
+        strncat(full_path, p, sizeof(full_path) - strlen(full_path) - 1);
+        p = full_path;
+    }
+
+    // Normalize for stable behavior.
+    char norm[256];
+    strncpy(norm, p, sizeof(norm) - 1);
+    norm[sizeof(norm) - 1] = 0;
+    path_normalize_inplace(norm);
+    p = norm;
+
+    fs_path_resolved_t r;
+    if (fs_resolve_path(proc, p, &r) != 0) return -1;
+
+    // RULE: userland must not create DEVFS directories
+    if (r.route == FS_ROUTE_DEVVFS) {
+        return -1;
+    }
+
+    int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;
+    if (slot < 0) return -1;
+
+    fs_mount_t *mount = fs_get_mount(slot);
+    if (!mount || !mount->valid) return -1;
+
+    return fs_mkdir(mount, r.rel_path);
 }
 
 int sys_rmdir(const char *path) {
-    (void)path;
-    // TODO: Implement via FAT32 write support
-    return -1;
+    if (!path) return -1;
+
+    process_t *proc = process_get_current();
+    if (!proc) return -1;
+
+    char kpath[256];
+    if (copy_string_from_user(path, kpath, sizeof(kpath)) != 0) return -1;
+
+    // Resolve relative paths against CWD (supports both / and $/ namespaces)
+    const char *p = kpath;
+    char full_path[256];
+    if (!(p[0] == '/' || (p[0] == '$' && p[1] == '/'))) {
+        const char *cwd = (proc->cwd[0] ? proc->cwd : "/");
+        strncpy(full_path, cwd, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = 0;
+        size_t len = strlen(full_path);
+        if (len == 0 || full_path[len - 1] != '/') {
+            strncat(full_path, "/", sizeof(full_path) - strlen(full_path) - 1);
+        }
+        strncat(full_path, p, sizeof(full_path) - strlen(full_path) - 1);
+        p = full_path;
+    }
+
+    // Normalize for stable behavior.
+    char norm[256];
+    strncpy(norm, p, sizeof(norm) - 1);
+    norm[sizeof(norm) - 1] = 0;
+    path_normalize_inplace(norm);
+    p = norm;
+
+    fs_path_resolved_t r;
+    if (fs_resolve_path(proc, p, &r) != 0) return -1;
+
+    // RULE: userland must not remove DEVFS directories
+    if (r.route == FS_ROUTE_DEVVFS) {
+        return -1;
+    }
+
+    int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;
+    if (slot < 0) return -1;
+
+    fs_mount_t *mount = fs_get_mount(slot);
+    if (!mount || !mount->valid) return -1;
+
+    return fs_rmdir(mount, r.rel_path);
 }
 
 int sys_unlink(const char *path) {
-    (void)path;
-    // TODO: Implement via FAT32 write support
-    return -1;
+    if (!path) return -1;
+
+    process_t *proc = process_get_current();
+    if (!proc) return -1;
+
+    char kpath[256];
+    if (copy_string_from_user(path, kpath, sizeof(kpath)) != 0) return -1;
+
+    // Resolve relative paths against CWD (supports both / and $/ namespaces)
+    const char *p = kpath;
+    char full_path[256];
+    if (!(p[0] == '/' || (p[0] == '$' && p[1] == '/'))) {
+        const char *cwd = (proc->cwd[0] ? proc->cwd : "/");
+        strncpy(full_path, cwd, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = 0;
+        size_t len = strlen(full_path);
+        if (len == 0 || full_path[len - 1] != '/') {
+            strncat(full_path, "/", sizeof(full_path) - strlen(full_path) - 1);
+        }
+        strncat(full_path, p, sizeof(full_path) - strlen(full_path) - 1);
+        p = full_path;
+    }
+
+    // Normalize for stable behavior.
+    char norm[256];
+    strncpy(norm, p, sizeof(norm) - 1);
+    norm[sizeof(norm) - 1] = 0;
+    path_normalize_inplace(norm);
+    p = norm;
+
+    fs_path_resolved_t r;
+    if (fs_resolve_path(proc, p, &r) != 0) return -1;
+
+    // RULE: userland must not delete DEVFS entries
+    if (r.route == FS_ROUTE_DEVVFS) {
+        return -1;
+    }
+
+    int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;
+    if (slot < 0) return -1;
+
+    fs_mount_t *mount = fs_get_mount(slot);
+    if (!mount || !mount->valid) return -1;
+
+    return fs_unlink(mount, r.rel_path);
 }
 
 int sys_chdir(const char *path) {
@@ -875,6 +1025,9 @@ static int sys_vfs_mkfs(const vfs_mkfs_req_t *user_req) {
 
     const char *label = req.label[0] ? req.label : NULL;
 
+    int rc = 0;
+    uint8_t mbr_type = 0;
+
     if (strcmp(req.fs_name, "fat32") == 0) {
         // Match Windows' typical FAT32 formatter limit (~32GiB): refuse unless forced.
         if (req.sectors > 67108864u && (req.flags & VFS_MKFS_FLAG_FORCE) == 0) {
@@ -892,10 +1045,23 @@ static int sys_vfs_mkfs(const vfs_mkfs_req_t *user_req) {
             else spc = 64;                        // > 32GiB   => 32KiB clusters
         }
 
-        return fs_format(req.vdrive_id, req.start_lba, req.sectors, label, spc);
+        rc = fs_format(req.vdrive_id, req.start_lba, req.sectors, label, spc);
+        if (rc == 0) mbr_type = 0x0C; // FAT32 LBA
+    } else if (strcmp(req.fs_name, "mdfs") == 0) {
+        rc = mdfs_mkfs(req.vdrive_id, req.start_lba, req.sectors, label);
+        if (rc == 0) mbr_type = 0xE1; // ModularFS
+    } else {
+        rc = fs_ext_mkfs(req.fs_name, req.vdrive_id, req.start_lba, req.sectors, label);
+        if (rc == 0 && strcmp(req.fs_name, "ext2") == 0) mbr_type = 0x83; // Linux
     }
 
-    return fs_ext_mkfs(req.fs_name, req.vdrive_id, req.start_lba, req.sectors, label);
+    // Best-effort MBR type update: if the formatted region starts at an MBR partition,
+    // update the partition type to match the filesystem.
+    if (rc == 0 && mbr_type) {
+        (void)fs_mbr_set_type_for_lba(req.vdrive_id, req.start_lba, mbr_type);
+    }
+
+    return rc;
 }
 
 static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user_out) {

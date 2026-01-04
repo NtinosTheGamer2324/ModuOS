@@ -38,7 +38,6 @@
 // VFS formatting / mkfs
 #define SYS_VFS_MKFS    36
 #define SYS_VFS_GETPART 37
-
 /* User identity */
 #define SYS_GETUID      33
 #define SYS_SETUID      34

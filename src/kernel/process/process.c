@@ -317,15 +317,29 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
                 proc->argc = 64;
             }
 
+            int argv_ok = 1;
             for (int i = proc->argc - 1; i >= 0; i--) {
                 const char *s = proc->argv[i] ? proc->argv[i] : "";
                 size_t len = strlen(s) + 1;
+                if (sp < user_stack_base + len + 64) {
+                    COM_LOG_ERROR(COM1_PORT, "argv does not fit on user stack");
+                    argv_ok = 0;
+                    break;
+                }
                 sp -= len;
                 memcpy((void*)(uintptr_t)sp, s, len);
                 user_str_ptrs[i] = sp;
             }
 
-            /* Align for argv array */
+            if (!argv_ok) {
+                proc->argc = 0;
+                proc->cpu_state.r12 = 0;
+                proc->cpu_state.r13 = 0;
+                /* leave proc->user_rsp as initially set */
+                goto argv_done;
+            }
+
+            /* Align before placing the argv pointer table */
             sp &= ~0xFULL;
 
             /* argv pointers array (argc+1) */
@@ -336,11 +350,17 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
             }
             user_argv[proc->argc] = 0;
 
-            /* Ensure SysV AMD64 stack alignment for userland.
-             * GCC assumes on function entry: (%rsp + 8) % 16 == 0.
-             * Since we enter userland via iretq (no CALL pushing a return address),
-             * we must bias the initial stack by 8 bytes.
+            /*
+             * Ensure SysV AMD64 stack alignment for userland.
+             * On function entry, GCC expects: (%rsp + 8) % 16 == 0  (i.e. rsp % 16 == 8)
+             * because a CALL would have pushed an 8-byte return address.
+             * We enter via iretq, so we synthesize that return address and (if needed)
+             * add an extra 8-byte pad so the invariant always holds.
              */
+            if (((sp - 8) & 0xFULL) != 8) {
+                sp -= 8;
+                *(uint64_t*)(uintptr_t)sp = 0; /* pad */
+            }
             sp -= 8;
             *(uint64_t*)(uintptr_t)sp = 0; /* fake return address */
 
@@ -350,6 +370,7 @@ process_t* process_create_with_args(const char *name, void (*entry_point)(void),
             proc->cpu_state.r12 = (uint64_t)proc->argc;
             proc->cpu_state.r13 = (uint64_t)(uintptr_t)user_argv;
         }
+argv_done:
 
         /* Use r14/r15 to pass user RIP/RSP to the trampoline via context_switch restore. */
         proc->cpu_state.r14 = proc->user_rip;

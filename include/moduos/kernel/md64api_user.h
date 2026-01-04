@@ -12,8 +12,9 @@ typedef struct md64api_sysinfo_data_u {
     uint64_t sys_available_ram;
     uint64_t sys_total_ram;
 
-    int SystemVersion;
-    int KernelVersion;
+    /* Version strings (copied from kernel; user-safe) */
+    char SystemVersion[32];
+    char KernelVersion[64];
 
     char KernelVendor[64];
     char os_name[32];

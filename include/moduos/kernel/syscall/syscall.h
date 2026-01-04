@@ -7,10 +7,7 @@
 #include "moduos/kernel/md64api_user.h"
 #include "moduos/fs/fd.h"  // for off_t
 
-#ifndef _SSIZE_T_DEFINED
-#define _SSIZE_T_DEFINED
-typedef long ssize_t;
-#endif
+// ssize_t is defined in include/moduos/fs/fd.h
 
 // System call numbers (shared with userspace)
 #include "moduos/kernel/syscall/syscall_numbers.h"
