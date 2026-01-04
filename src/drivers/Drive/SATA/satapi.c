@@ -21,7 +21,7 @@
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
 #include <stddef.h>
-#include <string.h>
+#include "moduos/kernel/memory/string.h"
 
 // SATAPI devices (one per AHCI port)
 static satapi_device_t satapi_devices[AHCI_MAX_PORTS];
@@ -105,14 +105,15 @@ static int satapi_send_packet(uint8_t port_num, uint8_t *scsi_cmd,
      * contiguous (kheap) and virt_to_phys may return 0 for some mappings.
      *
      * Use a single-page, physically contiguous bounce buffer (identity-mapped) for transfers
-     * up to 4KiB, then memcpy to the caller buffer.
+     * up to SATAPI_BOUNCE_SIZE, then memcpy to the caller buffer.
      */
-    static uint8_t satapi_bounce_page[4096] __attribute__((aligned(4096)));
+#define SATAPI_BOUNCE_SIZE 4096
+    static uint8_t satapi_bounce_page[SATAPI_BOUNCE_SIZE] __attribute__((aligned(4096)));
     void *dma_buf = NULL;
     uint64_t dma_phys = 0;
 
     if (buffer && buffer_len > 0) {
-        if (buffer_len > sizeof(satapi_bounce_page)) {
+        if (buffer_len > SATAPI_BOUNCE_SIZE) {
             COM_LOG_ERROR(COM1_PORT, "SATAPI: transfer too large for bounce buffer");
             return SATAPI_ERR_HARDWARE;
         }
@@ -337,20 +338,57 @@ int satapi_read_blocks(uint8_t port_num, uint32_t lba, uint32_t count, void *buf
         cmd[7] = (uint8_t)((count >> 8) & 0xFF);
         cmd[8] = (uint8_t)(count & 0xFF);
         
-        uint32_t transfer_size = count * SATAPI_SECTOR_SIZE;
-        int result = satapi_send_packet(port_num, cmd, buffer, transfer_size, 0);
-        
-        if (result == SATAPI_SUCCESS) {
-            satapi_devices[port_num].reads_completed++;
-            return SATAPI_SUCCESS;
-        } else {
-            satapi_devices[port_num].errors++;
-            
-            if (attempt < SATAPI_RETRY_COUNT - 1) {
-                COM_LOG_WARN(COM1_PORT, "SATAPI: Read failed, retrying");
-                satapi_msleep(100);  // Short delay before retry
+        /*
+         * The underlying PACKET send uses a 4KiB bounce buffer.
+         * Split large reads into smaller chunks so higher-level callers can
+         * request arbitrary block counts.
+         */
+        const uint32_t max_blocks_per_xfer = SATAPI_BOUNCE_SIZE / SATAPI_SECTOR_SIZE; /* 2 */
+        uint32_t remaining = count;
+        uint32_t cur_lba = lba;
+        uint8_t *out = (uint8_t*)buffer;
+
+        /* Ensure command LBA starts from the requested lba for each retry attempt. */
+        cmd[2] = (uint8_t)((cur_lba >> 24) & 0xFF);
+        cmd[3] = (uint8_t)((cur_lba >> 16) & 0xFF);
+        cmd[4] = (uint8_t)((cur_lba >> 8) & 0xFF);
+        cmd[5] = (uint8_t)(cur_lba & 0xFF);
+
+        while (remaining > 0) {
+            uint32_t chunk_blocks = remaining;
+            if (chunk_blocks > max_blocks_per_xfer) chunk_blocks = max_blocks_per_xfer;
+
+            /* Update transfer length for this chunk */
+            cmd[7] = (uint8_t)((chunk_blocks >> 8) & 0xFF);
+            cmd[8] = (uint8_t)(chunk_blocks & 0xFF);
+
+            uint32_t transfer_size = chunk_blocks * SATAPI_SECTOR_SIZE;
+            int result = satapi_send_packet(port_num, cmd, out, transfer_size, 0);
+            if (result != SATAPI_SUCCESS) {
+                satapi_devices[port_num].errors++;
+                goto retry;
             }
+
+            remaining -= chunk_blocks;
+            cur_lba += chunk_blocks;
+            out += transfer_size;
+
+            /* Update LBA for next chunk */
+            cmd[2] = (uint8_t)((cur_lba >> 24) & 0xFF);
+            cmd[3] = (uint8_t)((cur_lba >> 16) & 0xFF);
+            cmd[4] = (uint8_t)((cur_lba >> 8) & 0xFF);
+            cmd[5] = (uint8_t)(cur_lba & 0xFF);
         }
+
+        satapi_devices[port_num].reads_completed++;
+        return SATAPI_SUCCESS;
+
+retry:
+        if (attempt < SATAPI_RETRY_COUNT - 1) {
+            COM_LOG_WARN(COM1_PORT, "SATAPI: Read failed, retrying");
+            satapi_msleep(100);  // Short delay before retry
+        }
+        /* retry outer loop */
     }
     
     return SATAPI_ERR_READ_FAILED;

@@ -347,9 +347,27 @@ ssize_t fd_write(int fd, const void* buffer, size_t count) {
         return devfs_write(fd_table[fd].cached_data, buffer, count);
     }
 
-    /* Regular file writing still not implemented */
-    com_write_string(COM1_PORT, "[FD] File writing not implemented (non-devfs)\n");
-    return -3;
+    /* Regular file writing (minimal): whole-file overwrite from offset 0.
+     * Enough for installers/cp and test tools.
+     */
+    if (fd_table[fd].position != 0) {
+        com_write_string(COM1_PORT, "[FD] write: non-zero offset not supported yet\n");
+        return -3;
+    }
+
+    fs_mount_t *mount = fs_get_mount(fd_table[fd].mount_slot);
+    if (!mount || !mount->valid) return -3;
+
+    int rc = fs_write_file(mount, fd_table[fd].path, buffer, count);
+    if (rc != 0) {
+        // Propagate filesystem error codes to userland for debugging.
+        // Convention: 0 = success, negative = error.
+        return (rc < 0) ? (ssize_t)rc : -3;
+    }
+
+    fd_table[fd].position += count;
+    fd_table[fd].file_size = fd_table[fd].position;
+    return (ssize_t)count;
 }
 
 /* Seek in file */

@@ -10,7 +10,8 @@ typedef enum {
     FS_TYPE_UNKNOWN   = 0,
     FS_TYPE_FAT32     = 1,
     FS_TYPE_ISO9660   = 2,
-    FS_TYPE_EXTERNAL  = 3
+    FS_TYPE_EXTERNAL  = 3,
+    FS_TYPE_MDFS      = 4
 } fs_type_t;
 
 /* File information structure */
@@ -105,12 +106,23 @@ typedef struct fs_ext_driver_ops {
     // Returns 0 on success.
     int (*mkfs)(int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors, const char *volume_label);
 
-    // Read-only v1 requires these
+    // Read support
     int (*read_file)(fs_mount_t *mount, const char *path, void *buffer, size_t buffer_size, size_t *bytes_read);
+
+    // Optional write support (NULL => read-only)
+    int (*write_file)(fs_mount_t *mount, const char *path, const void *buffer, size_t size);
+
     int (*stat)(fs_mount_t *mount, const char *path, fs_file_info_t *info);
     int (*file_exists)(fs_mount_t *mount, const char *path);
     int (*directory_exists)(fs_mount_t *mount, const char *path);
     int (*list_directory)(fs_mount_t *mount, const char *path);
+
+    // Optional directory mutation
+    int (*mkdir)(fs_mount_t *mount, const char *path);
+    int (*rmdir)(fs_mount_t *mount, const char *path);
+
+    // Optional file mutation
+    int (*unlink)(fs_mount_t *mount, const char *path);
 
     // Directory iteration
     fs_dir_t* (*opendir)(fs_mount_t *mount, const char *path);
@@ -123,6 +135,9 @@ int fs_register_driver(const char *name, const fs_ext_driver_ops_t *ops);
 
 // Invoke an external filesystem driver's mkfs callback (if provided).
 int fs_ext_mkfs(const char *driver_name, int vdrive_id, uint32_t partition_lba, uint32_t partition_sectors, const char *volume_label);
+
+// Internal helper: update MBR partition type for the partition starting at start_lba.
+int fs_mbr_set_type_for_lba(int vdrive_id, uint32_t start_lba, uint8_t new_type);
 
 int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type);
 
@@ -251,6 +266,15 @@ int fs_list_directory(fs_mount_t* mount, const char* path);
  * @return: 1 if exists and is directory, 0 otherwise
  */
 int fs_directory_exists(fs_mount_t* mount, const char* path);
+
+// Create a directory at path (absolute within mount). Returns 0 on success.
+int fs_mkdir(fs_mount_t* mount, const char* path);
+
+// Remove an empty directory at path (absolute within mount). Returns 0 on success.
+int fs_rmdir(fs_mount_t* mount, const char* path);
+
+// Remove a file at path (absolute within mount). Returns 0 on success.
+int fs_unlink(fs_mount_t* mount, const char* path);
 
 /**
  * Open directory for iteration

@@ -248,11 +248,23 @@ int iso9660_mount_auto(int vdrive_id) {
 
     for (int d = start; d <= end; d++) {
         if (!vdrive_is_ready(d)) continue;
+
+        /* ISO9660 auto-detection should only run on optical drives.
+         * Hard disks can contain arbitrary data that may accidentally satisfy
+         * a weak PVD probe.
+         */
+        vdrive_t* vdrive = vdrive_get(d);
+        int is_optical = 0;
+        if (vdrive) {
+            is_optical = (vdrive->type == VDRIVE_TYPE_ATA_ATAPI || vdrive->type == VDRIVE_TYPE_SATA_OPTICAL);
+        }
+        if (!is_optical) {
+            continue;
+        }
         
         int handle = iso9660_mount(d, 0);
         if (handle >= 0) return handle;
 
-        vdrive_t* vdrive = vdrive_get(d);
         if (vdrive && !vdrive->read_only) {
             /* DMA safety: keep MBR reads within a single 4KiB page. */
             static uint8_t mbr_page[4096] __attribute__((aligned(4096)));

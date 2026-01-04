@@ -2,6 +2,7 @@
 #include "moduos/fs/fs.h"
 #include "moduos/fs/DOS/FAT32/fat32.h"
 #include "moduos/fs/ISOFS/iso9660.h"
+#include "moduos/fs/MDFS/mdfs.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/memory/string.h"
 
@@ -81,19 +82,20 @@ static int fs_mbr_partition_index_for_lba(int vdrive_id, uint32_t partition_lba)
     /* MBR only makes sense on 512-byte sector disks. */
     if (d->sector_size != 512) return 0;
 
-    static uint8_t mbr_page[4096] __attribute__((aligned(4096)));
-    uint8_t *mbr = mbr_page;
+    uint8_t *mbr = (uint8_t*)kmalloc(512);
+    if (!mbr) return 0;
 
-    if (vdrive_read_sector((uint8_t)vdrive_id, 0, mbr) != VDRIVE_SUCCESS) return 0;
-    if (mbr[510] != 0x55 || mbr[511] != 0xAA) return 0;
+    if (vdrive_read_sector((uint8_t)vdrive_id, 0, mbr) != VDRIVE_SUCCESS) { kfree(mbr); return 0; }
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) { kfree(mbr); return 0; }
 
     for (int i = 0; i < 4; i++) {
         const uint8_t *e = mbr + MBR_PARTITION_TABLE_OFFSET + i * MBR_PARTITION_ENTRY_SIZE;
         uint8_t type = e[4];
         uint32_t first_lba = read_le32(e + 8);
         if (type == 0x00) continue;
-        if (first_lba == partition_lba) return i + 1;
+        if (first_lba == partition_lba) { kfree(mbr); return i + 1; }
     }
+    kfree(mbr);
     return 0;
 }
 
@@ -106,11 +108,11 @@ static int fs_mbr_list_partitions(int vdrive_id, uint32_t out_first_lba[4], uint
     if (!d || !d->present) return 0;
     if (d->sector_size != 512) return 0;
 
-    static uint8_t mbr_page[4096] __attribute__((aligned(4096)));
-    uint8_t *mbr = mbr_page;
+    uint8_t *mbr = (uint8_t*)kmalloc(512);
+    if (!mbr) return 0;
 
-    if (vdrive_read_sector((uint8_t)vdrive_id, 0, mbr) != VDRIVE_SUCCESS) return 0;
-    if (mbr[510] != 0x55 || mbr[511] != 0xAA) return 0;
+    if (vdrive_read_sector((uint8_t)vdrive_id, 0, mbr) != VDRIVE_SUCCESS) { kfree(mbr); return 0; }
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) { kfree(mbr); return 0; }
 
     int count = 0;
     for (int i = 0; i < 4; i++) {
@@ -122,6 +124,7 @@ static int fs_mbr_list_partitions(int vdrive_id, uint32_t out_first_lba[4], uint
         if (out_type) out_type[i] = type;
         count++;
     }
+    kfree(mbr);
     return count;
 }
 
@@ -137,11 +140,11 @@ int fs_mbr_get_partition(int vdrive_id, int part_no, uint32_t *out_start_lba, ui
     if (!d || !d->present) return -2;
     if (d->sector_size != 512) return -3;
 
-    static uint8_t mbr_page[4096] __attribute__((aligned(4096)));
-    uint8_t *mbr = mbr_page;
+    uint8_t *mbr = (uint8_t*)kmalloc(512);
+    if (!mbr) return -7;
 
-    if (vdrive_read_sector((uint8_t)vdrive_id, 0, mbr) != VDRIVE_SUCCESS) return -4;
-    if (mbr[510] != 0x55 || mbr[511] != 0xAA) return -5;
+    if (vdrive_read_sector((uint8_t)vdrive_id, 0, mbr) != VDRIVE_SUCCESS) { kfree(mbr); return -4; }
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) { kfree(mbr); return -5; }
 
     int idx = part_no - 1;
     const uint8_t *e = mbr + MBR_PARTITION_TABLE_OFFSET + idx * MBR_PARTITION_ENTRY_SIZE;
@@ -149,11 +152,12 @@ int fs_mbr_get_partition(int vdrive_id, int part_no, uint32_t *out_start_lba, ui
     uint32_t first_lba = read_le32(e + 8);
     uint32_t sectors = read_le32(e + 12);
 
-    if (type == 0x00 || first_lba == 0 || sectors == 0) return -6;
+    if (type == 0x00 || first_lba == 0 || sectors == 0) { kfree(mbr); return -6; }
 
     if (out_start_lba) *out_start_lba = first_lba;
     if (out_sectors) *out_sectors = sectors;
     if (out_type) *out_type = type;
+    kfree(mbr);
     return 0;
 }
 
@@ -363,8 +367,21 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
             const fat32_fs_t *fs = fat32_get_fs(handle);
             if (fs) partition_lba = fs->partition_lba;
         } else {
-            iso_rc = iso9660_mount_auto(vdrive_id);
-            handle = iso_rc;
+            /* Only probe ISO9660 automatically on optical drives. */
+            vdrive_t *vd = vdrive_get(vdrive_id);
+            int is_optical = 0;
+            if (vd) {
+                is_optical = (vd->type == VDRIVE_TYPE_ATA_ATAPI || vd->type == VDRIVE_TYPE_SATA_OPTICAL);
+            }
+
+            if (is_optical) {
+                iso_rc = iso9660_mount_auto(vdrive_id);
+                handle = iso_rc;
+            } else {
+                iso_rc = -9999;
+                handle = -1;
+            }
+
             if (handle >= 0) {
                 mount.type = FS_TYPE_ISO9660;
                 mount.handle = handle;
@@ -389,6 +406,21 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
                     (void)ptype;
                     int pc = fs_mbr_list_partitions(vdrive_id, first_lba, ptype);
                     if (pc > 0) {
+                        // Fast-path: if partition type is ModularFS (0xE1), try in-kernel MDFS first.
+                        for (int pi = 0; pi < 4; pi++) {
+                            if (first_lba[pi] == 0) continue;
+                            if (ptype[pi] == 0xE1) {
+                                int mh = mdfs_mount(vdrive_id, first_lba[pi]);
+                                if (mh >= 0) {
+                                    mount.type = FS_TYPE_MDFS;
+                                    mount.handle = mh;
+                                    mount.valid = 1;
+                                    partition_lba = first_lba[pi];
+                                    goto autodetect_done;
+                                }
+                            }
+                        }
+
                         com_write_string(COM1_PORT, "[FS] Probing external drivers on MBR partitions...\n");
                         for (int pi = 0; pi < 4; pi++) {
                             if (first_lba[pi] == 0) continue;
@@ -408,17 +440,49 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
                 }
             }
         }
+autodetect_done:
     } else if (type == FS_TYPE_UNKNOWN) {
-        /* User specified LBA, but unknown filesystem type - try built-ins then external */
-        fat_rc = fat32_mount(vdrive_id, partition_lba);
-        handle = fat_rc;
-        if (handle >= 0) {
-            mount.type = FS_TYPE_FAT32;
-            mount.handle = handle;
+        /* User specified LBA, but unknown filesystem type.
+         * IMPORTANT: If FAT32 probe fails with an invalid boot signature (-3),
+         * do NOT fall back to other filesystem probes, because that can lead
+         * to incorrect auto-mounts (false positives) on unformatted/unknown data.
+         */
+        // First try MDFS (in-kernel) since FAT32 signature mismatch is common on non-FAT partitions.
+        int mdfs_rc = mdfs_mount(vdrive_id, partition_lba);
+        if (mdfs_rc >= 0) {
+            mount.type = FS_TYPE_MDFS;
+            mount.handle = mdfs_rc;
             mount.valid = 1;
         } else {
-            iso_rc = iso9660_mount(vdrive_id, partition_lba);
-            handle = iso_rc;
+            fat_rc = fat32_mount(vdrive_id, partition_lba);
+            handle = fat_rc;
+            if (handle >= 0) {
+                mount.type = FS_TYPE_FAT32;
+                mount.handle = handle;
+                mount.valid = 1;
+            } else {
+                /* fall through to ISO/external probing below */
+            }
+            /*
+             * FAT32 returning -3 (invalid boot signature) is expected for non-FAT partitions
+             * (e.g. ext2). Do NOT treat it as a hard failure here; continue probing other
+             * filesystem types.
+             */
+            /* Only probe ISO9660 on optical drives unless explicitly requested. */
+            vdrive_t *vd = vdrive_get(vdrive_id);
+            int is_optical = 0;
+            if (vd) {
+                is_optical = (vd->type == VDRIVE_TYPE_ATA_ATAPI || vd->type == VDRIVE_TYPE_SATA_OPTICAL);
+            }
+
+            if (is_optical) {
+                iso_rc = iso9660_mount(vdrive_id, partition_lba);
+                handle = iso_rc;
+            } else {
+                iso_rc = -9999;
+                handle = -1;
+            }
+
             if (handle >= 0) {
                 mount.type = FS_TYPE_ISO9660;
                 mount.handle = handle;
@@ -456,6 +520,17 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
                     mount.valid = 1;
                 }
                 break;
+
+            case FS_TYPE_MDFS: {
+                int mrc = mdfs_mount(vdrive_id, partition_lba);
+                handle = mrc;
+                if (handle >= 0) {
+                    mount.type = FS_TYPE_MDFS;
+                    mount.handle = handle;
+                    mount.valid = 1;
+                }
+                break;
+            }
 
             default:
                 return -4;
@@ -504,7 +579,7 @@ int fs_mount_drive(int vdrive_id, uint32_t partition_lba, fs_type_t type) {
         com_write_string(COM1_PORT, slot_str);
     }
     com_write_string(COM1_PORT, "\n");
-    
+
     return slot;
 }
 
@@ -607,8 +682,11 @@ int fs_get_mount_label(int slot, char *out, size_t out_size) {
 void fs_list_mounts(void) {
     fs_init();
 
-    VGA_Write("Slot  Label         Type      vDrive  LBA\n");
-    VGA_Write("----  ------------  --------  ------  ----------\n");
+    VGA_Write("Slot  Label         Type      vDrive  LBA         Access Path (DevFS Namespace)\n");
+    VGA_Write("----  ------------  --------  ------  ----------  -----------------------------\n");
+
+    // NOTE to users:
+    // Mounted filesystems are exposed via DevFS under $/mnt/<Label>/
 
     for (int i = 0; i < MAX_MOUNTS; i++) {
         if (mount_table[i].in_use) {
@@ -621,6 +699,7 @@ void fs_list_mounts(void) {
 
             /* Label */
             char label[32];
+            VGA_Write("  ");
             if (fs_get_mount_label(i, label, sizeof(label)) != 0) {
                 strcpy(label, "<unknown>");
             }
@@ -640,9 +719,16 @@ void fs_list_mounts(void) {
             /* LBA */
             itoa(mount_table[i].partition_lba, num, 10);
             VGA_Write(num);
-            VGA_Write("\n");
+            for (int p = strlen(num); p < 12; p++) VGA_Write(" ");
+
+            /* Access Path */
+            VGA_Write("$/mnt/");
+            VGA_Write(label);
+            VGA_Write("/\n");
         }
     }
+
+    VGA_Write("\nTip: use 'cd $/mnt/<Label>/' (example: cd $/mnt/vDrive1-P1/)\n");
 }
 
 /* Get total mount count */
@@ -680,6 +766,10 @@ int fs_read_file(fs_mount_t* mount, const char* path, void* buffer,
                 result = iso9660_read_file_by_path(mount->handle, path, buffer, buffer_size, &size);
                 break;
 
+            case FS_TYPE_MDFS:
+                result = mdfs_read_file_by_path(mount->handle, path, buffer, buffer_size, &size);
+                break;
+
             default:
                 return -3;
         }
@@ -694,11 +784,20 @@ int fs_write_file(fs_mount_t* mount, const char* path, const void* buffer, size_
         return -1;
     }
 
+    if (mount->type == FS_TYPE_EXTERNAL) {
+        if (mount->ext_ops && mount->ext_ops->write_file) {
+            return mount->ext_ops->write_file(mount, path, buffer, size);
+        }
+        return -4; // external fs is read-only / write not implemented
+    }
+
     switch (mount->type) {
         case FS_TYPE_FAT32:
             return fat32_write_file_by_path(mount->handle, path, buffer, size);
         case FS_TYPE_ISO9660:
             return -2; // read-only
+        case FS_TYPE_MDFS:
+            return mdfs_write_file_by_path(mount->handle, path, buffer, size);
         default:
             return -3;
     }
@@ -774,6 +873,24 @@ int fs_stat(fs_mount_t* mount, const char* path, fs_file_info_t* info) {
             info->cluster = entry.extent_lba;
             return 0;
         }
+
+        case FS_TYPE_MDFS: {
+            uint32_t sz = 0;
+            int is_dir = 0;
+            int rc = mdfs_stat_by_path(mount->handle, path, &sz, &is_dir);
+            if (rc != 0) return -2;
+
+            const char *bn = path;
+            const char *p = path;
+            while (*p) { if (*p == '/') bn = p + 1; p++; }
+            if (!*bn) bn = "/";
+            strncpy(info->name, bn, sizeof(info->name) - 1);
+            info->name[sizeof(info->name) - 1] = 0;
+            info->size = sz;
+            info->is_directory = is_dir;
+            info->cluster = 0;
+            return 0;
+        }
             
         default:
             return -4;
@@ -828,8 +945,80 @@ int fs_directory_exists(fs_mount_t* mount, const char* path) {
         case FS_TYPE_ISO9660:
             return iso9660_directory_exists(mount->handle, path);
 
+        case FS_TYPE_MDFS: {
+            uint32_t sz = 0;
+            int is_dir = 0;
+            return (mdfs_stat_by_path(mount->handle, path ? path : "/", &sz, &is_dir) == 0) && is_dir;
+        }
+
         default:
             return 0;
+    }
+}
+
+int fs_mkdir(fs_mount_t* mount, const char* path) {
+    if (!mount || !mount->valid || !path) return -1;
+
+    if (mount->type == FS_TYPE_EXTERNAL) {
+        if (mount->ext_ops && mount->ext_ops->mkdir) {
+            return mount->ext_ops->mkdir(mount, path);
+        }
+        return -4;
+    }
+
+    switch (mount->type) {
+        case FS_TYPE_FAT32:
+            return fat32_mkdir_by_path(mount->handle, path);
+        case FS_TYPE_MDFS:
+            return mdfs_mkdir_by_path(mount->handle, path);
+        case FS_TYPE_ISO9660:
+            return -2; // read-only
+        default:
+            return -3;
+    }
+}
+
+int fs_rmdir(fs_mount_t* mount, const char* path) {
+    if (!mount || !mount->valid || !path) return -1;
+
+    if (mount->type == FS_TYPE_EXTERNAL) {
+        if (mount->ext_ops && mount->ext_ops->rmdir) {
+            return mount->ext_ops->rmdir(mount, path);
+        }
+        return -4;
+    }
+
+    switch (mount->type) {
+        case FS_TYPE_FAT32:
+            return fat32_rmdir_by_path(mount->handle, path);
+        case FS_TYPE_MDFS:
+            return mdfs_rmdir_by_path(mount->handle, path);
+        case FS_TYPE_ISO9660:
+            return -2;
+        default:
+            return -3;
+    }
+}
+
+int fs_unlink(fs_mount_t* mount, const char* path) {
+    if (!mount || !mount->valid || !path) return -1;
+
+    if (mount->type == FS_TYPE_EXTERNAL) {
+        if (mount->ext_ops && mount->ext_ops->unlink) {
+            return mount->ext_ops->unlink(mount, path);
+        }
+        return -4;
+    }
+
+    switch (mount->type) {
+        case FS_TYPE_FAT32:
+            return fat32_unlink_by_path(mount->handle, path);
+        case FS_TYPE_MDFS:
+            return mdfs_unlink_by_path(mount->handle, path);
+        case FS_TYPE_ISO9660:
+            return -2;
+        default:
+            return -3;
     }
 }
 
@@ -840,6 +1029,7 @@ const char* fs_type_name(fs_type_t type) {
         case FS_TYPE_FAT32:   return "FAT32";
         case FS_TYPE_ISO9660: return "ISO9660";
         case FS_TYPE_EXTERNAL:return "External";
+        case FS_TYPE_MDFS:    return "MDFS";
         case FS_TYPE_UNKNOWN: return "Unknown";
         default:              return "Invalid";
     }
@@ -1001,6 +1191,22 @@ fs_dir_t* fs_opendir(fs_mount_t* mount, const char* path) {
 
 
 
+        case FS_TYPE_MDFS: {
+            typedef struct { mdfs_dirent_t *entries; int total; int pos; } mdfs_dir_data_t;
+            mdfs_dir_data_t *data = (mdfs_dir_data_t*)kmalloc(sizeof(mdfs_dir_data_t));
+            if (!data) { kfree(dir); return NULL; }
+            memset(data, 0, sizeof(*data));
+            // v2 entry-set dirs: allocate a fixed number of decoded entries for readdir.
+            const int max_entries = 256;
+            data->entries = (mdfs_dirent_t*)kmalloc(sizeof(mdfs_dirent_t) * (size_t)max_entries);
+            if (!data->entries) { kfree(data); kfree(dir); return NULL; }
+            data->total = mdfs_read_dir(mount->handle, path ? path : "/", data->entries, max_entries);
+            if (data->total < 0) { kfree(data->entries); kfree(data); kfree(dir); return NULL; }
+            data->pos = 0;
+            dir->fs_specific = data;
+            break;
+        }
+
         default:
 
             kfree(dir);
@@ -1091,7 +1297,19 @@ int fs_readdir(fs_dir_t* dir, fs_dirent_t* entry) {
 
         }
 
-
+        case FS_TYPE_MDFS: {
+            typedef struct { mdfs_dirent_t *entries; int total; int pos; } mdfs_dir_data_t;
+            mdfs_dir_data_t *data = (mdfs_dir_data_t*)dir->fs_specific;
+            if (data->pos >= data->total) return 0;
+            mdfs_dirent_t *src = &data->entries[data->pos++];
+            strncpy(entry->name, src->name, sizeof(entry->name) - 1);
+            entry->name[sizeof(entry->name) - 1] = 0;
+            entry->size = 0;
+            entry->is_directory = (src->type == 2);
+            entry->reserved = 0;
+            dir->position++;
+            return 1;
+        }
 
         default:
 
@@ -1140,6 +1358,16 @@ void fs_closedir(fs_dir_t* dir) {
 
                 break;
 
+            }
+
+            case FS_TYPE_MDFS: {
+                typedef struct { mdfs_dirent_t *entries; int total; int pos; } mdfs_dir_data_t;
+                mdfs_dir_data_t *data = (mdfs_dir_data_t*)dir->fs_specific;
+                if (data) {
+                    if (data->entries) kfree(data->entries);
+                    kfree(data);
+                }
+                break;
             }
 
             default:

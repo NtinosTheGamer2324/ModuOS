@@ -117,6 +117,7 @@ static const char* get_partition_type_string(uint8_t type) {
         case 0x82: return "Linux swap";
         case 0x83: return "Linux";
         case 0x85: return "Linux ext";
+        case 0xE1: return "ModularFS";
         case 0x8E: return "Linux LVM";
         case 0xA5: return "FreeBSD";
         case 0xA6: return "OpenBSD";

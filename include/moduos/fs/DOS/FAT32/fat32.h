@@ -46,6 +46,11 @@ int fat32_read_file_by_path(int handle, const char* path, void* out_buf, size_t 
 
 /* Write/overwrite a file by path (existing file only). */
 int fat32_write_file_by_path(int handle, const char* path, const void* data, size_t size);
+
+// Create a directory (LFN supported)
+int fat32_mkdir_by_path(int handle, const char* path);
+int fat32_rmdir_by_path(int handle, const char* path);
+int fat32_unlink_by_path(int handle, const char* path);
 int fat32_read_cluster(int handle, uint32_t cluster, void* buffer);
 int fat32_next_cluster(int handle, uint32_t cluster, uint32_t* out_next);
 
