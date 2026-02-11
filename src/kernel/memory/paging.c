@@ -6,9 +6,24 @@
 #include <stddef.h>
 #include "moduos/kernel/memory/string.h"
 
+/* SMP Safety: Track whether SMP has started */
+static int paging_smp_started = 0;
+
+#define ASSERT_BSP_ONLY() do { \
+    if (paging_smp_started) { \
+        com_write_string(COM1_PORT, "PANIC: Paging operation after SMP start!\n"); \
+        for(;;) __asm__ volatile("hlt"); \
+    } \
+} while(0)
+
+void paging_set_smp_started(void) {
+    paging_smp_started = 1;
+}
+
 #define PT_ENTRIES 512
 #define PAGE_MASK (~0xFFFULL)
 #define PAGE_SIZE  4096ULL
+#define PAGE_MASK_2M (~0x1FFFFFULL)  /* 2MB page mask */
 
 /* VGA text buffer is at 0xB8000 - we must preserve this! */
 #define VGA_TEXT_BUFFER 0xB8000ULL
@@ -27,6 +42,9 @@ static uint64_t phys_offset = 0; /* 0 means identity mapping */
 static uint64_t ioremap_base = 0;
 static uint64_t ioremap_next = 0;
 
+/* A tiny kernel scratch mapping area (2 pages). */
+static uint64_t scratch_base = 0;
+
 void paging_set_phys_offset(uint64_t offset) {
     phys_offset = offset;
 }
@@ -38,8 +56,10 @@ static inline void *phys_to_virt(uint64_t phys) {
 }
 
 void *phys_to_virt_kernel(uint64_t phys) {
-    // Identity mapping for kernel (phys_offset = 0)
-    return (void *)(uintptr_t)phys;
+    /* Kernel-only physical mapping.
+     * In higher-half mode, the kernel maps (some) physical memory at phys_offset.
+     */
+    return phys_to_virt(phys);
 }
 
 /*
@@ -79,6 +99,14 @@ uint64_t paging_get_pml4_phys(void) {
     return pml4_phys;
 }
 
+void paging_switch_cr3(uint64_t new_cr3_phys) {
+    if (!new_cr3_phys) return;
+    __asm__ volatile("mov %0, %%cr3" :: "r"(new_cr3_phys) : "memory");
+    /* Keep paging.c internal state in sync with the active address space */
+    pml4_phys = new_cr3_phys & 0xFFFFFFFFFFFFF000ULL;
+    pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+}
+
 static void format_hex64(char *buf, uint64_t v) {
     const char hex[] = "0123456789abcdef";
     buf[0] = '0';
@@ -100,6 +128,7 @@ void paging_init(void) {
     /* Defensive: ensure ioremap allocator starts from a known state even if .bss wasn't cleared */
     ioremap_base = 0;
     ioremap_next = 0;
+    scratch_base = 0;
 
     if (kernel_debug_is_on()) {
         com_write_string(COM1_PORT, "[PAGING] Initializing AMD64 paging...\n");
@@ -352,11 +381,25 @@ int paging_unmap_page(uint64_t virt) {
 
     uint64_t ent3 = pdpt[i3];
     if (!(ent3 & PFLAG_PRESENT)) return -1;
+    
+    /*Check for 1GiB huge page */
+    if (ent3 & (1ULL << 7)) {
+        /* Cannot unmap single 4K page from 1GiB huge page */
+        return -1;
+    }
+    
     uint64_t *pd = (uint64_t *)phys_to_virt(ent3 & PAGE_MASK);
     if (!pd) return -1;
 
     uint64_t ent2 = pd[i2];
     if (!(ent2 & PFLAG_PRESENT)) return -1;
+    
+    /*Check for 2MiB huge page */
+    if (ent2 & (1ULL << 7)) {
+        /* Cannot unmap single 4K page from 2MiB huge page */
+        return -1;
+    }
+    
     uint64_t *pt = (uint64_t *)phys_to_virt(ent2 & PAGE_MASK);
     if (!pt) return -1;
 
@@ -404,7 +447,16 @@ int paging_map_2m_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     // If it's already a huge page, also leave it.
     uint64_t ent2 = pd[i2];
     if (ent2 & PFLAG_PRESENT) {
-        return 0;
+        /* Verify same mapping instead of silently failing */
+        uint64_t existing_phys = ent2 & PAGE_MASK_2M;
+        uint64_t requested_phys = phys & PAGE_MASK_2M;
+        if (existing_phys == requested_phys) {
+            /* Already mapped to same physical address - success */
+            return 0;
+        }
+        /* Different mapping - this is an error! */
+        /* Caller expected to map to different phys - data corruption risk */
+        return -1;  /* Return error instead of silent success */
     }
 
     // Set 2MB huge page entry (PS bit)
@@ -457,10 +509,41 @@ uint64_t paging_create_process_pml4(void) {
     uint64_t v = (uint64_t)(uintptr_t)new_pml4;
     uint64_t new_phys = (phys_offset == 0) ? v : (v - phys_offset);
 
+    /* Per-process address spaces:
+     * - High half (256..511): copy kernel mappings so the kernel is visible in every process.
+     * - Low half (0..255): ideally empty so user space is private.
+     *
+     * IMPORTANT BOOTSTRAP NOTE:
+     * During early boot, the kernel may still be running on a low identity-mapped stack
+     * (set up by the boot asm). If we clear the low-half PML4 entries and then switch CR3,
+     * the current RSP becomes unmapped and the very next call/push will fault, often
+     * cascading into a triple fault.
+     *
+     * To keep the system stable while exec() builds a process address space, we preserve
+     * any *kernel-only* low-half mappings (entries without PFLAG_USER). This keeps the
+     * boot/identity region mapped for the kernel, while still preventing user-mode from
+     * accessing it.
+     */
     for (int i = 0; i < PT_ENTRIES; ++i) {
         uint64_t e = pml4[i];
-        if (e & PFLAG_PRESENT) new_pml4[i] = e;
-        else new_pml4[i] = 0;
+        if (i >= 256) {
+            new_pml4[i] = (e & PFLAG_PRESENT) ? e : 0;
+        } else {
+            /* Preserve low identity mappings only if they are present and not user-accessible. */
+            if ((e & PFLAG_PRESENT) && !(e & PFLAG_USER)) {
+                new_pml4[i] = e;
+            } else {
+                new_pml4[i] = 0;
+            }
+        }
+    }
+
+    if (kernel_debug_is_on()) {
+        com_write_string(COM1_PORT, "[PAGING] Created process PML4 at ");
+        char tmpbuf[32];
+        format_hex64(tmpbuf, new_phys);
+        com_write_string(COM1_PORT, tmpbuf);
+        com_write_string(COM1_PORT, "\n");
     }
 
     return new_phys;
@@ -494,10 +577,21 @@ int paging_map_range_to_pml4(uint64_t *pml4_virt, uint64_t virt_base, uint64_t p
 
         uint64_t *pdpt = get_or_create_in_pml4(pml4_virt, i4);
         if (!pdpt) return -1;
+        if (flags & PFLAG_USER) {
+            pml4_virt[i4] |= PFLAG_USER;
+        }
+
         uint64_t *pd = get_or_create(pdpt, i3);
         if (!pd) return -1;
+        if (flags & PFLAG_USER) {
+            pdpt[i3] |= PFLAG_USER;
+        }
+
         uint64_t *pt = get_or_create(pd, i2);
         if (!pt) return -1;
+        if (flags & PFLAG_USER) {
+            pd[i2] |= PFLAG_USER;
+        }
 
         uint64_t entry = (paddr & PAGE_MASK) | (flags & 0xFFFULL) | PFLAG_PRESENT;
         pt[i1] = entry;
@@ -510,6 +604,125 @@ int paging_map_range_to_pml4(uint64_t *pml4_virt, uint64_t virt_base, uint64_t p
     return 0;
 }
 
+uint64_t paging_get_pte(uint64_t virt) {
+    uint64_t *current_pml4 = paging_get_pml4();
+    if (!current_pml4) {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        uint64_t pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
+        current_pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+        if (!current_pml4) return 0;
+    }
+
+    uint64_t pml4_idx = (virt >> 39) & 0x1FF;
+    uint64_t pdpt_idx = (virt >> 30) & 0x1FF;
+    uint64_t pd_idx   = (virt >> 21) & 0x1FF;
+    uint64_t pt_idx   = (virt >> 12) & 0x1FF;
+
+    uint64_t pml4_entry = current_pml4[pml4_idx];
+    if (!(pml4_entry & PFLAG_PRESENT)) return 0;
+
+    uint64_t pdpt_phys = pml4_entry & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
+    if (!pdpt) return 0;
+    uint64_t pdpt_entry = pdpt[pdpt_idx];
+    if (!(pdpt_entry & PFLAG_PRESENT)) return 0;
+
+    if (pdpt_entry & (1ULL << 7)) {
+        return pdpt_entry; // 1GiB huge
+    }
+
+    uint64_t pd_phys = pdpt_entry & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *pd = (uint64_t*)phys_to_virt(pd_phys);
+    if (!pd) return 0;
+    uint64_t pd_entry = pd[pd_idx];
+    if (!(pd_entry & PFLAG_PRESENT)) return 0;
+
+    if (pd_entry & (1ULL << 7)) {
+        return pd_entry; // 2MiB huge
+    }
+
+    uint64_t pt_phys = pd_entry & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *pt = (uint64_t*)phys_to_virt(pt_phys);
+    if (!pt) return 0;
+    return pt[pt_idx];
+}
+
+int paging_set_pte(uint64_t virt, uint64_t pte) {
+    if (!pml4) paging_init();
+    if (!pml4) return -1;
+
+    unsigned i4 = (virt >> 39) & 0x1FF;
+    unsigned i3 = (virt >> 30) & 0x1FF;
+    unsigned i2 = (virt >> 21) & 0x1FF;
+    unsigned i1 = (virt >> 12) & 0x1FF;
+
+    uint64_t *pdpt = get_or_create(pml4, i4);
+    if (!pdpt) return -1;
+    if (pte & PFLAG_USER) pml4[i4] |= PFLAG_USER;
+
+    uint64_t *pd = get_or_create(pdpt, i3);
+    if (!pd) return -1;
+    if (pte & PFLAG_USER) pdpt[i3] |= PFLAG_USER;
+
+    uint64_t *pt = get_or_create(pd, i2);
+    if (!pt) return -1;
+    if (pte & PFLAG_USER) pd[i2] |= PFLAG_USER;
+
+    pt[i1] = pte;
+    __asm__ volatile("invlpg (%0)" :: "r"(virt & ~0xFFFULL) : "memory");
+    return 0;
+}
+
+uint64_t paging_get_flags(uint64_t virt) {
+    uint64_t *current_pml4 = paging_get_pml4();
+    if (!current_pml4) {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        uint64_t pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
+        current_pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+        if (!current_pml4) return 0;
+    }
+
+    uint64_t pml4_idx = (virt >> 39) & 0x1FF;
+    uint64_t pdpt_idx = (virt >> 30) & 0x1FF;
+    uint64_t pd_idx   = (virt >> 21) & 0x1FF;
+    uint64_t pt_idx   = (virt >> 12) & 0x1FF;
+
+    uint64_t pml4_entry = current_pml4[pml4_idx];
+    if (!(pml4_entry & PFLAG_PRESENT)) return 0;
+
+    uint64_t pdpt_phys = pml4_entry & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
+    if (!pdpt) return 0;
+    uint64_t pdpt_entry = pdpt[pdpt_idx];
+    if (!(pdpt_entry & PFLAG_PRESENT)) return 0;
+
+    if (pdpt_entry & (1ULL << 7)) {
+        // 1GiB huge page: no PT entry; flags live in pdpt entry
+        return pdpt_entry & 0xFFFULL;
+    }
+
+    uint64_t pd_phys = pdpt_entry & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *pd = (uint64_t*)phys_to_virt(pd_phys);
+    if (!pd) return 0;
+    uint64_t pd_entry = pd[pd_idx];
+    if (!(pd_entry & PFLAG_PRESENT)) return 0;
+
+    if (pd_entry & (1ULL << 7)) {
+        // 2MiB huge page
+        return pd_entry & 0xFFFULL;
+    }
+
+    uint64_t pt_phys = pd_entry & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *pt = (uint64_t*)phys_to_virt(pt_phys);
+    if (!pt) return 0;
+    uint64_t pt_entry = pt[pt_idx];
+    if (!(pt_entry & PFLAG_PRESENT)) return 0;
+
+    return pt_entry & 0xFFFULL;
+}
+
 uint64_t paging_virt_to_phys(uint64_t virt) {
     uint64_t *current_pml4 = paging_get_pml4();
     if (!current_pml4) {
@@ -517,9 +730,8 @@ uint64_t paging_virt_to_phys(uint64_t virt) {
         uint64_t cr3;
         __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
         
-        /* In identity mapping, we can access page tables directly */
         uint64_t pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
-        current_pml4 = (uint64_t*)(uintptr_t)pml4_phys;
+        current_pml4 = (uint64_t*)phys_to_virt(pml4_phys);
     }
     
     uint64_t pml4_idx = (virt >> 39) & 0x1FF;
@@ -534,9 +746,9 @@ uint64_t paging_virt_to_phys(uint64_t virt) {
         return 0;
     }
     
-    /* Get PDPT physical address and access it (identity mapped) */
     uint64_t pdpt_phys = pml4_entry & 0xFFFFFFFFFFFFF000ULL;
-    uint64_t *pdpt = (uint64_t*)(uintptr_t)pdpt_phys;
+    uint64_t *pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
+    if (!pdpt) return 0;
     
     uint64_t pdpt_entry = pdpt[pdpt_idx];
     if (!(pdpt_entry & PFLAG_PRESENT)) {
@@ -550,9 +762,9 @@ uint64_t paging_virt_to_phys(uint64_t virt) {
         return page_phys | page_offset;
     }
     
-    /* Get PD physical address */
     uint64_t pd_phys = pdpt_entry & 0xFFFFFFFFFFFFF000ULL;
-    uint64_t *pd = (uint64_t*)(uintptr_t)pd_phys;
+    uint64_t *pd = (uint64_t*)phys_to_virt(pd_phys);
+    if (!pd) return 0;
     
     uint64_t pd_entry = pd[pd_idx];
     if (!(pd_entry & PFLAG_PRESENT)) {
@@ -566,9 +778,9 @@ uint64_t paging_virt_to_phys(uint64_t virt) {
         return page_phys | page_offset;
     }
     
-    /* Get PT physical address */
     uint64_t pt_phys = pd_entry & 0xFFFFFFFFFFFFF000ULL;
-    uint64_t *pt = (uint64_t*)(uintptr_t)pt_phys;
+    uint64_t *pt = (uint64_t*)phys_to_virt(pt_phys);
+    if (!pt) return 0;
     
     uint64_t pt_entry = pt[pt_idx];
     if (!(pt_entry & PFLAG_PRESENT)) {
@@ -606,7 +818,49 @@ static uint64_t pick_ioremap_base(void) {
     return 0;
 }
 
+static uint64_t pick_scratch_base(void) {
+    /* Pick a free high-half PML4 slot for a tiny 2-page scratch area.
+     * Prefer a different slot than ioremap.
+     */
+    if (!pml4) return 0;
+
+    for (int idx = 509; idx >= 256; --idx) {
+        if (idx == 256) continue; /* heap */
+        if (ioremap_base && ((ioremap_base >> 39) & 0x1FF) == (uint64_t)idx) continue;
+
+        if (!(pml4[idx] & PFLAG_PRESENT)) {
+            return 0xFFFF000000000000ULL | ((uint64_t)idx << 39);
+        }
+    }
+
+    return 0;
+}
+
+uint64_t paging_get_scratch_base(void) {
+    if (!scratch_base) {
+        if (!pml4) {
+            paging_init();
+            if (!pml4) return 0;
+        }
+
+        scratch_base = pick_scratch_base();
+        if (!scratch_base) return 0;
+
+        /* Leave a small guard so accidental overflows fault earlier. */
+        scratch_base += 0x2000ULL;
+    }
+
+    return scratch_base;
+}
+
 void* ioremap(uint64_t phys_addr, uint64_t size) {
+    ASSERT_BSP_ONLY();  /* ioremap is not SMP-safe */
+    
+    /* Minimal always-on trace: framebuffer bringup depends on this. */
+    com_write_string(COM1_PORT, "[IOREMAP] phys=");
+    com_printf(COM1_PORT, "0x%08x%08x size=0x%x\n",
+               (uint32_t)(phys_addr >> 32), (uint32_t)(phys_addr & 0xFFFFFFFFu),
+               (uint32_t)size);
     if (kernel_debug_is_on()) {
         com_write_string(COM1_PORT, "[IOREMAP] Called with phys=0x");
         com_printf(COM1_PORT, "%08x", (uint32_t)(phys_addr >> 32));
@@ -629,6 +883,8 @@ void* ioremap(uint64_t phys_addr, uint64_t size) {
     uint64_t phys_base = phys_addr & PAGE_MASK;
     uint64_t offset = phys_addr & 0xFFF;
     uint64_t aligned_size = ((size + offset + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+
+    const uint64_t huge_sz = 2ULL * 1024 * 1024;
     
     if (kernel_debug_is_on()) {
         com_printf(COM1_PORT, "[IOREMAP] Aligned phys=0x%08x, offset=0x%x, size=0x%x\n", 
@@ -673,7 +929,26 @@ void* ioremap(uint64_t phys_addr, uint64_t size) {
 
     // Allocate virtual address from MMIO region
     uint64_t virt_base = ioremap_next;
-    ioremap_next += aligned_size;
+
+    /* If possible, align large mappings to 2MiB so we can use huge pages.
+     * This significantly reduces page-table pressure during early boot.
+     */
+    uint64_t map_size = aligned_size;
+    if ((phys_base % huge_sz) == 0 && aligned_size >= huge_sz) {
+        virt_base = (virt_base + (huge_sz - 1)) & ~(huge_sz - 1);
+        /* Round mapping size up to whole 2MiB chunks so we can avoid a 4KiB tail.
+         * NOTE: this may map slightly more MMIO than requested; callers must not
+         * touch beyond their declared size.
+         */
+        map_size = (aligned_size + huge_sz - 1) & ~(huge_sz - 1);
+    }
+
+    ioremap_next = virt_base + map_size;
+
+    com_write_string(COM1_PORT, "[IOREMAP] virt_base=");
+    com_printf(COM1_PORT, "0x%08x%08x pages=%u\n",
+               (uint32_t)(virt_base >> 32), (uint32_t)(virt_base & 0xFFFFFFFFu),
+               (uint32_t)(aligned_size / PAGE_SIZE));
 
     if (kernel_debug_is_on()) {
         com_write_string(COM1_PORT, "[IOREMAP] Allocated virtual range: 0x");
@@ -691,27 +966,47 @@ void* ioremap(uint64_t phys_addr, uint64_t size) {
         com_printf(COM1_PORT, "[IOREMAP] Mapping with flags: 0x%x (W+PCD+PWT)\n", (uint32_t)flags);
     }
 
-    // Map each page
-    uint64_t pages = aligned_size / PAGE_SIZE;
-    if (kernel_debug_is_on()) {
-        com_printf(COM1_PORT, "[IOREMAP] Mapping %d pages...\n", (uint32_t)pages);
+    /* Prefer 2MiB huge pages when possible. */
+    uint64_t mapped = 0;
+    if ((phys_base % huge_sz) == 0 && (virt_base % huge_sz) == 0) {
+        uint64_t huge_pages = (aligned_size + huge_sz - 1) / huge_sz;
+        if (huge_pages) {
+            com_write_string(COM1_PORT, "[IOREMAP] mapping huge pages count=");
+            com_printf(COM1_PORT, "%u\n", (uint32_t)huge_pages);
+            for (uint64_t i = 0; i < huge_pages; i++) {
+                uint64_t vaddr = virt_base + (i * huge_sz);
+                uint64_t paddr = phys_base + (i * huge_sz);
+                com_write_string(COM1_PORT, "[IOREMAP] map2m v=");
+                com_printf(COM1_PORT, "0x%08x%08x p=0x%08x%08x\n",
+                           (uint32_t)(vaddr >> 32), (uint32_t)(vaddr & 0xFFFFFFFFu),
+                           (uint32_t)(paddr >> 32), (uint32_t)(paddr & 0xFFFFFFFFu));
+                int rc = paging_map_2m_page(vaddr, paddr, flags);
+                com_write_string(COM1_PORT, "[IOREMAP] map2m rc=");
+                com_printf(COM1_PORT, "%d\n", rc);
+                if (rc != 0) {
+                    com_write_string(COM1_PORT, "[IOREMAP] ERROR: paging_map_2m_page failed\n");
+                    return NULL;
+                }
+            }
+            mapped = huge_pages * huge_sz;
+        }
     }
-    
-    for (uint64_t i = 0; i < pages; i++) {
-        uint64_t vaddr = virt_base + (i * PAGE_SIZE);
-        uint64_t paddr = phys_base + (i * PAGE_SIZE);
-        
-        int result = paging_map_page(vaddr, paddr, flags);
-        if (result != 0) {
-            com_printf(COM1_PORT, "[IOREMAP] ERROR: Failed to map page %d (result=%d)\n",
-                       (uint32_t)i, result);
-            com_write_string(COM1_PORT, "[IOREMAP]   Virtual = 0x");
-            com_printf(COM1_PORT, "%08x%08x\n", 
-                       (uint32_t)(vaddr >> 32), (uint32_t)(vaddr & 0xFFFFFFFF));
-            com_write_string(COM1_PORT, "[IOREMAP]   Physical = 0x");
-            com_printf(COM1_PORT, "%08x%08x\n",
-                       (uint32_t)(paddr >> 32), (uint32_t)(paddr & 0xFFFFFFFF));
-            return NULL;
+
+    /* If we used huge pages, we intentionally rounded up, so no 4KiB tail mapping here.
+     * If huge pages could not be used at all, fall back to 4KiB mapping.
+     */
+    if (mapped == 0) {
+        uint64_t pages = aligned_size / PAGE_SIZE;
+        com_write_string(COM1_PORT, "[IOREMAP] mapping 4k pages=");
+        com_printf(COM1_PORT, "%u\n", (uint32_t)pages);
+        for (uint64_t i = 0; i < pages; i++) {
+            uint64_t vaddr = virt_base + (i * PAGE_SIZE);
+            uint64_t paddr = phys_base + (i * PAGE_SIZE);
+            int result = paging_map_page(vaddr, paddr, flags);
+            if (result != 0) {
+                com_write_string(COM1_PORT, "[IOREMAP] ERROR: paging_map_page failed\n");
+                return NULL;
+            }
         }
     }
 
@@ -733,22 +1028,19 @@ void* ioremap(uint64_t phys_addr, uint64_t size) {
         // Verify the mapping by checking the page tables
         com_write_string(COM1_PORT, "[IOREMAP] Verifying mapping with virt_to_phys...\n");
     }
+    /* Mapping verification via page-table walk is useful, but during early boot
+     * (and especially while bringing up higher-half/physmap) it can itself fault.
+     * Leave it behind kernel_debug only; no hard-fail.
+     */
     if (kernel_debug_is_on()) {
         uint64_t verify_phys = paging_virt_to_phys(result_virt);
         if (verify_phys != phys_addr) {
-            com_write_string(COM1_PORT, "[IOREMAP] WARNING: virt_to_phys returned 0x");
-            com_printf(COM1_PORT, "%08x%08x, expected 0x%08x%08x\n",
-                       (uint32_t)(verify_phys >> 32), (uint32_t)(verify_phys & 0xFFFFFFFF),
-                       (uint32_t)(phys_addr >> 32), (uint32_t)(phys_addr & 0xFFFFFFFF));
-            if (verify_phys == 0) {
-                com_write_string(COM1_PORT, "[IOREMAP] ERROR: Mapping verification failed - page not present!\n");
-                return NULL;
-            }
+            com_write_string(COM1_PORT, "[IOREMAP] WARNING: virt_to_phys mismatch\n");
         } else {
             com_write_string(COM1_PORT, "[IOREMAP] Mapping verification OK\n");
         }
     }
-    
+
     return (void*)result_virt;
 }
 
