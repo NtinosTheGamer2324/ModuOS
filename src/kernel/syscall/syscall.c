@@ -555,7 +555,7 @@ void sys_yield(void) {
     /* Request a reschedule after returning to userspace.
      * Avoid context switching on the syscall stack.
      */
-    process_yield();
+    scheduler_request_reschedule();
 }
 
 void* sys_sbrk(intptr_t increment) {
