@@ -12,11 +12,22 @@ framebuffer_mode_t VGA_GetFrameBufferMode(void);
 // Set framebuffer for GRAPHICS mode (VBE/future). No-op in TEXT mode.
 void VGA_SetFrameBuffer(const framebuffer_t *fb);
 
+// Reinitialize the framebuffer-backed text console (fb_console) against the current framebuffer.
+// Intended for use after a mode change (new addr/width/height/pitch). Preserves cursor and colors.
+void VGA_ReinitFrameBufferConsole(void);
+// Force a full repaint of the text console into the graphics framebuffer (restores prompt after gfx apps).
+void VGA_ForceRedrawConsole(void);
+
 // Get current framebuffer descriptor. Returns 0 on success, -1 if not in graphics mode.
 int VGA_GetFrameBuffer(framebuffer_t *out);
 
 // Clear framebuffer for GRAPHICS mode. No-op in TEXT mode.
 void VGA_ClearFrameBuffer(uint32_t color);
+
+// Optional flush hook for paravirtual GPUs (e.g., QXL) where fb memory is not
+// directly scanned out unless explicitly updated.
+void VGA_SetFlushHook(void (*flush)(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h));
+void VGA_FlushRect(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
 /* Basic VGA output functions */
 void VGA_WriteChar(char c);

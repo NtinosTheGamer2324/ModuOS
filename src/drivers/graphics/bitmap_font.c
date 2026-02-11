@@ -1,5 +1,7 @@
 #include "moduos/drivers/graphics/bitmap_font.h"
 
+
+//tbh i used chatgpt to generate the font. Cause i am too lazy to make a full font
 /* 8x16 font data.
  * For brevity, this includes a minimal readable subset for ASCII 0x20..0x7E.
  * Unimplemented glyphs map to '?'.

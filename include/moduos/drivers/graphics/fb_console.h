@@ -6,6 +6,7 @@
 #include "moduos/drivers/graphics/framebuffer.h"
 #include "moduos/drivers/graphics/bitmap_font.h"
 #include "moduos/drivers/graphics/bmp_font.h"
+#include "moduos/drivers/graphics/pf2.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +32,10 @@ typedef struct {
     bmp_font_t bmp_font;
     int bmp_font_ready;
 
+    /* Optional PF2 font (Unicode) - pointer owned by caller */
+    const pf2_font_t *pf2_font;
+    int pf2_font_ready;
+
     /* When using bmp_font: render size (dest) for each glyph, in pixels */
     uint16_t bmp_render_w;
     uint16_t bmp_render_h;
@@ -47,6 +52,12 @@ typedef struct {
     uint8_t utf8_pending_len;   /* expected total bytes in sequence (0 if not in a sequence) */
     uint8_t utf8_pending_used;  /* how many bytes collected so far */
     uint8_t utf8_pending[4];    /* collected bytes */
+
+    /* Flush batching / damage tracking (used to avoid per-glyph GPU flushes). */
+    bool batch_flush;
+    bool dirty_any;
+    uint32_t dirty_x0, dirty_y0;
+    uint32_t dirty_x1, dirty_y1; /* exclusive */
 } fb_console_t;
 
 /* Initialize console for a given framebuffer using built-in bitmap font. */
@@ -54,6 +65,9 @@ int fbcon_init(fb_console_t *c, const framebuffer_t *fb);
 
 /* Attach a BMP atlas font (ModuOSDEF.bmp). bmp_buf must remain valid for lifetime of console. */
 int fbcon_set_bmp_font_moduosdef(fb_console_t *c, const void *bmp_buf, size_t bmp_size);
+
+/* Attach a PF2 font (Unicode). font must remain valid for lifetime of console. */
+void fbcon_set_pf2_font(fb_console_t *c, const pf2_font_t *font);
 
 void fbcon_set_text_color(fb_console_t *c, uint8_t fg, uint8_t bg);
 

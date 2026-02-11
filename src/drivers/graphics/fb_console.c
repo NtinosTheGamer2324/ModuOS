@@ -3,6 +3,58 @@
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/memory/paging.h"
+#include "moduos/drivers/graphics/VGA.h"
+
+static inline void fbcon_dirty_add(fb_console_t *c, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!c || !c->ready) return;
+    if (w == 0 || h == 0) return;
+
+    if (x + w > c->fb.width)  w = (c->fb.width  > x) ? (c->fb.width - x) : 0;
+    if (y + h > c->fb.height) h = (c->fb.height > y) ? (c->fb.height - y) : 0;
+    if (w == 0 || h == 0) return;
+
+    uint32_t x0 = x;
+    uint32_t y0 = y;
+    uint32_t x1 = x + w;
+    uint32_t y1 = y + h;
+
+    if (!c->dirty_any) {
+        c->dirty_any = true;
+        c->dirty_x0 = x0; c->dirty_y0 = y0;
+        c->dirty_x1 = x1; c->dirty_y1 = y1;
+        return;
+    }
+
+    if (x0 < c->dirty_x0) c->dirty_x0 = x0;
+    if (y0 < c->dirty_y0) c->dirty_y0 = y0;
+    if (x1 > c->dirty_x1) c->dirty_x1 = x1;
+    if (y1 > c->dirty_y1) c->dirty_y1 = y1;
+}
+
+static inline void fbcon_flush_rect(fb_console_t *c, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!c || !c->ready) return;
+
+    if (c->batch_flush) {
+        fbcon_dirty_add(c, x, y, w, h);
+        return;
+    }
+
+    VGA_FlushRect(x, y, w, h);
+}
+
+static inline void fbcon_flush_commit(fb_console_t *c) {
+    if (!c || !c->ready) return;
+    if (!c->dirty_any) return;
+
+    uint32_t x0 = c->dirty_x0;
+    uint32_t y0 = c->dirty_y0;
+    uint32_t w  = (c->dirty_x1 > x0) ? (c->dirty_x1 - x0) : 0;
+    uint32_t h  = (c->dirty_y1 > y0) ? (c->dirty_y1 - y0) : 0;
+
+    c->dirty_any = false;
+
+    if (w && h) VGA_FlushRect(x0, y0, w, h);
+}
 
 /* Debug logging in fb console can stress stack/formatters; keep it off by default. */
 #ifndef FBCON_DEBUG
@@ -181,6 +233,9 @@ static void fb_scroll_up(fb_console_t *c) {
     if (c->y >= dy) c->y -= dy;
     else c->y = 0;
 
+    fbcon_flush_rect(c, 0, 0, c->fb.width, c->fb.height);
+    fbcon_flush_commit(c);
+
     /* Scrolling invalidates the drawn cursor position */
     c->cursor_drawn = false;
 }
@@ -230,6 +285,7 @@ static void fbcon_cursor_hide(fb_console_t *c) {
     /* Remove underline cursor by inverting it back */
     uint32_t uy = (c->y + c->cell_h >= 2) ? (c->y + c->cell_h - 2) : c->y;
     fb_invert_rect(&c->fb, c->x, uy, c->cell_w, 2);
+    fbcon_flush_rect(c, c->x, uy, c->cell_w, 2);
     c->cursor_drawn = false;
 }
 
@@ -241,6 +297,7 @@ static void fbcon_cursor_show(fb_console_t *c) {
     /* Draw underline cursor */
     uint32_t uy = (c->y + c->cell_h >= 2) ? (c->y + c->cell_h - 2) : c->y;
     fb_invert_rect(&c->fb, c->x, uy, c->cell_w, 2);
+    fbcon_flush_rect(c, c->x, uy, c->cell_w, 2);
     c->cursor_drawn = true;
 }
 
@@ -327,6 +384,16 @@ int fbcon_init(fb_console_t *c, const framebuffer_t *fb) {
     return 0;
 }
 
+void fbcon_set_pf2_font(fb_console_t *c, const pf2_font_t *font) {
+    if (!c) return;
+    c->pf2_font = font;
+    c->pf2_font_ready = (font != NULL);
+    if (c->pf2_font_ready && font) {
+        if (font->maxw) c->cell_w = font->maxw;
+        if (font->maxh) c->cell_h = font->maxh;
+    }
+}
+
 int fbcon_set_bmp_font_moduosdef(fb_console_t *c, const void *bmp_buf, size_t bmp_size) {
     if (!c || !bmp_buf || bmp_size < 64) return -1;
     int r = bmp_font_init_moduosdef(&c->bmp_font, bmp_buf, bmp_size);
@@ -369,6 +436,8 @@ void fbcon_clear(fb_console_t *c) {
     c->x = c->margin_left;
     c->y = c->margin_top;
     fbcon_cursor_show(c);
+    fbcon_flush_rect(c, 0, 0, c->fb.width, c->fb.height);
+    fbcon_flush_commit(c);
 }
 
 static void fbcon_newline(fb_console_t *c) {
@@ -382,6 +451,44 @@ static void fbcon_newline(fb_console_t *c) {
         else c->y = 0;
     }
     fbcon_cursor_show(c);
+}
+
+
+static int fbcon_draw_glyph_pf2(fb_console_t *c, uint32_t cp) {
+    if (!c || !c->ready || !c->pf2_font_ready || !c->pf2_font) return 0;
+    pf2_glyph_t g;
+    if (!pf2_get_glyph(c->pf2_font, cp, &g)) return 0;
+
+    // Clear cell background
+    uint8_t br,bg,bb;
+    vga16_to_rgb(c->bg, &br,&bg,&bb);
+    uint32_t bgpx = fb_pack_rgb888(&c->fb, br,bg,bb);
+    fb_fill_rect(&c->fb, c->x, c->y, c->cell_w, c->cell_h, bgpx);
+
+    // Foreground
+    uint8_t fr,fg,fb2;
+    vga16_to_rgb(c->fg, &fr,&fg,&fb2);
+    uint32_t fgpx = fb_pack_rgb888(&c->fb, fr,fg,fb2);
+
+    uint32_t row_bytes = (g.width + 7u) / 8u;
+    if (row_bytes == 0) return 0;
+
+    int32_t ox = (int32_t)c->x + g.xoff;
+    int32_t oy = (int32_t)c->y + g.yoff;
+    for (uint32_t yy = 0; yy < g.height; yy++) {
+        const uint8_t *row = g.bitmap + yy * row_bytes;
+        for (uint32_t xx = 0; xx < g.width; xx++) {
+            uint8_t b = row[xx >> 3];
+            if (b & (0x80u >> (xx & 7u))) {
+                int32_t px = ox + (int32_t)xx;
+                int32_t py = oy + (int32_t)yy;
+                if (px >= 0 && py >= 0 && (uint32_t)px < c->fb.width && (uint32_t)py < c->fb.height) {
+                    fb_put_pixel(&c->fb, (uint32_t)px, (uint32_t)py, fgpx);
+                }
+            }
+        }
+    }
+    return 1;
 }
 
 static void fbcon_draw_glyph(fb_console_t *c, uint8_t ch) {
@@ -459,6 +566,7 @@ static void fbcon_putc_raw(fb_console_t *c, char ch) {
     }
 
     fbcon_draw_glyph(c, (uint8_t)ch);
+    fbcon_flush_rect(c, c->x, c->y, c->cell_w, c->cell_h);
     c->x += c->cell_w;
     fbcon_cursor_show(c);
 }
@@ -523,6 +631,17 @@ static void fbcon_emit_codepoint(fb_console_t *c, uint32_t cp) {
     }
 #endif
 
+    // Prefer PF2 Unicode glyphs when available
+    if (c->pf2_font_ready && c->pf2_font) {
+        fbcon_cursor_hide(c);
+        if (fbcon_draw_glyph_pf2(c, cp)) {
+            fbcon_flush_rect(c, c->x, c->y, c->cell_w, c->cell_h);
+            c->x += c->cell_w;
+            fbcon_cursor_show(c);
+            return;
+        }
+        fbcon_cursor_show(c);
+    }
     const char *exp = fbcon_unicode_to_ascii_fallback(cp);
     if (exp) {
         while (*exp) fbcon_putc_raw(c, *exp++);
@@ -688,6 +807,10 @@ static uint8_t fbcon_unicode_to_cp437(uint32_t cp) {
 void fbcon_write(fb_console_t *c, const char *s) {
     if (!c || !s) return;
 
+    bool prev_batch = c->batch_flush;
+    c->batch_flush = true;
+    c->dirty_any = false;
+
     /* Ensure we don't mix buffered UTF-8 decoding with an in-progress bytewise sequence. */
     c->utf8_pending_len = 0;
     c->utf8_pending_used = 0;
@@ -706,10 +829,17 @@ void fbcon_write(fb_console_t *c, const char *s) {
         fbcon_emit_codepoint(c, cp);
         i += used;
     }
+
+    c->batch_flush = prev_batch;
+    fbcon_flush_commit(c);
 }
 
 void fbcon_write_n(fb_console_t *c, const char *s, size_t n) {
     if (!c || !s) return;
+
+    bool prev_batch = c->batch_flush;
+    c->batch_flush = true;
+    c->dirty_any = false;
 
     c->utf8_pending_len = 0;
     c->utf8_pending_used = 0;
@@ -727,6 +857,9 @@ void fbcon_write_n(fb_console_t *c, const char *s, size_t n) {
         fbcon_emit_codepoint(c, cp);
         i += used;
     }
+
+    c->batch_flush = prev_batch;
+    fbcon_flush_commit(c);
 }
 
 void fbcon_write_at(fb_console_t *c, uint32_t row, uint32_t col, const char *s) {
@@ -771,5 +904,7 @@ void fbcon_backspace(fb_console_t *c) {
     vga16_to_rgb(c->bg, &r,&g,&b);
     uint32_t px = fb_pack_rgb888(&c->fb, r,g,b);
     fb_fill_rect(&c->fb, c->x, c->y, c->cell_w, c->cell_h, px);
+    fbcon_flush_rect(c, c->x, c->y, c->cell_w, c->cell_h);
     fbcon_cursor_show(c);
+    fbcon_flush_commit(c);
 }

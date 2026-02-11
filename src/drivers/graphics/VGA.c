@@ -6,6 +6,7 @@
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/debug.h"
 #include "moduos/drivers/graphics/fb_console.h"
+#include "moduos/drivers/graphics/pf2.h"
 #include "moduos/kernel/bootscreen.h"
 #include <stdbool.h>
 #include <stdarg.h>
@@ -27,10 +28,19 @@ static fb_console_t g_fbcon;
 static bool g_fbcon_inited = false;
 static bool g_splash_lock = false;
 
+/* Optional flush hook for paravirtual GPUs (e.g., QXL). */
+static void (*g_flush_hook)(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h) = NULL;
+/* Prevent re-entrancy if the flush hook itself ends up triggering console output. */
+static bool g_in_flush = false;
+
 /* optional BMP font (owned buffer loaded from FS) */
 static void *g_fbcon_font_bmp_buf = NULL;
 static size_t g_fbcon_font_bmp_size = 0;
 static int g_fbcon_font_bmp_loaded = 0;
+
+/* optional PF2 unicode font */
+static pf2_font_t g_fbcon_pf2;
+static int g_fbcon_pf2_loaded = 0;
 
 // Scrollback buffer
 static uint16_t scrollback_buffer[SCROLLBACK_LINES * WIDTH];
@@ -102,6 +112,16 @@ static void vga_try_init_fb_console(void) {
             /* Optional BMP atlas font */
             if (!g_fbcon_font_bmp_loaded) {
                 const char *path = "/ModuOS/shared/fonts/ModuOSDEF.bmp";
+        // Try PF2 unicode font as well
+        if (!g_fbcon_pf2_loaded) {
+            const char *pf2p = "/ModuOS/shared/usr/assets/fonts/Unicode.pf2";
+            int pr = pf2_font_load_from_mount_slot(&g_fbcon_pf2, slot, pf2p);
+            if (pr == 0) {
+                g_fbcon_pf2_loaded = 1;
+                fbcon_set_pf2_font(&g_fbcon, &g_fbcon_pf2);
+                com_write_string(COM1_PORT, "[FBCON] Using PF2 font: /ModuOS/shared/usr/assets/fonts/Unicode.pf2\n");
+            }
+        }
                 int r = hvfs_read(slot, path, &g_fbcon_font_bmp_buf, &g_fbcon_font_bmp_size);
                 if (r == 0 && g_fbcon_font_bmp_buf && g_fbcon_font_bmp_size) {
                     int fr = fbcon_set_bmp_font_moduosdef(&g_fbcon, g_fbcon_font_bmp_buf, g_fbcon_font_bmp_size);
@@ -259,6 +279,62 @@ void VGA_ClearFrameBuffer(uint32_t color) {
             memset(p + (uint64_t)y * g_fb.pitch, 0, g_fb.pitch);
         }
     }
+}
+
+void VGA_SetFlushHook(void (*flush)(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h)) {
+    g_flush_hook = flush;
+}
+
+void VGA_FlushRect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (g_fb_mode != FB_MODE_GRAPHICS) return;
+    if (!g_fb.addr || g_fb.width == 0 || g_fb.height == 0) return;
+    if (w == 0 || h == 0) return;
+
+    /* Clamp to framebuffer bounds. */
+    if (x >= g_fb.width || y >= g_fb.height) return;
+    if (x + w > g_fb.width)  w = g_fb.width - x;
+    if (y + h > g_fb.height) h = g_fb.height - y;
+    if (w == 0 || h == 0) return;
+
+    if (g_flush_hook && !g_in_flush) {
+        g_in_flush = true;
+        g_flush_hook(&g_fb, x, y, w, h);
+        g_in_flush = false;
+    }
+}
+
+void VGA_ReinitFrameBufferConsole(void) {
+    if (g_fb_mode != FB_MODE_GRAPHICS) return;
+
+    /* Preserve current text colors and cursor position (in text cells). */
+    uint8_t fg = vga_fg_color;
+    uint8_t bg = vga_bg_color;
+    uint32_t row = 0, col = 0;
+    if (g_fbcon_inited) {
+        fbcon_get_cursor_pos(&g_fbcon, &row, &col);
+    }
+
+    /* Force re-init against the new framebuffer geometry/address. */
+    g_fbcon_inited = false;
+    vga_try_init_fb_console();
+
+    if (g_fbcon_inited) {
+        fbcon_set_text_color(&g_fbcon, fg, bg);
+        fbcon_set_cursor_pos(&g_fbcon, row, col);
+    }
+}
+
+void VGA_ForceRedrawConsole(void) {
+    if (g_fb_mode != FB_MODE_GRAPHICS) return;
+
+    vga_try_init_fb_console();
+    if (!g_fbcon_inited) return;
+
+    /* Best-effort: clear and redraw bootscreen overlay on top. */
+    fbcon_clear(&g_fbcon);
+    bootscreen_overlay_redraw();
+
+    VGA_FlushRect(0, 0, g_fb.width, g_fb.height);
 }
 
 /* Text color control (public API) */
