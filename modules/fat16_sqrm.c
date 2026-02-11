@@ -52,6 +52,12 @@ static uint32_t div_ceil_u32(uint32_t a, uint32_t b) {
     return (a + b - 1) / b;
 }
 
+static const sqrm_module_desc_t sqrm_module_desc = {
+    .abi_version = 1,
+    .type = SQRM_TYPE_FS,
+    .name = "fat16",
+};
+
 static const sqrm_kernel_api_t *g_api;
 
 // FAT BPB (FAT16)

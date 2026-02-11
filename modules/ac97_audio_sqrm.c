@@ -1,4 +1,5 @@
 #include "moduos/kernel/sqrm.h"
+#include "moduos/kernel/COM/com.h" // com_printf
 
 /*
  * AC97 audio driver (SQRM module) - minimal PCM out for QEMU -device AC97.
@@ -8,7 +9,8 @@
  * (port IO, DMA, com_write_string, audio_register_pcm).
  */
 
-static const uint16_t COM1_PORT = 0x3F8;
+// COM1_PORT is provided by moduos/kernel/COM/com.h
+
 
 const sqrm_module_desc_t sqrm_module_desc = {
     .abi_version = 1,

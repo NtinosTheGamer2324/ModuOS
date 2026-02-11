@@ -8,7 +8,7 @@
  *
  * Notes:
  * - A module must export:
- *     - `sqrm_module_desc` (sqrm_module_desc_t)
+ *     - `sqrm_module_desc` (sqrm_module_desc_t or sqrm_module_desc_v2_t)
  *     - `sqrm_module_init(const sqrm_kernel_api_t *api)`
  * - Build as ELF64 ET_DYN with entrypoint `sqrm_module_init`.
  */
@@ -22,8 +22,12 @@ extern "C" {
 
 /* ---- SQRM core ---- */
 
+#define SQRM_ABI_V1 1u
+#define SQRM_ABI_V2 2u
+
 #ifndef SQRM_ABI_VERSION
-#define SQRM_ABI_VERSION 1u
+// Default to v1 for maximum compatibility; modules can opt into v2.
+#define SQRM_ABI_VERSION SQRM_ABI_V1
 #endif
 
 #define SQRM_DESC_SYMBOL "sqrm_module_desc"
@@ -34,6 +38,10 @@ typedef enum {
     SQRM_TYPE_DRIVE   = 2,
     SQRM_TYPE_USB     = 3,
     SQRM_TYPE_AUDIO   = 4,
+    SQRM_TYPE_GPU     = 5,
+    SQRM_TYPE_NET     = 6,
+    SQRM_TYPE_HID     = 7,
+    SQRM_TYPE_GENERIC = 8,
 } sqrm_module_type_t;
 
 typedef struct {
@@ -42,12 +50,41 @@ typedef struct {
     const char *name;             /* short name (e.g., "ext2") */
 } sqrm_module_desc_t;
 
-/* Helper macro to define the required descriptor symbol */
+// ABI v2 descriptor (backward-compatible extension)
+// NOTE: This struct must start with the ABI v1 fields (abi_version/type/name).
+typedef struct {
+    // v1 prefix
+    uint32_t abi_version; // must be SQRM_ABI_V2
+    sqrm_module_type_t type;
+    const char *name;
+
+    // v2 additions
+    uint16_t class_id;
+    uint16_t subclass_id;
+    uint16_t dep_count;
+    uint16_t flags;
+    const char * const *deps; // array of dependency names
+} sqrm_module_desc_v2_t;
+
+/* Helper macro to define the required descriptor symbol (ABI v1) */
 #define SQRM_DEFINE_MODULE(_type, _name_literal) \
     const sqrm_module_desc_t sqrm_module_desc = { \
         .abi_version = SQRM_ABI_VERSION, \
         .type = (_type), \
         .name = (_name_literal), \
+    }
+
+/* Helper macro to define the required descriptor symbol (ABI v2) */
+#define SQRM_DEFINE_MODULE_V2(_type, _name_literal, _class_id, _subclass_id, _dep_count, _deps_ptr) \
+    const sqrm_module_desc_v2_t sqrm_module_desc = { \
+        .abi_version = SQRM_ABI_V2, \
+        .type = (_type), \
+        .name = (_name_literal), \
+        .class_id = (_class_id), \
+        .subclass_id = (_subclass_id), \
+        .dep_count = (_dep_count), \
+        .flags = 0, \
+        .deps = (_deps_ptr), \
     }
 
 /* ---- Minimal blockdev ABI (optional) ---- */
@@ -110,7 +147,7 @@ typedef struct fs_dirent {
     uint32_t reserved;
 } fs_dirent_t;
 
-/* External FS driver ops (v1: read-only) */
+/* External FS driver ops (v1.1: read-write) */
 typedef struct fs_ext_driver_ops {
     int (*probe)(int vdrive_id, uint32_t partition_lba);
     int (*mount)(int vdrive_id, uint32_t partition_lba, fs_mount_t *mount);
@@ -129,6 +166,96 @@ typedef struct fs_ext_driver_ops {
     int (*readdir)(fs_dir_t *dir, fs_dirent_t *entry);
     void (*closedir)(fs_dir_t *dir);
 } fs_ext_driver_ops_t;
+
+/* ---- Optional shared service ABIs (exported via sqrm_service_register/get) ---- */
+
+// Network service API (L2 NIC API). Return negative errno on failure.
+// Note: higher-level networking (DHCP/DNS/HTTP/etc) is not part of this NIC ABI.
+typedef struct {
+    int (*get_link_up)(void);
+    int (*get_mtu)(uint32_t *out);
+    int (*get_mac)(uint8_t out_mac[6]);
+    int (*tx_frame)(const void *frame, size_t len);
+    int (*rx_poll)(void *out_frame, size_t out_cap, size_t *out_len);
+    int (*rx_consume)(void);
+} sqrm_net_api_v1_t;
+
+// USB service API (minimal core). Intended to be implemented by a usb core module.
+typedef struct {
+    int (*get_controller_count)(void);
+    int (*get_device_count)(void);
+    int (*enumerate)(void); // request a (re)enumeration
+} sqrm_usb_api_v1_t;
+
+// HID service API (minimal). Intended to be implemented by a hid module.
+typedef struct {
+    int (*get_keyboard_present)(void);
+    int (*get_mouse_present)(void);
+} sqrm_hid_api_v1_t;
+
+// USB controller ABI (used by usb core to bind to controllers).
+// Service name convention: "usbctl_uhci" / "usbctl_ohci" / "usbctl_ehci"
+
+typedef enum {
+    SQRM_USB_SPEED_LOW  = 1,
+    SQRM_USB_SPEED_FULL = 2,
+    SQRM_USB_SPEED_HIGH = 3,
+} sqrm_usb_speed_t;
+
+typedef enum {
+    SQRM_USB_XFER_CONTROL   = 1,
+    SQRM_USB_XFER_BULK      = 2,
+    SQRM_USB_XFER_INTERRUPT = 3,
+} sqrm_usb_xfer_type_t;
+
+typedef struct {
+    uint8_t  bmRequestType;
+    uint8_t  bRequest;
+    uint16_t wValue;
+    uint16_t wIndex;
+    uint16_t wLength;
+} __attribute__((packed)) sqrm_usb_setup_packet_t;
+
+typedef struct {
+    // Target
+    uint8_t dev_addr;   // USB device address (0 for default)
+    uint8_t endpoint;   // endpoint number
+    uint8_t speed;      // sqrm_usb_speed_t
+    uint8_t xfer_type;  // sqrm_usb_xfer_type_t
+
+    // CONTROL only
+    sqrm_usb_setup_packet_t setup;
+
+    // Data stage
+    void   *data;
+    uint32_t length;
+    uint8_t direction_in; // 1=IN, 0=OUT
+
+    // Results
+    int32_t status;        // 0 or -errno
+    uint32_t actual_length;
+} sqrm_usb_transfer_v1_t;
+
+typedef uint32_t sqrm_usb_xfer_handle_t;
+#define SQRM_USB_XFER_INVALID_HANDLE 0u
+
+typedef struct {
+    uint8_t bus, device, function;
+    uint8_t irq_line;
+    uint16_t io_base;   // UHCI uses IO space
+} sqrm_uhci_controller_info_v1_t;
+
+typedef struct {
+    // discovery
+    int (*get_controller_count)(void);
+    int (*get_controller_info)(int index, sqrm_uhci_controller_info_v1_t *out);
+
+    // transfer submission
+    // submit copies/uses fields in xfer (implementation-defined); on success returns nonzero handle.
+    sqrm_usb_xfer_handle_t (*submit)(int controller_index, sqrm_usb_transfer_v1_t *xfer);
+    int (*wait)(sqrm_usb_xfer_handle_t handle, uint32_t timeout_ms);
+    int (*cancel)(sqrm_usb_xfer_handle_t handle);
+} sqrm_usbctl_uhci_api_v1_t;
 
 /* ---- Kernel API table passed to modules ---- */
 
@@ -171,6 +298,20 @@ typedef struct sqrm_kernel_api {
     void *(*kmalloc)(size_t sz);
     void (*kfree)(void *p);
 
+    /* MMIO mapping (GPU/NET modules) */
+    void* (*ioremap)(uint64_t phys_addr, uint64_t size);
+    void* (*ioremap_guarded)(uint64_t phys_addr, uint64_t size);
+
+    /* Address translation helper */
+    uint64_t (*virt_to_phys)(uint64_t virt);
+
+    /* PCI config space access */
+    uint32_t (*pci_cfg_read32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
+    void (*pci_cfg_write32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
+
+    /* Optional PCI helpers */
+    void* (*pci_find_device)(uint16_t vendor_id, uint16_t device_id);
+
     /* DMA (capability-gated; may be NULL) */
     int (*dma_alloc)(void *out_dma_buffer, size_t size, size_t align);
     void (*dma_free)(void *dma_buffer);
@@ -188,6 +329,12 @@ typedef struct sqrm_kernel_api {
     void (*irq_uninstall_handler)(int irq);
     void (*pic_send_eoi)(uint8_t irq);
 
+    /* Timing (capability-gated; may be NULL) */
+    uint64_t (*get_system_ticks)(void);
+    uint64_t (*ticks_to_ms)(uint64_t ticks);
+    uint64_t (*ms_to_ticks)(uint64_t ms);
+    void (*sleep_ms)(uint64_t ms);
+
     /* VFS (capability-gated; may be NULL) */
     int (*fs_register_driver)(const char *name, const fs_ext_driver_ops_t *ops);
 
@@ -204,6 +351,10 @@ typedef struct sqrm_kernel_api {
 
     /* Audio (capability-gated; may be NULL) */
     int (*audio_register_pcm)(const char *dev_name, const audio_pcm_ops_t *ops, void *ctx);
+
+    /* SQRM services (exports) */
+    int (*sqrm_service_register)(const char *service_name, const void *api_ptr, size_t api_size);
+    const void* (*sqrm_service_get)(const char *service_name, size_t *out_size);
 } sqrm_kernel_api_t;
 
 typedef int (*sqrm_module_init_fn)(const sqrm_kernel_api_t *api);

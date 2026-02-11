@@ -5,7 +5,7 @@
 
 static const sqrm_module_desc_t sqrm_module_desc = {
     .abi_version = 1,
-    .type = SQRM_TYPE_USB,
+    .type = SQRM_TYPE_GENERIC,
     .name = "hello",
 };
 
