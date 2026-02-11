@@ -549,8 +549,9 @@ int sys_sleep(unsigned int seconds) {
 }
 
 void sys_yield(void) {
-    /* Avoid scheduling inside syscall context (iret frame on stack). */
-    scheduler_request_reschedule();
+    /* Allow graphics apps to yield so input/events update. */
+    __asm__ volatile("sti" ::: "memory");
+    process_yield();
 }
 
 void* sys_sbrk(intptr_t increment) {
