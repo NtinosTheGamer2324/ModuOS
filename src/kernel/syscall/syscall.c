@@ -552,8 +552,9 @@ int sys_sleep(unsigned int seconds) {
 }
 
 void sys_yield(void) {
-    /* Allow graphics apps to yield so input/events update. */
-    __asm__ volatile("sti" ::: "memory");
+    /* Yield within syscall context without re-enabling IRQs.
+     * The syscall entry path already masks interrupts to protect the iret frame.
+     */
     process_yield();
 }
 
