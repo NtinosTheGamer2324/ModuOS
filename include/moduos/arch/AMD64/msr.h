@@ -21,6 +21,10 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define MSR_IA32_LSTAR  0xC0000082
 #define MSR_IA32_FMASK  0xC0000084
 
+/* GS base MSRs (used for per-CPU data + SWAPGS) */
+#define MSR_IA32_GS_BASE        0xC0000101
+#define MSR_IA32_KERNEL_GS_BASE 0xC0000102
+
 #define EFER_SCE        (1ULL << 0)
 
 #endif

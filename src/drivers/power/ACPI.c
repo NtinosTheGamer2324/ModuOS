@@ -4,6 +4,7 @@
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/memory/paging.h"  // Add this for ioremap()
+#include "moduos/kernel/acpi_boot.h"
 
 /* Global ACPI tables */
 static rsdp_descriptor_t* rsdp = NULL;
@@ -147,11 +148,28 @@ static void* find_acpi_table(const char* signature) {
 int acpi_init(void) {
     COM_LOG(COM1_PORT, "Initializing ACPI...");
 
-    /* Find RSDP (always in low memory) */
-    rsdp = find_rsdp();
+    /* Prefer bootloader-provided RSDP (Multiboot2 ACPI tags) */
+    uint64_t rsdp_phys = acpi_boot_get_rsdp_phys();
+    if (rsdp_phys) {
+        // RSDP lives in physical memory; use physmap if needed.
+        rsdp = (rsdp_descriptor_t*)phys_to_virt_kernel(rsdp_phys);
+    } else {
+        /* Legacy scan fallback */
+        rsdp = find_rsdp();
+    }
     if (!rsdp) {
         COM_LOG_ERROR(COM1_PORT, "RSDP not found");
         return -1;
+    }
+
+    // Validate checksum quickly; if boot-provided pointer is stale/corrupt, fall back to scan.
+    if (!acpi_checksum(rsdp, (rsdp->revision >= 2) ? rsdp->length : 20)) {
+        COM_LOG_WARN(COM1_PORT, "RSDP checksum invalid; falling back to legacy scan");
+        rsdp = find_rsdp();
+        if (!rsdp) {
+            COM_LOG_ERROR(COM1_PORT, "RSDP not found");
+            return -1;
+        }
     }
 
     COM_LOG_OK(COM1_PORT, "RSDP found");
