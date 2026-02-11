@@ -4,7 +4,10 @@
 #include "moduos/fs/ISOFS/iso9660.h"
 #include "moduos/fs/MDFS/mdfs.h"
 #include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/spinlock.h"
+#include "moduos/kernel/errno.h"
 #include "moduos/kernel/memory/string.h"
+#include "moduos/arch/AMD64/interrupts/timer.h"
 
 // External FS driver registry (third-party)
 #define FS_EXT_MAX_DRIVERS 16
@@ -60,6 +63,7 @@ int fs_ext_mkfs(const char *driver_name, int vdrive_id, uint32_t partition_lba, 
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/spinlock.h"
 
 /* Kernel mount table - like Linux's mount namespace */
 #define MAX_MOUNTS 26
@@ -220,6 +224,12 @@ typedef struct {
 
 static mount_entry_t mount_table[MAX_MOUNTS];
 static int mount_table_initialized = 0;
+static spinlock_t mount_table_lock;
+
+/* FS tracing (timing) */
+static int g_fs_trace = 0;
+void fs_set_trace(int enabled) { g_fs_trace = enabled ? 1 : 0; }
+int fs_get_trace(void) { return g_fs_trace; }
 
 /* Initialize mount table */
 void fs_init(void) {
@@ -237,6 +247,7 @@ void fs_init(void) {
     }
     
     mount_table_initialized = 1;
+    spinlock_init(&mount_table_lock);
     com_write_string(COM1_PORT, "[FS] Mount table initialized\n");
 }
 
@@ -749,7 +760,10 @@ int fs_read_file(fs_mount_t* mount, const char* path, void* buffer,
     if (!mount || !mount->valid || !path || !buffer) {
         return -1;
     }
-    
+
+    uint64_t t0 = 0;
+    if (g_fs_trace) t0 = get_system_ticks();
+
     int result = -1;
     size_t size = 0;
     
@@ -776,31 +790,79 @@ int fs_read_file(fs_mount_t* mount, const char* path, void* buffer,
     }
     
     if (bytes_read) *bytes_read = size;
+
+    if (g_fs_trace) {
+        uint64_t t1 = get_system_ticks();
+        uint64_t dt = t1 - t0;
+        uint32_t hz = get_pit_frequency();
+        uint64_t ms = ticks_to_ms(dt);
+        com_printf(COM1_PORT, "[FS-TRACE] read %s bytes=%u rc=%d dticks=%u hz=%u time=%ums\n",
+                   path,
+                   (unsigned)size,
+                   result,
+                   (unsigned)dt,
+                   (unsigned)hz,
+                   (unsigned)ms);
+    }
+
     return result;
 }
 
 int fs_write_file(fs_mount_t* mount, const char* path, const void* buffer, size_t size) {
+    return fs_write_file_at(mount, path, buffer, size, 0);
+}
+
+int fs_write_file_at(fs_mount_t* mount, const char* path, const void* buffer, size_t size, size_t offset) {
     if (!mount || !mount->valid || !path || (!buffer && size != 0)) {
         return -1;
     }
 
+    uint64_t t0 = 0;
+    if (g_fs_trace) t0 = get_system_ticks();
+
+    /* External FS drivers currently only expose whole-file overwrite (no offset writes). */
     if (mount->type == FS_TYPE_EXTERNAL) {
+        if (offset != 0) return -10;
         if (mount->ext_ops && mount->ext_ops->write_file) {
             return mount->ext_ops->write_file(mount, path, buffer, size);
         }
-        return -4; // external fs is read-only / write not implemented
+        return -4;
     }
 
+    int rc;
     switch (mount->type) {
         case FS_TYPE_FAT32:
-            return fat32_write_file_by_path(mount->handle, path, buffer, size);
+            /* FAT32 write path is whole-file overwrite only for now. */
+            if (offset != 0) rc = -10;
+            else rc = fat32_write_file_by_path(mount->handle, path, buffer, size);
+            break;
         case FS_TYPE_ISO9660:
-            return -2; // read-only
+            rc = -EROFS; // read-only
+            break;
         case FS_TYPE_MDFS:
-            return mdfs_write_file_by_path(mount->handle, path, buffer, size);
+            rc = mdfs_write_file_at_by_path(mount->handle, path, buffer, size, offset);
+            break;
         default:
-            return -3;
+            rc = -3;
+            break;
     }
+
+    if (g_fs_trace) {
+        uint64_t t1 = get_system_ticks();
+        uint64_t dt = t1 - t0;
+        uint32_t hz = get_pit_frequency();
+        uint64_t ms = ticks_to_ms(dt);
+        com_printf(COM1_PORT, "[FS-TRACE] write %s bytes=%u off=%u rc=%d dticks=%u hz=%u time=%ums\n",
+                   path,
+                   (unsigned)size,
+                   (unsigned)offset,
+                   rc,
+                   (unsigned)dt,
+                   (unsigned)hz,
+                   (unsigned)ms);
+    }
+
+    return rc;
 }
 
 int fs_stat(fs_mount_t* mount, const char* path, fs_file_info_t* info) {
@@ -972,7 +1034,7 @@ int fs_mkdir(fs_mount_t* mount, const char* path) {
         case FS_TYPE_MDFS:
             return mdfs_mkdir_by_path(mount->handle, path);
         case FS_TYPE_ISO9660:
-            return -2; // read-only
+            return -EROFS; // read-only
         default:
             return -3;
     }
@@ -994,7 +1056,7 @@ int fs_rmdir(fs_mount_t* mount, const char* path) {
         case FS_TYPE_MDFS:
             return mdfs_rmdir_by_path(mount->handle, path);
         case FS_TYPE_ISO9660:
-            return -2;
+            return -EROFS;
         default:
             return -3;
     }
@@ -1016,7 +1078,7 @@ int fs_unlink(fs_mount_t* mount, const char* path) {
         case FS_TYPE_MDFS:
             return mdfs_unlink_by_path(mount->handle, path);
         case FS_TYPE_ISO9660:
-            return -2;
+            return -EROFS;
         default:
             return -3;
     }

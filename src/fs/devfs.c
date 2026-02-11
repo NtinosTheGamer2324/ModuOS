@@ -2,12 +2,19 @@
 #include "moduos/kernel/md64api_grp.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
+#include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/process/process.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/drivers/graphics/framebuffer.h"
+#include "moduos/drivers/graphics/videoctl.h"
 #include "moduos/kernel/interrupts/irq_lock.h"
 #include "moduos/kernel/interrupts/hlt_wait.h"
+#include "moduos/kernel/spinlock.h"
+
+// Forward declarations
+static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count);
 
 #define DEVFS_MAX_DEVICES 32
 
@@ -29,6 +36,8 @@ typedef struct devfs_node {
     const devfs_device_ops_t *ops;
     void *ctx;
     devfs_owner_t owner;
+    int user_owned;
+    void *user_ctx;
 } devfs_node_t;
 
 // Legacy flat device table (kept for vDrives/other root devices until fd.c is migrated)
@@ -41,11 +50,14 @@ typedef struct {
 typedef struct {
     int flags;
     int is_tree;
+    const devfs_device_ops_t *ops;
+    void *opened_ctx;
     union {
         devfs_node_t *node;      // tree device
         devfs_device_t *legacy;  // legacy flat device
     } u;
 } devfs_handle_t;
+
 
 // -------------------- Input devices --------------------
 
@@ -73,12 +85,14 @@ static devfs_event_stream_t g_evt0;
 static devfs_device_t g_devices[DEVFS_MAX_DEVICES];
 static devfs_node_t *g_root = NULL;
 static int g_inited = 0;
+static spinlock_t devfs_lock;
 
 static devfs_node_t* devfs_new_node(devfs_node_type_t type, const char *name, devfs_node_t *parent) {
     devfs_node_t *n = (devfs_node_t*)kmalloc(sizeof(devfs_node_t));
     if (!n) return NULL;
     memset(n, 0, sizeof(*n));
     n->type = type;
+    n->user_owned = 0;
     n->parent = parent;
     if (name) {
         strncpy(n->name, name, sizeof(n->name) - 1);
@@ -101,6 +115,38 @@ static devfs_node_t* devfs_add_child(devfs_node_t *dir, devfs_node_t *child) {
     dir->children = child;
     child->parent = dir;
     return child;
+}
+
+static void devfs_free_owner(devfs_owner_t *owner) {
+    if (!owner) return;
+    if (owner->kind == DEVFS_OWNER_USER && owner->id) {
+        kfree((void*)owner->id);
+        owner->id = NULL;
+    }
+}
+
+static void devfs_free_user_ctx(devfs_node_t *node) {
+    if (!node) return;
+    if (node->owner.kind == DEVFS_OWNER_USER && node->ctx) {
+        kfree(node->ctx);
+        node->ctx = NULL;
+    }
+}
+
+static const char *devfs_normalize_path(const char *path) {
+    if (!path) return NULL;
+
+    // Normalize accepted prefixes: allow $/dev, /dev, or raw userland paths.
+    if (strncmp(path, "$/dev", 5) == 0) {
+        path += 5;
+        if (*path == '/') path++;
+    } else if (strncmp(path, "/dev", 4) == 0) {
+        path += 4;
+        if (*path == '/') path++;
+    }
+
+    while (*path == '/') path++;
+    return path;
 }
 
 static int devfs_is_reserved_for_sqrm(const char *path) {
@@ -171,12 +217,16 @@ int devfs_register_path(const char *path, const devfs_device_ops_t *ops, void *c
     if (!path || !path[0]) return -2;
     if (!ops || !ops->name || !ops->name[0] || !ops->read) return -3;
 
+    /* Normalize user paths: accept $/dev/... or /dev/... and strip prefix. */
+    const char *path_in = devfs_normalize_path(path);
+    if (!path_in || !path_in[0]) return -2;
+
     if (owner.kind == DEVFS_OWNER_SQRM) {
-        if (devfs_is_reserved_for_sqrm(path)) return -4;
+        if (devfs_is_reserved_for_sqrm(path_in)) return -4;
     }
 
     devfs_node_t *cur = g_root;
-    const char *p = path;
+    const char *p = path_in;
     char seg[64];
     char last[64];
     last[0] = 0;
@@ -223,8 +273,20 @@ int devfs_register_path(const char *path, const devfs_device_ops_t *ops, void *c
         devfs_replace_decision_t d = existing->ops->can_replace(existing->ctx, path, owner.id ? owner.id : "");
         if (d != DEVFS_REPLACE_ALLOW) return -11;
 
+        if (existing->owner.kind == DEVFS_OWNER_USER || owner.kind == DEVFS_OWNER_USER) {
+            const char *old_id = existing->owner.id ? existing->owner.id : "";
+            const char *new_id = owner.id ? owner.id : "";
+            if (strcmp(old_id, new_id) != 0) return -11;
+        }
+
         // replace in-place
+        devfs_free_user_ctx(existing);
+        devfs_free_owner(&existing->owner);
         existing->ops = ops;
+        existing->user_owned = (owner.kind == DEVFS_OWNER_USER);
+        if (existing->user_owned) {
+            existing->user_ctx = NULL;
+        }
         existing->ctx = ctx;
         existing->owner = owner;
         return 0;
@@ -233,6 +295,10 @@ int devfs_register_path(const char *path, const devfs_device_ops_t *ops, void *c
     devfs_node_t *ndev = devfs_new_node(DEVFS_NODE_DEV, last, cur);
     if (!ndev) return -12;
     ndev->ops = ops;
+    ndev->user_owned = (owner.kind == DEVFS_OWNER_USER);
+    if (ndev->user_owned) {
+        ndev->user_ctx = NULL;
+    }
     ndev->ctx = ctx;
     ndev->owner = owner;
     devfs_add_child(cur, ndev);
@@ -305,6 +371,8 @@ void* devfs_open(const char *name, int flags) {
     if (!h) return NULL;
     h->flags = flags;
     h->is_tree = 0;
+    h->ops = d->ops;
+    h->opened_ctx = (h->ops && h->ops->open) ? h->ops->open(d->ctx, flags) : d->ctx;
     h->u.legacy = d;
     return h;
 }
@@ -327,6 +395,8 @@ void* devfs_open_path(const char *path, int flags) {
     if (!h) return NULL;
     h->flags = flags;
     h->is_tree = 1;
+    h->ops = n->ops;
+    h->opened_ctx = (h->ops && h->ops->open) ? h->ops->open(n->ctx, flags) : n->ctx;
     h->u.node = n;
     return h;
 }
@@ -360,12 +430,12 @@ ssize_t devfs_read(void *handle, void *buf, size_t count) {
     if (h->is_tree) {
         devfs_node_t *n = h->u.node;
         if (!n || n->type != DEVFS_NODE_DEV || !n->ops || !n->ops->read) return -1;
-        return n->ops->read(n->ctx, buf, count);
+        return h->ops->read(h->opened_ctx, buf, count);
     }
 
     devfs_device_t *d = h->u.legacy;
     if (!d || !d->ops || !d->ops->read) return -1;
-    return d->ops->read(d->ctx, buf, count);
+    return h->ops->read(h->opened_ctx, buf, count);
 }
 
 ssize_t devfs_write(void *handle, const void *buf, size_t count) {
@@ -375,12 +445,12 @@ ssize_t devfs_write(void *handle, const void *buf, size_t count) {
     if (h->is_tree) {
         devfs_node_t *n = h->u.node;
         if (!n || n->type != DEVFS_NODE_DEV || !n->ops || !n->ops->write) return -1;
-        return n->ops->write(n->ctx, buf, count);
+        return h->ops->write(h->opened_ctx, buf, count);
     }
 
     devfs_device_t *d = h->u.legacy;
     if (!d || !d->ops || !d->ops->write) return -1;
-    return d->ops->write(d->ctx, buf, count);
+    return h->ops->write(h->opened_ctx, buf, count);
 }
 
 int devfs_close(void *handle) {
@@ -389,13 +459,13 @@ int devfs_close(void *handle) {
 
     if (h->is_tree) {
         devfs_node_t *n = h->u.node;
-        if (n && n->ops && n->ops->close) {
-            n->ops->close(n->ctx);
+        if (h->ops && h->ops->close) {
+            h->ops->close(h->opened_ctx);
         }
     } else {
         devfs_device_t *d = h->u.legacy;
-        if (d && d->ops && d->ops->close) {
-            d->ops->close(d->ctx);
+        if (h->ops && h->ops->close) {
+            h->ops->close(h->opened_ctx);
         }
     }
 
@@ -571,6 +641,74 @@ int devfs_input_init(void) {
 
 // -------------------- Graphics devices --------------------
 
+// VIDEO0 v2 per-open state (write->read responses + buffer handles)
+#define VIDEO0_MAX_BUFS 16
+
+typedef struct {
+    uint32_t handle;
+    uint32_t fmt;
+    uint32_t pitch;
+    uint32_t size_bytes;
+    uint64_t phys_base;
+    uint64_t user_addr; // 0 if not mapped yet
+    uint8_t in_use;
+} video0_buf_t;
+
+typedef struct {
+    uint8_t resp[512];
+    uint32_t resp_len;
+    uint32_t resp_off;
+
+    // dirty rect accumulated since last FLUSH
+    uint32_t dirty_x0, dirty_y0, dirty_x1, dirty_y1;
+    int dirty_valid;
+
+    video0_buf_t bufs[VIDEO0_MAX_BUFS];
+    uint32_t next_handle;
+} video0_open_ctx_t;
+
+static uint64_t g_video0_next_user_va = 0x0000005000000000ULL;
+
+static uint64_t video0_alloc_user_va(uint64_t size_bytes) {
+    uint64_t sz = (size_bytes + 0xFFFULL) & ~0xFFFULL;
+    uint64_t base = g_video0_next_user_va;
+    g_video0_next_user_va = base + sz + 0x1000ULL;
+    return base;
+}
+
+static video0_buf_t* video0_find_buf(video0_open_ctx_t *c, uint32_t handle) {
+    if (!c || handle == 0) return NULL;
+    for (uint32_t i = 0; i < VIDEO0_MAX_BUFS; i++) {
+        if (c->bufs[i].in_use && c->bufs[i].handle == handle) return &c->bufs[i];
+    }
+    return NULL;
+}
+
+static video0_buf_t* video0_alloc_buf_slot(video0_open_ctx_t *c) {
+    if (!c) return NULL;
+    for (uint32_t i = 0; i < VIDEO0_MAX_BUFS; i++) {
+        if (!c->bufs[i].in_use) return &c->bufs[i];
+    }
+    return NULL;
+}
+
+static void* dev_video0_open(void *ctx, int flags) {
+    (void)ctx; (void)flags;
+    video0_open_ctx_t *c = (video0_open_ctx_t*)kzalloc(sizeof(video0_open_ctx_t));
+    if (!c) return NULL;
+    c->next_handle = 1;
+    return c;
+}
+
+static int dev_video0_close(void *ctx) {
+    video0_open_ctx_t *c = (video0_open_ctx_t*)ctx;
+    if (!c) return 0;
+    // NOTE: buffer phys memory currently leaked (no contiguous free API).
+    kfree(c);
+    return 0;
+}
+
+
 typedef struct __attribute__((packed)) {
     uint64_t fb_addr;
     uint32_t width;
@@ -609,6 +747,15 @@ static uint64_t dev_video0_get_user_fb_addr(const framebuffer_t *fb) {
 
 static ssize_t dev_video0_read(void *ctx, void *buf, size_t count) {
     (void)ctx;
+    video0_open_ctx_t *c = (video0_open_ctx_t*)ctx;
+    if (c && c->resp_len > 0) {
+        uint32_t remain = c->resp_len - c->resp_off;
+        uint32_t n = (remain < count) ? remain : (uint32_t)count;
+        memcpy(buf, c->resp + c->resp_off, n);
+        c->resp_off += n;
+        if (c->resp_off >= c->resp_len) { c->resp_len = 0; c->resp_off = 0; }
+        return (ssize_t)n;
+    }
     if (!buf) return -1;
     if (count < sizeof(devfs_video_info_t)) return -2;
 
@@ -639,9 +786,10 @@ static ssize_t dev_video0_read(void *ctx, void *buf, size_t count) {
 
 static const devfs_device_ops_t g_dev_video0_ops = {
     .name = "video0",
+    .open = dev_video0_open,
     .read = dev_video0_read,
-    .write = NULL,
-    .close = NULL,
+    .write = dev_video0_write,
+    .close = dev_video0_close,
 };
 
 int devfs_graphics_init(void) {
@@ -702,11 +850,6 @@ void devfs_input_push_event(const Event *e) {
             return;
         }
 
-        /*
-         * Avoid double-newline: many keymaps already set ascii='\n' for Enter.
-         * If we also inject '\n' on KEY_ENTER, userland line reads will see an
-         * extra empty line ("skips password" symptom).
-         */
         if (e->data.keyboard.keycode == KEY_ENTER) {
             if (c == 0) c = '\n';
         }
@@ -720,3 +863,276 @@ void devfs_input_push_event(const Event *e) {
         }
     }
 }
+
+
+static inline void video0_dirty_union(video0_open_ctx_t *c, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!c || w == 0 || h == 0) return;
+    uint32_t x1 = x + w;
+    uint32_t y1 = y + h;
+    if (!c->dirty_valid) {
+        c->dirty_x0 = x; c->dirty_y0 = y; c->dirty_x1 = x1; c->dirty_y1 = y1;
+        c->dirty_valid = 1;
+        return;
+    }
+    if (x < c->dirty_x0) c->dirty_x0 = x;
+    if (y < c->dirty_y0) c->dirty_y0 = y;
+    if (x1 > c->dirty_x1) c->dirty_x1 = x1;
+    if (y1 > c->dirty_y1) c->dirty_y1 = y1;
+}
+
+static inline void video0_resp_set(video0_open_ctx_t *c, const void *data, uint32_t len) {
+    if (!c) return;
+    if (len > sizeof(c->resp)) len = (uint32_t)sizeof(c->resp);
+    memcpy(c->resp, data, len);
+    c->resp_len = len;
+    c->resp_off = 0;
+}
+
+static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
+    video0_open_ctx_t *c = (video0_open_ctx_t*)ctx;
+    if (!c || !buf || count < sizeof(videoctl2_hdr_t)) return -1;
+
+    const videoctl2_hdr_t *h = (const videoctl2_hdr_t*)buf;
+    if (h->magic != VIDEOCTL_MAGIC2) return -1;
+    if (h->abi_version != VIDEOCTL_ABI_VERSION) return -1;
+    if (h->size_bytes == 0 || h->size_bytes > count) return -1;
+
+    framebuffer_t fb;
+    memset(&fb, 0, sizeof(fb));
+    VGA_GetFrameBuffer(&fb);
+
+    switch (h->cmd) {
+        case VIDEOCTL_CMD2_GET_INFO: {
+            videoctl2_info_t resp;
+            memset(&resp, 0, sizeof(resp));
+            resp.hdr = *h;
+            resp.hdr.size_bytes = sizeof(resp);
+
+            if (fb.addr) {
+                resp.width = fb.width;
+                resp.height = fb.height;
+                resp.pitch = fb.pitch;
+                resp.bpp = fb.bpp;
+                if (fb.bpp == 32) resp.fmt = MD64API_GRP_FMT_XRGB8888;
+                else if (fb.bpp == 16) resp.fmt = MD64API_GRP_FMT_RGB565;
+                else resp.fmt = MD64API_GRP_FMT_UNKNOWN;
+            }
+
+            resp.caps = VIDEOCTL2_CAP_ENQUEUE_FILL_RECT |
+                        VIDEOCTL2_CAP_ENQUEUE_BLIT |
+                        VIDEOCTL2_CAP_ENQUEUE_BLIT_BUF |
+                        VIDEOCTL2_CAP_FLUSH |
+                        VIDEOCTL2_CAP_BUF_HANDLES |
+                        VIDEOCTL2_CAP_BUF_SG_PAGES;
+            strncpy(resp.driver, "kernel_sw", sizeof(resp.driver)-1);
+
+            video0_resp_set(c, &resp, sizeof(resp));
+            return (ssize_t)h->size_bytes;
+        }
+
+        case VIDEOCTL_CMD2_ALLOC_BUF: {
+            if (h->size_bytes < sizeof(videoctl2_alloc_buf_t)) return -1;
+            videoctl2_alloc_buf_t resp;
+            memcpy(&resp, buf, sizeof(resp));
+
+            if (resp.size_bytes == 0 || resp.size_bytes > (64u * 1024u * 1024u)) {
+                resp.handle = 0; resp.pitch = 0;
+                video0_resp_set(c, &resp, sizeof(resp));
+                return (ssize_t)h->size_bytes;
+            }
+
+            video0_buf_t *slot = video0_alloc_buf_slot(c);
+            if (!slot) {
+                resp.handle = 0; resp.pitch = 0;
+                video0_resp_set(c, &resp, sizeof(resp));
+                return (ssize_t)h->size_bytes;
+            }
+
+            uint64_t pages = (((uint64_t)resp.size_bytes + 0xFFFULL) >> 12);
+            uint64_t phys = phys_alloc_contiguous((size_t)pages);
+            if (!phys) {
+                resp.handle = 0; resp.pitch = 0;
+                video0_resp_set(c, &resp, sizeof(resp));
+                return (ssize_t)h->size_bytes;
+            }
+            void *kptr = phys_to_virt_kernel(phys);
+            if (kptr) memset(kptr, 0, pages * 0x1000ULL);
+
+            uint32_t handle = c->next_handle++;
+            slot->in_use = 1;
+            slot->handle = handle;
+            slot->fmt = resp.fmt;
+            slot->size_bytes = resp.size_bytes;
+            slot->phys_base = phys;
+            slot->user_addr = 0;
+
+            uint32_t pitch = 0;
+            if (fb.addr && resp.size_bytes == fb.pitch * fb.height) pitch = fb.pitch;
+            slot->pitch = pitch;
+
+            resp.handle = handle;
+            resp.pitch = pitch;
+            video0_resp_set(c, &resp, sizeof(resp));
+            return (ssize_t)h->size_bytes;
+        }
+
+        case VIDEOCTL_CMD2_MAP_BUF: {
+            if (h->size_bytes < sizeof(videoctl2_map_buf_t)) return -1;
+            videoctl2_map_buf_t resp;
+            memcpy(&resp, buf, sizeof(resp));
+
+            video0_buf_t *b = video0_find_buf(c, resp.handle);
+            if (!b) {
+                resp.user_addr = 0; resp.size_bytes = 0; resp.pitch = 0; resp.fmt = 0;
+                video0_resp_set(c, &resp, sizeof(resp));
+                return (ssize_t)h->size_bytes;
+            }
+
+            if (!b->user_addr) {
+                uint64_t ua = video0_alloc_user_va(b->size_bytes);
+                if (paging_map_range(ua, b->phys_base, b->size_bytes, PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
+                    resp.user_addr = 0; resp.size_bytes = 0; resp.pitch = 0; resp.fmt = 0;
+                    video0_resp_set(c, &resp, sizeof(resp));
+                    return (ssize_t)h->size_bytes;
+                }
+                b->user_addr = ua;
+            }
+
+            resp.user_addr = b->user_addr;
+            resp.size_bytes = b->size_bytes;
+            resp.pitch = b->pitch;
+            resp.fmt = b->fmt;
+            video0_resp_set(c, &resp, sizeof(resp));
+            return (ssize_t)h->size_bytes;
+        }
+
+        case VIDEOCTL_CMD2_ENQUEUE: {
+            if (h->size_bytes < sizeof(videoctl2_enqueue_t)) return -1;
+            const videoctl2_enqueue_t *req = (const videoctl2_enqueue_t*)buf;
+            if (!fb.addr) return -1;
+            if (!(fb.bpp == 32 || fb.bpp == 16)) return -1;
+
+            uint8_t *dst = (uint8_t*)fb.addr;
+
+            if (req->u.fill.op == VIDEOCTL2_OP_FILL_RECT) {
+                uint32_t x=req->u.fill.x, y=req->u.fill.y, w=req->u.fill.w, hh=req->u.fill.h;
+                if (x>=fb.width || y>=fb.height) return (ssize_t)h->size_bytes;
+                if (x+w>fb.width) w = fb.width - x;
+                if (y+hh>fb.height) hh = fb.height - y;
+                if (fb.bpp == 32) {
+                    uint32_t color = req->u.fill.argb;
+                    for (uint32_t yy=0; yy<hh; yy++) {
+                        uint32_t *row = (uint32_t*)(dst + (y+yy)*fb.pitch + x*4);
+                        for (uint32_t xx=0; xx<w; xx++) row[xx] = color;
+                    }
+                } else {
+                    uint32_t c32 = req->u.fill.argb;
+                    uint16_t c565 = (uint16_t)(((c32>>19)&0x1F)<<11 | ((c32>>10)&0x3F)<<5 | ((c32>>3)&0x1F));
+                    for (uint32_t yy=0; yy<hh; yy++) {
+                        uint16_t *row = (uint16_t*)(dst + (y+yy)*fb.pitch + x*2);
+                        for (uint32_t xx=0; xx<w; xx++) row[xx] = c565;
+                    }
+                }
+                video0_dirty_union(c, x, y, w, hh);
+                return (ssize_t)h->size_bytes;
+            }
+
+            if (req->u.blit.op == VIDEOCTL2_OP_BLIT) {
+                uint32_t sx=req->u.blit.src_x, sy=req->u.blit.src_y;
+                uint32_t dx=req->u.blit.dst_x, dy=req->u.blit.dst_y;
+                uint32_t w=req->u.blit.w, hh=req->u.blit.h;
+                if (sx>=fb.width || sy>=fb.height || dx>=fb.width || dy>=fb.height) return (ssize_t)h->size_bytes;
+                if (sx+w>fb.width) w = fb.width - sx;
+                if (dx+w>fb.width) w = fb.width - dx;
+                if (sy+hh>fb.height) hh = fb.height - sy;
+                if (dy+hh>fb.height) hh = fb.height - dy;
+                uint32_t bpp = (fb.bpp==32)?4:2;
+                for (uint32_t yy=0; yy<hh; yy++) {
+                    void *srcp = dst + (sy+yy)*fb.pitch + sx*bpp;
+                    void *dstp = dst + (dy+yy)*fb.pitch + dx*bpp;
+                    memmove(dstp, srcp, w*bpp);
+                }
+                video0_dirty_union(c, dx, dy, w, hh);
+                return (ssize_t)h->size_bytes;
+            }
+
+            if (req->u.blit_buf.op == VIDEOCTL2_OP_BLIT_BUF) {
+                video0_buf_t *b = video0_find_buf(c, req->u.blit_buf.handle);
+                if (!b) return (ssize_t)h->size_bytes;
+                uint8_t *srcbuf = (uint8_t*)phys_to_virt_kernel(b->phys_base);
+                if (!srcbuf) return (ssize_t)h->size_bytes;
+
+                uint32_t sx=req->u.blit_buf.src_x, sy=req->u.blit_buf.src_y;
+                uint32_t dx=req->u.blit_buf.dst_x, dy=req->u.blit_buf.dst_y;
+                uint32_t w=req->u.blit_buf.w, hh=req->u.blit_buf.h;
+                uint32_t sp=req->u.blit_buf.src_pitch;
+                uint32_t sf=req->u.blit_buf.src_fmt;
+                if (dx>=fb.width || dy>=fb.height) return (ssize_t)h->size_bytes;
+                if (dx+w>fb.width) w = fb.width - dx;
+                if (dy+hh>fb.height) hh = fb.height - dy;
+
+                if (fb.bpp==32 && sf==MD64API_GRP_FMT_XRGB8888) {
+                    for (uint32_t yy=0; yy<hh; yy++) {
+                        uint32_t *srcrow = (uint32_t*)(srcbuf + (sy+yy)*sp + sx*4);
+                        uint32_t *dstrow = (uint32_t*)(dst + (dy+yy)*fb.pitch + dx*4);
+                        memcpy(dstrow, srcrow, w*4);
+                    }
+                }
+                video0_dirty_union(c, dx, dy, w, hh);
+                return (ssize_t)h->size_bytes;
+            }
+
+            return (ssize_t)h->size_bytes;
+        }
+
+        case VIDEOCTL_CMD2_FLUSH: {
+            if (!fb.addr) return -1;
+            uint32_t x=0,y=0,w=0,hh=0;
+            if (h->size_bytes >= sizeof(videoctl2_flush_t)) {
+                const videoctl2_flush_t *req = (const videoctl2_flush_t*)buf;
+                x=req->x; y=req->y; w=req->w; hh=req->h;
+            }
+            if (w==0 || hh==0) {
+                if (c->dirty_valid) {
+                    x=c->dirty_x0; y=c->dirty_y0; w=c->dirty_x1 - c->dirty_x0; hh=c->dirty_y1 - c->dirty_y0;
+                }
+            }
+            if (w && hh) VGA_FlushRect(x,y,w,hh);
+            c->dirty_valid = 0;
+            return (ssize_t)h->size_bytes;
+        }
+
+        case VIDEOCTL_CMD2_CURSOR_SET:
+        case VIDEOCTL_CMD2_CURSOR_MOVE:
+        case VIDEOCTL_CMD2_CURSOR_SHOW:
+            return (ssize_t)h->size_bytes;
+
+        default:
+            return -1;
+    }
+}
+
+
+// ------------------------------------------------------------
+// GUI IPC stubs
+// ------------------------------------------------------------
+// Some kernel components expect these symbols even if the GUI device
+// is not built in this devfs implementation.
+
+int devfs_gui_init(void) {
+    // No GUI device/server available.
+    return 0;
+}
+
+uint32_t devfs_gui_server_pid(void) {
+    // 0 means: no GUI server claimed.
+    return 0;
+}
+
+
+
+
+
+
+
+

@@ -14,4 +14,10 @@
  */
 int hvfs_read(int drvmnt, const char* path, void **outbuf, size_t *out_size);
 
+/* Free a buffer returned by hvfs_read().
+ * If the buffer came from the HVFS cache, it will be released (refcount--).
+ * Otherwise it will be kfree()'d.
+ */
+void hvfs_free(int drvmnt, const char *path, void *buf);
+
 #endif // HVFS_H

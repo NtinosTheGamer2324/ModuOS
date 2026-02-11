@@ -2,6 +2,7 @@
 #include "moduos/fs/fd.h"
 #include "moduos/fs/fs.h"
 #include "moduos/fs/hvfs.h"
+#include "moduos/fs/hvfs_cache.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/memory/memory.h"
@@ -9,7 +10,22 @@
 #include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/fs/path.h"
 #include "moduos/fs/devfs.h"
+#include "moduos/fs/userfs.h"
 #include "moduos/drivers/graphics/VGA.h"
+#include "moduos/fs/MDFS/mdfs.h"
+
+/* NOTE: FD_DEBUG can be enabled to trace file operations to COM1.
+ * This is extremely slow on real hardware/VMs (serial output bottleneck).
+ */
+#ifndef FD_DEBUG
+#define FD_DEBUG 0
+#endif
+
+#if FD_DEBUG
+#define FD_LOG(s) com_write_string(COM1_PORT, s)
+#else
+#define FD_LOG(s) do { (void)(s); } while (0)
+#endif
 
 /* Enhanced file descriptor structure with cached data */
 typedef struct {
@@ -20,16 +36,64 @@ typedef struct {
     int flags;                /* FD_FLAG_* flags */
     int in_use;               /* Is this FD active? */
     int pid;                  /* Owner process ID (0 for kernel) */
-    void* cached_data;        /* Cached file contents (for reading) OR devfs handle */
+    void* cached_data;        /* Cached file contents (for reading) OR devfs/userfs handle */
     int is_directory;         /* 1 if this is a directory descriptor */
     void* dir_handle;         /* Directory handle (fs_dir_t*) or DEVVFS handle */
     int is_devvfs;            /* 1 if dir_handle is a DEVVFS pseudo dir */
     int is_devfs;             /* 1 if cached_data is a devfs handle */
+    int is_userfs;            /* 1 if cached_data is a userfs handle */
+
+    /* FS-specific cache to accelerate repeated writes (MDFS). */
+    uint32_t cached_inode;
+    uint8_t  cached_type;
+    uint8_t  cache_valid;
+    uint8_t  _pad_cache;
+
+    /* Write coalescing buffer (for large sequential file writes).
+     * This is critical for performance when userland writes in 4KiB chunks.
+     */
+    uint8_t *wbuf;
+    size_t   wbuf_cap;
+    size_t   wbuf_len;
+    size_t   wbuf_file_off; /* file offset corresponding to wbuf[0] */
 } file_descriptor_internal_t;
 
 /* Global file descriptor table */
 static file_descriptor_internal_t fd_table[MAX_FDS];
 static int fd_initialized = 0;
+
+#define FD_WRITEBUF_DEFAULT_CAP (256u * 1024u) /* 256KiB */
+#define FD_WRITEBUF_MAX_CAP     (4u * 1024u * 1024u) /* 4MiB */
+
+static int fd_flush_write_buffer(int fd) {
+    if (fd < 0 || fd >= MAX_FDS) return -1;
+    if (!fd_table[fd].in_use) return -1;
+    if (fd_table[fd].wbuf_len == 0) return 0;
+
+    fs_mount_t *mount = fs_get_mount(fd_table[fd].mount_slot);
+    if (!mount || !mount->valid) return -3;
+
+    int rc;
+    if (mount->type == FS_TYPE_MDFS && fd_table[fd].cache_valid && fd_table[fd].cached_type == 1 && fd_table[fd].cached_inode != 0) {
+        rc = mdfs_write_file_at_by_inode(mount->handle, fd_table[fd].cached_inode,
+                                         fd_table[fd].wbuf, fd_table[fd].wbuf_len,
+                                         fd_table[fd].wbuf_file_off);
+    } else {
+        rc = fs_write_file_at(mount, fd_table[fd].path, fd_table[fd].wbuf, fd_table[fd].wbuf_len, fd_table[fd].wbuf_file_off);
+    }
+
+    if (rc != 0) return (rc < 0) ? rc : -3;
+
+    /* If we flushed data at the current position, advance position accordingly.
+     * Note: fd_table[fd].position tracks the logical file position used by fd_write().
+     */
+    if (fd_table[fd].position == fd_table[fd].wbuf_file_off + fd_table[fd].wbuf_len) {
+        /* position already accounts for buffered writes */
+    }
+
+    fd_table[fd].wbuf_len = 0;
+    return 0;
+}
 
 /* Initialize FD table */
 void fd_init(void) {
@@ -48,6 +112,17 @@ void fd_init(void) {
         fd_table[i].dir_handle = NULL;
         fd_table[i].is_devvfs = 0;
         fd_table[i].is_devfs = 0;
+        fd_table[i].is_userfs = 0;
+
+        fd_table[i].cached_inode = 0;
+        fd_table[i].cached_type = 0;
+        fd_table[i].cache_valid = 0;
+        fd_table[i]._pad_cache = 0;
+
+        fd_table[i].wbuf = NULL;
+        fd_table[i].wbuf_cap = 0;
+        fd_table[i].wbuf_len = 0;
+        fd_table[i].wbuf_file_off = 0;
     }
     
     /* Reserve standard file descriptors */
@@ -67,7 +142,7 @@ void fd_init(void) {
     fd_table[STDERR_FILENO].cached_data = NULL;
     
     fd_initialized = 1;
-    com_write_string(COM1_PORT, "[FD] File descriptor table initialized\n");
+    FD_LOG("[FD] File descriptor table initialized\n");
 }
 
 /* Find free file descriptor */
@@ -125,12 +200,62 @@ static int fd_open_devfs_internal(const char *node, int flags) {
     fd_table[fd].dir_handle = NULL;
     fd_table[fd].is_devvfs = 0;
     fd_table[fd].is_devfs = 1;
+    fd_table[fd].is_userfs = 0;
+
+    return fd;
+}
+
+static int fd_open_userfs_internal(const char *node, int flags) {
+    fd_init();
+    if (!node || !*node) return -1;
+
+    void *h = userfs_open_path(node, flags);
+    if (!h) {
+        return -1;
+    }
+
+    int fd = find_free_fd();
+    if (fd < 0) {
+        userfs_close(h);
+        return -6;
+    }
+
+    int fd_flags = 0;
+    if ((flags & O_RDWR) == O_RDWR) {
+        fd_flags = FD_FLAG_READ | FD_FLAG_WRITE;
+    } else if (flags & O_WRONLY) {
+        fd_flags = FD_FLAG_WRITE;
+    } else {
+        fd_flags = FD_FLAG_READ;
+    }
+
+    process_t* proc = process_get_current();
+    int pid = proc ? proc->pid : 0;
+
+    fd_table[fd].mount_slot = -1;
+    strncpy(fd_table[fd].path, node, sizeof(fd_table[fd].path) - 1);
+    fd_table[fd].path[sizeof(fd_table[fd].path) - 1] = 0;
+    fd_table[fd].position = 0;
+    fd_table[fd].file_size = 0;
+    fd_table[fd].flags = fd_flags;
+    fd_table[fd].pid = pid;
+    fd_table[fd].cached_data = h;
+    fd_table[fd].in_use = 1;
+    fd_table[fd].is_directory = 0;
+    fd_table[fd].dir_handle = NULL;
+    fd_table[fd].is_devvfs = 0;
+    fd_table[fd].is_devfs = 0;
+    fd_table[fd].is_userfs = 1;
 
     return fd;
 }
 
 int fd_open_devfs(const char *node, int flags) {
     return fd_open_devfs_internal(node, flags);
+}
+
+int fd_open_userfs(const char *node, int flags) {
+    return fd_open_userfs_internal(node, flags);
 }
 
 /* Open file - now uses HVFS to cache file contents */
@@ -140,14 +265,14 @@ int fd_open(int mount_slot, const char* path, int flags, int mode) {
     fd_init();
     
     if (!path || mount_slot < 0 || mount_slot >= 26) {
-        com_write_string(COM1_PORT, "[FD] Invalid parameters\n");
+        FD_LOG("[FD] Invalid parameters\n");
         return -1;
     }
     
     /* Find free FD first */
     int fd = find_free_fd();
     if (fd < 0) {
-        com_write_string(COM1_PORT, "[FD] No free file descriptors\n");
+        FD_LOG("[FD] No free file descriptors\n");
         return -6;
     }
     
@@ -177,11 +302,13 @@ int fd_open(int mount_slot, const char* path, int flags, int mode) {
         int hvfs_result = hvfs_read(mount_slot, path, &file_buffer, &file_size);
         
         if (hvfs_result != 0) {
-            com_write_string(COM1_PORT, "[FD] HVFS read failed: ");
-            char err_str[16];
-            itoa(hvfs_result, err_str, 10);
-            com_write_string(COM1_PORT, err_str);
-            com_write_string(COM1_PORT, "\n");
+            FD_LOG("[FD] HVFS read failed: ");
+            if (FD_DEBUG) {
+                char err_str[16];
+                itoa(hvfs_result, err_str, 10);
+                com_write_string(COM1_PORT, err_str);
+                com_write_string(COM1_PORT, "\n");
+            }
             
             /* Map HVFS errors to fd_open errors */
             switch (hvfs_result) {
@@ -193,11 +320,13 @@ int fd_open(int mount_slot, const char* path, int flags, int mode) {
             }
         }
         
-        com_write_string(COM1_PORT, "[FD] HVFS loaded file: ");
-        char size_str[32];
-        itoa(file_size, size_str, 10);
-        com_write_string(COM1_PORT, size_str);
-        com_write_string(COM1_PORT, " bytes\n");
+        if (FD_DEBUG) {
+            com_write_string(COM1_PORT, "[FD] HVFS loaded file: ");
+            char size_str[32];
+            itoa(file_size, size_str, 10);
+            com_write_string(COM1_PORT, size_str);
+            com_write_string(COM1_PORT, " bytes\n");
+        }
     }
     
     /* Initialize FD */
@@ -210,14 +339,35 @@ int fd_open(int mount_slot, const char* path, int flags, int mode) {
     fd_table[fd].pid = pid;
     fd_table[fd].cached_data = file_buffer;
     fd_table[fd].in_use = 1;
+
+    fd_table[fd].cache_valid = 0;
+    fd_table[fd].cached_inode = 0;
+    fd_table[fd].cached_type = 0;
+
+    /* If this is an MDFS mount and we intend to write, resolve/create inode once.
+     * This avoids path lookup and directory scans on every write().
+     */
+    fs_mount_t *m = fs_get_mount(mount_slot);
+    if (m && m->valid && m->type == FS_TYPE_MDFS && (fd_flags & FD_FLAG_WRITE)) {
+        uint32_t ino_n = 0;
+        int tr = (flags & O_TRUNC) ? 1 : 0;
+        int rc2 = mdfs_create_file_trunc(m->handle, path, tr, &ino_n);
+        if (rc2 == 0) {
+            fd_table[fd].cache_valid = 1;
+            fd_table[fd].cached_inode = ino_n;
+            fd_table[fd].cached_type = 1;
+        }
+    }
     
-    com_write_string(COM1_PORT, "[FD] Opened file: ");
-    com_write_string(COM1_PORT, path);
-    com_write_string(COM1_PORT, " as FD ");
-    char fd_str[16];
-    itoa(fd, fd_str, 10);
-    com_write_string(COM1_PORT, fd_str);
-    com_write_string(COM1_PORT, "\n");
+    if (FD_DEBUG) {
+        com_write_string(COM1_PORT, "[FD] Opened file: ");
+        com_write_string(COM1_PORT, path);
+        com_write_string(COM1_PORT, " as FD ");
+        char fd_str[16];
+        itoa(fd, fd_str, 10);
+        com_write_string(COM1_PORT, fd_str);
+        com_write_string(COM1_PORT, "\n");
+    }
     
     return fd;
 }
@@ -232,25 +382,52 @@ int fd_close(int fd) {
     
     /* Don't close stdin/stdout/stderr */
     if (fd <= 2) {
-        com_write_string(COM1_PORT, "[FD] Cannot close standard fd\n");
+        FD_LOG("[FD] Cannot close standard fd\n");
         return -2;
     }
     
-    /* Close devfs handle OR free cached file data */
+    /* Flush pending buffered writes before closing. */
+    (void)fd_flush_write_buffer(fd);
+
+    /* Flush MDFS inode write-behind cache (performance optimization) */
+    {
+        fs_mount_t *m = fs_get_mount(fd_table[fd].mount_slot);
+        if (m && m->valid && m->type == FS_TYPE_MDFS && fd_table[fd].cache_valid && fd_table[fd].cached_type == 1 && fd_table[fd].cached_inode != 0) {
+            (void)mdfs_flush_inode(m->handle, fd_table[fd].cached_inode);
+        }
+    }
+
+    /* Free write buffer */
+    if (fd_table[fd].wbuf) {
+        kfree(fd_table[fd].wbuf);
+        fd_table[fd].wbuf = NULL;
+        fd_table[fd].wbuf_cap = 0;
+        fd_table[fd].wbuf_len = 0;
+        fd_table[fd].wbuf_file_off = 0;
+    }
+
+    /* Close devfs/userfs handle OR free cached file data */
     if (fd_table[fd].cached_data) {
         if (fd_table[fd].is_devfs) {
             devfs_close(fd_table[fd].cached_data);
+        } else if (fd_table[fd].is_userfs) {
+            userfs_close(fd_table[fd].cached_data);
         } else {
-            kfree(fd_table[fd].cached_data);
+            /* cached_data may be an HVFS cached buffer. */
+            if (!hvfs_cache_release(fd_table[fd].mount_slot, fd_table[fd].path, fd_table[fd].cached_data)) {
+                kfree(fd_table[fd].cached_data);
+            }
         }
         fd_table[fd].cached_data = NULL;
     }
     
-    com_write_string(COM1_PORT, "[FD] Closed FD ");
-    char fd_str[16];
-    itoa(fd, fd_str, 10);
-    com_write_string(COM1_PORT, fd_str);
-    com_write_string(COM1_PORT, "\n");
+    if (FD_DEBUG) {
+        com_write_string(COM1_PORT, "[FD] Closed FD ");
+        char fd_str[16];
+        itoa(fd, fd_str, 10);
+        com_write_string(COM1_PORT, fd_str);
+        com_write_string(COM1_PORT, "\n");
+    }
     
     fd_table[fd].in_use = 0;
     fd_table[fd].mount_slot = -1;
@@ -262,6 +439,12 @@ int fd_close(int fd) {
     fd_table[fd].dir_handle = NULL;
     fd_table[fd].is_devvfs = 0;
     fd_table[fd].is_devfs = 0;
+    fd_table[fd].is_userfs = 0;
+
+    fd_table[fd].wbuf = NULL;
+    fd_table[fd].wbuf_cap = 0;
+    fd_table[fd].wbuf_len = 0;
+    fd_table[fd].wbuf_file_off = 0;
     
     return 0;
 }
@@ -276,7 +459,7 @@ ssize_t fd_read(int fd, void* buffer, size_t count) {
     
     /* Check read permission */
     if (!(fd_table[fd].flags & FD_FLAG_READ)) {
-        com_write_string(COM1_PORT, "[FD] No read permission\n");
+        FD_LOG("[FD] No read permission\n");
         return -2;
     }
     
@@ -291,9 +474,15 @@ ssize_t fd_read(int fd, void* buffer, size_t count) {
         return devfs_read(fd_table[fd].cached_data, buffer, count);
     }
 
+    /* userfs-backed FD */
+    if (fd_table[fd].is_userfs) {
+        if (!fd_table[fd].cached_data) return -4;
+        return userfs_read(fd_table[fd].cached_data, buffer, count);
+    }
+
     /* Check if we have cached data */
     if (!fd_table[fd].cached_data) {
-        com_write_string(COM1_PORT, "[FD] No cached data for reading\n");
+        FD_LOG("[FD] No cached data for reading\n");
         return -4;
     }
     
@@ -330,6 +519,27 @@ ssize_t fd_write(int fd, const void* buffer, size_t count) {
         return -2;
     }
 
+
+    // DEBUG: identify what fd=3 is for paintgfx crash diagnosis
+    if (fd == 3) {
+        com_write_string(COM1_PORT, "[FD_WRITE] fd=3 pid=");
+        char dbuf[32];
+        itoa(fd_table[fd].pid, dbuf, 10); com_write_string(COM1_PORT, dbuf);
+        com_write_string(COM1_PORT, " is_devfs=");
+        itoa(fd_table[fd].is_devfs, dbuf, 10); com_write_string(COM1_PORT, dbuf);
+        com_write_string(COM1_PORT, " is_userfs=");
+        itoa(fd_table[fd].is_userfs, dbuf, 10); com_write_string(COM1_PORT, dbuf);
+        com_write_string(COM1_PORT, " mount=");
+        itoa(fd_table[fd].mount_slot, dbuf, 10); com_write_string(COM1_PORT, dbuf);
+        com_write_string(COM1_PORT, " flags=0x");
+        itoa(fd_table[fd].flags, dbuf, 16); com_write_string(COM1_PORT, dbuf);
+        com_write_string(COM1_PORT, " path=");
+        com_write_string(COM1_PORT, fd_table[fd].path);
+        com_write_string(COM1_PORT, " count=");
+        itoa((int)count, dbuf, 10); com_write_string(COM1_PORT, dbuf);
+        com_write_string(COM1_PORT, "\n");
+    }
+
     /* Handle stdout/stderr specially */
     if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
         /* Userspace typically writes via SYS_WRITE (string) for console output.
@@ -347,26 +557,98 @@ ssize_t fd_write(int fd, const void* buffer, size_t count) {
         return devfs_write(fd_table[fd].cached_data, buffer, count);
     }
 
-    /* Regular file writing (minimal): whole-file overwrite from offset 0.
-     * Enough for installers/cp and test tools.
+    /* userfs-backed FD: dispatch to userfs_write */
+    if (fd_table[fd].is_userfs) {
+        if (!fd_table[fd].cached_data) return -4;
+        return userfs_write(fd_table[fd].cached_data, buffer, count);
+    }
+
+    /* Regular file writing: COALESCE small sequential writes into bigger IO.
+     * Without this, userland writing in 4KiB chunks can cause hundreds of thousands of
+     * vdrive_write() calls.
      */
-    if (fd_table[fd].position != 0) {
-        com_write_string(COM1_PORT, "[FD] write: non-zero offset not supported yet\n");
-        return -3;
+    if (count == 0) return 0;
+
+    /* Ensure buffer exists. */
+    if (!fd_table[fd].wbuf) {
+        fd_table[fd].wbuf_cap = FD_WRITEBUF_DEFAULT_CAP;
+        fd_table[fd].wbuf = (uint8_t*)kmalloc(fd_table[fd].wbuf_cap);
+        fd_table[fd].wbuf_len = 0;
+        fd_table[fd].wbuf_file_off = fd_table[fd].position;
+        if (!fd_table[fd].wbuf) {
+            // Fall back to direct write if we can't allocate the buffer.
+            fs_mount_t *mount = fs_get_mount(fd_table[fd].mount_slot);
+            if (!mount || !mount->valid) return -3;
+            int rc;
+            if (mount->type == FS_TYPE_MDFS && fd_table[fd].cache_valid && fd_table[fd].cached_type == 1 && fd_table[fd].cached_inode != 0) {
+                rc = mdfs_write_file_at_by_inode(mount->handle, fd_table[fd].cached_inode, buffer, count, fd_table[fd].position);
+            } else {
+                rc = fs_write_file_at(mount, fd_table[fd].path, buffer, count, fd_table[fd].position);
+            }
+            if (rc != 0) return (rc < 0) ? (ssize_t)rc : -3;
+            fd_table[fd].position += count;
+            if (fd_table[fd].position > fd_table[fd].file_size) fd_table[fd].file_size = fd_table[fd].position;
+            return (ssize_t)count;
+        }
     }
 
-    fs_mount_t *mount = fs_get_mount(fd_table[fd].mount_slot);
-    if (!mount || !mount->valid) return -3;
-
-    int rc = fs_write_file(mount, fd_table[fd].path, buffer, count);
-    if (rc != 0) {
-        // Propagate filesystem error codes to userland for debugging.
-        // Convention: 0 = success, negative = error.
-        return (rc < 0) ? (ssize_t)rc : -3;
+    /* If this write is not contiguous with buffered data, flush first. */
+    size_t expected_off = fd_table[fd].wbuf_file_off + fd_table[fd].wbuf_len;
+    if (fd_table[fd].position != expected_off) {
+        int frc = fd_flush_write_buffer(fd);
+        if (frc != 0) return (ssize_t)frc;
+        fd_table[fd].wbuf_file_off = fd_table[fd].position;
     }
 
-    fd_table[fd].position += count;
-    fd_table[fd].file_size = fd_table[fd].position;
+    const uint8_t *src = (const uint8_t*)buffer;
+    size_t remaining = count;
+    while (remaining > 0) {
+        size_t space = fd_table[fd].wbuf_cap - fd_table[fd].wbuf_len;
+        if (space == 0) {
+            /* Buffer full. For sequential workloads, prefer growing the buffer up to a cap
+             * instead of flushing too often.
+             */
+            if (fd_table[fd].wbuf_cap < FD_WRITEBUF_MAX_CAP) {
+                size_t new_cap = fd_table[fd].wbuf_cap * 2u;
+                if (new_cap > FD_WRITEBUF_MAX_CAP) new_cap = FD_WRITEBUF_MAX_CAP;
+
+                uint8_t *nb = (uint8_t*)kmalloc(new_cap);
+                if (nb) {
+                    memcpy(nb, fd_table[fd].wbuf, fd_table[fd].wbuf_len);
+                    kfree(fd_table[fd].wbuf);
+                    fd_table[fd].wbuf = nb;
+                    fd_table[fd].wbuf_cap = new_cap;
+                    space = fd_table[fd].wbuf_cap - fd_table[fd].wbuf_len;
+                } else {
+                    int frc = fd_flush_write_buffer(fd);
+                    if (frc != 0) return (ssize_t)frc;
+                    fd_table[fd].wbuf_file_off = fd_table[fd].position;
+                    space = fd_table[fd].wbuf_cap;
+                }
+            } else {
+                int frc = fd_flush_write_buffer(fd);
+                if (frc != 0) return (ssize_t)frc;
+                fd_table[fd].wbuf_file_off = fd_table[fd].position;
+                space = fd_table[fd].wbuf_cap;
+            }
+        }
+
+        size_t take = (remaining < space) ? remaining : space;
+        memcpy(fd_table[fd].wbuf + fd_table[fd].wbuf_len, src, take);
+        fd_table[fd].wbuf_len += take;
+        fd_table[fd].position += take;
+        src += take;
+        remaining -= take;
+
+        /* Flush eagerly once buffer is full; otherwise keep coalescing. */
+        if (fd_table[fd].wbuf_len == fd_table[fd].wbuf_cap) {
+            int frc = fd_flush_write_buffer(fd);
+            if (frc != 0) return (ssize_t)frc;
+            fd_table[fd].wbuf_file_off = fd_table[fd].position;
+        }
+    }
+
+    if (fd_table[fd].position > fd_table[fd].file_size) fd_table[fd].file_size = fd_table[fd].position;
     return (ssize_t)count;
 }
 
@@ -385,6 +667,15 @@ off_t fd_lseek(int fd, off_t offset, int whence) {
     
     off_t new_pos;
     
+    /* Seeking changes the write position. If we have buffered writes, flush first
+     * to preserve ordering and file offsets.
+     */
+    if ((fd_table[fd].flags & FD_FLAG_WRITE) && fd_table[fd].wbuf_len) {
+        int frc = fd_flush_write_buffer(fd);
+        if (frc != 0) return frc;
+        fd_table[fd].wbuf_file_off = fd_table[fd].position;
+    }
+
     switch (whence) {
         case SEEK_SET:
             new_pos = offset;

@@ -235,7 +235,7 @@ int iso9660_mount(int vdrive_id, uint32_t partition_lba) {
     fs->root_size = rd[10] | (rd[11] << 8) | (rd[12] << 16) | (rd[13] << 24);
     fs->active = 1;
 
-    com_printf("ISO9660: mounted handle=%d, vdrive=%d, lbs=%u, root_extent=%u (with Rock Ridge LFN support)\n",
+    com_printf(COM1_PORT, "ISO9660: mounted handle=%d, vdrive=%d, lbs=%u, root_extent=%u (with Rock Ridge LFN support)\n",
                handle, vdrive_id, fs->logical_block_size, fs->root_extent_lba);
     return handle;
 }
@@ -318,26 +318,37 @@ int iso9660_get_mount_count(void) {
 
 int iso9660_read_extent(int handle, uint32_t extent_lba, uint32_t size_bytes, void* buffer) {
     if (!iso9660_valid_handle(handle)) return -1;
-    
+
     iso9660_fs_t* fs = &iso_mounts[handle];
     uint32_t lbs = fs->logical_block_size;
     uint32_t blocks = (size_bytes + lbs - 1) / lbs;
-    
-    static uint8_t block_buf[2048];
+
+    /* Performance: read extents in chunks instead of 1 block at a time.
+     * This drastically reduces vDrive/AHCI command overhead for app loading.
+     */
+    const uint32_t max_chunk_blocks = (ISO9660_READ_BUFFER_LIMIT / 2048u);
+    static uint8_t chunk_buf[ISO9660_READ_BUFFER_LIMIT];
+
     uint32_t remaining = size_bytes;
     uint8_t* dest = (uint8_t*)buffer;
-    
-    for (uint32_t b = 0; b < blocks; b++) {
-        int r = read_logical_blocks_rel(fs, extent_lba + b, 1, block_buf);
+
+    uint32_t b = 0;
+    while (b < blocks) {
+        uint32_t chunk = blocks - b;
+        if (chunk > max_chunk_blocks) chunk = max_chunk_blocks;
+
+        int r = read_logical_blocks_rel(fs, extent_lba + b, chunk, chunk_buf);
         if (r != 0) return -2;
-        
-        uint32_t to_copy = (remaining < lbs) ? remaining : lbs;
-        memcpy(dest, block_buf, to_copy);
-        
-        dest += to_copy;
-        remaining -= to_copy;
+
+        uint32_t bytes_in_chunk = chunk * lbs;
+        if (bytes_in_chunk > remaining) bytes_in_chunk = remaining;
+        memcpy(dest, chunk_buf, bytes_in_chunk);
+
+        dest += bytes_in_chunk;
+        remaining -= bytes_in_chunk;
+        b += chunk;
     }
-    
+
     return 0;
 }
 

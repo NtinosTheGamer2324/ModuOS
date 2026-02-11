@@ -201,6 +201,10 @@ int fs_get_mount_count(void);
 int fs_read_file(fs_mount_t* mount, const char* path, void* buffer, 
                  size_t buffer_size, size_t* bytes_read);
 
+/* FS tracing (timing) */
+void fs_set_trace(int enabled);
+int fs_get_trace(void);
+
 /**
  * Write entire file from buffer.
  * Currently supported for FAT32 only.
@@ -212,6 +216,10 @@ int fs_read_file(fs_mount_t* mount, const char* path, void* buffer,
  * @return: 0 on success, negative on error
  */
 int fs_write_file(fs_mount_t* mount, const char* path, const void* buffer, size_t size);
+
+// Offset-aware write (used by FD layer for sequential writes). Returns 0 on success.
+int fs_write_file_at(fs_mount_t* mount, const char* path, const void* buffer, size_t size, size_t offset);
+
 
 /**
  * Get file information

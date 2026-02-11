@@ -12,6 +12,7 @@ extern "C" {
 
 // Simple DEVVFS character device interface (kernel-only)
 
+typedef void* (*devfs_open_fn)(void *ctx, int flags);
 typedef ssize_t (*devfs_read_fn)(void *ctx, void *buf, size_t count);
 typedef ssize_t (*devfs_write_fn)(void *ctx, const void *buf, size_t count);
 typedef int (*devfs_close_fn)(void *ctx);
@@ -19,6 +20,7 @@ typedef int (*devfs_close_fn)(void *ctx);
 typedef enum {
     DEVFS_OWNER_KERNEL = 0,
     DEVFS_OWNER_SQRM   = 1,
+    DEVFS_OWNER_USER   = 2,
 } devfs_owner_kind_t;
 
 typedef enum {
@@ -34,6 +36,7 @@ typedef devfs_replace_decision_t (*devfs_can_replace_fn)(
 
 typedef struct {
     const char *name;      // basename, e.g. "kbd0"
+    devfs_open_fn open;    // optional; if NULL ctx is shared device ctx
     devfs_read_fn read;
     devfs_write_fn write;
     devfs_close_fn close;
@@ -56,7 +59,6 @@ int devfs_mkdir_p(const char *path, devfs_owner_t owner);
 // Example: "usb/ehci0" => $/dev/usb/ehci0
 // This auto-creates intermediate directories.
 int devfs_register_path(const char *path, const devfs_device_ops_t *ops, void *ctx, devfs_owner_t owner);
-
 // Look up a device by name; returns opaque handle (internal)
 void* devfs_open(const char *name, int flags);
 
@@ -81,6 +83,12 @@ int devfs_input_init(void);
 // Built-in graphics devices
 int devfs_graphics_init(void);
 
+// Built-in GUI IPC device ($/dev/gui0)
+int devfs_gui_init(void);
+
+// Return current GUI server pid (0 if none). Kernel-only.
+uint32_t devfs_gui_server_pid(void);
+
 // Inject an input event (called by PS/2 and USB HID)
 void devfs_input_push_event(const Event *e);
 
@@ -89,3 +97,5 @@ void devfs_input_push_event(const Event *e);
 #endif
 
 #endif
+
+

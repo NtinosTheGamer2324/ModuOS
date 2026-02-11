@@ -44,6 +44,14 @@ typedef struct {
     int flags;                /* FD_FLAG_* flags */
     int in_use;               /* Is this FD active? */
     int pid;                  /* Owner process ID (0 for kernel) */
+
+    /* FS-specific cache to accelerate repeated writes.
+     * For MDFS we cache inode number resolved/created at open() time.
+     */
+    uint32_t cached_inode;
+    uint8_t  cached_type;
+    uint8_t  cache_valid;
+    uint8_t  _pad_cache;
 } file_descriptor_t;
 
 /**
@@ -64,6 +72,9 @@ int fd_open(int mount_slot, const char* path, int flags, int mode);
 
 // Open a DEVFS character device (e.g. "$\/dev\/kbd0")
 int fd_open_devfs(const char *node, int flags);
+
+// Open a USERFS character device (e.g. "$/userland/users/auth")
+int fd_open_userfs(const char *node, int flags);
 
 
 /**

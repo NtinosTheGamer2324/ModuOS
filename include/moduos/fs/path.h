@@ -11,7 +11,8 @@ struct process;
 typedef enum {
     FS_ROUTE_CURRENT = 0, /* current_slot mount */
     FS_ROUTE_DEVVFS  = 1, /* $/ virtual namespace */
-    FS_ROUTE_MOUNT   = 2  /* explicit mount (returned in out_mount) */
+    FS_ROUTE_MOUNT   = 2, /* explicit mount (returned in out_mount) */
+    FS_ROUTE_USERLAND = 3 /* $/userland pseudo filesystem */
 } fs_route_t;
 
 typedef struct {
@@ -30,6 +31,7 @@ typedef struct {
  *  - $/mnt/vDriveN/... => mount for that vDrive
  *  - $/mnt => DEVVFS list of mounts
  *  - $/dev => DEVVFS list of devices
+ *  - $/userland => USERFS pseudo filesystem
  */
 int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *out);
 
