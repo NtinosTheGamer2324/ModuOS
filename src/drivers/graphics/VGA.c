@@ -110,6 +110,7 @@ static void vga_try_init_fb_console(void) {
         int slot = kernel_get_boot_slot();
         if (slot >= 0) {
             /* Try FNT unicode font (custom format) first */
+            #if 1
             if (!g_fbcon_fnt_loaded) {
                 const char *fntp = "/ModuOS/shared/usr/assets/fonts/Unicode.fnt";
                 void *fnt_buf = NULL;
@@ -125,6 +126,7 @@ static void vga_try_init_fb_console(void) {
                     }
                 }
             }
+            #endif
             
             /* Optional BMP atlas font */
             if (!g_fbcon_font_bmp_loaded) {
