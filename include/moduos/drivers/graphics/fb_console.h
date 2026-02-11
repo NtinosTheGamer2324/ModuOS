@@ -7,6 +7,7 @@
 #include "moduos/drivers/graphics/bitmap_font.h"
 #include "moduos/drivers/graphics/bmp_font.h"
 #include "moduos/drivers/graphics/pf2.h"
+#include "moduos/drivers/graphics/fnt_font.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,6 +36,10 @@ typedef struct {
     /* Optional PF2 font (Unicode) - pointer owned by caller */
     const pf2_font_t *pf2_font;
     int pf2_font_ready;
+
+    /* FNT font (custom format) - pointer owned by caller */
+    const fnt_font_t *fnt_font;
+    int fnt_font_ready;
 
     /* When using bmp_font: render size (dest) for each glyph, in pixels */
     uint16_t bmp_render_w;
@@ -68,6 +73,9 @@ int fbcon_set_bmp_font_moduosdef(fb_console_t *c, const void *bmp_buf, size_t bm
 
 /* Attach a PF2 font (Unicode). font must remain valid for lifetime of console. */
 void fbcon_set_pf2_font(fb_console_t *c, const pf2_font_t *font);
+
+/* Attach an FNT font (custom format). font must remain valid for lifetime of console. */
+void fbcon_set_fnt_font(fb_console_t *c, const fnt_font_t *font);
 
 void fbcon_set_text_color(fb_console_t *c, uint8_t fg, uint8_t bg);
 

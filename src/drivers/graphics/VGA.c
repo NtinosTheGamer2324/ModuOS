@@ -6,7 +6,7 @@
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/debug.h"
 #include "moduos/drivers/graphics/fb_console.h"
-#include "moduos/drivers/graphics/pf2.h"
+#include "moduos/drivers/graphics/fnt_font.h"
 #include "moduos/kernel/bootscreen.h"
 #include <stdbool.h>
 #include <stdarg.h>
@@ -39,8 +39,8 @@ static size_t g_fbcon_font_bmp_size = 0;
 static int g_fbcon_font_bmp_loaded = 0;
 
 /* optional PF2 unicode font */
-static pf2_font_t g_fbcon_pf2;
-static int g_fbcon_pf2_loaded = 0;
+static fnt_font_t *g_fbcon_fnt = NULL;
+static int g_fbcon_fnt_loaded = 0;
 
 // Scrollback buffer
 static uint16_t scrollback_buffer[SCROLLBACK_LINES * WIDTH];
@@ -112,14 +112,19 @@ static void vga_try_init_fb_console(void) {
             /* Optional BMP atlas font */
             if (!g_fbcon_font_bmp_loaded) {
                 const char *path = "/ModuOS/shared/fonts/ModuOSDEF.bmp";
-        // Try PF2 unicode font as well
-        if (!g_fbcon_pf2_loaded) {
-            const char *pf2p = "/ModuOS/shared/usr/assets/fonts/Unicode.pf2";
-            int pr = pf2_font_load_from_mount_slot(&g_fbcon_pf2, slot, pf2p);
-            if (pr == 0) {
-                g_fbcon_pf2_loaded = 1;
-                fbcon_set_pf2_font(&g_fbcon, &g_fbcon_pf2);
-                com_write_string(COM1_PORT, "[FBCON] Using PF2 font: /ModuOS/shared/usr/assets/fonts/Unicode.pf2\n");
+        // Try FNT unicode font (custom format)
+        if (!g_fbcon_fnt_loaded) {
+            const char *fntp = "/ModuOS/shared/usr/assets/fonts/Unicode.fnt";
+            void *fnt_buf = NULL;
+            size_t fnt_size = 0;
+            int fr = hvfs_read(slot, fntp, &fnt_buf, &fnt_size);
+            if (fr == 0 && fnt_buf && fnt_size) {
+                g_fbcon_fnt = fnt_load_font(fnt_buf, fnt_size);
+                if (g_fbcon_fnt) {
+                    g_fbcon_fnt_loaded = 1;
+                    fbcon_set_fnt_font(&g_fbcon, g_fbcon_fnt);
+                    com_write_string(COM1_PORT, "[FBCON] Using FNT font: /ModuOS/shared/usr/assets/fonts/Unicode.fnt\n");
+                }
             }
         }
                 int r = hvfs_read(slot, path, &g_fbcon_font_bmp_buf, &g_fbcon_font_bmp_size);

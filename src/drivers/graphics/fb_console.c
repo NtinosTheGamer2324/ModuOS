@@ -394,6 +394,16 @@ void fbcon_set_pf2_font(fb_console_t *c, const pf2_font_t *font) {
     }
 }
 
+void fbcon_set_fnt_font(fb_console_t *c, const fnt_font_t *font) {
+    if (!c) return;
+    c->fnt_font = font;
+    c->fnt_font_ready = (font != NULL);
+    if (c->fnt_font_ready && font) {
+        if (font->header.glyph_width) c->cell_w = font->header.glyph_width;
+        if (font->header.glyph_height) c->cell_h = font->header.glyph_height;
+    }
+}
+
 int fbcon_set_bmp_font_moduosdef(fb_console_t *c, const void *bmp_buf, size_t bmp_size) {
     if (!c || !bmp_buf || bmp_size < 64) return -1;
     int r = bmp_font_init_moduosdef(&c->bmp_font, bmp_buf, bmp_size);
@@ -482,6 +492,31 @@ static int fbcon_draw_glyph_pf2(fb_console_t *c, uint32_t cp) {
             if (b & (0x80u >> (xx & 7u))) {
                 int32_t px = ox + (int32_t)xx;
                 int32_t py = oy + (int32_t)yy;
+                if (px >= 0 && py >= 0 && (uint32_t)px < c->fb.width && (uint32_t)py < c->fb.height) {
+                    fb_put_pixel(&c->fb, (uint32_t)px, (uint32_t)py, fgpx);
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+static int fbcon_draw_glyph_fnt(fb_console_t *c, uint32_t cp) {
+    if (!c || !c->ready || !c->fnt_font_ready || !c->fnt_font) return 0;
+    fnt_glyph_t *glyph = fnt_get_glyph((fnt_font_t *)c->fnt_font, cp);
+    if (!glyph) return 0;
+    uint8_t br, bg, bb;
+    vga16_to_rgb(c->bg, &br, &bg, &bb);
+    uint32_t bgpx = fb_pack_rgb888(&c->fb, br, bg, bb);
+    fb_fill_rect(&c->fb, c->x, c->y, c->cell_w, c->cell_h, bgpx);
+    uint8_t fr, fg, fb2;
+    vga16_to_rgb(c->fg, &fr, &fg, &fb2);
+    uint32_t fgpx = fb_pack_rgb888(&c->fb, fr, fg, fb2);
+    for (int yy = 0; yy < glyph->bitmap_height; yy++) {
+        for (int xx = 0; xx < glyph->bitmap_width; xx++) {
+            if (fnt_get_pixel(glyph, xx, yy)) {
+                int px = (int)c->x + xx;
+                int py = (int)c->y + yy;
                 if (px >= 0 && py >= 0 && (uint32_t)px < c->fb.width && (uint32_t)py < c->fb.height) {
                     fb_put_pixel(&c->fb, (uint32_t)px, (uint32_t)py, fgpx);
                 }
@@ -622,7 +657,19 @@ static void fbcon_emit_codepoint(fb_console_t *c, uint32_t cp) {
             com_printf(COM1_PORT, "%02x", (unsigned)(uint8_t)enc[i]);
             if (i + 1 < elen) com_write_string(COM1_PORT, " ");
         }
-        com_write_string(COM1_PORT, " char='");
+    // Prefer FNT font first (custom format)
+    if (c->fnt_font_ready && c->fnt_font) {
+        fbcon_cursor_hide(c);
+        if (fbcon_draw_glyph_fnt(c, cp)) {
+            fbcon_flush_rect(c, c->x, c->y, c->cell_w, c->cell_h);
+            c->x += c->cell_w;
+            fbcon_cursor_show(c);
+            return;
+        }
+        fbcon_cursor_show(c);
+    }
+    
+    // Fallback to PF2 Unicode glyphs when available
         for (size_t i = 0; i < elen; i++) {
             char tmp[2] = {enc[i], 0};
             com_write_string(COM1_PORT, tmp);
@@ -631,7 +678,19 @@ static void fbcon_emit_codepoint(fb_console_t *c, uint32_t cp) {
     }
 #endif
 
-    // Prefer PF2 Unicode glyphs when available
+    // Prefer FNT font first (custom format)
+    if (c->fnt_font_ready && c->fnt_font) {
+        fbcon_cursor_hide(c);
+        if (fbcon_draw_glyph_fnt(c, cp)) {
+            fbcon_flush_rect(c, c->x, c->y, c->cell_w, c->cell_h);
+            c->x += c->cell_w;
+            fbcon_cursor_show(c);
+            return;
+        }
+        fbcon_cursor_show(c);
+    }
+    
+    // Fallback to PF2 Unicode glyphs when available
     if (c->pf2_font_ready && c->pf2_font) {
         fbcon_cursor_hide(c);
         if (fbcon_draw_glyph_pf2(c, cp)) {
