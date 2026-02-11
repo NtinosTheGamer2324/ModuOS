@@ -23,6 +23,27 @@ static const char* safe_str(const char *s) {
     return (s && s[0]) ? s : "";
 }
 
+/* Simple uint64 -> string conversion (avoids snprintf %llu issues) */
+static void u64_to_str(uint64_t v, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    char tmp[32];
+    size_t i = 0;
+    if (v == 0) {
+        out[0] = '0';
+        out[1] = 0;
+        return;
+    }
+    while (v > 0 && i < sizeof(tmp) - 1) {
+        tmp[i++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    size_t pos = 0;
+    while (i > 0 && pos + 1 < out_sz) {
+        out[pos++] = tmp[--i];
+    }
+    out[pos] = 0;
+}
+
 static void usage(const char *argv0) {
     printf("Usage: %s [--no-logo] [--no-bar] [--no-features] [--color]\n", argv0 ? argv0 : "neofetch");
 }
@@ -186,6 +207,7 @@ int md_main(long argc, char** argv) {
     }
 
     md64api_sysinfo_data_u info_s;
+    memset(&info_s, 0, sizeof(info_s));
     if (get_system_info_u(&info_s) != 0) {
         printf("Failed to get system info\n");
         return 1;
@@ -223,13 +245,17 @@ int md_main(long argc, char** argv) {
     char mem_line[96];
     mem_line[0] = 0;
     if (mem_total > 0) {
+        char used_buf[32];
+        char total_buf[32];
+        u64_to_str(mem_used, used_buf, sizeof(used_buf));
+        u64_to_str(mem_total, total_buf, sizeof(total_buf));
         if (show_bar) {
             char bar[32];
             /* Default bar width. May shrink later once we know layout. */
             make_bar(bar, sizeof(bar), mem_used, mem_total, 12);
-            snprintf(mem_line, sizeof(mem_line), "%llu/%llu %s", mem_used, mem_total, bar);
+            snprintf(mem_line, sizeof(mem_line), "%s/%s %s", used_buf, total_buf, bar);
         } else {
-            snprintf(mem_line, sizeof(mem_line), "%llu/%llu", mem_used, mem_total);
+            snprintf(mem_line, sizeof(mem_line), "%s/%s", used_buf, total_buf);
         }
     }
 
