@@ -29,9 +29,19 @@ typedef struct __attribute__((packed)) {
     uint64_t size_bytes;
     uint32_t link_count;
     uint32_t flags;
+
+    /* Data block pointers */
     uint64_t direct[MDFS_MAX_DIRECT];
-    uint64_t indirect1;
-    uint8_t  _pad[MDFS_INODE_SIZE - 2 - 2 - 4 - 4 - 8 - 4 - 4 - (8*MDFS_MAX_DIRECT) - 8];
+    uint64_t indirect1; /* single indirect: block full of uint64_t block numbers */
+    uint64_t indirect2; /* double indirect */
+    uint64_t indirect3; /* triple indirect */
+
+    /* ACL (Access Control List) - 68 bytes */
+    uint8_t  acl_count;        /* Number of ACEs (0-16) */
+    uint8_t  acl_reserved[3];  /* Padding for alignment */
+    uint32_t acl_aces[16];     /* ACE array (64 bytes) */
+
+    uint8_t  _pad[MDFS_INODE_SIZE - 2 - 2 - 4 - 4 - 8 - 4 - 4 - (8*MDFS_MAX_DIRECT) - 8 - 8 - 8 - 68];
 } mdfs_inode_t;
 
 // Primary directory record (32 bytes)
@@ -95,15 +105,33 @@ typedef struct {
     uint32_t sectors;
 
     mdfs_superblock_t sb;
+    
+    /* Performance optimization hints */
+    uint64_t alloc_hint_block;   /* Last allocated block (start search here) */
+    uint32_t alloc_hint_inode;   /* Last allocated inode (start search here) */
 } mdfs_fs_t;
 
 int mdfs_mount(int vdrive_id, uint32_t start_lba);
 int mdfs_mkfs(int vdrive_id, uint32_t start_lba, uint32_t sectors, const char *label);
 const mdfs_fs_t *mdfs_get_fs(int handle);
 
+/* Cache management */
+void mdfs_cache_init(void);
+void mdfs_cache_flush_all(void);
+
 // VFS integration helpers (v1: flat root directory only)
 int mdfs_read_file_by_path(int handle, const char *path, void *buffer, size_t buffer_size, size_t *bytes_read);
 int mdfs_write_file_by_path(int handle, const char *path, const void *buffer, size_t size);
+int mdfs_write_file_at_by_path(int handle, const char *path, const void *buffer, size_t size, size_t offset);
+
+/* Fast path helpers (avoid path lookup on every write). */
+int mdfs_resolve_path(int handle, const char *path, uint32_t *out_ino, uint8_t *out_type);
+int mdfs_create_file_trunc(int handle, const char *path, int truncate, uint32_t *out_ino);
+int mdfs_write_file_at_by_inode(int handle, uint32_t ino_num, const void *buffer, size_t size, size_t offset);
+
+// Flush cached inode metadata (write-behind) for streaming writes.
+int mdfs_flush_inode(int handle, uint32_t ino_num);
+
 int mdfs_stat_by_path(int handle, const char *path, uint32_t *out_size, int *out_is_dir);
 int mdfs_read_dir(int handle, const char *path, mdfs_dirent_t *out, int max_entries);
 int mdfs_read_root_dir(int handle, mdfs_dirent_t *out, int max_entries);
