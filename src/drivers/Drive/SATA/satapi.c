@@ -20,6 +20,7 @@
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
+#include "moduos/kernel/memory/phys.h"
 #include <stddef.h>
 #include "moduos/kernel/memory/string.h"
 
@@ -108,7 +109,13 @@ static int satapi_send_packet(uint8_t port_num, uint8_t *scsi_cmd,
      * up to SATAPI_BOUNCE_SIZE, then memcpy to the caller buffer.
      */
 #define SATAPI_BOUNCE_SIZE 4096
-    static uint8_t satapi_bounce_page[SATAPI_BOUNCE_SIZE] __attribute__((aligned(4096)));
+
+    /* Per-port DMA bounce buffer.
+     * Must use a real physical address for PRDT; cannot assume virt==phys with paging.
+     */
+    static uint64_t satapi_bounce_phys[AHCI_MAX_PORTS] = {0};
+    static uint8_t *satapi_bounce_virt[AHCI_MAX_PORTS] = {0};
+
     void *dma_buf = NULL;
     uint64_t dma_phys = 0;
 
@@ -118,8 +125,25 @@ static int satapi_send_packet(uint8_t port_num, uint8_t *scsi_cmd,
             return SATAPI_ERR_HARDWARE;
         }
 
-        dma_buf = satapi_bounce_page;
-        dma_phys = (uint64_t)(uintptr_t)satapi_bounce_page; /* identity */
+        if (!satapi_bounce_phys[port_num]) {
+            uint64_t pa = phys_alloc_frame();
+            if (!pa) {
+                COM_LOG_ERROR(COM1_PORT, "SATAPI: OOM allocating bounce page");
+                return SATAPI_ERR_HARDWARE;
+            }
+            /* Map bounce page into kernel VA space (identity mapping is present for RAM). */
+            satapi_bounce_phys[port_num] = pa;
+            satapi_bounce_virt[port_num] = (uint8_t*)phys_to_virt_kernel(pa);
+            if (!satapi_bounce_virt[port_num]) {
+                COM_LOG_ERROR(COM1_PORT, "SATAPI: failed to map bounce page");
+                phys_free_frame(pa);
+                satapi_bounce_phys[port_num] = 0;
+                return SATAPI_ERR_HARDWARE;
+            }
+        }
+
+        dma_buf = satapi_bounce_virt[port_num];
+        dma_phys = satapi_bounce_phys[port_num];
 
         if (is_write) {
             memcpy(dma_buf, buffer, buffer_len);
@@ -179,7 +203,7 @@ static int satapi_send_packet(uint8_t port_num, uint8_t *scsi_cmd,
         if ((port->ci & (1 << slot)) == 0) {
             // Command completed
             if (buffer && buffer_len > 0 && !is_write) {
-                memcpy(buffer, satapi_bounce_page, buffer_len);
+                memcpy(buffer, dma_buf, buffer_len);
             }
             return SATAPI_SUCCESS;
         }

@@ -1,7 +1,6 @@
 //shell.c
 #include "moduos/kernel/shell/zenith4.h"
 #include "moduos/kernel/sqrm.h"
-#include "moduos/kernel/shell/legacy/MSDOS.h"
 #include "moduos/fs/fs.h"
 #include "moduos/kernel/memory/memory.h"
 #include <stddef.h>
@@ -13,6 +12,11 @@
 #include "moduos/drivers/Time/RTC.h"
 #include "moduos/arch/AMD64/interrupts/irq.h"
 #include "moduos/fs/fs.h"  // Unified filesystem interface
+#include "moduos/fs/hvfs_cache.h"
+
+/* fault_print_last_user_pf */
+void fault_print_last_user_pf(void);
+void vdrive_cache_dump_stats(void);
 #include "moduos/kernel/shell/helpers.h"
 #include "moduos/fs/path.h"
 #include "moduos/fs/fd.h"
@@ -21,13 +25,12 @@
 #include "moduos/kernel/events/events.h"
 #include "moduos/kernel/debug.h"
 #include "moduos/kernel/panic.h"
-#include "moduos/kernel/applications/rl-clock.h"
 #include "moduos/drivers/Drive/vDrive.h"  // Changed from ATA to vDrive
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/exec.h"
 #include "moduos/kernel/bootscreen.h"
 #include "moduos/kernel/kernel.h"  // For boot_drive_index
-#include "moduos/kernel/games/game_menu.h"
+#include "moduos/kernel/md64api.h"
 #include "moduos/drivers/power/ACPI.h"
 #include "moduos/kernel/memory/memory.h"
 
@@ -375,51 +378,12 @@ static int auto_mount_boot_drive(void) {
 
 void read_pcname_file(void)
 {
-    static char pcname_buf[128];
-    size_t bytes = 0;
-
-    /* Default name fallback */
-    strncpy(pcname_buf, "UNKNOWN-PC", sizeof(pcname_buf) - 1);
-    pcname_buf[sizeof(pcname_buf) - 1] = '\0';
-
-    /* No boot slot -> fallback */
-    if (shell_state.boot_slot < 0) {
-        goto set_name;
-    }
-
-    /* Get mount from kernel */
-    fs_mount_t* mount = fs_get_mount(shell_state.boot_slot);
-    if (!mount || !mount->valid) {
-        goto set_name;
-    }
-
-    /* Check file exists */
-    if (!fs_file_exists(mount, "/ModuOS/System64/pcname.txt")) {
-        goto set_name;
-    }
-
-    /* Read file into buffer (leave room for NUL) */
-    if (fs_read_file(mount, "/ModuOS/System64/pcname.txt",
-                     pcname_buf, sizeof(pcname_buf) - 1, &bytes) != 0) {
-        goto set_name;
-    }
-
-    /* Clamp bytes and ensure NUL termination */
-    if (bytes >= sizeof(pcname_buf))
-        bytes = sizeof(pcname_buf) - 1;
-    pcname_buf[bytes] = '\0';
-
-    /* Strip trailing CR/LF */
-    for (size_t i = 0; i < bytes; i++) {
-        if (pcname_buf[i] == '\r' || pcname_buf[i] == '\n') {
-            pcname_buf[i] = '\0';
-            break;
-        }
-    }
-
-set_name:
-    /* Copy into shell_state.pcname */
-    strncpy(shell_state.pcname, pcname_buf, sizeof(shell_state.pcname) - 1);
+    /* Reliable: use MD64API system info instead of reading from FS.
+     * This avoids hangs when storage is busy or when dropping back to zenith4.
+     */
+    md64api_sysinfo_data info = get_system_info();
+    const char *name = (info.pcname && info.pcname[0]) ? info.pcname : "UNKNOWN-PC";
+    strncpy(shell_state.pcname, name, sizeof(shell_state.pcname) - 1);
     shell_state.pcname[sizeof(shell_state.pcname) - 1] = '\0';
 }
 
@@ -503,8 +467,9 @@ void zenith4_start() {
     fs_get_mount_info(boot_slot, &vdrive_id, NULL, &type);
     const char* fs_name = fs_type_name(type);
     /* drive letters are deprecated */
-    
+    VGA_Write("PREABC");
     read_pcname_file();
+    VGA_Write("ABC");
 
     while (shell_state.running == 1)
     {
@@ -576,7 +541,6 @@ void zenith4_start() {
             VGA_Write("\\cycd <path>           Change directory\\rr\n");
             VGA_Write("\\cypwd                 Print current directory\\rr\n");
             VGA_Write("\\cycat <path>          Display file contents\\rr\n");
-            VGA_Write("\\cygames               Shows Game Menu!\\rr\n");
             VGA_Write("\\cydate                Show current date and time\\rr\n");
             VGA_Write("\\cybanner              Show system banners\\rr\n");
             VGA_Write("\\cytimestamps          Toggle timestamps in the prompt\\rr\n");
@@ -929,6 +893,54 @@ void zenith4_start() {
             } else {
                 VGA_Write("\\crUsage: debug off|med|on|status\\rr\n");
             }
+
+        } else if (strcmp(command, "fstrace") == 0) {
+            if (strlen(args) == 0 || strcmp(args, "status") == 0) {
+                VGA_Writef("\\cyFS trace: %s\\rr\n", fs_get_trace() ? "ON" : "OFF");
+                VGA_Write("Usage: fstrace on|off\n");
+            } else if (strcmp(args, "on") == 0) {
+                fs_set_trace(1);
+                VGA_Write("\\cgFS trace enabled (timing logs to COM1)\\rr\n");
+            } else if (strcmp(args, "off") == 0) {
+                fs_set_trace(0);
+                VGA_Write("\\cgFS trace disabled\\rr\n");
+            } else {
+                VGA_Write("\\crUsage: fstrace on|off|status\\rr\n");
+            }
+
+        } else if (strcmp(command, "lastfault") == 0) {
+            /* COM1 only, per policy */
+            fault_print_last_user_pf();
+            VGA_Write("(lastfault printed to COM1)\n");
+
+        } else if (strcmp(command, "vdcache") == 0) {
+            /* COM1 only */
+            vdrive_cache_dump_stats();
+            VGA_Write("(vdcache printed to COM1)\n");
+
+        } else if (strcmp(command, "hvfscache") == 0) {
+            if (strlen(args) == 0 || strcmp(args, "status") == 0) {
+                hvfs_cache_mode_t m = hvfs_cache_get_mode();
+                const char *mn = (m == HVFS_CACHE_32M) ? "32M" : (m == HVFS_CACHE_128M) ? "128M" : "UNLIMITED";
+                VGA_Writef("\\cyHVFS cache: %s  used=%u KiB  hits=%u  misses=%u\\rr\n",
+                          mn,
+                          (unsigned)(hvfs_cache_bytes_used() / 1024ULL),
+                          (unsigned)hvfs_cache_hits(),
+                          (unsigned)hvfs_cache_misses());
+                VGA_Write("Usage: hvfscache 32m|128m|unlimited|status\n");
+            } else if (strcmp(args, "32m") == 0 || strcmp(args, "32M") == 0) {
+                hvfs_cache_set_mode(HVFS_CACHE_32M);
+                VGA_Write("\\cgHVFS cache mode set to 32M\\rr\n");
+            } else if (strcmp(args, "128m") == 0 || strcmp(args, "128M") == 0) {
+                hvfs_cache_set_mode(HVFS_CACHE_128M);
+                VGA_Write("\\cgHVFS cache mode set to 128M\\rr\n");
+            } else if (strcmp(args, "unlimited") == 0) {
+                hvfs_cache_set_mode(HVFS_CACHE_UNLIMITED);
+                VGA_Write("\\cgHVFS cache mode set to UNLIMITED\\rr\n");
+            } else {
+                VGA_Write("\\crUsage: hvfscache 32m|128m|unlimited|status\\rr\n");
+            }
+
         } else if (strcmp(command, "mounts") == 0) {
             fs_list_mounts();  // Kernel function
         } else if (strcmp(command, "use") == 0) {
@@ -1189,12 +1201,6 @@ void zenith4_start() {
         } else if (strcmp(command, "banner") == 0) {
             zsbanner();
             mdbanner();
-        } else if (strcmp(command, "games") == 0) {
-            shell_state.running = 0;
-            VGA_Clear();
-            event_clear(); 
-            Menu();
-            shell_state.running = 1;
         } else if (strcmp(command, "timestamps") == 0) {
             if (shell_state.show_timestamps == 0) {
                 shell_state.show_timestamps = 1;
@@ -1203,12 +1209,6 @@ void zenith4_start() {
                 shell_state.show_timestamps = 0;
                 VGA_Write("\\cgTimestamps disabled\\rr\n");
             }
-        } else if (strcmp(command, "clock") == 0) {
-            Clock();
-        } else if (strcmp(command, "dos") == 0) {
-            shell_state.running = 0;
-            msdos_start();
-            shell_state.running = 1;
         } else if (strcmp(command, "bootinfo") == 0) {
             if (shell_state.boot_slot < 0) {
                 VGA_Write("\\cyNo boot drive detected\\rr\n");
@@ -1319,9 +1319,9 @@ void zenith4_start() {
                         shell_state.jobs_cmd[idx][COMMAND_MAX_LEN - 1] = 0;
                     }
 
-                    VGA_Writef("\\cg[bg] started PID %d\\rr\\n", pid);
+                    VGA_Writef("\\cg[bg] started PID %d\\rr\n", pid);
                 } else {
-                    VGA_Write("\\cr[bg] exec failed\\rr\\n");
+                    VGA_Write("\\cr[bg] exec failed\\rr\n");
                 }
             } else {
                 exec(tmp);

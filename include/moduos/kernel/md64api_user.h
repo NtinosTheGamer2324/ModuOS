@@ -42,6 +42,7 @@ typedef struct md64api_sysinfo_data_u {
     char virtualization_vendor[32];
 
     char gpu_name[128];
+    char gpu_driver[64];
     int gpu_vram_mb;
 
     uint64_t storage_total_mb;
@@ -54,6 +55,14 @@ typedef struct md64api_sysinfo_data_u {
 
     int secure_boot_enabled;
     int tpm_version;
+
+    /* RTC date/time snapshot (from kernel RTC). */
+    uint8_t rtc_second;
+    uint8_t rtc_minute;
+    uint8_t rtc_hour;
+    uint8_t rtc_day;
+    uint8_t rtc_month;
+    uint16_t rtc_year;
 } md64api_sysinfo_data_u;
 
 #endif

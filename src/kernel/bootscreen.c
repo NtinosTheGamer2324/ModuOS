@@ -549,6 +549,9 @@ int bootscreen_show(void *mb2) {
         bootscreen_blit_bmp(&fb, &img);
     }
 
+    /* Paravirtual GPUs (e.g., QXL) require an explicit flush after CPU-side writes. */
+    VGA_FlushRect(0, 0, fb.width, fb.height);
+
     /* NOTE: In QEMU we have seen intermittent early-boot faults around kfree() here.
      * Keep the BMP buffer allocated (small leak) to prioritize boot stability.
      */

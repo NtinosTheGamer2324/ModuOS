@@ -33,4 +33,7 @@ KeyCode usb_hid_to_keycode(uint8_t hid_code);
 uint8_t usb_get_event_modifiers(uint8_t hid_mods);
 void usb_handle_key_press(uint8_t hid_key, uint8_t modifiers);
 
+// Translate HID keycode + modifiers to ASCII (used by input event generation)
+char hid_keycode_to_ascii(uint8_t keycode, uint8_t modifiers);
+
 #endif // MODUOS_DRIVERS_INPUT_H

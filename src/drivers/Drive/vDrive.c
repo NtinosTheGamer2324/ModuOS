@@ -9,6 +9,9 @@
 #include "moduos/drivers/graphics/VGA.h"
 #include <stddef.h>
 
+// freestanding: use kernel string/memory routines
+#include "moduos/kernel/memory/string.h"
+
 // MBR partition entry structure
 typedef struct __attribute__((packed)) {
     uint8_t status;           // 0x80 = bootable, 0x00 = non-bootable
@@ -31,6 +34,103 @@ static vdrive_system_t vdrive_system = {0};
 
 // Last error per drive
 static int drive_last_error[VDRIVE_MAX_DRIVES] = {0};
+
+// ===========================================================================
+// vDrive Read Cache (per-drive, direct-mapped)
+// ===========================================================================
+
+#define VDRIVE_CACHE_BYTES   (4 * 1024 * 1024) /* 4MiB per drive */
+
+typedef struct {
+    uint8_t inited;
+    uint32_t sector_size;
+    uint32_t entries;
+    uint8_t *data;      /* entries * sector_size */
+    uint64_t *tags;     /* entries, stores LBA */
+    uint8_t *valid;     /* entries */
+    uint64_t hits;
+    uint64_t misses;
+} vdrive_cache_t;
+
+static vdrive_cache_t g_vdrive_cache[VDRIVE_MAX_DRIVES];
+
+static void vdrive_cache_init(uint8_t vdrive_id, uint32_t sector_size) {
+    if (vdrive_id >= VDRIVE_MAX_DRIVES) return;
+    vdrive_cache_t *c = &g_vdrive_cache[vdrive_id];
+
+    if (c->inited && c->sector_size == sector_size) return;
+
+    /* Re-init if sector size changes (shouldn't happen) */
+    if (c->inited) {
+        if (c->data) kfree(c->data);
+        if (c->tags) kfree(c->tags);
+        if (c->valid) kfree(c->valid);
+        memset(c, 0, sizeof(*c));
+    }
+
+    if (sector_size == 0) sector_size = 512;
+    uint32_t entries = (uint32_t)(VDRIVE_CACHE_BYTES / sector_size);
+    if (entries < 64) entries = 64;
+
+    c->sector_size = sector_size;
+    c->entries = entries;
+    c->data = (uint8_t*)kmalloc((size_t)entries * (size_t)sector_size);
+    c->tags = (uint64_t*)kmalloc((size_t)entries * sizeof(uint64_t));
+    c->valid = (uint8_t*)kmalloc((size_t)entries);
+
+    if (!c->data || !c->tags || !c->valid) {
+        if (c->data) kfree(c->data);
+        if (c->tags) kfree(c->tags);
+        if (c->valid) kfree(c->valid);
+        memset(c, 0, sizeof(*c));
+        return;
+    }
+
+    memset(c->valid, 0, (size_t)entries);
+    c->inited = 1;
+}
+
+static inline uint32_t vdrive_cache_index(const vdrive_cache_t *c, uint64_t lba) {
+    return (c->entries != 0) ? (uint32_t)(lba % (uint64_t)c->entries) : 0;
+}
+
+static int vdrive_cache_get(uint8_t vdrive_id, uint64_t lba, void *out_sector) {
+    vdrive_cache_t *c = &g_vdrive_cache[vdrive_id];
+    if (!c->inited) return 0;
+
+    uint32_t idx = vdrive_cache_index(c, lba);
+    if (!c->valid[idx] || c->tags[idx] != lba) {
+        c->misses++;
+        return 0;
+    }
+
+    memcpy(out_sector, c->data + ((size_t)idx * (size_t)c->sector_size), c->sector_size);
+    c->hits++;
+    return 1;
+}
+
+static void vdrive_cache_put(uint8_t vdrive_id, uint64_t lba, const void *sector) {
+    vdrive_cache_t *c = &g_vdrive_cache[vdrive_id];
+    if (!c->inited) return;
+
+    uint32_t idx = vdrive_cache_index(c, lba);
+    memcpy(c->data + ((size_t)idx * (size_t)c->sector_size), sector, c->sector_size);
+    c->tags[idx] = lba;
+    c->valid[idx] = 1;
+}
+
+static void vdrive_cache_invalidate_range(uint8_t vdrive_id, uint64_t lba, uint32_t count) {
+    vdrive_cache_t *c = &g_vdrive_cache[vdrive_id];
+    if (!c->inited) return;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t cur = lba + i;
+        uint32_t idx = vdrive_cache_index(c, cur);
+        if (c->valid[idx] && c->tags[idx] == cur) {
+            c->valid[idx] = 0;
+        }
+    }
+}
 
 // ===========================================================================
 // Helper Functions
@@ -492,6 +592,19 @@ int vdrive_read(uint8_t vdrive_id, uint64_t lba, uint32_t count, void *buffer) {
         drive_last_error[vdrive_id] = VDRIVE_ERR_NULL_BUFFER;
         return VDRIVE_ERR_NULL_BUFFER;
     }
+
+    /* Ensure cache initialized for this drive */
+    vdrive_cache_init(vdrive_id, drive->sector_size);
+
+    /* Fast path: cached single-sector reads */
+    if (count == 1) {
+        if (vdrive_cache_get(vdrive_id, lba, buffer)) {
+            drive->reads++;
+            drive->status = VDRIVE_STATUS_READY;
+            drive_last_error[vdrive_id] = VDRIVE_SUCCESS;
+            return VDRIVE_SUCCESS;
+        }
+    }
     
     int result = -1;
     drive->status = VDRIVE_STATUS_BUSY;
@@ -545,6 +658,14 @@ int vdrive_read(uint8_t vdrive_id, uint64_t lba, uint32_t count, void *buffer) {
     }
     
     if (result == 0) {
+        /* Populate cache with what we just read */
+        if (buffer) {
+            uint8_t *b = (uint8_t*)buffer;
+            for (uint32_t i = 0; i < count; i++) {
+                vdrive_cache_put(vdrive_id, lba + i, b + ((size_t)i * (size_t)drive->sector_size));
+            }
+        }
+
         drive->reads++;
         drive->status = VDRIVE_STATUS_READY;
         drive_last_error[vdrive_id] = VDRIVE_SUCCESS;
@@ -586,6 +707,12 @@ int vdrive_write(uint8_t vdrive_id, uint64_t lba, uint32_t count, const void *bu
         drive_last_error[vdrive_id] = VDRIVE_ERR_NULL_BUFFER;
         return VDRIVE_ERR_NULL_BUFFER;
     }
+
+    /* Ensure cache initialized for this drive */
+    vdrive_cache_init(vdrive_id, drive->sector_size);
+
+    /* Writes invalidate cached sectors */
+    vdrive_cache_invalidate_range(vdrive_id, lba, count);
     
     int result = -1;
     drive->status = VDRIVE_STATUS_BUSY;
@@ -715,6 +842,19 @@ void vdrive_dump_info(uint8_t vdrive_id) {
     }
     
     com_write_string(COM1_PORT, "==========================\n\n");
+}
+
+void vdrive_cache_dump_stats(void) {
+    for (int i = 0; i < VDRIVE_MAX_DRIVES; i++) {
+        vdrive_t *d = vdrive_get(i);
+        if (!d) continue;
+        vdrive_cache_t *c = &g_vdrive_cache[i];
+        if (!c->inited) continue;
+        com_printf(COM1_PORT, "[vDriveCache] drive=%d sector=%u entries=%u hits=%llu misses=%llu\n",
+                   i, c->sector_size, c->entries,
+                   (unsigned long long)c->hits,
+                   (unsigned long long)c->misses);
+    }
 }
 
 void vdrive_dump_all(void) {

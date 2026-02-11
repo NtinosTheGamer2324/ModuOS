@@ -1,5 +1,6 @@
 #include "moduos/drivers/input/input.h"
 #include "moduos/drivers/input/ps2/ps2.h" // ps2_init(), keyboard_irq_handler()
+#include "moduos/drivers/input/ps2/mouse.h"
 
 #include "moduos/drivers/USB/usb.h"
 #include "moduos/drivers/USB/Classes/hid.h"
@@ -100,6 +101,26 @@ static void input_flush_events(void) {
     }
 
     devfs_close(eh);
+}
+
+// Drain any remaining bytes from $/dev/input/kbd0 (nonblocking). This prevents
+// stray repeats or buffered chars from triggering unintended commands after a
+// foreground program exits.
+static void input_flush_kbd0(void) {
+    void *kh = devfs_open_path("input/kbd0", O_RDONLY | O_NONBLOCK);
+    if (!kh) {
+        // fallback for legacy flat DEVFS
+        kh = devfs_open("kbd0", O_RDONLY | O_NONBLOCK);
+    }
+    if (!kh) return;
+
+    for (;;) {
+        char c = 0;
+        ssize_t n = devfs_read(kh, &c, 1);
+        if (n != 1) break;
+    }
+
+    devfs_close(kh);
 }
 
 // Read a line from $/dev/input/kbd0, echoing to VGA (libc-like behavior).
@@ -214,6 +235,10 @@ char* input(void) {
     // Prevent the same typing from being replayed later by event0 consumers.
     input_flush_events();
 
+    // Clear any leftover kbd0 bytes (e.g., key repeat buffering) before returning
+    // to the shell prompt.
+    input_flush_kbd0();
+
     return g_line_buf;
 }
 
@@ -228,6 +253,10 @@ int input_init(void) {
     } else {
         COM_LOG_OK(COM1_PORT, "PS/2 initialized");
 
+        // Best-effort PS/2 mouse init (IRQ12).
+        if (ps2_mouse_init() != 0) {
+            COM_LOG_WARN(COM1_PORT, "PS/2 mouse init failed");
+        }
     }
 
     // USB + HID
@@ -348,4 +377,44 @@ void usb_process_keyboard_report(hid_device_t *hid) {
 // Legacy polling function (USB is interrupt-driven)
 void usb_input_poll(void) {
     // no-op
+}
+
+// Minimal helper copied from the old in-kernel USB HID class driver.
+// Keeping it here avoids linking against in-kernel USB drivers (USB is SQRM-only).
+char hid_keycode_to_ascii(uint8_t keycode, uint8_t modifiers) {
+    bool shift = (modifiers & 0x22) != 0; // Left Shift (0x02) or Right Shift (0x20)
+
+    // Letters (a-z)
+    if (keycode >= 0x04 && keycode <= 0x1D) {
+        char c = (char)('a' + (keycode - 0x04));
+        return shift ? (char)(c - 32) : c;
+    }
+
+    // Numbers (1-0)
+    if (keycode >= 0x1E && keycode <= 0x27) {
+        static const char nums[] = "1234567890";
+        static const char nums_shift[] = "!@#$%^&*()";
+        uint8_t idx = (uint8_t)(keycode - 0x1E);
+        return shift ? nums_shift[idx] : nums[idx];
+    }
+
+    // Common punctuation + whitespace
+    switch (keycode) {
+        case 0x28: return '\n'; // Enter
+        case 0x2C: return ' ';  // Space
+        case 0x2D: return shift ? '_' : '-';
+        case 0x2E: return shift ? '+' : '=';
+        case 0x2F: return shift ? '{' : '[';
+        case 0x30: return shift ? '}' : ']';
+        case 0x31: return shift ? '|' : '\\';
+        case 0x33: return shift ? ':' : ';';
+        case 0x34: return shift ? '"' : '\'';
+        case 0x35: return shift ? '~' : '`';
+        case 0x36: return shift ? '<' : ',';
+        case 0x37: return shift ? '>' : '.';
+        case 0x38: return shift ? '?' : '/';
+        default: break;
+    }
+
+    return 0;
 }

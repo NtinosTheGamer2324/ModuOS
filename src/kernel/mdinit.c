@@ -1,6 +1,7 @@
 // mdinit.c - kernel initialization sequence extracted from kernel.c
 
 #include "moduos/kernel/mdinit.h"
+#include "moduos/kernel/smp.h"
 #include "moduos/arch/AMD64/gdt.h"
 
 // We include the old kernel.c dependencies here so init behavior remains unchanged.
@@ -26,6 +27,12 @@ void memory_smoke_test(void);
 #include "moduos/arch/AMD64/interrupts/irq.h"
 #include "moduos/arch/AMD64/interrupts/pic.h"
 #include "moduos/arch/AMD64/interrupts/timer.h"
+#include "moduos/arch/AMD64/interrupts/apic.h"
+#include "moduos/arch/AMD64/interrupts/ioapic.h"
+
+// Optional USB HID debug polling (compile-time gated)
+void hid_debug_poll_early(void);
+
 
 #include "moduos/drivers/input/input.h"
 #include "moduos/drivers/input/ps2/ps2.h"
@@ -118,8 +125,8 @@ static void Interrupts_Init(void) {
     irq_init();
     COM_LOG_OK(COM1_PORT, "Initialized IRQs");
 
-    COM_LOG_INFO(COM1_PORT, "Initializing PIT (100Hz)");
-    pit_init(100);
+    COM_LOG_INFO(COM1_PORT, "Initializing PIT (1000Hz)");
+    pit_init(1000);
     COM_LOG_OK(COM1_PORT, "PIT initialized");
 
     COM_LOG_INFO(COM1_PORT, "Loading IDT");
@@ -135,6 +142,9 @@ static void Interrupts_Init(void) {
 static void loading(void);
 
 // Full init sequence
+static uint64_t g_mdinit_mb2_ptr = 0;
+uint64_t mdinit_get_mb2_ptr(void) { return g_mdinit_mb2_ptr; }
+
 static void init(uint64_t mb2_ptr_init);
 
 // ------------------ DEVICE INIT (split) ------------------
@@ -162,9 +172,6 @@ static void storage_early_init(void) {
     } else {
         COM_LOG_WARN(COM1_PORT, "SATA initialization failed");
     }
-
-    vdrive_debug_registration();
-    DEBUG_PAUSE(5);
 
     // ATA Initialization (fallback for older systems)
     COM_LOG_INFO(COM1_PORT, "Initializing ATA Controller / Drives");
@@ -204,6 +211,7 @@ static void devices_late_init(void) {
     //  - graphics: $/dev/graphics/video0
     devfs_input_init();
     devfs_graphics_init();
+    devfs_gui_init();
 
     COM_LOG_INFO(COM1_PORT, "Initializing input subsystem");
     input_init();
@@ -292,6 +300,8 @@ static int detect_boot_drive(void) {
         com_write_string(COM1_PORT, ")...\n");
 
         int slot = -1;
+
+        /* Optical drives are handled as whole-disk ISO9660 (no partition scan). */
         if (drive->type == VDRIVE_TYPE_ATA_ATAPI || drive->type == VDRIVE_TYPE_SATA_OPTICAL) {
             com_write_string(COM1_PORT, "[INFO] Optical drive detected, trying ISO9660...\n");
             slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_ISO9660);
@@ -306,20 +316,63 @@ static int detect_boot_drive(void) {
             }
             com_write_string(COM1_PORT, "[INFO] ISO9660 mounted successfully\n");
         } else {
-            com_write_string(COM1_PORT, "[INFO] Hard drive detected, auto-detecting filesystem...\n");
-            slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_UNKNOWN);
+            /* Hard drives: scan MBR partitions first, then fall back to whole disk.
+             * This avoids the "only checks partition 1" issue.
+             */
+            com_write_string(COM1_PORT, "[INFO] Hard drive detected, scanning partitions for boot marker...\n");
 
-            if (slot < 0) {
-                com_write_string(COM1_PORT, "[INFO] vDrive ");
+            int found = 0;
+            for (int part_no = 1; part_no <= 4; part_no++) {
+                uint32_t start_lba = 0, sectors = 0;
+                uint8_t ptype = 0;
+                if (fs_mbr_get_partition(vdrive_id, part_no, &start_lba, &sectors, &ptype) != 0) {
+                    continue;
+                }
+                if (start_lba == 0 || sectors == 0 || ptype == 0x00) continue;
+
+                com_write_string(COM1_PORT, "[INFO] Trying vDrive ");
                 id_str[0] = '0' + vdrive_id;
                 id_str[1] = '\0';
                 com_write_string(COM1_PORT, id_str);
-                com_write_string(COM1_PORT, " mount failed (slot=");
-                char tmp[16];
-                itoa(slot, tmp, 10);
-                com_write_string(COM1_PORT, tmp);
-                com_write_string(COM1_PORT, ")\n");
-                continue;
+                com_write_string(COM1_PORT, " partition P");
+                char pbuf[4]; itoa(part_no, pbuf, 10);
+                com_write_string(COM1_PORT, pbuf);
+                com_write_string(COM1_PORT, " (LBA=");
+                char lb[16]; itoa((int)start_lba, lb, 10);
+                com_write_string(COM1_PORT, lb);
+                com_write_string(COM1_PORT, ")...\n");
+
+                slot = fs_mount_drive(vdrive_id, start_lba, FS_TYPE_UNKNOWN);
+                if (slot < 0) continue;
+
+                fs_mount_t* m = fs_get_mount(slot);
+                if (m && m->valid && fs_file_exists(m, "/ModuOS/System64/mdsys.sqr")) {
+                    found = 1;
+                    break;
+                }
+
+                fs_unmount_slot(slot);
+                slot = -1;
+            }
+
+            if (!found) {
+                com_write_string(COM1_PORT, "[INFO] No boot marker in MBR partitions, trying whole disk...\n");
+                slot = fs_mount_drive(vdrive_id, 0, FS_TYPE_UNKNOWN);
+
+                if (slot < 0) {
+                    com_write_string(COM1_PORT, "[INFO] vDrive ");
+                    id_str[0] = '0' + vdrive_id;
+                    id_str[1] = '\0';
+                    com_write_string(COM1_PORT, id_str);
+                    com_write_string(COM1_PORT, " mount failed (slot=");
+                    char tmp[16];
+                    itoa(slot, tmp, 10);
+                    com_write_string(COM1_PORT, tmp);
+                    com_write_string(COM1_PORT, ")\n");
+                    continue;
+                }
+            } else {
+                com_write_string(COM1_PORT, "[OK] Boot marker found on a partition\n");
             }
         }
 
@@ -407,6 +460,7 @@ static int detect_boot_drive(void) {
 
 // ------------------ INIT ------------------
 static void init(uint64_t mb2_ptr_init) {
+    g_mdinit_mb2_ptr = mb2_ptr_init;
     // Initialize COM ports FIRST for early debug output
     com_early_init(COM1_PORT);
     com_early_init(COM2_PORT);
@@ -507,17 +561,31 @@ static void init(uint64_t mb2_ptr_init) {
         /* Do NOT re-enable splash lock here; let normal console output work. */
     }
 
-    // Load kernel modules (.sqrm) as early as possible now that the boot filesystem is available.
-    sqrm_load_all();
+    // Load SQRM early drivers: Graphics first, then FS drivers.
+    sqrm_load_early_drivers();
 
-    // External filesystem drivers may have registered during SQRM loading.
+    // External filesystem drivers may have registered during SQRM early loading.
     // Rescan so additional drives/partitions (e.g., ext2 HDD) become available automatically.
     fs_rescan_all();
+
+    // Load the rest of SQRM modules (USB/NET/AUDIO/etc).
+    sqrm_load_late_drivers();
+
+    // Optional: poll HID reports for a short time during boot to validate USB HID.
+    hid_debug_poll_early();
 
     // Initialize ACPI
     if (acpi_init() == 0) {
         acpi_initialized = 1;
         COM_LOG_OK(COM1_PORT, "ACPI initialized");
+
+        // APIC/LAPIC/IOAPIC init temporarily disabled (work in progress).
+        // Re-enable once APIC interrupt vectors/EOI are fully stable.
+        // (void)apic_init_from_madt();
+        // (void)apic_timer_init(1000);
+        // if (ioapic_init_from_madt() == 0) {
+        //     for (int i = 0; i < 16; i++) pic_mask_irq((uint8_t)i);
+        // }
     } else {
         COM_LOG_WARN(COM1_PORT, "ACPI initialization failed");
     }
@@ -527,6 +595,9 @@ static void init(uint64_t mb2_ptr_init) {
 
     // Initialize process management system
     COM_LOG_INFO(COM1_PORT, "Initializing process management");
+
+    /* Set up per-CPU GS base for BSP before anything touches syscall stack/TSS. */
+    smp_init_bsp_early();
 
     /* Install kernel-owned GDT+TSS with user segments before any ring3 work. */
     amd64_gdt_init();

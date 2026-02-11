@@ -433,35 +433,87 @@ const char* pci_vendor_name(uint16_t vendor_id) {
     }
 }
 
+static void com_print_hex16(uint16_t v) {
+    const char *hex = "0123456789abcdef";
+    char b[5];
+    b[0] = hex[(v >> 12) & 0xF];
+    b[1] = hex[(v >> 8) & 0xF];
+    b[2] = hex[(v >> 4) & 0xF];
+    b[3] = hex[v & 0xF];
+    b[4] = 0;
+    com_write_string(COM1_PORT, b);
+}
+
+static void com_print_hex32(uint32_t v) {
+    const char *hex = "0123456789abcdef";
+    char b[9];
+    for (int i = 0; i < 8; i++) {
+        b[i] = hex[(v >> ((7 - i) * 4)) & 0xF];
+    }
+    b[8] = 0;
+    com_write_string(COM1_PORT, b);
+}
+
 void pci_dump_device(pci_device_t *dev) {
     com_write_string(COM1_PORT, "[PCI] Device: ");
-    
+
     // Bus:Device.Function
     char buf[32];
     int pos = 0;
-    
+
     // Bus
     if (dev->bus < 10) buf[pos++] = '0';
     buf[pos++] = '0' + (dev->bus / 10);
     buf[pos++] = '0' + (dev->bus % 10);
     buf[pos++] = ':';
-    
+
     // Device
     if (dev->device < 10) buf[pos++] = '0';
     buf[pos++] = '0' + (dev->device / 10);
     buf[pos++] = '0' + (dev->device % 10);
     buf[pos++] = '.';
-    
+
     // Function
     buf[pos++] = '0' + dev->function;
     buf[pos++] = ' ';
     buf[pos] = '\0';
-    
+
     com_write_string(COM1_PORT, buf);
+
+    // Vendor/device IDs
+    com_print_hex16(dev->vendor_id);
+    com_write_string(COM1_PORT, ":");
+    com_print_hex16(dev->device_id);
+    com_write_string(COM1_PORT, " ");
+
+    // Human names
     com_write_string(COM1_PORT, pci_vendor_name(dev->vendor_id));
     com_write_string(COM1_PORT, " [");
     com_write_string(COM1_PORT, pci_class_name(dev->class_code));
-    com_write_string(COM1_PORT, "]\n");
+    com_write_string(COM1_PORT, "]");
+
+    // Class/subclass/progif
+    com_write_string(COM1_PORT, " class=");
+    com_print_hex16(((uint16_t)dev->class_code << 8) | dev->subclass);
+    com_write_string(COM1_PORT, " if=");
+    com_print_hex16(dev->prog_if);
+    com_write_string(COM1_PORT, "\n");
+
+    // For display devices, dump BARs (raw)
+    if (dev->class_code == PCI_CLASS_DISPLAY) {
+        for (int i = 0; i < 6; i++) {
+            com_write_string(COM1_PORT, "[PCI]   BAR");
+            char n[2] = { (char)('0' + i), 0 };
+            com_write_string(COM1_PORT, n);
+            com_write_string(COM1_PORT, "=");
+            com_print_hex32(dev->bar[i]);
+            com_write_string(COM1_PORT, " size=");
+            com_print_hex32(dev->bar_size[i]);
+            com_write_string(COM1_PORT, " type=");
+            com_write_string(COM1_PORT, dev->bar_type[i] ? "IO" : "MMIO");
+            com_write_string(COM1_PORT, "\n");
+        }
+    }
 }
 
 // ============================================================================

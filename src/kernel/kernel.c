@@ -504,9 +504,9 @@ static void kernel_try_enable_framebuffer(uint64_t mb2_ptr) {
 }
 
 static void gfx_sleep_ms(uint64_t ms) {
-    /* PIT runs at 100Hz (pit_init(100)), so 1 tick = 10ms */
+    /* Delay using PIT ticks */
     const uint64_t start = get_system_ticks();
-    const uint64_t ticks = (ms + 9) / 10;
+    const uint64_t ticks = ms_to_ticks(ms);
     while ((get_system_ticks() - start) < ticks) {
         __asm__ volatile("hlt");
     }
@@ -607,10 +607,12 @@ void kernel_main(uint64_t mb2_ptr)
     }
     */
     VGA_Clear();
-    VGA_Writef("This is free software, distributed without any warranty.\n");
-    VGA_Writef("Copyright (c) New Technologies Software — ModuOS Login\n");
-    exec("/Apps/login.sqr");
-    kernel_post_init_run_shell();
+    // Start configured services/apps before launching login.
+    extern void kernel_run_autostart(int boot_slot);
+    kernel_run_autostart(boot_drive_slot);
+
+    shell_process_entry();
+
     /* Should never be reached */
     for (;;) {
         __asm__ volatile("hlt");

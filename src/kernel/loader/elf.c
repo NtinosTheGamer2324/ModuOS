@@ -66,6 +66,23 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
     }
     
     elf64_ehdr_t *ehdr = (elf64_ehdr_t *)elf_data;
+
+    /* Basic bounds checks to avoid faults on malformed binaries. */
+    if (size < sizeof(*ehdr)) {
+        COM_LOG_ERROR(COM1_PORT, "ELF too small");
+        return -1;
+    }
+    if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) {
+        COM_LOG_ERROR(COM1_PORT, "ELF has no program headers");
+        return -1;
+    }
+    uint64_t phentsz = (ehdr->e_phentsize ? ehdr->e_phentsize : (uint64_t)sizeof(elf64_phdr_t));
+    uint64_t ph_end = ehdr->e_phoff + (uint64_t)ehdr->e_phnum * phentsz;
+    if (ph_end > size || ehdr->e_phoff > size) {
+        COM_LOG_ERROR(COM1_PORT, "ELF program header table out of range");
+        return -1;
+    }
+
     elf64_phdr_t *phdr = (elf64_phdr_t *)((uint8_t *)elf_data + ehdr->e_phoff);
     
     com_write_string(COM1_PORT, "[ELF] Loading ");
@@ -79,6 +96,11 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_LOAD) {
+            /* Validate file-backed range before touching it. */
+            if (phdr[i].p_offset + phdr[i].p_filesz > size) {
+                COM_LOG_ERROR(COM1_PORT, "ELF segment file range out of bounds");
+                return -1;
+            }
             uint64_t seg_start = phdr[i].p_vaddr & ~0xFFFULL;
             uint64_t seg_end = (phdr[i].p_vaddr + phdr[i].p_memsz + 0xFFFULL) & ~0xFFFULL;
             if (img_base == 0 || seg_start < img_base) img_base = seg_start;
@@ -131,39 +153,16 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
             
             // Set up page flags
             // User programs execute in CPL=3, so their pages MUST be mapped with PFLAG_USER.
-            // Also respect ELF segment writability.
-            uint64_t flags = PFLAG_PRESENT | PFLAG_USER;
+            // IMPORTANT: We must be able to write to the mapped pages while loading (memset/memcpy),
+            // even for RX text segments. We'll temporarily map as writable, then (optionally)
+            // tighten permissions after copying.
+            uint64_t final_flags = PFLAG_PRESENT | PFLAG_USER;
             if (phdr[i].p_flags & PF_W) {
-                flags |= PFLAG_WRITABLE;
+                final_flags |= PFLAG_WRITABLE;
             }
+            /* Temporary flags for loading */
+            uint64_t load_flags = final_flags | PFLAG_WRITABLE;
             
-            /*
-             * Safety: if the target virtual range is already mapped (e.g. repeated exec),
-             * unmap it first. This prevents collisions with existing mappings, especially
-             * when reusing the same process address space template.
-             */
-            {
-                size_t pages = aligned_size / PAGE_SIZE;
-                int unmapped_any = 0;
-                for (size_t p = 0; p < pages; p++) {
-                    uint64_t vcheck = vaddr_aligned + (uint64_t)p * PAGE_SIZE;
-                    if (paging_virt_to_phys(vcheck) != 0) {
-                        if (!unmapped_any) {
-                            com_write_string(COM1_PORT, "[ELF] Warning: target vaddr range already mapped; unmapping first...\n");
-                            unmapped_any = 1;
-                        }
-                        paging_unmap_page(vcheck);
-                    }
-                }
-                if (unmapped_any) {
-                    __asm__ volatile(
-                        "mov %%cr3, %%rax\n"
-                        "mov %%rax, %%cr3\n"
-                        ::: "rax", "memory"
-                    );
-                }
-            }
-
             // Map the pages
             com_write_string(COM1_PORT, "[ELF] Mapping 0x");
             for (int j = 15; j >= 0; j--) {
@@ -179,10 +178,10 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
             }
             com_write_string(COM1_PORT, "\n");
             
-            if (paging_map_range(vaddr_aligned, phys_base, aligned_size, flags) != 0) {
+            if (paging_map_range(vaddr_aligned, phys_base, aligned_size, load_flags) != 0) {
                 COM_LOG_ERROR(COM1_PORT, "Failed to map segment");
                 for (size_t p = 0; p < num_pages; p++) {
-                    phys_free_frame(phys_base + p * PAGE_SIZE);
+                    phys_ref_dec(phys_base + p * PAGE_SIZE);
                 }
                 return -1;
             }
@@ -200,6 +199,21 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
             
             uint8_t *data_dest = (uint8_t *)vaddr;
             memcpy(data_dest, (uint8_t *)elf_data + phdr[i].p_offset, phdr[i].p_filesz);
+
+            /* Tighten permissions after load: drop WRITABLE if this segment is not writable.
+             * This avoids leaving RX segments writable.
+             */
+            if ((final_flags & PFLAG_WRITABLE) == 0) {
+                for (size_t p = 0; p < num_pages; p++) {
+                    uint64_t page_v = vaddr_aligned + (uint64_t)p * PAGE_SIZE;
+                    uint64_t pte = paging_get_pte(page_v);
+                    if (pte & PFLAG_PRESENT) {
+                        uint64_t phys = pte & 0xFFFFFFFFFFFFF000ULL;
+                        uint64_t new_pte = phys | (final_flags & 0xFFFULL);
+                        (void)paging_set_pte(page_v, new_pte);
+                    }
+                }
+            }
             
             com_write_string(COM1_PORT, "[ELF] Copied ");
             itoa(phdr[i].p_filesz, buf, 10);

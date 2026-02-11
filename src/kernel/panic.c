@@ -34,11 +34,22 @@ static void panic_header(const char* title)
 #include "moduos/kernel/memory/string.h"
 
 static uint32_t fb_pack_rgb(const framebuffer_t *fb, uint8_t r, uint8_t g, uint8_t b) {
+    if (!fb) return 0;
+
     if (fb->bpp == 16) {
+        /* Assume RGB565 */
         uint16_t rr = (uint16_t)((r * 31u) / 255u);
         uint16_t gg = (uint16_t)((g * 63u) / 255u);
         uint16_t bb = (uint16_t)((b * 31u) / 255u);
         return (uint32_t)((rr << 11) | (gg << 5) | bb);
+    }
+
+    /* If the bootloader didn't provide mask fields, fall back to XRGB8888.
+     * This fixes "GUI panic only shows [PANIC]" because otherwise all packed
+     * colors become 0 (black-on-black).
+     */
+    if (fb->bpp == 32 && (!fb->red_mask_size || !fb->green_mask_size || !fb->blue_mask_size)) {
+        return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
     }
 
     /* 32bpp RGB layout via multiboot positions */

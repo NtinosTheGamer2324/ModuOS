@@ -1,4 +1,6 @@
 #include "moduos/kernel/md64api.h"
+#include "moduos/kernel/user_identity.h"
+#include "moduos/kernel/gfx.h"
 #include "moduos/drivers/Time/RTC.h"
 #include "moduos/kernel/kernel.h"
 #include "moduos/kernel/memory/string.h"
@@ -450,7 +452,8 @@ static const char *get_cpu_flags_string(void)
 /* --- PCI helpers --- */
 static pci_device_t *find_pci_class(uint8_t class_code)
 {
-    pci_scan_bus();
+    // NOTE: do not rescan PCI on every md64api call; it is slow and noisy.
+    // PCI is scanned during boot (pci_init). Here we only consult the cached list.
     int count = pci_get_device_count();
     for (int i = 0; i < count; ++i) {
         pci_device_t *dev = pci_get_device(i);
@@ -513,12 +516,14 @@ md64api_sysinfo_data get_system_info(void)
     static char cpu_vendor[13];
     static char cpu_brand[49];
     static char gpu_name_buf[128];
+    static char gpu_driver_buf[64];
     static char disk_model_buf[128];
 
     /* zero static buffers */
     cpu_vendor[0] = 0;
     cpu_brand[0] = 0;
     gpu_name_buf[0] = 0;
+    gpu_driver_buf[0] = 0;
     disk_model_buf[0] = 0;
 
     /* CPUID: vendor + brand + flags */
@@ -542,16 +547,16 @@ md64api_sysinfo_data get_system_info(void)
 
     /* --- OS / Kernel Info --- */
     info.SystemVersion = "0.5.5";
-    info.KernelVersion = "MDKernel 0.5.5";
+    info.KernelVersion = "MDKernel 0.5.6";
     info.KernelVendor = "NTSoftware";
     info.os_name = "ModuOS";
     info.os_arch = "AMD64";
 
     /* --- System Identity --- */
     info.pcname = pcname;
-    info.username = "mdman";
+    info.username = KERNEL_USERNAME;
     info.domain = "SYSTEM";
-    info.kconsole = "VBE Text Konsole";
+    info.kconsole = "Display Text Konsole";
 
     /* --- CPU Info --- */
     info.cpu = cpu_vendor[0] ? cpu_vendor : "";
@@ -613,11 +618,23 @@ md64api_sysinfo_data get_system_info(void)
             const char *name = format_pci_vendor_device(gpu->vendor_id, gpu->device_id);
             snprintf(gpu_name_buf, sizeof(gpu_name_buf), "%s", name);
             info.gpu_name = gpu_name_buf;
-            info.gpu_vram_mb = 0;
         } else {
             info.gpu_name = "";
-            info.gpu_vram_mb = 0;
         }
+
+        // Active GPU driver (SQRM module name)
+        {
+            const char *drv = gfx_get_sqrm_gpu_driver_name();
+            if (drv && drv[0]) {
+                // Prefer showing the actual module filename
+                snprintf(gpu_driver_buf, sizeof(gpu_driver_buf), "%s.sqrm", drv);
+                info.gpu_driver = gpu_driver_buf;
+            } else {
+                info.gpu_driver = "";
+            }
+        }
+
+        info.gpu_vram_mb = 0;
     }
 
     /* --- Storage Info (from PCI storage class) --- */
@@ -665,3 +682,4 @@ md64api_date_time get_date_time(void) {
 
     return date_time;
 }
+

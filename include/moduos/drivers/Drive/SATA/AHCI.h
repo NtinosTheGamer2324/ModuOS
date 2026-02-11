@@ -38,7 +38,12 @@
 #define HBA_PxCMD_CR            0x8000  // Command List Running
 
 // Port Interrupt Status/Enable Bits
-#define HBA_PxIS_TFES           (1 << 30)  // Task File Error Status
+#define HBA_PxIS_DHRS           (1u << 0)   // Device-to-Host Register FIS
+#define HBA_PxIS_PSS            (1u << 1)   // PIO Setup FIS
+#define HBA_PxIS_DSS            (1u << 2)   // DMA Setup FIS
+#define HBA_PxIS_SDBS           (1u << 3)   // Set Device Bits FIS
+#define HBA_PxIS_DPS            (1u << 5)   // Descriptor Processed
+#define HBA_PxIS_TFES           (1u << 30)  // Task File Error Status
 
 // Port SATA Status Register
 #define HBA_PxSSTS_DET_MASK     0x0F
@@ -223,11 +228,16 @@ typedef struct {
     hba_port_t *port;
     ahci_device_type_t type;
     uint8_t port_num;
-    
+
     hba_cmd_header_t *cmd_list;     // 1K per port
     hba_fis_t *fis;                 // 256 bytes per port
     hba_cmd_table_t *cmd_tables[32]; // One per command slot
-    
+
+    /* IRQ completion tracking */
+    volatile uint32_t last_ci;
+    volatile uint32_t completed_slots;
+    volatile uint32_t error_slots;
+
     uint64_t sector_count;
     uint16_t sector_size;
     char model[41];

@@ -74,7 +74,7 @@ typedef struct {
 } MouseEventData;
 
 // Generic event structure
-typedef struct {
+typedef struct Event {
     EventType type;
     uint64_t timestamp;     // Optional: system tick count
     union {

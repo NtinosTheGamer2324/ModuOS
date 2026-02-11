@@ -1,0 +1,293 @@
+#include "moduos/kernel/xenith26_shm.h"
+#include "moduos/kernel/process/process.h"
+#include "moduos/kernel/memory/paging.h"
+#include "moduos/kernel/memory/phys.h"
+#include "moduos/kernel/memory/usercopy.h"
+#include "moduos/kernel/interrupts/irq_lock.h"
+#include "moduos/fs/devfs.h"
+#include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/memory/memory.h" /* kmalloc/kfree */
+
+#define X26_MAX_BUFS 128
+#define X26_MAX_PAGES_PER_BUF 4096 /* 16MB */
+
+/* Xenith26 SHM mapping region (must NOT overlap normal user_mmap_base range, because fork clones that).
+ * process.c uses user_mmap_base = 0x0000006000000000.
+ */
+#define X26_SHM_BASE  0x0000007000000000ULL
+#define X26_SHM_LIMIT (X26_SHM_BASE + 256ULL * 1024ULL * 1024ULL)
+
+typedef struct {
+    int used;
+    uint32_t id;
+    uint32_t owner_pid;
+    uint16_t w, h;
+    uint32_t stride;
+    uint64_t size_bytes;
+    size_t pages;
+    uint64_t *phys_pages; /* array of physical page bases */
+} x26_buf_t;
+
+static x26_buf_t g_bufs[X26_MAX_BUFS];
+static uint32_t g_next_id = 1;
+
+static x26_buf_t* buf_find(uint32_t id) {
+    for (size_t i = 0; i < X26_MAX_BUFS; i++) {
+        if (g_bufs[i].used && g_bufs[i].id == id) return &g_bufs[i];
+    }
+    return NULL;
+}
+
+static x26_buf_t* buf_alloc_slot(void) {
+    for (size_t i = 0; i < X26_MAX_BUFS; i++) {
+        if (!g_bufs[i].used) return &g_bufs[i];
+    }
+    return NULL;
+}
+
+static int map_into_current(x26_buf_t *b, uint64_t vaddr, uint64_t pflags) {
+    if (!b || !b->phys_pages) return -1;
+    if ((vaddr & 0xFFFULL) != 0) return -2;
+
+    /* Ensure destination range is unmapped */
+    for (size_t i = 0; i < b->pages; i++) {
+        uint64_t va = vaddr + (uint64_t)i * 0x1000ULL;
+        if (paging_get_flags(va) & PFLAG_PRESENT) return -3;
+    }
+
+    for (size_t i = 0; i < b->pages; i++) {
+        uint64_t va = vaddr + (uint64_t)i * 0x1000ULL;
+        uint64_t pa = b->phys_pages[i];
+        if (paging_map_page(va, pa, pflags) != 0) return -4;
+        phys_ref_inc(pa);
+    }
+
+    return 0;
+}
+
+static int unmap_from_current(x26_buf_t *b, uint64_t vaddr) {
+    if (!b || !b->phys_pages) return -1;
+    if ((vaddr & 0xFFFULL) != 0) return -2;
+
+    for (size_t i = 0; i < b->pages; i++) {
+        uint64_t va = vaddr + (uint64_t)i * 0x1000ULL;
+        uint64_t pa = paging_virt_to_phys(va) & ~0xFFFULL;
+        (void)paging_unmap_page(va);
+        if (pa) phys_ref_dec(pa);
+    }
+    return 0;
+}
+
+int x26_shm_create(x26_shm_create_req_t *user_req) {
+    x26_shm_create_req_t req;
+    if (usercopy_from_user(&req, user_req, sizeof(req)) != 0) return -1;
+
+    process_t *p = process_get_current();
+    if (!p || !p->is_user) return -2;
+
+    if (req.w == 0 || req.h == 0) return -3;
+    if (req.fmt != 1 /* MD64API_GRP_FMT_XRGB8888 */) return -4;
+
+    uint64_t stride = (uint64_t)req.w * 4ULL;
+    uint64_t size = stride * (uint64_t)req.h;
+    size = (size + 0xFFFULL) & ~0xFFFULL;
+    size_t pages = (size_t)(size / 0x1000ULL);
+    if (pages == 0 || pages > X26_MAX_PAGES_PER_BUF) return -5;
+
+    x26_buf_t *b = buf_alloc_slot();
+    if (!b) return -6;
+
+    memset(b, 0, sizeof(*b));
+    b->used = 1;
+    b->id = g_next_id++;
+    b->owner_pid = p->pid;
+    b->w = req.w;
+    b->h = req.h;
+    b->stride = (uint32_t)stride;
+    b->size_bytes = size;
+    b->pages = pages;
+
+    b->phys_pages = (uint64_t*)kmalloc(sizeof(uint64_t) * pages);
+    if (!b->phys_pages) {
+        b->used = 0;
+        return -7;
+    }
+
+    for (size_t i = 0; i < pages; i++) {
+        uint64_t pa = phys_alloc_frame();
+        if (!pa) {
+            /* rollback */
+            for (size_t j = 0; j < i; j++) {
+                phys_ref_dec(b->phys_pages[j]);
+            }
+            kfree(b->phys_pages);
+            b->used = 0;
+            return -8;
+        }
+        b->phys_pages[i] = pa;
+        /* object holds one ref */
+        phys_ref_inc(pa);
+    }
+
+    uint64_t map_addr = req.preferred_addr;
+    if (!map_addr || (map_addr & 0xFFFULL)) {
+        /* require fixed address for now */
+        map_addr = 0;
+    }
+    if (map_addr < X26_SHM_BASE || (map_addr + size) > X26_SHM_LIMIT) {
+        map_addr = 0;
+    }
+    if (!map_addr) {
+        /* rollback */
+        for (size_t i = 0; i < pages; i++) phys_ref_dec(b->phys_pages[i]);
+        kfree(b->phys_pages);
+        b->used = 0;
+        return -9;
+    }
+
+    uint64_t pflags = PFLAG_PRESENT | PFLAG_USER | PFLAG_WRITABLE;
+    int rc = map_into_current(b, map_addr, pflags);
+    if (rc != 0) {
+        for (size_t i = 0; i < pages; i++) phys_ref_dec(b->phys_pages[i]);
+        kfree(b->phys_pages);
+        b->used = 0;
+        return -10;
+    }
+
+    /* Track mapping in process for fork cleanup */
+    for (size_t mi = 0; mi < 32; mi++) {
+        if (!p->x26_maps[mi].used) {
+            p->x26_maps[mi].used = 1;
+            p->x26_maps[mi].buf_id = b->id;
+            p->x26_maps[mi].vaddr = map_addr;
+            p->x26_maps[mi].size_bytes = b->size_bytes;
+            break;
+        }
+    }
+
+    req.buf_id = b->id;
+    req.stride = b->stride;
+    req.mapped_addr = map_addr;
+    req.size_bytes = b->size_bytes;
+
+    if (usercopy_to_user(user_req, &req, sizeof(req)) != 0) return -11;
+    return 0;
+}
+
+int x26_shm_map(x26_shm_map_req_t *user_req) {
+    x26_shm_map_req_t req;
+    if (usercopy_from_user(&req, user_req, sizeof(req)) != 0) return -1;
+
+    process_t *p = process_get_current();
+    if (!p || !p->is_user) return -2;
+
+    x26_buf_t *b = buf_find(req.buf_id);
+    if (!b) return -3;
+
+    /* Access control: owner can request RW, server (gui0 server pid) can map RO.
+     * Others denied.
+     */
+    uint32_t server_pid = devfs_gui_server_pid();
+    int is_owner = (p->pid == b->owner_pid);
+    int is_server = (server_pid != 0 && p->pid == server_pid);
+    if (!is_owner && !is_server) return -4;
+
+    uint64_t map_addr = req.preferred_addr;
+    if (!map_addr || (map_addr & 0xFFFULL)) return -5;
+    if (map_addr < X26_SHM_BASE || (map_addr + b->size_bytes) > X26_SHM_LIMIT) return -5;
+
+    uint64_t pflags = PFLAG_PRESENT | PFLAG_USER;
+    if (is_owner && (req.flags & 1u)) {
+        pflags |= PFLAG_WRITABLE;
+    }
+
+    int rc = map_into_current(b, map_addr, pflags);
+    if (rc != 0) return -6;
+
+    /* Track mapping */
+    for (size_t mi = 0; mi < 32; mi++) {
+        if (!p->x26_maps[mi].used) {
+            p->x26_maps[mi].used = 1;
+            p->x26_maps[mi].buf_id = b->id;
+            p->x26_maps[mi].vaddr = map_addr;
+            p->x26_maps[mi].size_bytes = b->size_bytes;
+            break;
+        }
+    }
+
+    req.mapped_addr = map_addr;
+    req.size_bytes = b->size_bytes;
+    if (usercopy_to_user(user_req, &req, sizeof(req)) != 0) return -7;
+    return 0;
+}
+
+int x26_shm_unmap(uint32_t buf_id, uint64_t addr) {
+    process_t *p = process_get_current();
+    if (!p || !p->is_user) return -1;
+
+    x26_buf_t *b = buf_find(buf_id);
+    if (!b) return -2;
+
+    int rc = unmap_from_current(b, addr);
+    if (rc == 0) {
+        for (size_t mi = 0; mi < 32; mi++) {
+            if (p->x26_maps[mi].used && p->x26_maps[mi].buf_id == buf_id && p->x26_maps[mi].vaddr == addr) {
+                p->x26_maps[mi].used = 0;
+            }
+        }
+    }
+    return rc;
+}
+
+void x26_shm_process_unmap_all(process_t *p) {
+    if (!p) return;
+    /* Unmap all tracked Xenith26 shm mappings in the CURRENT address space.
+     * Caller must have switched to p's CR3 already.
+     */
+    for (size_t mi = 0; mi < 32; mi++) {
+        if (!p->x26_maps[mi].used) continue;
+        x26_buf_t *b = buf_find(p->x26_maps[mi].buf_id);
+        if (b) {
+            (void)unmap_from_current(b, p->x26_maps[mi].vaddr);
+        }
+        p->x26_maps[mi].used = 0;
+    }
+}
+
+int x26_shm_destroy(uint32_t buf_id) {
+    process_t *p = process_get_current();
+    if (!p || !p->is_user) return -1;
+
+    x26_buf_t *b = buf_find(buf_id);
+    if (!b) return -2;
+
+    uint32_t server_pid = devfs_gui_server_pid();
+    int is_owner = (p->pid == b->owner_pid);
+    int is_server = (server_pid != 0 && p->pid == server_pid);
+    if (!is_owner && !is_server) return -3;
+
+    /* Drop object ref and free table entry. Mappings keep pages alive via refcounts. */
+    for (size_t i = 0; i < b->pages; i++) {
+        phys_ref_dec(b->phys_pages[i]);
+    }
+    kfree(b->phys_pages);
+    memset(b, 0, sizeof(*b));
+    return 0;
+}
+
+void x26_shm_process_cleanup(uint32_t pid) {
+    /* Destroy all buffers owned by pid */
+    for (size_t i = 0; i < X26_MAX_BUFS; i++) {
+        x26_buf_t *b = &g_bufs[i];
+        if (!b->used) continue;
+        if (b->owner_pid != pid) continue;
+
+        for (size_t j = 0; j < b->pages; j++) {
+            phys_ref_dec(b->phys_pages[j]);
+        }
+        kfree(b->phys_pages);
+        memset(b, 0, sizeof(*b));
+    }
+}
+

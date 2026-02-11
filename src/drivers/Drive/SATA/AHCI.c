@@ -1,14 +1,42 @@
 #include "moduos/drivers/Drive/SATA/AHCI.h"
+
+/* AHCI DMA sizing
+ * We allocate command tables large enough for AHCI_PRDT_MAX_ENTRIES PRDTs.
+ */
+#define AHCI_PRDT_MAX_ENTRIES 128
+
+/* AHCI PRDT entry length field (DBC) is 22 bits (0-based), allowing up to 4MiB per PRD. */
+#define AHCI_PRD_MAX_BYTES (4u * 1024u * 1024u)
+
+#define AHCI_MAX_BYTES_PER_CMD (AHCI_PRDT_MAX_ENTRIES * AHCI_PRD_MAX_BYTES)
+/* Sector count in the FIS is 16-bit. Use 65535 as a conservative max. */
+#define AHCI_MAX_SECTORS_PER_CMD (((AHCI_MAX_BYTES_PER_CMD / 512u) < 65535u) ? (AHCI_MAX_BYTES_PER_CMD / 512u) : 65535u)
+
+/* Worst-case PRDT sizing if the caller buffer is physically fragmented (one PRD per page).
+ * Also account for potential unaligned start (can consume an extra page).
+ */
+#define AHCI_MAX_BYTES_PER_CMD_WORST (AHCI_PRDT_MAX_ENTRIES * (uint32_t)PAGE_SIZE - ((uint32_t)PAGE_SIZE - 1u))
+#define AHCI_MAX_SECTORS_PER_CMD_WORST (AHCI_MAX_BYTES_PER_CMD_WORST / 512u)
 #include "moduos/drivers/PCI/pci.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/macros.h"
+#include "moduos/arch/AMD64/interrupts/pic.h"
+#include "moduos/arch/AMD64/interrupts/irq.h"
+#include "moduos/arch/AMD64/interrupts/timer.h"
+#include "moduos/kernel/interrupts/hlt_wait.h"
+#include "moduos/kernel/mdinit.h"
+#include "moduos/kernel/multiboot2.h"
 #include <stdint.h>
 #include <stddef.h>
 
 static ahci_controller_t ahci_controller;
+static int ahci_irq_line = -1;
+static int ahci_force_poll = 0;
+
+static void ahci_irq_handler(void);
 
 // Memory allocation helper for DMA buffers
 static void* ahci_alloc_dma(size_t size) {
@@ -25,12 +53,192 @@ static void* ahci_alloc_dma(size_t size) {
     return ptr;
 }
 
-// Microsecond delay helper (you may need to implement this based on your timer)
+// ===========================================================================
+// Timing / wait helpers
+// ===========================================================================
+
+/* Note: PIT runs at 100Hz by default (10ms/tick). */
+static inline void ahci_cpu_pause(void) {
+    __asm__ volatile("pause" ::: "memory");
+}
+
+/*
+ * Legacy delay helper used in init/reset/identify paths.
+ * IMPORTANT: Do not use this in the read/write hot path.
+ */
 static void ahci_usleep(uint32_t us) {
-    // Simple busy wait - replace with proper timer-based delay if available
     for (volatile uint32_t i = 0; i < us * 100; i++) {
-        __asm__ volatile("pause");
+        ahci_cpu_pause();
     }
+}
+
+/*
+ * Wait until (port->tfd & mask) becomes 0, or until timeout_ms elapses.
+ *
+ * This is used in the I/O hot path. Do not sleep in 1ms increments; poll tightly
+ * with PAUSE (or HLT if IRQs are expected) and use the system tick counter only
+ * for the timeout.
+ */
+static int ahci_wait_tfd_clear(hba_port_t *port, uint32_t mask, uint32_t timeout_ms) {
+    const uint64_t start = get_system_ticks();
+    const uint64_t timeout_ticks = ms_to_ticks(timeout_ms);
+
+    /* Some hypervisors can "lose" timer interrupts briefly while a device is wedged.
+     * If the PIT tick stops advancing, a pure tick-based timeout will never fire.
+     *
+     * Keep a conservative fallback budget based on a bounded busy-wait sleep.
+     * This is only used if we detect that ticks are not moving.
+     */
+    uint32_t fallback_ms = timeout_ms;
+    uint64_t last_tick = start;
+    uint32_t stagnant_iters = 0;
+
+    uint32_t backoff = 0;
+    for (;;) {
+        if ((port->tfd & mask) == 0) return 0;
+
+        const uint64_t now = get_system_ticks();
+        if ((now - start) >= timeout_ticks) return -1;
+
+        if (now == last_tick) {
+            /* If ticks are not advancing, don't deadlock forever. */
+            stagnant_iters++;
+            if (stagnant_iters >= 50000u) {
+                stagnant_iters = 0;
+                if (fallback_ms == 0) return -1;
+                fallback_ms--;
+                ahci_usleep(1000); /* ~1ms best-effort */
+            }
+        } else {
+            last_tick = now;
+            stagnant_iters = 0;
+        }
+
+        /* Default to PAUSE polling (fast). Avoid HLT here: if timer IRQs are stuck,
+         * HLT can turn a short stall into a permanent hang.
+         */
+        backoff++;
+        (void)backoff;
+        ahci_cpu_pause();
+    }
+}
+
+/*
+ * Wait for a command slot to complete (CI bit cleared or completion flag set),
+ * or error/timeout. Used in the read/write hot path.
+ */
+static int ahci_wait_cmd_done(uint8_t port_num, int slot, uint32_t timeout_ms) {
+    ahci_port_info_t *pi = &ahci_controller.ports[port_num];
+    hba_port_t *port = pi->port;
+
+    const uint64_t start = get_system_ticks();
+    const uint64_t timeout_ticks = ms_to_ticks(timeout_ms);
+
+    uint32_t fallback_ms = timeout_ms;
+    uint64_t last_tick = start;
+    uint32_t stagnant_iters = 0;
+
+    for (;;) {
+        if (pi->error_slots & (1u << slot)) return -1;
+        if (pi->completed_slots & (1u << slot)) return 0;
+        if ((port->ci & (1u << slot)) == 0) return 0;
+        if (port->is & HBA_PxIS_TFES) return -1;
+
+        const uint64_t now = get_system_ticks();
+        if ((now - start) >= timeout_ticks) return -1;
+
+        if (now == last_tick) {
+            stagnant_iters++;
+            if (stagnant_iters >= 50000u) {
+                stagnant_iters = 0;
+                if (fallback_ms == 0) return -1;
+                fallback_ms--;
+                ahci_usleep(1000);
+            }
+        } else {
+            last_tick = now;
+            stagnant_iters = 0;
+        }
+
+        /* Avoid HLT here for the same reason as ahci_wait_tfd_clear():
+         * if timer interrupts are not firing, HLT can deadlock.
+         */
+        ahci_cpu_pause();
+    }
+}
+
+/*
+ * Build PRDT entries for a (possibly non-contiguous) virtual buffer.
+ * Coalesces physically contiguous ranges and grows each PRD up to AHCI_PRD_MAX_BYTES.
+ */
+static int ahci_build_prdt(hba_cmd_table_t *cmdtbl, const void *buffer, uint32_t bytes, uint16_t *out_prdtl) {
+    if (!cmdtbl || !buffer || bytes == 0 || !out_prdtl) return -1;
+
+    /* Fast path: if the buffer is physically contiguous, emit a single PRD.
+     * This avoids per-page paging_virt_to_phys() calls in the hot path.
+     */
+    {
+        const uint64_t v0 = (uint64_t)(uintptr_t)buffer;
+        const uint64_t p0 = paging_virt_to_phys(v0);
+        const uint64_t plast = paging_virt_to_phys(v0 + (uint64_t)bytes - 1u);
+        if (plast == (p0 + (uint64_t)bytes - 1u)) {
+            if (bytes > AHCI_PRD_MAX_BYTES) return -1; /* caller should chunk */
+            cmdtbl->prdt_entry[0].dba  = (uint32_t)p0;
+            cmdtbl->prdt_entry[0].dbau = (uint32_t)(p0 >> 32);
+            cmdtbl->prdt_entry[0].dbc  = bytes - 1u;
+            cmdtbl->prdt_entry[0].i    = 1;
+            *out_prdtl = 1;
+            return 0;
+        }
+    }
+
+    const uint8_t *v = (const uint8_t*)buffer;
+    uint32_t remaining = bytes;
+
+    uint16_t prdtl = 0;
+    uint64_t cur_phys = 0;
+    uint32_t cur_len = 0;
+
+    while (remaining > 0) {
+        const uint64_t vaddr = (uint64_t)(uintptr_t)v;
+        const uint32_t page_off = (uint32_t)(vaddr & (PAGE_SIZE - 1ULL));
+        uint32_t chunk = (uint32_t)(PAGE_SIZE - page_off);
+        if (chunk > remaining) chunk = remaining;
+
+        const uint64_t phys = paging_virt_to_phys(vaddr);
+
+        /* Try to extend current PRD if physically contiguous and within max length. */
+        if (cur_len > 0 && phys == (cur_phys + cur_len) && (cur_len + chunk) <= AHCI_PRD_MAX_BYTES) {
+            cur_len += chunk;
+        } else {
+            /* Flush previous PRD if any. */
+            if (cur_len > 0) {
+                cmdtbl->prdt_entry[prdtl].dba  = (uint32_t)cur_phys;
+                cmdtbl->prdt_entry[prdtl].dbau = (uint32_t)(cur_phys >> 32);
+                cmdtbl->prdt_entry[prdtl].dbc  = cur_len - 1;
+                cmdtbl->prdt_entry[prdtl].i    = 0;
+                prdtl++;
+                if (prdtl >= AHCI_PRDT_MAX_ENTRIES) return -1;
+            }
+
+            cur_phys = phys;
+            cur_len  = chunk;
+        }
+
+        v += chunk;
+        remaining -= chunk;
+    }
+
+    /* Flush last PRD */
+    if (cur_len == 0) return -1;
+    cmdtbl->prdt_entry[prdtl].dba  = (uint32_t)cur_phys;
+    cmdtbl->prdt_entry[prdtl].dbau = (uint32_t)(cur_phys >> 32);
+    cmdtbl->prdt_entry[prdtl].dbc  = cur_len - 1;
+    cmdtbl->prdt_entry[prdtl].i    = 1; /* interrupt on last */
+    prdtl++;
+
+    *out_prdtl = prdtl;
+    return 0;
 }
 
 // ===========================================================================
@@ -111,10 +319,12 @@ int ahci_port_rebase(hba_port_t *port, int portno) {
     // Allocate command tables (256 bytes each, 32 slots)
     hba_cmd_header_t *cmdheader = (hba_cmd_header_t*)clb;
     for (int i = 0; i < 32; i++) {
-        cmdheader[i].prdtl = 8;  // 8 PRDT entries per command table
+        cmdheader[i].prdtl = AHCI_PRDT_MAX_ENTRIES;
         
-        // Allocate command table (256 + 8*16 bytes for PRDT entries)
-        void *ctba = ahci_alloc_dma(256 + 8 * 16);
+        /* Allocate command table big enough for a large PRDT.
+         * hba_cmd_table_t includes prdt_entry[1] already.
+         */
+        void *ctba = ahci_alloc_dma(sizeof(hba_cmd_table_t) + (AHCI_PRDT_MAX_ENTRIES - 1) * sizeof(hba_prdt_entry_t));
         if (!ctba) {
             COM_LOG_ERROR(COM1_PORT, "Failed to allocate command table");
             return -1;
@@ -130,6 +340,54 @@ int ahci_port_rebase(hba_port_t *port, int portno) {
     
     ahci_start_cmd(port);
     return 0;
+}
+
+static inline void cpu_hlt_once(void) {
+    /* Ensure interrupts are enabled while halting.
+     * This prevents deadlocks if called from code paths that might temporarily
+     * run with IF=0.
+     */
+    __asm__ volatile("sti; hlt");
+}
+
+static void ahci_irq_handler(void) {
+    if (!ahci_controller.abar) return;
+
+    uint32_t is = ahci_controller.abar->is;
+    if (is == 0) {
+        /* Spurious */
+        if (ahci_irq_line >= 0) pic_send_eoi((uint8_t)ahci_irq_line);
+        return;
+    }
+
+    for (int p = 0; p < AHCI_MAX_PORTS; p++) {
+        if ((is & (1u << p)) == 0) continue;
+
+        ahci_port_info_t *pi = &ahci_controller.ports[p];
+        hba_port_t *port = pi->port;
+        if (!port) continue;
+
+        uint32_t pis = port->is;
+        port->is = pis; /* ack */
+
+        uint32_t ci_now = port->ci;
+        uint32_t ci_prev = pi->last_ci;
+        uint32_t done = ci_prev & ~ci_now; /* 1->0 transitions */
+        if (done) {
+            pi->completed_slots |= done;
+        }
+        pi->last_ci = ci_now;
+
+        if (pis & HBA_PxIS_TFES) {
+            /* Mark all active slots as errored */
+            pi->error_slots |= ci_now;
+        }
+    }
+
+    /* Clear HBA interrupt status */
+    ahci_controller.abar->is = is;
+
+    if (ahci_irq_line >= 0) pic_send_eoi((uint8_t)ahci_irq_line);
 }
 
 int ahci_find_cmdslot(hba_port_t *port) {
@@ -284,38 +542,20 @@ int ahci_identify_device(uint8_t port_num) {
         cmdfis->counth = 0;
         
         // Wait for port to be ready
-        int spin = 0;
-        while ((port->tfd & (0x80 | 0x08)) && spin < 1000) {
-            ahci_usleep(1000);
-            spin++;
-        }
-        
-        if (spin == 1000) {
+        if (ahci_wait_tfd_clear(port, (0x80 | 0x08), 500 /*ms*/) != 0) {
             com_write_string(COM1_PORT, "[AHCI] SATAPI port hung before IDENTIFY\n");
             kfree(identify_buf);
             return 0; // Return success with default model
         }
-        
+
         // Issue command
-        port->ci = 1 << slot;
-        
-        // Wait for completion (with longer timeout for slow drives)
-        spin = 0;
-        while (spin < 10000) {
-            if ((port->ci & (1 << slot)) == 0)
-                break;
-            if (port->is & HBA_PxIS_TFES) {
-                com_write_string(COM1_PORT, "[AHCI] SATAPI IDENTIFY PACKET failed (task file error)\n");
-                com_printf(COM1_PORT, "[AHCI] Port %d TFD=0x%08x IS=0x%08x SERR=0x%08x\n", 
-                          port_num, port->tfd, port->is, port->serr);
-                kfree(identify_buf);
-                return 0; // Return success with default model
-            }
-            ahci_usleep(1000);
-            spin++;
-        }
-        
-        if (spin == 10000) {
+        port->ci = 1u << slot;
+        port_info->last_ci |= (1u << slot);
+
+        // Wait for completion (prefer fast polling with a real timeout; IRQs may not fire on some hypervisors)
+        port_info->completed_slots &= ~(1u << slot);
+        port_info->error_slots &= ~(1u << slot);
+        if (ahci_wait_cmd_done(port_num, slot, 5000 /*ms*/) != 0) {
             com_write_string(COM1_PORT, "[AHCI] SATAPI IDENTIFY PACKET timeout\n");
             kfree(identify_buf);
             return 0; // Return success with default model
@@ -403,41 +643,23 @@ int ahci_identify_device(uint8_t port_num) {
     cmdfis->counth = 0;
     
     // Wait for port to be ready
-    int spin = 0;
-    while ((port->tfd & (0x80 | 0x08)) && spin < 1000) {
-        ahci_usleep(1000); // 1ms
-        spin++;
-    }
-    
-    if (spin == 1000) {
+    if (ahci_wait_tfd_clear(port, (0x80 | 0x08), 500 /*ms*/) != 0) {
         COM_LOG_ERROR(COM1_PORT, "Port hung");
         kfree(identify_buf);
         return -1;
     }
     
     // Issue command
-    port->ci = 1 << slot;
+    port->ci = 1u << slot;
+    ahci_controller.ports[port_num].last_ci |= (1u << slot);
     
-    // Wait for completion
-    spin = 0;
-    while (spin < 10000) { // 10 second timeout (increased for slow drives)
-        if ((port->ci & (1 << slot)) == 0)
-            break;
-        if (port->is & HBA_PxIS_TFES) {
-            COM_LOG_ERROR(COM1_PORT, "IDENTIFY command failed (task file error)");
-            com_printf(COM1_PORT, "[AHCI] Port %d TFD=0x%08x IS=0x%08x SERR=0x%08x\n", 
-                      port_num, port->tfd, port->is, port->serr);
-            kfree(identify_buf);
-            return -1;
-        }
-        ahci_usleep(1000); // 1ms
-        spin++;
-    }
-    
-    if (spin == 10000) {
-        COM_LOG_ERROR(COM1_PORT, "IDENTIFY command timeout after 10 seconds");
-        com_printf(COM1_PORT, "[AHCI] Port %d CI=0x%08x TFD=0x%08x IS=0x%08x SERR=0x%08x\n", 
-                  port_num, port->ci, port->tfd, port->is, port->serr);
+    // Wait for completion (prefer fast polling with a real timeout; IRQs may not fire on some hypervisors)
+    port_info->completed_slots &= ~(1u << slot);
+    port_info->error_slots &= ~(1u << slot);
+    if (ahci_wait_cmd_done(port_num, slot, 5000 /*ms*/) != 0) {
+        COM_LOG_ERROR(COM1_PORT, "IDENTIFY command timeout");
+        com_printf(COM1_PORT, "[AHCI] Port %d CI=0x%08x TFD=0x%08x IS=0x%08x SERR=0x%08x\n",
+                   port_num, port->ci, port->tfd, port->is, port->serr);
         kfree(identify_buf);
         return -1;
     }
@@ -494,45 +716,49 @@ int ahci_read_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, void
     if (!port || port_info->type != AHCI_DEV_SATA)
         return -1;
     
-    // Clear pending interrupts
-    port->is = (uint32_t)-1;
-    
-    int slot = ahci_find_cmdslot(port);
-    if (slot == -1) {
-        COM_LOG_ERROR(COM1_PORT, "No free command slot");
-        return -1;
-    }
-    
-    hba_cmd_header_t *cmdheader = &port_info->cmd_list[slot];
-    cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
-    cmdheader->w = 0;  // Read from device
-    cmdheader->prdtl = (uint16_t)((count - 1) / 16 + 1);  // PRDT entries
-    
-    hba_cmd_table_t *cmdtbl = port_info->cmd_tables[slot];
-    
-    // Setup PRDT entries
-    uint32_t bytes_remaining = count * 512;
-    uint8_t *buf_ptr = (uint8_t*)buffer;
-    
-    for (int i = 0; i < cmdheader->prdtl - 1; i++) {
-        uint64_t buf_phys = paging_virt_to_phys((uint64_t)buf_ptr);
-        cmdtbl->prdt_entry[i].dba = (uint32_t)buf_phys;
-        cmdtbl->prdt_entry[i].dbau = (uint32_t)(buf_phys >> 32);
-        cmdtbl->prdt_entry[i].dbc = 8192 - 1;  // 8K bytes (0-based)
-        cmdtbl->prdt_entry[i].i = 0;
-        buf_ptr += 8192;
-        bytes_remaining -= 8192;
-    }
-    
-    // Last entry
-    uint64_t buf_phys = paging_virt_to_phys((uint64_t)buf_ptr);
-    cmdtbl->prdt_entry[cmdheader->prdtl - 1].dba = (uint32_t)buf_phys;
-    cmdtbl->prdt_entry[cmdheader->prdtl - 1].dbau = (uint32_t)(buf_phys >> 32);
-    cmdtbl->prdt_entry[cmdheader->prdtl - 1].dbc = bytes_remaining - 1;
-    cmdtbl->prdt_entry[cmdheader->prdtl - 1].i = 1;  // Interrupt on completion
-    
-    // Setup command FIS
-    fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t*)(&cmdtbl->cfis);
+    /* Chunk large transfers to avoid overflowing the command table PRDT.
+     * Our cmd tables are sized for AHCI_PRDT_MAX_ENTRIES entries.
+     */
+    uint8_t *buf8 = (uint8_t*)buffer;
+    uint32_t remaining = count;
+
+    while (remaining > 0) {
+        /* Start optimistic for throughput, but fall back if the PRDT would overflow
+         * (e.g. physically fragmented caller buffers).
+         */
+        uint32_t this_count = (remaining > AHCI_MAX_SECTORS_PER_CMD) ? AHCI_MAX_SECTORS_PER_CMD : remaining;
+        if (this_count > AHCI_MAX_SECTORS_PER_CMD_WORST) this_count = AHCI_MAX_SECTORS_PER_CMD_WORST;
+
+        // Clear pending interrupts
+        port->is = (uint32_t)-1;
+
+        int slot = ahci_find_cmdslot(port);
+        if (slot == -1) {
+            COM_LOG_ERROR(COM1_PORT, "No free command slot");
+            return -1;
+        }
+
+        hba_cmd_header_t *cmdheader = &port_info->cmd_list[slot];
+        cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
+        cmdheader->w = 0;  // Read from device
+
+        hba_cmd_table_t *cmdtbl = port_info->cmd_tables[slot];
+
+        uint16_t prdtl = 0;
+        for (;;) {
+            const uint32_t bytes = this_count * 512u;
+            if (ahci_build_prdt(cmdtbl, buf8, bytes, &prdtl) == 0) break;
+
+            if (this_count <= 1) {
+                COM_LOG_ERROR(COM1_PORT, "Failed to build PRDT");
+                return -1;
+            }
+            this_count >>= 1;
+        }
+        cmdheader->prdtl = prdtl;
+
+        // Setup command FIS
+        fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t*)(&cmdtbl->cfis);
     
     cmdfis->fis_type = FIS_TYPE_REG_H2D;
     cmdfis->c = 1;  // Command
@@ -547,94 +773,86 @@ int ahci_read_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, void
     cmdfis->lba4 = (uint8_t)(start_lba >> 32);
     cmdfis->lba5 = (uint8_t)(start_lba >> 40);
     
-    cmdfis->countl = (uint8_t)count;
-    cmdfis->counth = (uint8_t)(count >> 8);
+    cmdfis->countl = (uint8_t)this_count;
+    cmdfis->counth = (uint8_t)(this_count >> 8);
     
-    // Wait for port to be ready
-    int spin = 0;
-    while ((port->tfd & (0x80 | 0x08)) && spin < 1000) {
-        ahci_usleep(1000);
-        spin++;
-    }
-    
-    if (spin == 1000) {
+    // Wait for port to be ready (BSY/DRQ clear)
+    if (ahci_wait_tfd_clear(port, (0x80 | 0x08), 500 /*ms*/) != 0) {
         COM_LOG_ERROR(COM1_PORT, "Port hung");
         return -1;
     }
-    
+
     // Issue command
-    port->ci = 1 << slot;
-    
+    port->ci = 1u << slot;
+    ahci_controller.ports[port_num].last_ci |= (1u << slot);
+
     // Wait for completion
-    spin = 0;
-    while (spin < 5000) {
-        if ((port->ci & (1 << slot)) == 0)
-            break;
-        if (port->is & HBA_PxIS_TFES) {
-            COM_LOG_ERROR(COM1_PORT, "Read command failed");
-            return -1;
-        }
-        ahci_usleep(1000);
-        spin++;
-    }
-    
-    if (spin == 5000) {
-        COM_LOG_ERROR(COM1_PORT, "Read command timeout");
+    ahci_controller.ports[port_num].completed_slots &= ~(1u << slot);
+    ahci_controller.ports[port_num].error_slots &= ~(1u << slot);
+    if (ahci_wait_cmd_done(port_num, slot, 5000 /*ms*/) != 0) {
+        COM_LOG_ERROR(COM1_PORT, "Read command timeout/error");
         return -1;
     }
-    
+
+    /* Advance */
+    buf8 += (this_count * 512u);
+    start_lba += this_count;
+    remaining -= this_count;
+    }
+
     return 0;
 }
 
 int ahci_write_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, const void *buffer) {
     if (port_num >= AHCI_MAX_PORTS || count == 0 || !buffer)
         return -1;
-    
+
     ahci_port_info_t *port_info = &ahci_controller.ports[port_num];
     hba_port_t *port = port_info->port;
-    
+
     if (!port || port_info->type != AHCI_DEV_SATA)
         return -1;
-    
-    // Clear pending interrupts
-    port->is = (uint32_t)-1;
-    
-    int slot = ahci_find_cmdslot(port);
-    if (slot == -1) {
-        COM_LOG_ERROR(COM1_PORT, "No free command slot");
-        return -1;
-    }
-    
-    hba_cmd_header_t *cmdheader = &port_info->cmd_list[slot];
-    cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
-    cmdheader->w = 1;  // Write to device
-    cmdheader->prdtl = (uint16_t)((count - 1) / 16 + 1);
-    
-    hba_cmd_table_t *cmdtbl = port_info->cmd_tables[slot];
-    
-    // Setup PRDT entries
-    uint32_t bytes_remaining = count * 512;
-    const uint8_t *buf_ptr = (const uint8_t*)buffer;
-    
-    for (int i = 0; i < cmdheader->prdtl - 1; i++) {
-        uint64_t buf_phys = paging_virt_to_phys((uint64_t)buf_ptr);
-        cmdtbl->prdt_entry[i].dba = (uint32_t)buf_phys;
-        cmdtbl->prdt_entry[i].dbau = (uint32_t)(buf_phys >> 32);
-        cmdtbl->prdt_entry[i].dbc = 8192 - 1;
-        cmdtbl->prdt_entry[i].i = 0;
-        buf_ptr += 8192;
-        bytes_remaining -= 8192;
-    }
-    
-    // Last entry
-    uint64_t buf_phys = paging_virt_to_phys((uint64_t)buf_ptr);
-    cmdtbl->prdt_entry[cmdheader->prdtl - 1].dba = (uint32_t)buf_phys;
-    cmdtbl->prdt_entry[cmdheader->prdtl - 1].dbau = (uint32_t)(buf_phys >> 32);
-    cmdtbl->prdt_entry[cmdheader->prdtl - 1].dbc = bytes_remaining - 1;
-    cmdtbl->prdt_entry[cmdheader->prdtl - 1].i = 1;
-    
-    // Setup command FIS
-    fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t*)(&cmdtbl->cfis);
+
+    const uint8_t *buf8 = (const uint8_t*)buffer;
+    uint32_t remaining = count;
+
+    while (remaining > 0) {
+        /* Start optimistic for throughput, but fall back if the PRDT would overflow
+         * (e.g. physically fragmented caller buffers).
+         */
+        uint32_t this_count = (remaining > AHCI_MAX_SECTORS_PER_CMD) ? AHCI_MAX_SECTORS_PER_CMD : remaining;
+        if (this_count > AHCI_MAX_SECTORS_PER_CMD_WORST) this_count = AHCI_MAX_SECTORS_PER_CMD_WORST;
+
+        // Clear pending interrupts
+        port->is = (uint32_t)-1;
+
+        int slot = ahci_find_cmdslot(port);
+        if (slot == -1) {
+            COM_LOG_ERROR(COM1_PORT, "No free command slot");
+            return -1;
+        }
+
+        hba_cmd_header_t *cmdheader = &port_info->cmd_list[slot];
+        cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
+        cmdheader->w = 1;  // Write to device
+
+        hba_cmd_table_t *cmdtbl = port_info->cmd_tables[slot];
+
+        uint16_t prdtl = 0;
+        for (;;) {
+            const uint32_t bytes = this_count * 512u;
+            if (ahci_build_prdt(cmdtbl, buf8, bytes, &prdtl) == 0) break;
+
+            if (this_count <= 1) {
+                COM_LOG_ERROR(COM1_PORT, "Failed to build PRDT");
+                return -1;
+            }
+            this_count >>= 1;
+        }
+        cmdheader->prdtl = prdtl;
+
+        // Setup command FIS
+        fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t*)(&cmdtbl->cfis);
     
     cmdfis->fis_type = FIS_TYPE_REG_H2D;
     cmdfis->c = 1;
@@ -649,42 +867,32 @@ int ahci_write_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, con
     cmdfis->lba4 = (uint8_t)(start_lba >> 32);
     cmdfis->lba5 = (uint8_t)(start_lba >> 40);
     
-    cmdfis->countl = (uint8_t)count;
-    cmdfis->counth = (uint8_t)(count >> 8);
+    cmdfis->countl = (uint8_t)this_count;
+    cmdfis->counth = (uint8_t)(this_count >> 8);
     
-    // Wait for port to be ready
-    int spin = 0;
-    while ((port->tfd & (0x80 | 0x08)) && spin < 1000) {
-        ahci_usleep(1000);
-        spin++;
-    }
-    
-    if (spin == 1000) {
+    // Wait for port to be ready (BSY/DRQ clear)
+    if (ahci_wait_tfd_clear(port, (0x80 | 0x08), 500 /*ms*/) != 0) {
         COM_LOG_ERROR(COM1_PORT, "Port hung");
         return -1;
     }
-    
+
     // Issue command
-    port->ci = 1 << slot;
-    
+    port->ci = 1u << slot;
+    ahci_controller.ports[port_num].last_ci |= (1u << slot);
+
     // Wait for completion
-    spin = 0;
-    while (spin < 5000) {
-        if ((port->ci & (1 << slot)) == 0)
-            break;
-        if (port->is & HBA_PxIS_TFES) {
-            COM_LOG_ERROR(COM1_PORT, "Write command failed");
-            return -1;
-        }
-        ahci_usleep(1000);
-        spin++;
-    }
-    
-    if (spin == 5000) {
-        COM_LOG_ERROR(COM1_PORT, "Write command timeout");
+    ahci_controller.ports[port_num].completed_slots &= ~(1u << slot);
+    ahci_controller.ports[port_num].error_slots &= ~(1u << slot);
+    if (ahci_wait_cmd_done(port_num, slot, 5000 /*ms*/) != 0) {
+        COM_LOG_ERROR(COM1_PORT, "Write command timeout/error");
         return -1;
     }
-    
+
+    buf8 += (this_count * 512u);
+    start_lba += this_count;
+    remaining -= this_count;
+    }
+
     return 0;
 }
 
@@ -778,8 +986,13 @@ int ahci_probe_ports(void) {
                 com_write_string(COM1_PORT, port_str);
                 com_write_string(COM1_PORT, "\n");
                 
-                // Disable interrupts for this port
-                port->ie = 0;
+                // Enable port interrupts (completion + error)
+                port->ie = HBA_PxIS_DHRS | HBA_PxIS_PSS | HBA_PxIS_DPS | HBA_PxIS_SDBS | HBA_PxIS_TFES;
+
+                // Init slot completion tracking
+                ahci_controller.ports[i].last_ci = port->ci;
+                ahci_controller.ports[i].completed_slots = 0;
+                ahci_controller.ports[i].error_slots = 0;
                 
                 // Clear any pending interrupts
                 port->is = (uint32_t)-1;
@@ -945,10 +1158,54 @@ int ahci_init(void) {
     // Enable AHCI mode
     com_write_string(COM1_PORT, "[AHCI] Enabling AHCI mode...\n");
     ahci_controller.abar->ghc |= HBA_GHC_AHCI_ENABLE;
-    
-    // Disable interrupts globally
-    ahci_controller.abar->ghc &= ~HBA_GHC_IE;
-    com_write_string(COM1_PORT, "[AHCI] AHCI mode enabled, interrupts disabled\n");
+
+    // Optional boot arg: "ahci-poll" forces polling mode (do not enable GHC.IE, do not install IRQ handler).
+    ahci_force_poll = 0;
+    {
+        uint64_t mb2 = mdinit_get_mb2_ptr();
+        if (mb2) {
+            struct multiboot_tag *t = multiboot2_find_tag((void*)(uintptr_t)mb2, MULTIBOOT_TAG_TYPE_CMDLINE);
+            if (t) {
+                struct multiboot_tag_string *s = (struct multiboot_tag_string*)t;
+                const char *cmd = s->string;
+                // minimal token match: look for "ahci-poll" as a standalone token
+                if (cmd) {
+                    const char tok[] = "ahci-poll";
+                    for (size_t i = 0; cmd[i]; i++) {
+                        if (i > 0 && cmd[i-1] != ' ' && cmd[i-1] != '\t') continue;
+                        size_t j = 0;
+                        while (tok[j] && cmd[i + j] == tok[j]) j++;
+                        if (tok[j] == 0) {
+                            char end = cmd[i + j];
+                            if (end == 0 || end == ' ' || end == '\t') {
+                                ahci_force_poll = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (ahci_force_poll) {
+        com_write_string(COM1_PORT, "[AHCI] Boot arg ahci-poll set: forcing polling mode (interrupts disabled)\n");
+        ahci_irq_line = -1;
+        ahci_controller.abar->ghc &= ~HBA_GHC_IE;
+    } else {
+        // Install INTx IRQ handler (PIC) and enable AHCI interrupts
+        if (pci_dev && pci_dev->interrupt_line < 16) {
+            ahci_irq_line = (int)pci_dev->interrupt_line;
+            irq_install_handler(ahci_irq_line, ahci_irq_handler);
+            com_printf(COM1_PORT, "[AHCI] Installed INTx handler on IRQ %d\n", ahci_irq_line);
+        } else {
+            com_write_string(COM1_PORT, "[AHCI] WARNING: No valid PCI interrupt line; staying in polling mode\n");
+            ahci_irq_line = -1;
+        }
+
+        ahci_controller.abar->ghc |= HBA_GHC_IE;
+        com_write_string(COM1_PORT, "[AHCI] AHCI mode enabled, interrupts enabled\n");
+    }
     
     // Wait for controller to be ready
     ahci_usleep(1000);

@@ -48,6 +48,7 @@ typedef struct md64api_sysinfo_data
 
     /* --- GPU Info --- */
     string gpu_name;                /* GPU model */
+    string gpu_driver;              /* Active GPU driver module (e.g. qxl_gpu.sqrm) */
     int gpu_vram_mb;                /* VRAM in MB */
 
     /* --- Storage Info --- */
