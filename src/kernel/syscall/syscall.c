@@ -3,9 +3,13 @@
 #include "moduos/fs/part.h"
 #include "moduos/fs/MDFS/mdfs.h"
 #include "moduos/fs/devfs.h"
+#include "moduos/fs/userfs_user_api.h"
+#include "moduos/fs/userfs.h"
+#include "moduos/kernel/syscall/userfs_user.h"
 #include "moduos/kernel/syscall/syscall_numbers.h"
 #include "moduos/kernel/md64api.h"
 #include "moduos/kernel/process/process.h"
+#include "moduos/kernel/user_identity.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/phys.h"
@@ -13,10 +17,11 @@
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/debug.h"
-#include "moduos/kernel/process/process.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/md64api_user.h"
+#include "moduos/kernel/md64api_pidinfo_user.h"
+#include "moduos/kernel/process/proclist_user.h"
 #include "moduos/fs/fs.h"
 #include "moduos/fs/fd.h"
 #include "moduos/fs/path.h"
@@ -48,9 +53,14 @@ static int copy_string_from_user(const char *user_str, char *kernel_buf, size_t 
 
 extern void syscall_entry(void);
 
+volatile uint64_t g_last_syscall_num = 0;
+volatile uint64_t g_last_syscall_args[5] = {0,0,0,0,0};
+volatile uint64_t g_syscall_entry_rbp = 0;
+
 static int sys_vfs_mkfs(const vfs_mkfs_req_t *user_req);
 static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user_out);
-static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user_out);
+static int sys_pidinfo(uint32_t pid, md64api_pid_info_u *out, size_t out_size);
+static int sys_proclist(md_proclist_entry_u *out, size_t out_bytes);
 
 void syscall_init(void) {
     COM_LOG_INFO(COM1_PORT, "Initializing system calls");
@@ -64,9 +74,25 @@ void syscall_init(void) {
 
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
                          uint64_t arg3, uint64_t arg4, uint64_t arg5) {
-    // DEBUG: Log every syscall
+    g_last_syscall_num = syscall_num;
+    g_last_syscall_args[0] = arg1;
+    g_last_syscall_args[1] = arg2;
+    g_last_syscall_args[2] = arg3;
+    g_last_syscall_args[3] = arg4;
+    g_last_syscall_args[4] = arg5;
+    // DEBUG: Log all syscalls for early boot userman
+    process_t *dbg_proc = process_get_current();
+    if (dbg_proc && dbg_proc->pid == 1) {
+        com_write_string(COM1_PORT, "[SYSCALL] pid=1 num=");
+        char dbg_buf[16];
+        itoa((int)syscall_num, dbg_buf, 10);
+        com_write_string(COM1_PORT, dbg_buf);
+        com_write_string(COM1_PORT, " arg1=");
+        itoa((int)(uint64_t)arg1, dbg_buf, 10);
+        com_write_string(COM1_PORT, dbg_buf);
+        com_write_string(COM1_PORT, "\n");
+    }
     char buf[32];
-    
     switch (syscall_num) {
         case SYS_EXIT:    return sys_exit((int)arg1);
         case SYS_FORK:    return sys_fork();
@@ -85,6 +111,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_SETUID: {
             process_t *p = process_get_current();
             if (!p) return -1;
+            if (p->uid == KERNEL_UID) return -2; /* EPERM */
+            if ((uint32_t)arg1 == KERNEL_UID) return -2; /* EPERM */
             if (p->uid != 0) return -2; /* EPERM */
             p->uid = (uint32_t)arg1;
             return 0;
@@ -204,6 +232,12 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             return (uint64_t)sys_vfs_mkfs((const vfs_mkfs_req_t*)arg1);
         case SYS_VFS_GETPART:
             return (uint64_t)sys_vfs_getpart((const vfs_part_req_t*)arg1, (vfs_part_info_t*)arg2);
+        case SYS_USERFS_REGISTER:
+            return (uint64_t)sys_userfs_register((const userfs_user_node_t*)arg1);
+        case SYS_PROCLIST:
+            return (uint64_t)sys_proclist((md_proclist_entry_u*)arg1, (size_t)arg2);
+        case SYS_PIDINFO:
+            return (uint64_t)sys_pidinfo((uint32_t)arg1, (md64api_pid_info_u*)arg2, (size_t)arg3);
         default:
             if (kernel_debug_is_med()) {
                 com_write_string(COM1_PORT, "[SYSCALL] Unknown syscall: ");
@@ -223,6 +257,15 @@ int sys_exit(int status) {
     process_t* proc = process_get_current();
     if (proc) {
         fd_close_all(proc->pid);
+        com_write_string(COM1_PORT, "[SYS_EXIT] pid=");
+        char pbuf[12];
+        itoa((int)proc->pid, pbuf, 10);
+        com_write_string(COM1_PORT, pbuf);
+        com_write_string(COM1_PORT, " status=");
+        char sbuf[16];
+        itoa(status, sbuf, 10);
+        com_write_string(COM1_PORT, sbuf);
+        com_write_string(COM1_PORT, "\n");
     }
 
     /*
@@ -296,46 +339,50 @@ int sys_get_sysinfo2(md64api_sysinfo_data_u *out, size_t out_size) {
 
     md64api_sysinfo_data k = get_system_info();
 
+    md64api_sysinfo_data_u out_tmp;
+    memset(&out_tmp, 0, sizeof(out_tmp));
+
     /* Copy scalars */
-    out->sys_available_ram = k.sys_available_ram;
-    out->sys_total_ram = k.sys_total_ram;
+    out_tmp.sys_available_ram = k.sys_available_ram;
+    out_tmp.sys_total_ram = k.sys_total_ram;
     /* Version strings (user-safe). */
-    safe_strcpy(out->SystemVersion, sizeof(out->SystemVersion), k.SystemVersion);
-    safe_strcpy(out->KernelVersion, sizeof(out->KernelVersion), k.KernelVersion);
-    out->cpu_cores = k.cpu_cores;
-    out->cpu_threads = k.cpu_threads;
-    out->cpu_hyperthreading_enabled = k.cpu_hyperthreading_enabled;
-    out->cpu_base_mhz = k.cpu_base_mhz;
-    out->cpu_max_mhz = k.cpu_max_mhz;
-    out->cpu_cache_l1_kb = k.cpu_cache_l1_kb;
-    out->cpu_cache_l2_kb = k.cpu_cache_l2_kb;
-    out->cpu_cache_l3_kb = k.cpu_cache_l3_kb;
-    out->is_virtual_machine = k.is_virtual_machine;
-    out->gpu_vram_mb = k.gpu_vram_mb;
-    out->storage_total_mb = k.storage_total_mb;
-    out->storage_free_mb = k.storage_free_mb;
-    out->secure_boot_enabled = k.secure_boot_enabled;
-    out->tpm_version = k.tpm_version;
+    safe_strcpy(out_tmp.SystemVersion, sizeof(out_tmp.SystemVersion), k.SystemVersion);
+    safe_strcpy(out_tmp.KernelVersion, sizeof(out_tmp.KernelVersion), k.KernelVersion);
+    out_tmp.cpu_cores = k.cpu_cores;
+    out_tmp.cpu_threads = k.cpu_threads;
+    out_tmp.cpu_hyperthreading_enabled = k.cpu_hyperthreading_enabled;
+    out_tmp.cpu_base_mhz = k.cpu_base_mhz;
+    out_tmp.cpu_max_mhz = k.cpu_max_mhz;
+    out_tmp.cpu_cache_l1_kb = k.cpu_cache_l1_kb;
+    out_tmp.cpu_cache_l2_kb = k.cpu_cache_l2_kb;
+    out_tmp.cpu_cache_l3_kb = k.cpu_cache_l3_kb;
+    out_tmp.is_virtual_machine = k.is_virtual_machine;
+    out_tmp.gpu_vram_mb = k.gpu_vram_mb;
+    out_tmp.storage_total_mb = k.storage_total_mb;
+    out_tmp.storage_free_mb = k.storage_free_mb;
+    out_tmp.secure_boot_enabled = k.secure_boot_enabled;
+    out_tmp.tpm_version = k.tpm_version;
 
     /* Copy strings from kernel pointers into user buffer */
-    safe_strcpy(out->KernelVendor, sizeof(out->KernelVendor), k.KernelVendor);
-    safe_strcpy(out->os_name, sizeof(out->os_name), k.os_name);
-    safe_strcpy(out->os_arch, sizeof(out->os_arch), k.os_arch);
-    safe_strcpy(out->pcname, sizeof(out->pcname), k.pcname);
-    safe_strcpy(out->username, sizeof(out->username), k.username);
-    safe_strcpy(out->domain, sizeof(out->domain), k.domain);
-    safe_strcpy(out->kconsole, sizeof(out->kconsole), k.kconsole);
-    safe_strcpy(out->cpu, sizeof(out->cpu), k.cpu);
-    safe_strcpy(out->cpu_manufacturer, sizeof(out->cpu_manufacturer), k.cpu_manufacturer);
-    safe_strcpy(out->cpu_model, sizeof(out->cpu_model), k.cpu_model);
-    safe_strcpy(out->cpu_flags, sizeof(out->cpu_flags), k.cpu_flags);
-    safe_strcpy(out->virtualization_vendor, sizeof(out->virtualization_vendor), k.virtualization_vendor);
-    safe_strcpy(out->gpu_name, sizeof(out->gpu_name), k.gpu_name);
-    safe_strcpy(out->primary_disk_model, sizeof(out->primary_disk_model), k.primary_disk_model);
-    safe_strcpy(out->bios_vendor, sizeof(out->bios_vendor), k.bios_vendor);
-    safe_strcpy(out->bios_version, sizeof(out->bios_version), k.bios_version);
-    safe_strcpy(out->motherboard_model, sizeof(out->motherboard_model), k.motherboard_model);
+    safe_strcpy(out_tmp.KernelVendor, sizeof(out_tmp.KernelVendor), k.KernelVendor);
+    safe_strcpy(out_tmp.os_name, sizeof(out_tmp.os_name), k.os_name);
+    safe_strcpy(out_tmp.os_arch, sizeof(out_tmp.os_arch), k.os_arch);
+    safe_strcpy(out_tmp.pcname, sizeof(out_tmp.pcname), k.pcname);
+    safe_strcpy(out_tmp.username, sizeof(out_tmp.username), k.username);
+    safe_strcpy(out_tmp.domain, sizeof(out_tmp.domain), k.domain);
+    safe_strcpy(out_tmp.kconsole, sizeof(out_tmp.kconsole), k.kconsole);
+    safe_strcpy(out_tmp.cpu, sizeof(out_tmp.cpu), k.cpu);
+    safe_strcpy(out_tmp.cpu_manufacturer, sizeof(out_tmp.cpu_manufacturer), k.cpu_manufacturer);
+    safe_strcpy(out_tmp.cpu_model, sizeof(out_tmp.cpu_model), k.cpu_model);
+    safe_strcpy(out_tmp.cpu_flags, sizeof(out_tmp.cpu_flags), k.cpu_flags);
+    safe_strcpy(out_tmp.virtualization_vendor, sizeof(out_tmp.virtualization_vendor), k.virtualization_vendor);
+    safe_strcpy(out_tmp.gpu_name, sizeof(out_tmp.gpu_name), k.gpu_name);
+    safe_strcpy(out_tmp.primary_disk_model, sizeof(out_tmp.primary_disk_model), k.primary_disk_model);
+    safe_strcpy(out_tmp.bios_vendor, sizeof(out_tmp.bios_vendor), k.bios_vendor);
+    safe_strcpy(out_tmp.bios_version, sizeof(out_tmp.bios_version), k.bios_version);
+    safe_strcpy(out_tmp.motherboard_model, sizeof(out_tmp.motherboard_model), k.motherboard_model);
 
+    if (usercopy_to_user(out, &out_tmp, sizeof(out_tmp)) != 0) return -1;
     return 0;
 }
 
@@ -456,6 +503,14 @@ int sys_open(const char *pathname, int flags, int mode) {
 
         // DEVFS is hierarchical; node may contain slashes.
         return fd_open_devfs(node, flags);
+    }
+
+    if (r.route == FS_ROUTE_USERLAND) {
+        const char *node = r.rel_path;
+        while (*node == '/') node++;
+        if (!*node) return -1;
+
+        return fd_open_userfs(node, flags);
     }
 
     int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;
@@ -972,7 +1027,6 @@ int sys_opendir(const char *path) {
 int sys_readdir(int fd, char *name_buf, size_t buf_size, int *is_dir, uint32_t *size) {
     if (!name_buf || buf_size == 0) return -1;
 
-    /* Read into kernel temporaries, then copy to user */
     if (buf_size > 256) buf_size = 256;
     char kname[256];
     int k_is_dir = 0;
@@ -980,16 +1034,15 @@ int sys_readdir(int fd, char *name_buf, size_t buf_size, int *is_dir, uint32_t *
 
     int rc = fd_readdir(fd, kname, buf_size, &k_is_dir, &k_size);
     if (rc <= 0) {
-        /* 0=end of dir, <0=error */
-        return rc;
+        return rc; /* 0=end of dir, <0=error */
     }
 
-    /* rc==1: we have a valid entry in kname/k_is_dir/k_size */
     if (usercopy_to_user(name_buf, kname, buf_size) != 0) return -1;
     if (is_dir && usercopy_to_user(is_dir, &k_is_dir, sizeof(k_is_dir)) != 0) return -1;
     if (size && usercopy_to_user(size, &k_size, sizeof(k_size)) != 0) return -1;
     return 1;
 }
+
 
 static int sys_vfs_mkfs(const vfs_mkfs_req_t *user_req) {
     if (!user_req) return -1;
@@ -1039,7 +1092,6 @@ static int sys_vfs_mkfs(const vfs_mkfs_req_t *user_req) {
     if (rc == 0 && mbr_type) {
         (void)fs_mbr_set_type_for_lba(req.vdrive_id, req.start_lba, mbr_type);
     }
-
     return rc;
 }
 
@@ -1070,4 +1122,118 @@ static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user
 
 int sys_closedir(int fd) {
     return fd_closedir(fd);
+}
+
+int sys_userfs_register(const userfs_user_node_t *user_node) {
+    if (!user_node) return -1;
+
+    process_t *p = process_get_current();
+    if (!p) return -1;
+    if (p->uid != 0) return -2; /* root only */
+
+    userfs_user_node_t req;
+    if (usercopy_from_user(&req, user_node, sizeof(req)) != 0) return -1;
+
+    if (!req.path || !req.owner_id) return -1;
+
+    char kpath[128];
+    char kowner[64];
+    if (usercopy_string_from_user(kpath, req.path, sizeof(kpath)) != 0) return -1;
+    if (usercopy_string_from_user(kowner, req.owner_id, sizeof(kowner)) != 0) return -1;
+
+    const char *path_in = kpath;
+
+    com_write_string(COM1_PORT, "[USERFS] register ");
+    com_write_string(COM1_PORT, kpath);
+    com_write_string(COM1_PORT, " owner=");
+    com_write_string(COM1_PORT, kowner);
+    com_write_string(COM1_PORT, "\n");
+
+    size_t owner_len = strlen(kowner) + 1;
+    char *owner_copy = (char*)kmalloc(owner_len);
+    if (!owner_copy) return -12;
+    memcpy(owner_copy, kowner, owner_len);
+
+    int rc = userfs_register_user_path(path_in, owner_copy);
+    if (rc != 0) {
+        kfree(owner_copy);
+    }
+    com_write_string(COM1_PORT, "[USERFS] register rc=");
+    char rbuf[16];
+    itoa(rc, rbuf, 10);
+    com_write_string(COM1_PORT, rbuf);
+    com_write_string(COM1_PORT, "\n");
+    return rc;
+}
+
+static int sys_proclist(md_proclist_entry_u *out, size_t out_bytes) {
+    if (!out || out_bytes == 0) return -1;
+
+    size_t max_entries = out_bytes / sizeof(md_proclist_entry_u);
+    if (max_entries == 0) return -1;
+    if (max_entries > MAX_PROCESSES) max_entries = MAX_PROCESSES;
+
+    md_proclist_entry_u *kbuf = (md_proclist_entry_u*)kmalloc(max_entries * sizeof(md_proclist_entry_u));
+    if (!kbuf) return -1;
+
+    size_t count = 0;
+    for (size_t i = 0; i < MAX_PROCESSES && count < max_entries; i++) {
+        process_t *p = process_get_by_pid((uint32_t)i);
+        if (!p || p->pid == 0) continue;
+        md_proclist_entry_u e;
+        memset(&e, 0, sizeof(e));
+        e.pid = p->pid;
+        e.ppid = p->parent_pid;
+        e.state = (uint32_t)p->state;
+        e.total_time = p->total_time;
+        safe_strcpy(e.name, sizeof(e.name), p->name);
+        kbuf[count++] = e;
+    }
+
+    size_t out_size = count * sizeof(md_proclist_entry_u);
+    int rc = usercopy_to_user(out, kbuf, out_size);
+    kfree(kbuf);
+    if (rc != 0) return -1;
+    return (int)count;
+}
+
+static int sys_pidinfo(uint32_t pid, md64api_pid_info_u *out, size_t out_size) {
+    if (!out || out_size < sizeof(md64api_pid_info_u)) return -1;
+    if (pid >= MAX_PROCESSES) return -1;
+
+    process_t *p = process_get_by_pid(pid);
+    if (!p || p->pid == 0) return -1;
+
+    md64api_pid_info_u info;
+    memset(&info, 0, sizeof(info));
+    info.pid = p->pid;
+    info.ppid = p->parent_pid;
+    info.uid = p->uid;
+    info.gid = p->gid;
+    info.state = (uint32_t)p->state;
+    info.priority = (uint32_t)p->priority;
+    info.total_time = p->total_time;
+    info.user_rip = p->user_rip;
+    info.user_rsp = p->user_rsp;
+    info.is_user = (uint8_t)(p->is_user ? 1 : 0);
+
+    if (p->user_image_end > p->user_image_base) {
+        info.mem_image_bytes = p->user_image_end - p->user_image_base;
+    }
+    if (p->user_heap_end > p->user_heap_base) {
+        info.mem_heap_bytes = p->user_heap_end - p->user_heap_base;
+    }
+    if (p->user_mmap_end > p->user_mmap_base) {
+        info.mem_mmap_bytes = p->user_mmap_end - p->user_mmap_base;
+    }
+    if (p->user_stack_top > p->user_stack_low) {
+        info.mem_stack_bytes = p->user_stack_top - p->user_stack_low;
+    }
+    info.mem_total_bytes = info.mem_image_bytes + info.mem_heap_bytes + info.mem_mmap_bytes + info.mem_stack_bytes;
+
+    safe_strcpy(info.name, sizeof(info.name), p->name);
+    safe_strcpy(info.cwd, sizeof(info.cwd), p->cwd);
+
+    if (usercopy_to_user(out, &info, sizeof(info)) != 0) return -1;
+    return 0;
 }

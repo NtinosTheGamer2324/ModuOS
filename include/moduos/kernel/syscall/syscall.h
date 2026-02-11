@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include "moduos/kernel/md64api.h"
 #include "moduos/kernel/md64api_user.h"
+#include "moduos/fs/userfs_user_api.h"
 #include "moduos/fs/fd.h"  // for off_t
 
 // ssize_t is defined in include/moduos/fs/fd.h
@@ -49,6 +50,7 @@ int sys_unlink(const char *path);
 int sys_opendir(const char *path);
 int sys_readdir(int fd, char *name_buf, size_t buf_size, int *is_dir, uint32_t *size);
 int sys_closedir(int fd);
+int sys_userfs_register(const userfs_user_node_t *user_node);
 
 /* VM mapping (for userland ld.so) */
 void* sys_mmap(void *addr, size_t size, int prot, int flags);

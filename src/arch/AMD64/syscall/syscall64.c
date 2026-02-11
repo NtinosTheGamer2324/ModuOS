@@ -32,7 +32,7 @@ void amd64_syscall_init(void) {
     wrmsr(MSR_IA32_LSTAR, (uint64_t)(uintptr_t)syscall64_entry);
 
     /* FMASK: clear IF (and TF) on entry. We'll re-enable as desired in kernel. */
-    wrmsr(MSR_IA32_FMASK, (1ULL << 9) | (1ULL << 8));
+    wrmsr(MSR_IA32_FMASK, 0x700);
 
     COM_LOG_OK(COM1_PORT, "SYSCALL/SYSRET initialized");
 }

@@ -2,8 +2,11 @@
 bits 64
 
 extern syscall_handler
+extern g_syscall_entry_rbp
+extern g_syscall_entry_rsp
 
 global syscall_entry
+global syscall_entry_return
 
 section .text
 syscall_entry:
@@ -30,8 +33,9 @@ syscall_entry:
     push rax
 
     mov rbp, rsp
-    
-    ; Align stack
+    mov [rel g_syscall_entry_rbp], rbp
+
+    ; Align stack (match SysV ABI for C call)
     test rsp, 0xF
     jz .aligned
     sub rsp, 8
@@ -57,6 +61,7 @@ syscall_entry:
     mov [rsp], rax
 
     ; Restore all
+syscall_entry_return:
     pop rax    ; Gets the return value we just stored
     pop rbx
     pop rcx
@@ -73,4 +78,5 @@ syscall_entry:
     pop r14
     pop r15
 
+    sti
     iretq
