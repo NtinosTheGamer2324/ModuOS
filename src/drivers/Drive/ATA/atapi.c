@@ -69,7 +69,7 @@ static int atapi_send_packet(uint16_t base, uint16_t ctrl, uint8_t drive_sel, ui
     /* Issue PACKET command */
     outb(base + REG_COMMAND, ATA_CMD_PACKET);
     
-    /* CRITICAL FIX #2: Read status register to acknowledge/clear the interrupt */
+    /*Read status register to acknowledge/clear the interrupt */
     (void)inb(base + REG_STATUS);
 
     /* Small delay for device to process */
