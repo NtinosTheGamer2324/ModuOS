@@ -518,7 +518,7 @@ static int fbcon_draw_glyph_fnt(fb_console_t *c, uint32_t cp, uint16_t *out_adva
     fnt_glyph_t *glyph = fnt_get_glyph((fnt_font_t *)c->fnt_font, cp);
     if (!glyph) return 0;
     
-    uint16_t draw_w = glyph->width ? glyph->width : c->cell_w;
+    uint16_t draw_w = c->cell_w;
 
     /* Clear the cell background */
     uint8_t br, bg, bb;
@@ -543,7 +543,7 @@ static int fbcon_draw_glyph_fnt(fb_console_t *c, uint32_t cp, uint16_t *out_adva
     }
     
     /* Return the actual glyph width for proper spacing */
-    if (out_advance) *out_advance = draw_w;
+    if (out_advance) *out_advance = c->cell_w;
     return 1;
 }
 
@@ -706,12 +706,6 @@ static void fbcon_emit_codepoint(fb_console_t *c, uint32_t cp) {
     }
 
     uint16_t advance = c->cell_w;
-    if (c->fnt_font_ready && c->fnt_font) {
-        fnt_glyph_t *glyph = fnt_get_glyph((fnt_font_t *)c->fnt_font, cp);
-        if (glyph) {
-            advance = glyph->width ? glyph->width : c->cell_w;
-        }
-    }
 
     if (c->x + advance > c->fb.width) {
         fbcon_newline(c);
