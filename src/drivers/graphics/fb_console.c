@@ -615,28 +615,13 @@ static void fbcon_putc_raw(fb_console_t *c, char ch) {
         return;
     }
 
-    /* Check if we need to wrap before drawing */
     if (c->x + c->cell_w > c->fb.width) {
         fbcon_newline(c);
     }
 
-    /* Draw glyph and get actual width for proper advancement */
-    uint16_t old_x = c->x;
     fbcon_draw_glyph(c, (uint8_t)ch);
-    
-    /* For FNT fonts, fbcon_emit_codepoint handles advancement properly.
-       For non-FNT (bitmap/BMP), use cell_w */
-    uint16_t advance = c->cell_w;
-    if (c->fnt_font_ready && c->fnt_font) {
-        /* FNT already advanced in fbcon_emit_codepoint, so calculate delta */
-        advance = c->x - old_x;
-        if (advance == 0) advance = c->cell_w; /* Fallback if not advanced */
-    }
-    
-    fbcon_flush_rect(c, old_x, c->y, advance, c->cell_h);
-    if (!c->fnt_font_ready) {
-        c->x += c->cell_w;  /* Only advance for non-FNT fonts */
-    }
+    fbcon_flush_rect(c, c->x, c->y, c->cell_w, c->cell_h);
+    c->x += c->cell_w;
     fbcon_cursor_show(c);
 }
 
