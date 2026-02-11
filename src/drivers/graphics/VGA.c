@@ -112,43 +112,18 @@ static void vga_try_init_fb_console(void) {
             /* Try FNT unicode font (custom format) first */
             if (!g_fbcon_fnt_loaded) {
                 const char *fntp = "/ModuOS/shared/usr/assets/fonts/Unicode.fnt";
-                com_write_string(COM1_PORT, "[FNT] Attempting to load FNT font: ");
-                com_write_string(COM1_PORT, fntp);
-                com_write_string(COM1_PORT, "\n");
-                
                 void *fnt_buf = NULL;
                 size_t fnt_size = 0;
                 int fr = hvfs_read(slot, fntp, &fnt_buf, &fnt_size);
                 
-                com_write_string(COM1_PORT, "[FNT] hvfs_read returned: ");
-                com_printf(COM1_PORT, "%d\n", fr);
-                
                 if (fr == 0 && fnt_buf && fnt_size) {
-                    com_write_string(COM1_PORT, "[FNT] File read successfully, size: ");
-                    com_printf(COM1_PORT, "%u bytes\n", (unsigned int)fnt_size);
-                    com_write_string(COM1_PORT, "[FNT] Calling fnt_load_font()...\n");
-                    
                     g_fbcon_fnt = fnt_load_font(fnt_buf, fnt_size);
-                    
                     if (g_fbcon_fnt) {
-                        com_write_string(COM1_PORT, "[FNT] Font loaded successfully!\n");
                         g_fbcon_fnt_loaded = 1;
                         fbcon_set_fnt_font(&g_fbcon, g_fbcon_fnt);
                         com_write_string(COM1_PORT, "[FBCON] Using FNT font: /ModuOS/shared/usr/assets/fonts/Unicode.fnt\n");
-                    } else {
-                        com_write_string(COM1_PORT, "[FNT] ERROR: fnt_load_font() returned NULL\n");
-                    }
-                } else {
-                    if (fr != 0) {
-                        com_write_string(COM1_PORT, "[FNT] File not found or read error\n");
-                    } else if (!fnt_buf) {
-                        com_write_string(COM1_PORT, "[FNT] ERROR: Buffer is NULL\n");
-                    } else if (!fnt_size) {
-                        com_write_string(COM1_PORT, "[FNT] ERROR: File size is 0\n");
                     }
                 }
-            } else {
-                com_write_string(COM1_PORT, "[FNT] FNT font already loaded, skipping\n");
             }
             
             /* Optional BMP atlas font */
