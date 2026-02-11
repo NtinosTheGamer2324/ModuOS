@@ -52,10 +52,7 @@ void timer_irq_handler(void) {
 
     // Request scheduling / accounting.
     scheduler_tick();
-
-    // Preemptive scheduling: always attempt a switch on timer tick.
-    // schedule() will bail out if there's nothing else to run.
-    schedule();
+    scheduler_request_reschedule();
 }
 
 uint64_t get_system_ticks(void) {
