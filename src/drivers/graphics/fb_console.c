@@ -283,9 +283,15 @@ static void fbcon_cursor_hide(fb_console_t *c) {
     if (!c->cursor_drawn) return;
 
     /* Remove underline cursor by inverting it back */
+    uint16_t cursor_width = c->cell_w;
+    if (c->fnt_font_ready && c->fnt_font) {
+        cursor_width = c->fnt_font->header.glyph_width / 2;
+        if (cursor_width < 2) cursor_width = 2;
+    }
+    
     uint32_t uy = (c->y + c->cell_h >= 2) ? (c->y + c->cell_h - 2) : c->y;
-    fb_invert_rect(&c->fb, c->x, uy, c->cell_w, 2);
-    fbcon_flush_rect(c, c->x, uy, c->cell_w, 2);
+    fb_invert_rect(&c->fb, c->x, uy, cursor_width, 2);
+    fbcon_flush_rect(c, c->x, uy, cursor_width, 2);
     c->cursor_drawn = false;
 }
 
@@ -294,10 +300,16 @@ static void fbcon_cursor_show(fb_console_t *c) {
     if (!c->cursor_enabled) return;
     if (c->cursor_drawn) return;
 
-    /* Draw underline cursor */
+    /* Draw underline cursor - use smaller width for FNT fonts */
+    uint16_t cursor_width = c->cell_w;
+    if (c->fnt_font_ready && c->fnt_font) {
+        cursor_width = c->fnt_font->header.glyph_width / 2; /* Half the max width */
+        if (cursor_width < 2) cursor_width = 2;
+    }
+    
     uint32_t uy = (c->y + c->cell_h >= 2) ? (c->y + c->cell_h - 2) : c->y;
-    fb_invert_rect(&c->fb, c->x, uy, c->cell_w, 2);
-    fbcon_flush_rect(c, c->x, uy, c->cell_w, 2);
+    fb_invert_rect(&c->fb, c->x, uy, cursor_width, 2);
+    fbcon_flush_rect(c, c->x, uy, cursor_width, 2);
     c->cursor_drawn = true;
 }
 
@@ -501,19 +513,23 @@ static int fbcon_draw_glyph_pf2(fb_console_t *c, uint32_t cp) {
     return 1;
 }
 
-static int fbcon_draw_glyph_fnt(fb_console_t *c, uint32_t cp) {
+static int fbcon_draw_glyph_fnt(fb_console_t *c, uint32_t cp, uint16_t *out_advance) {
     if (!c || !c->ready || !c->fnt_font_ready || !c->fnt_font) return 0;
     fnt_glyph_t *glyph = fnt_get_glyph((fnt_font_t *)c->fnt_font, cp);
     if (!glyph) return 0;
+    
+    /* Clear the cell background */
     uint8_t br, bg, bb;
     vga16_to_rgb(c->bg, &br, &bg, &bb);
     uint32_t bgpx = fb_pack_rgb888(&c->fb, br, bg, bb);
-    fb_fill_rect(&c->fb, c->x, c->y, c->cell_w, c->cell_h, bgpx);
+    fb_fill_rect(&c->fb, c->x, c->y, glyph->width, c->cell_h, bgpx);
+    
+    /* Render the glyph pixels */
     uint8_t fr, fg, fb2;
     vga16_to_rgb(c->fg, &fr, &fg, &fb2);
     uint32_t fgpx = fb_pack_rgb888(&c->fb, fr, fg, fb2);
-    for (int yy = 0; yy < glyph->bitmap_height; yy++) {
-        for (int xx = 0; xx < glyph->bitmap_width; xx++) {
+    for (int yy = 0; yy < glyph->bitmap_height && yy < c->cell_h; yy++) {
+        for (int xx = 0; xx < glyph->bitmap_width && xx < glyph->width; xx++) {
             if (fnt_get_pixel(glyph, xx, yy)) {
                 int px = (int)c->x + xx;
                 int py = (int)c->y + yy;
@@ -523,6 +539,9 @@ static int fbcon_draw_glyph_fnt(fb_console_t *c, uint32_t cp) {
             }
         }
     }
+    
+    /* Return the actual glyph width for proper spacing */
+    if (out_advance) *out_advance = glyph->width;
     return 1;
 }
 
@@ -657,19 +676,6 @@ static void fbcon_emit_codepoint(fb_console_t *c, uint32_t cp) {
             com_printf(COM1_PORT, "%02x", (unsigned)(uint8_t)enc[i]);
             if (i + 1 < elen) com_write_string(COM1_PORT, " ");
         }
-    // Prefer FNT font first (custom format)
-    if (c->fnt_font_ready && c->fnt_font) {
-        fbcon_cursor_hide(c);
-        if (fbcon_draw_glyph_fnt(c, cp)) {
-            fbcon_flush_rect(c, c->x, c->y, c->cell_w, c->cell_h);
-            c->x += c->cell_w;
-            fbcon_cursor_show(c);
-            return;
-        }
-        fbcon_cursor_show(c);
-    }
-    
-    // Fallback to PF2 Unicode glyphs when available
         for (size_t i = 0; i < elen; i++) {
             char tmp[2] = {enc[i], 0};
             com_write_string(COM1_PORT, tmp);
@@ -681,9 +687,10 @@ static void fbcon_emit_codepoint(fb_console_t *c, uint32_t cp) {
     // Prefer FNT font first (custom format)
     if (c->fnt_font_ready && c->fnt_font) {
         fbcon_cursor_hide(c);
-        if (fbcon_draw_glyph_fnt(c, cp)) {
-            fbcon_flush_rect(c, c->x, c->y, c->cell_w, c->cell_h);
-            c->x += c->cell_w;
+        uint16_t advance = 0;
+        if (fbcon_draw_glyph_fnt(c, cp, &advance)) {
+            fbcon_flush_rect(c, c->x, c->y, advance, c->cell_h);
+            c->x += advance;
             fbcon_cursor_show(c);
             return;
         }
