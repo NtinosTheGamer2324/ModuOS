@@ -465,30 +465,59 @@ char *itoa(int value, char *str, int base) {
     return str;
 }
 
-// Optimized atoi function that avoids extra loops
-int atoi(const char *str) {
-    int result = 0;
-    int sign = 1;
-
-    while (*str == ' ' || *str == '\t') {
-        ++str;
+char *utoa(uint32_t value, char *str, int base) {
+    if (base < 2 || base > 36) {
+        str[0] = '\0';
+        return str;
     }
 
-    if (*str == '-') {
-        sign = -1;
-        ++str;
-    } else if (*str == '+') {
-        ++str;
+    char *ptr = str;
+    char *ptr1 = str;
+    char tmp_char;
+    uint32_t tmp_value;
+
+    do {
+        tmp_value = value;
+        value /= (uint32_t)base;
+        uint32_t digit = tmp_value - value * (uint32_t)base;
+        *ptr++ = (digit < 10) ? (char)('0' + digit) : (char)('a' + (digit - 10));
+    } while (value);
+
+    *ptr-- = '\0';
+
+    while (ptr1 < ptr) {
+        tmp_char = *ptr;
+        *ptr-- = *ptr1;
+        *ptr1++ = tmp_char;
     }
 
-    while (*str >= '0' && *str <= '9') {
-        result = result * 10 + (*str - '0');
-        ++str;
-    }
-
-    return sign * result;
+    return str;
 }
 
+int atoi(const char *str) {
+    if (!str) return 0;
+
+    while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') {
+        str++;
+    }
+
+    int sign = 1;
+    if (*str == '-') {
+        sign = -1;
+        str++;
+    } else if (*str == '+') {
+        str++;
+    }
+
+    int value = 0;
+    while (*str >= '0' && *str <= '9') {
+        int digit = *str - '0';
+        value = value * 10 + digit;
+        str++;
+    }
+
+    return value * sign;
+}
 char* str_append(int count, ...) {
     va_list args;
     va_start(args, count);
@@ -522,3 +551,9 @@ char* str_append(int count, ...) {
 
 
 // Helper function to convert string
+
+
+
+
+
+

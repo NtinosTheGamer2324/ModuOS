@@ -4,6 +4,7 @@
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/multiboot2.h"
+#include "moduos/kernel/acpi_boot.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -290,6 +291,9 @@ void memory_init(void *mb2_ptr) {
     // Framebuffer info (optional)
     struct multiboot_tag_framebuffer *fb_tag = NULL;
 
+    // ACPI RSDP from Multiboot2 tags (type 14/15)
+    uint64_t rsdp_phys = 0;
+
     while (tagp + sizeof(struct mb2_tag) <= end) {
         /*  Safe tag read */
         memory_barrier();
@@ -309,6 +313,14 @@ void memory_init(void *mb2_ptr) {
 
         if (tag->type == MULTIBOOT_TAG_TYPE_FRAMEBUFFER) {
             fb_tag = (struct multiboot_tag_framebuffer *)tag;
+        }
+
+        // ACPI tags: payload begins at +8, containing RSDP (old/new format). We just record the physical address.
+        if (tag->type == MULTIBOOT_TAG_TYPE_ACPI_OLD || tag->type == MULTIBOOT_TAG_TYPE_ACPI_NEW) {
+            rsdp_phys = (uint64_t)(uintptr_t)(tagp + 8);
+            log_msg("[MEM] Found MB2 ACPI tag, RSDP at ");
+            print_hex64(rsdp_phys);
+            log_msg("\n");
         }
 
         if (tag->type == 6) { /* Memory map tag */
@@ -437,5 +449,10 @@ void memory_init(void *mb2_ptr) {
     log_msg("\n");
 
     log_msg("[MEM] Physical allocator ready!\n");
+
+    // Publish boot-provided RSDP (if present). MB2 structure is reserved so this remains valid.
+    if (rsdp_phys) {
+        acpi_boot_set_rsdp_phys(rsdp_phys);
+    }
 
 }

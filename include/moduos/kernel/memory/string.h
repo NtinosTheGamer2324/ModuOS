@@ -30,6 +30,7 @@ char *strstr(const char *haystack, const char *needle);
 
 /* String conversion */
 char *itoa(int value, char *str, int base);
+char *utoa(uint32_t value, char *str, int base);
 int atoi(const char *str);
 
 

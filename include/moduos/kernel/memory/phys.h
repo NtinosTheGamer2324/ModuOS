@@ -17,8 +17,18 @@ uint64_t phys_alloc_frame(void);
 uint64_t phys_alloc_frame_below(uint64_t max_phys);
 void phys_free_frame(uint64_t paddr);
 
+/* Reference counting for shared frames (fork COW). */
+void phys_ref_inc(uint64_t paddr);
+void phys_ref_dec(uint64_t paddr);
+uint32_t phys_ref_get(uint64_t paddr);
+
 /* Allocate contiguous frames (returns physical base addr) */
 uint64_t phys_alloc_contiguous(size_t nframes);
+
+/* Allocate contiguous frames with a minimum alignment for the returned physical base.
+ * `align` must be a power-of-two and a multiple of PAGE_SIZE.
+ */
+uint64_t phys_alloc_contiguous_aligned(size_t nframes, uint64_t align);
 
 /* Reserve physical range (mark as used) */
 void phys_reserve_range(uint64_t pstart, uint64_t plen);

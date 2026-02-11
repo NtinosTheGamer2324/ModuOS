@@ -2,6 +2,7 @@
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/spinlock.h"
 #include "moduos/kernel/debug.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -10,7 +11,18 @@
 #define KHEAP_START 0xFFFF800000000000ULL
 #define KHEAP_MAX   (KHEAP_START + (32 * 1024 * 1024ULL)) /* 32 MiB heap */
 #define KHEAP_PAGE_FLAGS (PFLAG_PRESENT | PFLAG_WRITABLE)
-#define KHEAP_DEBUG 1  /* Set to 1 to enable verbose tracing */
+/* Heap debug verbosity:
+ * 0: off
+ * 1: lightweight (keep existing useful checks)
+ * 2: very verbose (can destroy performance; enable only when needed)
+ *
+ * Tied to FBCON_DEBUG so normal debug builds (FBCON_DEBUG=1) don't spam.
+ */
+#if defined(FBCON_DEBUG) && (FBCON_DEBUG >= 2)
+#  define KHEAP_DEBUG 2
+#else
+#  define KHEAP_DEBUG 1
+#endif
 
 #ifndef PAGE_SIZE
 #error "PAGE_SIZE must be defined"
@@ -50,36 +62,18 @@ static struct free_node *free_list = NULL;
 /* forward decls (used by early helpers like kheap_check_cycle) */
 static void uint64_to_hex(uint64_t v, char *buf, size_t buf_len);
 
-/* Single-core IRQ-safe heap lock: disable interrupts while manipulating heap state. */
-static uint64_t kheap_irq_flags = 0;
-static int kheap_lock_count = 0;
+/* SMP-safe heap lock using spinlock */
+/* Cache-line aligned to prevent false sharing */
+static spinlock_t kheap_spinlock __attribute__((aligned(64)));
+
+/* NOTE: kheap_init() MUST be called during boot before any kmalloc() */
 
 static inline void kheap_lock(void) {
-    uint64_t rflags;
-    __asm__ volatile(
-        "pushfq\n\t"
-        "popq %0\n\t"
-        "cli\n\t"
-        : "=r"(rflags)
-        :
-        : "memory"
-    );
-
-    /* Re-entrant: only save original IF on first entry */
-    if (kheap_lock_count == 0) {
-        kheap_irq_flags = rflags;
-    }
-    kheap_lock_count++;
+    spinlock_lock(&kheap_spinlock);
 }
 
 static inline void kheap_unlock(void) {
-    if (kheap_lock_count <= 0) return;
-    kheap_lock_count--;
-    if (kheap_lock_count == 0) {
-        if (kheap_irq_flags & (1ULL << 9)) {
-            __asm__ volatile("sti" ::: "memory");
-        }
-    }
+    spinlock_unlock(&kheap_spinlock);
 }
 
 #define KHEAP_UNLOCK_AND_RETURN() do { kheap_unlock(); return; } while (0)
@@ -141,7 +135,7 @@ static void log_oom(size_t requested_size, const char *reason) {
 
 /* Verbose debug helper */
 static void debug_log(const char *msg, uint64_t val, int is_hex) {
-#if KHEAP_DEBUG
+#if (KHEAP_DEBUG >= 2)
     char buf[32];
     // KHEAP debug spam can stall the system under QEMU; only print at very verbose level.
     if (kernel_debug_get_level() >= KDBG_ON) {
@@ -251,23 +245,41 @@ void *kmalloc(size_t size) {
         log_oom(size, "Phys memory low"); kheap_unlock(); return NULL;
     }
 
+#if (KHEAP_DEBUG >= 2)
+    com_write_string(COM1_PORT, "[KHEAP] Alloc phys contiguous pages=");
+    {
+        char tmp[32]; uint64_to_dec(pages, tmp, sizeof(tmp)); com_write_string(COM1_PORT, tmp);
+        com_write_string(COM1_PORT, "\n");
+    }
+#endif
     uint64_t phys = phys_alloc_contiguous(pages);
-    if (!phys) {
+#if (KHEAP_DEBUG >= 2)
+    com_write_string(COM1_PORT, "[KHEAP] phys_base=");
+    com_printf(COM1_PORT, "0x%08x%08x\n", (uint32_t)(phys >> 32), (uint32_t)(phys & 0xFFFFFFFFu));
+#endif
+    if (!phys) { 
         if (used_from_bump) heap_alloc_next -= pages * PAGE_SIZE;
         else insert_and_coalesce(virt, pages);
         log_oom(size, "Phys fragmentation"); kheap_unlock(); return NULL;
     }
 
+#if (KHEAP_DEBUG >= 2)
+    com_write_string(COM1_PORT, "[KHEAP] paging_map_range virt=");
+    com_printf(COM1_PORT, "0x%08x%08x size=0x%x\n", (uint32_t)(virt >> 32), (uint32_t)(virt & 0xFFFFFFFFu), (uint32_t)(pages * PAGE_SIZE));
+#endif
     if (paging_map_range(virt, phys, pages * PAGE_SIZE, KHEAP_PAGE_FLAGS) != 0) {
-        for (uint64_t i = 0; i < pages; ++i) phys_free_frame(phys + i * PAGE_SIZE);
+        for (uint64_t i = 0; i < pages; ++i) phys_ref_dec(phys + i * PAGE_SIZE);
         if (used_from_bump) heap_alloc_next -= pages * PAGE_SIZE;
         else insert_and_coalesce(virt, pages);
         log_oom(size, "Paging failure"); kheap_unlock(); return NULL;
     }
 
-    /* Debug: verify every mapped heap page is present in the page tables */
+    /* Debug: verify every mapped heap page is present AND maps to the expected physical page.
+     * If this fails, paging structures are being corrupted or reused.
+     */
     for (uint64_t i = 0; i < pages; ++i) {
         uint64_t vaddr = virt + i * PAGE_SIZE;
+        uint64_t expected = phys + i * PAGE_SIZE;
         uint64_t pa = paging_virt_to_phys(vaddr);
         if (pa == 0) {
             com_write_string(COM1_PORT, "[KHEAP] FATAL: paging_map_range reported success but page is not present. vaddr=");
@@ -276,10 +288,27 @@ void *kmalloc(size_t size) {
             com_write_string(COM1_PORT, "\n");
             for (;;) { __asm__ volatile("cli; hlt"); }
         }
+        if ((pa & ~0xFFFULL) != (expected & ~0xFFFULL)) {
+            com_write_string(COM1_PORT, "[KHEAP] FATAL: heap mapping mismatch vaddr=");
+            char hb[32]; uint64_to_hex(vaddr, hb, sizeof(hb));
+            com_write_string(COM1_PORT, hb);
+            com_write_string(COM1_PORT, " expected_phys=");
+            uint64_to_hex(expected, hb, sizeof(hb));
+            com_write_string(COM1_PORT, hb);
+            com_write_string(COM1_PORT, " got_phys=");
+            uint64_to_hex(pa, hb, sizeof(hb));
+            com_write_string(COM1_PORT, hb);
+            com_write_string(COM1_PORT, "\n");
+            for (;;) { __asm__ volatile("cli; hlt"); }
+        }
     }
 
     __asm__ volatile("mov %%cr3, %%rax\n\tmov %%rax, %%cr3" ::: "rax", "memory");
 
+#if (KHEAP_DEBUG >= 2)
+    com_write_string(COM1_PORT, "[KHEAP] writing header at virt=");
+    com_printf(COM1_PORT, "0x%08x%08x\n", (uint32_t)(virt >> 32), (uint32_t)(virt & 0xFFFFFFFFu));
+#endif
     struct alloc_header *hdr = (struct alloc_header *)(uintptr_t)virt;
     hdr->magic = ALLOC_MAGIC; hdr->size = size; hdr->pages = pages; hdr->phys_base = phys;
 
@@ -307,6 +336,8 @@ void kfree(void *ptr) {
 
     /* Handle kmalloc_aligned() pointers first.
      * The aligned prefix lives immediately before the pointer.
+     * 
+     * Must unlock before recursive kfree to avoid deadlock!
      */
     {
         uint64_t prefix_addr = p - sizeof(struct aligned_prefix);
@@ -317,8 +348,9 @@ void kfree(void *ptr) {
                     void *raw = ap->raw;
                     ap->magic = 0;
                     ap->raw = NULL;
-                    kfree(raw);
-                    KHEAP_UNLOCK_AND_RETURN();
+                    kheap_unlock();  /* UNLOCK before recursive call! */
+                    kfree(raw);      /* This will reacquire the lock */
+                    return;
                 }
             }
         }
@@ -350,6 +382,7 @@ void kfree(void *ptr) {
 
     struct alloc_header *hdr = (struct alloc_header *)(uintptr_t)hdr_addr;
 
+#if (KHEAP_DEBUG >= 2)
     /* Debug: log frees (helps detect unexpected frees/double frees) */
     {
         char hb[32]; uint64_to_hex((uint64_t)(uintptr_t)hdr, hb, sizeof(hb));
@@ -360,6 +393,7 @@ void kfree(void *ptr) {
         com_write_string(COM1_PORT, hb);
         com_write_string(COM1_PORT, "\n");
     }
+#endif
 
     if (hdr->magic != ALLOC_MAGIC) {
         /* If it was already freed, avoid touching more state. */
@@ -378,9 +412,11 @@ void kfree(void *ptr) {
         KHEAP_UNLOCK_AND_RETURN();
     }
 
+#if (KHEAP_DEBUG >= 2)
     com_printf(COM1_PORT, "[KHEAP]   size=%u pages=%u phys_base=0x%08x%08x\n",
                (uint32_t)hdr->size, (uint32_t)hdr->pages,
                (uint32_t)(hdr->phys_base >> 32), (uint32_t)(hdr->phys_base & 0xFFFFFFFFu));
+#endif
 
     uint64_t phys_base = hdr->phys_base;
     uint64_t pages = hdr->pages;
@@ -388,10 +424,16 @@ void kfree(void *ptr) {
 
     hdr->magic = FREED_MAGIC;
 
-    for (uint64_t i = 0; i < pages; i++) phys_free_frame(phys_base + i * PAGE_SIZE);
+    for (uint64_t i = 0; i < pages; i++) phys_ref_dec(phys_base + i * PAGE_SIZE);
     for (uint64_t i = 0; i < pages; i++) paging_unmap_page(virt + i * PAGE_SIZE);
     insert_and_coalesce(virt, pages);
     kheap_unlock();
+}
+
+
+/* Initialize kernel heap - MUST be called during boot */
+void kheap_init(void) {
+    spinlock_init(&kheap_spinlock);
 }
 
 void *kmalloc_aligned(size_t size, size_t alignment) {

@@ -9,20 +9,18 @@
  */
 static int user_range_is_mapped(uint64_t addr, size_t n) {
     if (n == 0) return 1;
+    if (addr >= 0x0000800000000000ULL) return 0;
+    uint64_t end = addr + (uint64_t)n - 1;
+    if (end < addr) return 0;
+    if (end >= 0x0000800000000000ULL) return 0;
 
-    uint64_t start = addr & ~0xFFFULL;
-    uint64_t end = (addr + (uint64_t)n - 1) & ~0xFFFULL;
+    uint64_t start_page = addr & ~0xFFFULL;
+    uint64_t end_page = end & ~0xFFFULL;
 
-    for (uint64_t v = start; v <= end; v += 0x1000ULL) {
-        /* If not mapped, virt_to_phys returns 0 in this kernel. */
-        uint64_t phys = paging_virt_to_phys(v);
-        if (phys == 0) return 0;
-
-        /* Walk the page tables to check USER bit on the final PTE.
-         * paging.c doesn’t expose this directly, so for now we enforce a simpler rule:
-         * user pointers must be in the low canonical half (< 0x0000800000000000).
-         */
-        if (v >= 0x0000800000000000ULL) return 0;
+    for (uint64_t v = start_page; v <= end_page; v += 0x1000ULL) {
+        uint64_t pte = paging_get_pte(v);
+        if (!(pte & PFLAG_PRESENT)) return 0;
+        if (!(pte & PFLAG_USER)) return 0;
     }
 
     return 1;

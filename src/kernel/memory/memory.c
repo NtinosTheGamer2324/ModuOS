@@ -10,22 +10,29 @@
 void memory_system_init(void *mb2)
 {
     com_write_string(COM1_PORT, "[MEM] Starting memory system initialization...\n");
-    
+
+    /* Configure phys->virt direct map used by early allocators/page-walkers.
+     * Boot sets up a 1GiB physmap at 0xFFFF880000000000.
+     */
+    paging_set_phys_offset(0xFFFF880000000000ULL);
+
     com_write_string(COM1_PORT, "[MEM] Step 1: Parsing Multiboot2 info and initializing physical allocator...\n");
     memory_init(mb2);
-    
+
     com_write_string(COM1_PORT, "[MEM] Step 2: Using bootloader's identity mapping...\n");
     early_identity_map();
     
+    /* No Multiboot2 framebuffer usage: graphics will be initialized by drivers later. */
+
     com_write_string(COM1_PORT, "[MEM] Step 3: Initializing paging system (copying bootloader mappings)...\n");
     paging_init();
 
-    // Optional: initialize linear framebuffer (graphics mode) if GRUB provided it.
-    // Fallback: stay in VGA text mode.
+    // Graphics init deferred to GPU drivers; stay in VGA text mode.
     {
-        struct multiboot_tag *t = multiboot2_find_tag(mb2, MULTIBOOT_TAG_TYPE_FRAMEBUFFER);
+        com_write_string(COM1_PORT, "[FB] Multiboot framebuffer disabled; using VGA text until GPU drivers init\n");
+        struct multiboot_tag *t = NULL;
         if (t) {
-            // Parse tag with explicit offsets (Multiboot2 spec):
+
             //  +0 type (u32)
             //  +4 size (u32)
             //  +8 framebuffer_addr (u64)
@@ -34,9 +41,11 @@ void memory_system_init(void *mb2)
             // +24 height (u32)
             // +28 bpp (u8)
             // +29 framebuffer_type (u8)
-            uint8_t *b = (uint8_t*)t;
+            uint8_t *b = (uint8_t*)t; // points to fb_tag_copy when have_fb_tag==1
             uint64_t fb_phys = *(uint64_t*)(b + 8);
             uint32_t pitch = *(uint32_t*)(b + 16);
+            com_write_string(COM1_PORT, "[FB] fb phys=");
+            com_printf(COM1_PORT, "0x%08x%08x\n", (uint32_t)(fb_phys >> 32), (uint32_t)(fb_phys & 0xFFFFFFFFu));
             uint32_t width = *(uint32_t*)(b + 20);
             uint32_t height = *(uint32_t*)(b + 24);
             uint8_t bpp = *(uint8_t*)(b + 28);
@@ -88,8 +97,20 @@ void memory_system_init(void *mb2)
                 { char tmp[32]; itoa((int)fb_size_aligned, tmp, 10); com_write_string(COM1_PORT, tmp); }
                 com_write_string(COM1_PORT, ") bytes\n");
 
-                // Guarded mapping: catch framebuffer overflows (common in early gfx code)
-                void *fb_virt = ioremap_guarded(fb_phys, fb_size_aligned);
+                /* TEMP SAFETY:
+                 * Some firmware/QEMU configurations place the framebuffer in very high MMIO space
+                 * (e.g. 0xF4000000). Early ioremap is still being stabilized for high MMIO and
+                 * can fault/triple-fault during boot.
+                 *
+                 * Until ioremap for high MMIO is fully reliable, fall back to VGA text mode.
+                 */
+                void *fb_virt = NULL;
+                if (fb_phys >= 0x40000000ULL) {
+                    com_write_string(COM1_PORT, "[FB] WARNING: framebuffer is high MMIO; deferring graphics init, staying in text mode\n");
+                } else {
+                    // Guarded mapping: catch framebuffer overflows (common in early gfx code)
+                    fb_virt = ioremap_guarded(fb_phys, fb_size_aligned);
+                }
                 com_write_string(COM1_PORT, "[FB] ioremap returned fb_virt=");
                 com_printf(COM1_PORT, "0x%08x%08x\n",
                            (uint32_t)(((uint64_t)(uintptr_t)fb_virt) >> 32),
@@ -146,11 +167,17 @@ void memory_system_init(void *mb2)
         }
     }
     
-    com_write_string(COM1_PORT, "[MEM] Step 4: Extending identity mapping to all RAM...\n");
-    early_identity_map_all();
-    
+    /* Step 4 (legacy): Extending identity mapping to all RAM.
+     *
+     * With a higher-half kernel and a physmap direct-map, we do not need to
+     * identity-map all RAM during early boot. Doing so can require splitting the
+     * bootloader's huge-page mappings (which also back the physmap window), and
+     * has been observed to fault on some configurations.
+     */
+    com_write_string(COM1_PORT, "[MEM] Step 4: Skipping full identity mapping (physmap enabled)\n");
+
     /* ADD THESE DEBUG LINES */
-    com_write_string(COM1_PORT, "[MEM] Step 4 complete! early_identity_map_all() returned successfully\n");
+    com_write_string(COM1_PORT, "[MEM] Step 4 complete (skipped)\n");
     com_write_string(COM1_PORT, "[MEM] Memory system initialized successfully!\n");
     com_write_string(COM1_PORT, "[MEM] Kernel heap is now available via kmalloc()\n");
     com_write_string(COM1_PORT, "[MEM] Returning from memory_system_init()...\n");
