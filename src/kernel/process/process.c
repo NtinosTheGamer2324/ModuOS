@@ -378,8 +378,10 @@ static void do_switch_and_reap(process_t *old, process_t *newp) {
         amd64_syscall_set_kernel_stack(top);
     }
 
-    /* Restore interrupt flag once the stack/CR3 is stable. */
-    __asm__ volatile("sti" ::: "memory");
+    /* Keep interrupts masked through the context switch to avoid IRQs
+     * firing on a partially switched stack/register set.
+     * The new context's RFLAGS restores IF as needed.
+     */
 
     /* Lazy FPU switching: set TS depending on whether the next process owns the live FPU state. */
     fpu_lazy_on_context_switch(newp);
@@ -452,7 +454,6 @@ void schedule(void) {
     }
 
     do_switch_and_reap(old, newp);
-    __asm__ volatile("sti");
 }
 
 void scheduler_tick(void) {
