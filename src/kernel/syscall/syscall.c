@@ -182,12 +182,22 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             uint8_t *dst_base = (uint8_t*)fb.addr + (uint64_t)dst_y * fb.pitch + (uint64_t)dst_x * bpp;
             size_t row_bytes = (size_t)src_w * bpp;
 
+            if (src_pitch < row_bytes) return -6;
+
+            uint8_t *rowbuf = (uint8_t*)kmalloc(row_bytes);
+            if (!rowbuf) return -1;
+
             for (uint32_t y = 0; y < src_h; y++) {
                 const uint8_t *srow = src + (uint64_t)y * src_pitch;
                 uint8_t *drow = dst_base + (uint64_t)y * fb.pitch;
-                memcpy(drow, srow, row_bytes);
+                if (usercopy_from_user(rowbuf, srow, row_bytes) != 0) {
+                    kfree(rowbuf);
+                    return -1;
+                }
+                memcpy(drow, rowbuf, row_bytes);
             }
 
+            kfree(rowbuf);
             return 0;
         }
         case SYS_SLEEP:   return sys_sleep((unsigned int)arg1);
