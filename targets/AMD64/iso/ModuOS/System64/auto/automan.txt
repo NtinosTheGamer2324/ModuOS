@@ -1,0 +1,93 @@
+AUTO Language Reference
+========================
+
+The AUTO language defines boot-time autostart entries in:
+  /ModuOS/System64/auto/autostart
+
+Each non-empty line is processed in order. Earlier lines run first.
+
+
+Basic syntax
+------------
+- One command per line:
+  /Apps/login.sqr
+
+- Foreground (blocking) using '$' suffix:
+  /Apps/login.sqr $
+
+- Explicit foreground/background (keywords win over '$'):
+  fg /Apps/login.sqr
+  bg /Apps/net.sqr
+
+
+Comments
+--------
+- Line comment:
+  // This is ignored
+
+- Block comment (can span lines):
+  /*
+    This is a block comment
+  */
+
+
+Delays
+------
+- sleep or delay, milliseconds by default:
+  sleep 2000
+  delay 2000
+
+- Use seconds with suffix:
+  sleep 2s
+
+
+Wait
+----
+- Wait for a PID to exit:
+  wait 3
+
+- Wait for a process name to exit:
+  wait login.sqr
+
+
+Once (per boot)
+--------------
+- Run a line only once during this boot:
+  once /Apps/hello.sqr
+
+
+Conditions
+----------
+- Run only if a file exists (on the boot filesystem):
+  ?exists /ModuOS/System64/users.db /Apps/login.sqr
+
+- Run only if a filesystem type is mounted:
+  ?fs ext2 /Apps/ext2tool.sqr
+
+- Run only if a device exists in $/dev:
+  ?dev $/dev/input/kbd0 /Apps/inputtest.sqr
+
+- Conditional block:
+  ?exists /ModuOS/System64/mdsys.sqr {
+      bg /ModuOS/System64/services/idk_daemon.ctl
+      bg /ModuOS/System64/services/net_daemon.ctl
+  }
+
+
+Sections and labels (for logging/organization)
+---------------------------------------------
+- Section headers:
+  early:
+  late:
+
+- Labels:
+  @graphics:
+
+
+Example autostart file
+----------------------
+/ModuOS/System64/Service/myservice.ctl
+fg /Apps/login.sqr
+sleep 2s
+?dev $/dev/input/kbd0 bg /Apps/inputtest.sqr
+once /Apps/hello.sqr

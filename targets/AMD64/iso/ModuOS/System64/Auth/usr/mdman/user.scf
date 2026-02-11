@@ -1,0 +1,9 @@
+[user]
+uid=0
+groups=mdauthority:1;
+salt=A34q543AHJD253546y754gsASDF5464
+username=mdman
+password=72524a9c98b8f6d3ab2ceca40493b5ab562da94aaa4c09d9794ecf6404390686
+
+[properties]
+needs_oobe=false
