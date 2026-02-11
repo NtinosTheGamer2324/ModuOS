@@ -4,6 +4,10 @@
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/spinlock.h"
 
+
+/* Global cache statistics */
+static mdfs_cache_stats_t g_cache_stats = {0};
+
 /* ============================================================================
  * Buffer Pool Implementation
  * ============================================================================ */
@@ -357,8 +361,6 @@ void mdfs_inode_cache_invalidate(int fs_handle) {
 /* ============================================================================
  * Statistics
  * ============================================================================ */
-
-static mdfs_cache_stats_t g_cache_stats = {0};
 
 void mdfs_cache_get_stats(mdfs_cache_stats_t *stats) {
     if (stats) {
