@@ -548,7 +548,10 @@ int sys_sleep(unsigned int seconds) {
     return 0;
 }
 
-void sys_yield(void) { process_yield(); }
+void sys_yield(void) {
+    /* Avoid scheduling inside syscall context (iret frame on stack). */
+    scheduler_request_reschedule();
+}
 
 void* sys_sbrk(intptr_t increment) {
     process_t *p = process_get_current();
