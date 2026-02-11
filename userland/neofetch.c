@@ -171,13 +171,18 @@ int md_main(long argc, char** argv) {
     int show_features = 1;
     int use_color = 0;
 
+    if (!argv || argc <= 0) {
+        argc = 0;
+    }
+
     for (long i = 1; i < argc; i++) {
         const char *a = argv[i];
+        if (!a) continue;
         if (streq(a, "--no-logo")) show_logo = 0;
         else if (streq(a, "--no-bar")) show_bar = 0;
         else if (streq(a, "--no-features")) show_features = 0;
         else if (streq(a, "--color")) use_color = 1;
-        else if (streq(a, "--help") || streq(a, "-h")) { usage(argv[0]); return 0; }
+        else if (streq(a, "--help") || streq(a, "-h")) { usage(argv ? argv[0] : NULL); return 0; }
     }
 
     md64api_sysinfo_data_u info_s;
