@@ -518,11 +518,13 @@ static int fbcon_draw_glyph_fnt(fb_console_t *c, uint32_t cp, uint16_t *out_adva
     fnt_glyph_t *glyph = fnt_get_glyph((fnt_font_t *)c->fnt_font, cp);
     if (!glyph) return 0;
     
+    uint16_t draw_w = glyph->width ? glyph->width : c->cell_w;
+
     /* Clear the cell background */
     uint8_t br, bg, bb;
     vga16_to_rgb(c->bg, &br, &bg, &bb);
     uint32_t bgpx = fb_pack_rgb888(&c->fb, br, bg, bb);
-    fb_fill_rect(&c->fb, c->x, c->y, glyph->width, c->cell_h, bgpx);
+    fb_fill_rect(&c->fb, c->x, c->y, draw_w, c->cell_h, bgpx);
     
     /* Render the glyph pixels */
     uint8_t fr, fg, fb2;
@@ -541,7 +543,7 @@ static int fbcon_draw_glyph_fnt(fb_console_t *c, uint32_t cp, uint16_t *out_adva
     }
     
     /* Return the actual glyph width for proper spacing */
-    if (out_advance) *out_advance = glyph->width;
+    if (out_advance) *out_advance = draw_w;
     return 1;
 }
 
@@ -734,7 +736,7 @@ void fbcon_putc(fb_console_t *c, char ch) {
     /* If not currently collecting a UTF-8 sequence, decide what to do. */
     if (c->utf8_pending_len == 0) {
         if (b < 0x80) {
-            fbcon_putc_raw(c, (char)b);
+            fbcon_emit_codepoint(c, (uint32_t)b);
             return;
         }
 
