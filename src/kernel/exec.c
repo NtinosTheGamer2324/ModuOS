@@ -2,12 +2,15 @@
 #include "moduos/kernel/exec.h"
 #include "moduos/kernel/shell/zenith4.h"
 #include "moduos/fs/fs.h"
+#include "moduos/fs/hvfs.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/loader/elf.h"
 #include "moduos/kernel/process/process.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/memory/usercopy.h"
+#include "moduos/kernel/memory/paging.h"
 
 extern shell_state_t shell_state;
 
@@ -16,6 +19,11 @@ extern void normalize_path(char* path);
 extern void join_path(const char* base, const char* component, char* result);
 
 #define MAX_ARGS 32
+
+/* Linux-like limit for argv+envp bytes */
+#define ARG_MAX (128 * 1024)
+
+#include "moduos/kernel/errno.h"
 
 /* Parse command line into dynamically allocated argv array */
 static int parse_args_dynamic(const char *cmdline, char ***out_argv, int max_args) {
@@ -192,37 +200,19 @@ int exec_run(const char *args, int wait_for_exit) {
     com_write_string(COM1_PORT, size_str);
     com_write_string(COM1_PORT, " bytes\n");
 
-    // Allocate buffer
-    com_write_string(COM1_PORT, "[EXEC] Calling kmalloc...\n");
-    void *buffer = kmalloc(info.size);
-    if (!buffer) {
-        VGA_Write("\\crFailed to allocate memory\\rr\n");
-        com_write_string(COM1_PORT, "[EXEC] kmalloc FAILED\n");
-        free_argv(argv, argc);
-        return -1;
-    }
-    
-    com_write_string(COM1_PORT, "[EXEC] kmalloc succeeded, buffer at 0x");
-    uint64_t buf_addr = (uint64_t)buffer;
-    for (int j = 15; j >= 0; j--) {
-        uint8_t nibble = (buf_addr >> (j * 4)) & 0xF;
-        char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
-        com_write_byte(COM1_PORT, hex);
-    }
-    com_write_string(COM1_PORT, "\n");
-
-    // Read file
-    com_write_string(COM1_PORT, "[EXEC] Calling fs_read_file...\n");
+    // Read file (HVFS cached)
+    com_write_string(COM1_PORT, "[EXEC] Calling hvfs_read...\n");
+    void *buffer = NULL;
     size_t bytes_read = 0;
-    if (fs_read_file(mount, exec_path, buffer, info.size, &bytes_read) != 0) {
+    int hvrc = hvfs_read(shell_state.current_slot, exec_path, &buffer, &bytes_read);
+    if (hvrc != 0 || !buffer) {
         VGA_Write("\\crFailed to read file\\rr\n");
-        com_write_string(COM1_PORT, "[EXEC] fs_read_file FAILED\n");
-        kfree(buffer);
+        com_write_string(COM1_PORT, "[EXEC] hvfs_read FAILED\n");
         free_argv(argv, argc);
         return -1;
     }
-    
-    com_write_string(COM1_PORT, "[EXEC] fs_read_file succeeded, read ");
+
+    com_write_string(COM1_PORT, "[EXEC] hvfs_read succeeded, read ");
     itoa(bytes_read, size_str, 10);
     com_write_string(COM1_PORT, size_str);
     com_write_string(COM1_PORT, " bytes\n");
@@ -234,7 +224,7 @@ int exec_run(const char *args, int wait_for_exit) {
     int has_interp = elf_get_interp_path(buffer, bytes_read, interp_path, sizeof(interp_path));
     if (has_interp < 0) {
         VGA_Write("\\crFailed to parse ELF interpreter\\rr\n");
-        kfree(buffer);
+        hvfs_free(shell_state.current_slot, exec_path, buffer);
         free_argv(argv, argc);
         return -1;
     }
@@ -251,7 +241,7 @@ int exec_run(const char *args, int wait_for_exit) {
         char **new_argv = (char **)kmalloc((new_argc + 1) * sizeof(char *));
         if (!new_argv) {
             VGA_Write("\\crFailed to allocate interpreter argv\\rr\n");
-            kfree(buffer);
+            hvfs_free(shell_state.current_slot, exec_path, buffer);
             free_argv(argv, argc);
             return -1;
         }
@@ -273,7 +263,7 @@ int exec_run(const char *args, int wait_for_exit) {
         }
         new_argv[out_i] = NULL;
 
-        kfree(buffer);
+        hvfs_free(shell_state.current_slot, exec_path, buffer);
         free_argv(argv, argc);
 
         if (!fs_file_exists(mount, interp_path)) {
@@ -289,17 +279,12 @@ int exec_run(const char *args, int wait_for_exit) {
             return -1;
         }
 
-        void *ibuf = kmalloc(iinfo.size);
-        if (!ibuf) {
-            VGA_Write("\\crInterpreter alloc failed\\rr\n");
-            free_argv(new_argv, new_argc);
-            return -1;
-        }
-
+        void *ibuf = NULL;
         size_t ibread = 0;
-        if (fs_read_file(mount, interp_path, ibuf, iinfo.size, &ibread) != 0) {
+        int ihrc = hvfs_read(shell_state.current_slot, interp_path, &ibuf, &ibread);
+        if (ihrc != 0 || !ibuf || ibread < (size_t)iinfo.size) {
             VGA_Write("\\crInterpreter read failed\\rr\n");
-            kfree(ibuf);
+            hvfs_free(shell_state.current_slot, interp_path, ibuf);
             free_argv(new_argv, new_argc);
             return -1;
         }
@@ -307,7 +292,7 @@ int exec_run(const char *args, int wait_for_exit) {
         uint64_t entry_point;
         uint64_t img_base = 0, img_end = 0;
         int elf_result = elf_load_with_args(ibuf, ibread, &entry_point, new_argc, new_argv, &img_base, &img_end);
-        kfree(ibuf);
+        hvfs_free(shell_state.current_slot, interp_path, ibuf);
 
         if (elf_result != 0) {
             VGA_Write("\\crFailed to load interpreter ELF\\rr\n");
@@ -324,7 +309,7 @@ int exec_run(const char *args, int wait_for_exit) {
         free_argv(new_argv, new_argc);
 
         if (!proc) {
-            VGA_Write("\\crFailed to create interpreter process\\rr\\n");
+            VGA_Write("\\crFailed to create interpreter process\\rr\n");
             return -1;
         }
 
@@ -345,10 +330,46 @@ int exec_run(const char *args, int wait_for_exit) {
 
     com_write_string(COM1_PORT, "[EXEC] About to call elf_load_with_args...\n");
 
-    // Load ELF with arguments
+    /* Per-process address spaces:
+     * Create a fresh PML4 for this user process, switch CR3 temporarily so that
+     * ELF segment mappings + user stack mappings land in that address space.
+     */
+    uint64_t kernel_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(kernel_cr3));
+
+    /* Switching CR3 while interrupts are enabled is dangerous: any IRQ/#PF handler
+     * expects the kernel IDT/stack/global mappings to be valid in the active CR3.
+     * If an interrupt fires while we're in a partially-initialized process address space,
+     * we can cascade into a double/triple fault.
+     *
+     * So we disable interrupts for the brief window where we build the process mappings.
+     */
+    uint64_t saved_rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(saved_rflags) :: "memory");
+
+    uint64_t proc_cr3 = paging_create_process_pml4();
+    if (!proc_cr3) {
+        /* restore IF */
+        if (saved_rflags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
+        VGA_Write("\\crFailed to create process address space\\rr\n");
+        hvfs_free(shell_state.current_slot, exec_path, buffer);
+        free_argv(argv, argc);
+        return -1;
+    }
+    paging_switch_cr3(proc_cr3);
+
+    // Load ELF with arguments (maps into current CR3)
     uint64_t entry_point;
     uint64_t img_base = 0, img_end = 0;
     int elf_result = elf_load_with_args(buffer, bytes_read, &entry_point, argc, argv, &img_base, &img_end);
+
+    /* Restore kernel CR3 before we continue running kernel code that may rely on
+     * existing kernel mappings/state.
+     */
+    paging_switch_cr3(kernel_cr3);
+
+    /* Restore interrupt flag after we've returned to the known-good kernel address space. */
+    if (saved_rflags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
     
     com_write_string(COM1_PORT, "[EXEC] elf_load_with_args returned: ");
     itoa(elf_result, size_str, 10);
@@ -358,14 +379,14 @@ int exec_run(const char *args, int wait_for_exit) {
     if (elf_result != 0) {
         VGA_Write("\\crFailed to load ELF\\rr\n");
         com_write_string(COM1_PORT, "[EXEC] ELF load failed!\n");
-        kfree(buffer);
+        hvfs_free(shell_state.current_slot, exec_path, buffer);
         free_argv(argv, argc);
         return -1;
     }
     
     // The ELF loader has already copied the data to new physical pages
-    com_write_string(COM1_PORT, "[EXEC] Freeing temporary buffer\n");
-    kfree(buffer); 
+    com_write_string(COM1_PORT, "[EXEC] Releasing temporary buffer\n");
+    hvfs_free(shell_state.current_slot, exec_path, buffer);
 
     com_write_string(COM1_PORT, "[EXEC] Entry point: 0x");
     for (int j = 15; j >= 0; j--) {
@@ -383,16 +404,28 @@ int exec_run(const char *args, int wait_for_exit) {
 
     com_write_string(COM1_PORT, "[EXEC] Creating process...\n");
     
-    // Create process with arguments
-    // NOTE: Process will own the argv memory now - don't free it here
-    process_t *proc;
+    /* Create process with arguments.
+     * IMPORTANT: create user stack mappings inside the process address space.
+     */
+    process_t *proc = NULL;
+    paging_switch_cr3(proc_cr3);
+    process_set_build_pml4((uint64_t*)phys_to_virt_kernel(proc_cr3), proc_cr3);
+
     if (argc > 0) {
         proc = process_create_with_args(filename, (void(*)(void))entry_point, 1, argc, argv);
         if (proc) { proc->user_image_base = img_base; proc->user_image_end = img_end; }
     } else {
         proc = process_create(filename, (void(*)(void))entry_point, 1);
-        free_argv(argv, argc); // Only free if not passed to process
+        free_argv(argv, argc);
     }
+
+    process_set_build_pml4(NULL, 0);
+
+    /* Ensure the process uses the new address space. */
+    if (proc) proc->page_table = proc_cr3;
+
+    /* Back to kernel address space. */
+    paging_switch_cr3(kernel_cr3);
 
     if (!proc) {
         com_write_string(COM1_PORT, "[EXEC] Process creation FAILED\n");

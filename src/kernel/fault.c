@@ -10,6 +10,10 @@
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/memory/paging.h"
 
+// Debug: last syscall info (from syscall.c)
+extern volatile uint64_t g_last_syscall_num;
+extern volatile uint64_t g_last_syscall_args[5];
+
 // Assembly stubs (defined in fault.asm)
 extern void fault_stub_0(void);
 extern void fault_stub_1(void);
@@ -29,6 +33,60 @@ extern void fault_stub_16(void);
 extern void fault_stub_17(void);
 extern void fault_stub_18(void);
 extern void fault_stub_19(void);
+
+static void format_hex64(uint64_t value, char* buffer);
+
+// Store last user-mode page fault details for debugging (COM1 only)
+typedef struct {
+    int valid;
+    uint32_t pid;
+    char pname[PROCESS_NAME_MAX];
+    uint64_t cr2;
+    uint64_t rip;
+    uint64_t rsp;
+    uint64_t rflags;
+    uint64_t cs;
+    uint64_t err;
+} last_user_pf_t;
+
+static volatile last_user_pf_t g_last_user_pf;
+
+static void record_user_pf(uint64_t cr2, uint64_t err, interrupt_frame_t *frame, uint64_t rsp_now) {
+    process_t *p = process_get_current();
+    g_last_user_pf.valid = 1;
+    g_last_user_pf.pid = p ? p->pid : 0;
+    for (int i = 0; i < PROCESS_NAME_MAX; i++) {
+        g_last_user_pf.pname[i] = p ? p->name[i] : 0;
+        if (!p || p->name[i] == 0) break;
+    }
+    g_last_user_pf.cr2 = cr2;
+    g_last_user_pf.rip = frame ? frame->rip : 0;
+    g_last_user_pf.rsp = rsp_now;
+    g_last_user_pf.rflags = frame ? frame->rflags : 0;
+    g_last_user_pf.cs = frame ? frame->cs : 0;
+    g_last_user_pf.err = err;
+}
+
+void fault_print_last_user_pf(void) {
+    if (!g_last_user_pf.valid) {
+        com_write_string(COM1_PORT, "[LASTFAULT] none\n");
+        return;
+    }
+
+    char h[32];
+    com_write_string(COM1_PORT, "[LASTFAULT] pid=");
+    char b[16]; itoa((int)g_last_user_pf.pid, b, 10); com_write_string(COM1_PORT, b);
+    com_write_string(COM1_PORT, " name=");
+    com_write_string(COM1_PORT, g_last_user_pf.pname);
+
+    com_write_string(COM1_PORT, " cr2="); format_hex64(g_last_user_pf.cr2, h); com_write_string(COM1_PORT, h);
+    com_write_string(COM1_PORT, " rip="); format_hex64(g_last_user_pf.rip, h); com_write_string(COM1_PORT, h);
+    com_write_string(COM1_PORT, " rsp="); format_hex64(g_last_user_pf.rsp, h); com_write_string(COM1_PORT, h);
+    com_write_string(COM1_PORT, " err="); format_hex64(g_last_user_pf.err, h); com_write_string(COM1_PORT, h);
+    com_write_string(COM1_PORT, " cs="); format_hex64(g_last_user_pf.cs, h); com_write_string(COM1_PORT, h);
+    com_write_string(COM1_PORT, " rflags="); format_hex64(g_last_user_pf.rflags, h); com_write_string(COM1_PORT, h);
+    com_write_string(COM1_PORT, "\n");
+}
 
 // Helper: Format hex value to string
 static void format_hex64(uint64_t value, char* buffer) {
@@ -413,6 +471,19 @@ void fault_handler_general_protection(uint64_t error_code, interrupt_frame_t *fr
     }
 
     char message[512];
+    // Debug: print last syscall info to COM1
+    com_write_string(COM1_PORT, "[GPF] last_syscall=");
+    char sbuf[32];
+    itoa((int)g_last_syscall_num, sbuf, 10);
+    com_write_string(COM1_PORT, sbuf);
+    com_write_string(COM1_PORT, " args=");
+    for (int ai = 0; ai < 5; ai++) {
+        com_write_string(COM1_PORT, "0x");
+        format_hex64((uint64_t)g_last_syscall_args[ai], sbuf);
+        com_write_string(COM1_PORT, sbuf);
+        if (ai != 4) com_write_string(COM1_PORT, " ");
+    }
+    com_write_string(COM1_PORT, "\n");
     int pos = 0;
     
     const char *base_msg = "Memory protection violation or privilege level error.";
@@ -507,32 +578,73 @@ void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame) {
     uint64_t faulting_address;
     __asm__ volatile("mov %%cr2, %0" : "=r"(faulting_address));
 
-    /* Fast-path: user-mode faults should not run heavy debug printing/walking.
-     * Just kill the process to avoid recursive faults inside the handler.
+    /* Handle Copy-On-Write write faults for user processes.
+     * Note: This handler runs in CPL0 even for user faults. We must keep it simple.
      */
     if ((frame->cs & 3) == 3) {
+        if ((error_code & PF_PRESENT) && (error_code & PF_WRITE)) {
+            uint64_t page = faulting_address & ~0xFFFULL;
+            uint64_t pte = paging_get_pte(page);
+            if ((pte & PFLAG_PRESENT) && (pte & PFLAG_USER) && (pte & PFLAG_COW) && !(pte & PFLAG_WRITABLE)) {
+                uint64_t old_phys = pte & 0xFFFFFFFFFFFFF000ULL;
+                uint64_t new_phys = phys_alloc_frame();
+                if (new_phys) {
+                    // Copy page contents using the paging scratch area.
+                    uint64_t scratch = paging_get_scratch_base();
+                    if (scratch) {
+                        uint64_t scratch2 = scratch + 0x1000ULL;
+                        if (paging_map_page(scratch, new_phys, PFLAG_PRESENT | PFLAG_WRITABLE) == 0 &&
+                            paging_map_page(scratch2, old_phys, PFLAG_PRESENT | PFLAG_WRITABLE) == 0) {
+                            memcpy((void*)(uintptr_t)scratch, (void*)(uintptr_t)scratch2, 4096);
+                            paging_unmap_page(scratch2);
+                            paging_unmap_page(scratch);
+
+                            // Install new PTE: writable, user, present, clear COW.
+                            uint64_t new_pte = (new_phys & 0xFFFFFFFFFFFFF000ULL) | (pte & 0xFFFULL);
+                            new_pte |= PFLAG_WRITABLE;
+                            new_pte &= ~PFLAG_COW;
+                            paging_set_pte(page, new_pte);
+
+                            phys_ref_dec(old_phys);
+                            in_pf = 0;
+                            return;
+                        }
+                        paging_unmap_page(scratch2);
+                        paging_unmap_page(scratch);
+                    }
+                    phys_free_frame(new_phys);
+                }
+            }
+        }
+
+        // Not a COW fixable fault: kill.
         process_t *p = process_get_current();
         if (p) {
             com_write_string(COM1_PORT, "\n[FAULT] User-mode #PF in PID ");
             char buf[12];
             itoa((int)p->pid, buf, 10);
             com_write_string(COM1_PORT, buf);
-
-            com_write_string(COM1_PORT, " RIP=0x");
-            for (int i = 15; i >= 0; i--) {
-                uint8_t nibble = (frame->rip >> (i * 4)) & 0xF;
-                char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
-                com_write_byte(COM1_PORT, hex);
-            }
-
-            com_write_string(COM1_PORT, " CR2=0x");
-            for (int i = 15; i >= 0; i--) {
-                uint8_t nibble = (faulting_address >> (i * 4)) & 0xF;
-                char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
-                com_write_byte(COM1_PORT, hex);
-            }
             com_write_string(COM1_PORT, " (killing process)\n");
         }
+
+        /* Always dump fault details to COM1 for headless debugging. */
+        uint64_t rsp_now;
+        __asm__ volatile("mov %%rsp, %0" : "=r"(rsp_now));
+        char h[32];
+        com_write_string(COM1_PORT, "[FAULT] user_pf cr2=");
+        format_hex64(faulting_address, h);
+        com_write_string(COM1_PORT, h);
+        com_write_string(COM1_PORT, " rip=");
+        format_hex64(frame->rip, h);
+        com_write_string(COM1_PORT, h);
+        com_write_string(COM1_PORT, " rsp=");
+        format_hex64(rsp_now, h);
+        com_write_string(COM1_PORT, h);
+        com_write_string(COM1_PORT, " err=");
+        format_hex64(error_code, h);
+        com_write_string(COM1_PORT, h);
+        com_write_string(COM1_PORT, "\n");
+
         in_pf = 0;
         process_exit(128 + 11);
         for (;;) { __asm__ volatile("hlt"); }
@@ -554,13 +666,17 @@ void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame) {
                 goto after_heap_demand;
             }
 
-            /* Zero the new physical page (assumes RAM is identity-mapped). */
-            memset((void*)(uintptr_t)pa, 0, 4096);
+            /* Zero the new physical page via kernel physmap. */
+            void *kva = phys_to_virt_kernel(pa);
+            if (!kva) { phys_free_frame(pa); goto after_heap_demand; }
+            memset(kva, 0, 4096);
 
-            /* Walk page tables via CR3 (identity-mapped tables) */
+            /* Walk page tables via CR3, using kernel physmap for table pages. */
             uint64_t cr3;
             __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-            uint64_t *pml4v = (uint64_t*)(uintptr_t)(cr3 & 0xFFFFFFFFFFFFF000ULL);
+            uint64_t pml4_phys = (cr3 & 0xFFFFFFFFFFFFF000ULL);
+            uint64_t *pml4v = (uint64_t*)phys_to_virt_kernel(pml4_phys);
+            if (!pml4v) { phys_free_frame(pa); goto after_heap_demand; }
 
             unsigned i4 = (page_base >> 39) & 0x1FF;
             unsigned i3 = (page_base >> 30) & 0x1FF;
@@ -569,15 +685,18 @@ void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame) {
 
             uint64_t e4 = pml4v[i4];
             if (!(e4 & 1ULL)) { phys_free_frame(pa); goto after_heap_demand; }
-            uint64_t *pdpt = (uint64_t*)(uintptr_t)(e4 & 0xFFFFFFFFFFFFF000ULL);
+            uint64_t *pdpt = (uint64_t*)phys_to_virt_kernel(e4 & 0xFFFFFFFFFFFFF000ULL);
+            if (!pdpt) { phys_free_frame(pa); goto after_heap_demand; }
 
             uint64_t e3 = pdpt[i3];
             if (!(e3 & 1ULL) || (e3 & (1ULL<<7))) { phys_free_frame(pa); goto after_heap_demand; }
-            uint64_t *pd = (uint64_t*)(uintptr_t)(e3 & 0xFFFFFFFFFFFFF000ULL);
+            uint64_t *pd = (uint64_t*)phys_to_virt_kernel(e3 & 0xFFFFFFFFFFFFF000ULL);
+            if (!pd) { phys_free_frame(pa); goto after_heap_demand; }
 
             uint64_t e2 = pd[i2];
             if (!(e2 & 1ULL) || (e2 & (1ULL<<7))) { phys_free_frame(pa); goto after_heap_demand; }
-            uint64_t *pt = (uint64_t*)(uintptr_t)(e2 & 0xFFFFFFFFFFFFF000ULL);
+            uint64_t *pt = (uint64_t*)phys_to_virt_kernel(e2 & 0xFFFFFFFFFFFFF000ULL);
+            if (!pt) { phys_free_frame(pa); goto after_heap_demand; }
 
             /* Install missing PTE */
             pt[i1] = (pa & 0xFFFFFFFFFFFFF000ULL) | PFLAG_PRESENT | PFLAG_WRITABLE;
@@ -592,10 +711,77 @@ void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame) {
     }
 after_heap_demand: ;
 
+    /* Stack growth: allow user stack to grow on demand, even from CPL0 (e.g., during exec argv copy).
+     * Torvalds-style heuristic: fault addr is in user range, within stack window, and close to user RSP.
+     */
+    {
+        process_t *p = process_get_current();
+        if (p && p->is_user) {
+            const uint64_t addr = faulting_address;
+            const uint64_t user_hi = 0x0000800000000000ULL;
+            if (addr < user_hi && p->user_stack_top && p->user_stack_low && p->user_stack_limit) {
+                uint64_t page = addr & ~0xFFFULL;
+
+                /* Determine current user RSP (prefer live cpu_state.rsp when in user mode). */
+                uint64_t ursp = p->user_rsp;
+                if ((frame->cs & 3) == 3) {
+                    ursp = p->cpu_state.rsp;
+                }
+
+                /* grow only downward and only within 64KiB of current user rsp */
+                const uint64_t slack = 64ULL * 1024ULL;
+                if (page < p->user_stack_low && page >= p->user_stack_limit) {
+                    uint64_t near = (ursp > slack) ? (ursp - slack) : 0;
+                    if (page >= near && page < p->user_stack_top) {
+                        uint64_t pa = phys_alloc_frame();
+                        if (pa) {
+                            if (paging_map_page(page, pa, PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) == 0) {
+                                p->user_stack_low = page;
+                                /* paging_map_page() already invalidated this VA via invlpg */
+                                in_pf = 0;
+                                return;
+                            }
+                            phys_free_frame(pa);
+                        }
+                    }
+                }
+
+                /* If it's a user-range fault and not handled as stack growth, kill the process. */
+                if (addr >= p->user_stack_limit && addr < user_hi) {
+                    com_write_string(COM1_PORT, "\n[FAULT] User-range #PF not stack-growth; killing PID ");
+                    char buf[12]; itoa((int)p->pid, buf, 10); com_write_string(COM1_PORT, buf);
+                    com_write_string(COM1_PORT, "\n");
+                    in_pf = 0;
+                    process_exit(128 + 11);
+                    for (;;) { __asm__ volatile("hlt"); }
+                }
+            }
+        }
+    }
+
     /* Minimal early print of CR2 + RIP before doing any heavier formatting. */
     uint64_t rsp_now;
     __asm__ volatile("mov %%rsp, %0" : "=r"(rsp_now));
+
+    /* Record for later retrieval */
+    if ((frame->cs & 3) == 3) {
+        record_user_pf(faulting_address, error_code, frame, rsp_now);
+    }
+
     com_write_string(COM1_PORT, "\n[FAULT] PAGE FAULT (early) CR2=0x");
+    // Debug: print last syscall info to COM1 (kernel PF diagnostics)
+    com_write_string(COM1_PORT, "[PF] last_syscall=");
+    char sbuf[32];
+    itoa((int)g_last_syscall_num, sbuf, 10);
+    com_write_string(COM1_PORT, sbuf);
+    com_write_string(COM1_PORT, " args=");
+    for (int ai = 0; ai < 5; ai++) {
+        com_write_string(COM1_PORT, "0x");
+        format_hex64((uint64_t)g_last_syscall_args[ai], sbuf);
+        com_write_string(COM1_PORT, sbuf);
+        if (ai != 4) com_write_string(COM1_PORT, " ");
+    }
+    com_write_string(COM1_PORT, "\n");
     for (int i = 15; i >= 0; i--) {
         uint8_t nibble = (faulting_address >> (i * 4)) & 0xF;
         char hex = nibble < 10 ? '0' + nibble : 'a' + (nibble - 10);
@@ -620,7 +806,7 @@ after_heap_demand: ;
        uint64_t cr3;
        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
        uint64_t pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
-       uint64_t *pml4v = (uint64_t*)(uintptr_t)pml4_phys; /* relies on identity mapping */
+       uint64_t *pml4v = (uint64_t*)phys_to_virt_kernel(pml4_phys);
 
        unsigned i4 = (faulting_address >> 39) & 0x1FF;
        unsigned i3 = (faulting_address >> 30) & 0x1FF;
@@ -631,17 +817,17 @@ after_heap_demand: ;
        com_printf(COM1_PORT, "[FAULT] PTW i4=%u e4=0x%08x%08x\n", (unsigned)i4,
                   (uint32_t)(e4 >> 32), (uint32_t)(e4 & 0xFFFFFFFFu));
        if (e4 & 1ULL) {
-           uint64_t *pdpt = (uint64_t*)(uintptr_t)(e4 & 0xFFFFFFFFFFFFF000ULL);
+           uint64_t *pdpt = (uint64_t*)phys_to_virt_kernel(e4 & 0xFFFFFFFFFFFFF000ULL);
            uint64_t e3 = pdpt[i3];
            com_printf(COM1_PORT, "[FAULT] PTW i3=%u e3=0x%08x%08x\n", (unsigned)i3,
                       (uint32_t)(e3 >> 32), (uint32_t)(e3 & 0xFFFFFFFFu));
            if ((e3 & 1ULL) && !(e3 & (1ULL<<7))) {
-               uint64_t *pd = (uint64_t*)(uintptr_t)(e3 & 0xFFFFFFFFFFFFF000ULL);
+               uint64_t *pd = (uint64_t*)phys_to_virt_kernel(e3 & 0xFFFFFFFFFFFFF000ULL);
                uint64_t e2 = pd[i2];
                com_printf(COM1_PORT, "[FAULT] PTW i2=%u e2=0x%08x%08x\n", (unsigned)i2,
                           (uint32_t)(e2 >> 32), (uint32_t)(e2 & 0xFFFFFFFFu));
                if ((e2 & 1ULL) && !(e2 & (1ULL<<7))) {
-                   uint64_t *pt = (uint64_t*)(uintptr_t)(e2 & 0xFFFFFFFFFFFFF000ULL);
+                   uint64_t *pt = (uint64_t*)phys_to_virt_kernel(e2 & 0xFFFFFFFFFFFFF000ULL);
                    uint64_t e1 = pt[i1];
                    com_printf(COM1_PORT, "[FAULT] PTW i1=%u e1=0x%08x%08x\n", (unsigned)i1,
                               (uint32_t)(e1 >> 32), (uint32_t)(e1 & 0xFFFFFFFFu));
@@ -745,6 +931,23 @@ after_heap_demand: ;
             com_write_string(COM1_PORT, buf);
             com_write_string(COM1_PORT, " (killing process)\n");
         }
+
+        /* Always dump fault details to COM1 for headless debugging. */
+        char h[32];
+        com_write_string(COM1_PORT, "[FAULT] user_pf cr2=");
+        format_hex64(faulting_address, h);
+        com_write_string(COM1_PORT, h);
+        com_write_string(COM1_PORT, " rip=");
+        format_hex64(frame->rip, h);
+        com_write_string(COM1_PORT, h);
+        com_write_string(COM1_PORT, " rsp=");
+        format_hex64(rsp_now, h);
+        com_write_string(COM1_PORT, h);
+        com_write_string(COM1_PORT, " err=");
+        format_hex64(error_code, h);
+        com_write_string(COM1_PORT, h);
+        com_write_string(COM1_PORT, "\n");
+
         in_pf = 0;
         process_exit(128 + 11);
         for (;;) { __asm__ volatile("hlt"); }
