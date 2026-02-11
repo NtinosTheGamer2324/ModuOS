@@ -686,10 +686,40 @@ static void fbcon_emit_codepoint(fb_console_t *c, uint32_t cp) {
     }
 #endif
 
+    if (cp == '\n') {
+        fbcon_newline(c);
+        return;
+    }
+    if (cp == '\r') {
+        fbcon_cursor_hide(c);
+        c->x = c->margin_left;
+        fbcon_cursor_show(c);
+        return;
+    }
+    if (cp == '\b') {
+        fbcon_backspace(c);
+        return;
+    }
+    if (cp == '\t') {
+        for (int i = 0; i < 4; i++) fbcon_putc_raw(c, ' ');
+        return;
+    }
+
+    uint16_t advance = c->cell_w;
+    if (c->fnt_font_ready && c->fnt_font) {
+        fnt_glyph_t *glyph = fnt_get_glyph((fnt_font_t *)c->fnt_font, cp);
+        if (glyph) {
+            advance = glyph->width ? glyph->width : c->cell_w;
+        }
+    }
+
+    if (c->x + advance > c->fb.width) {
+        fbcon_newline(c);
+    }
+
     // Prefer FNT font first (custom format)
     if (c->fnt_font_ready && c->fnt_font) {
         fbcon_cursor_hide(c);
-        uint16_t advance = 0;
         if (fbcon_draw_glyph_fnt(c, cp, &advance)) {
             fbcon_flush_rect(c, c->x, c->y, advance, c->cell_h);
             c->x += advance;

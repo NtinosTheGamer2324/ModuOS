@@ -330,6 +330,13 @@ void VGA_ReinitFrameBufferConsole(void) {
     if (g_fbcon_inited) {
         fbcon_set_text_color(&g_fbcon, fg, bg);
         fbcon_set_cursor_pos(&g_fbcon, row, col);
+
+        if (g_fbcon_fnt_loaded && g_fbcon_fnt) {
+            fbcon_set_fnt_font(&g_fbcon, g_fbcon_fnt);
+        }
+        if (g_fbcon_font_bmp_loaded && g_fbcon_font_bmp_buf && g_fbcon_font_bmp_size) {
+            fbcon_set_bmp_font_moduosdef(&g_fbcon, g_fbcon_font_bmp_buf, g_fbcon_font_bmp_size);
+        }
     }
 }
 
