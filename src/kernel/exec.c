@@ -514,6 +514,11 @@ int exec_run(const char *args, int wait_for_exit) {
                 itoa(proc->exit_code, size_str, 10);
                 com_write_string(COM1_PORT, size_str);
                 com_write_string(COM1_PORT, ")");
+
+                // Reap the zombie now that the parent has waited
+                process_destroy(proc);
+                com_write_string(COM1_PORT, " [EXEC] Reaped\n");
+                proc = NULL;
             }
             com_write_string(COM1_PORT, "\n");
         }
