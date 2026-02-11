@@ -6,6 +6,8 @@ RUN apt-get install -y nasm
 RUN apt-get install -y xorriso
 RUN apt-get install -y grub-pc-bin
 RUN apt-get install -y grub-common
+RUN apt-get install -y grub-efi-amd64-bin
+RUN apt-get install -y mtools
 RUN apt-get install -y dosfstools
 RUN apt-get install -y parted
 RUN apt-get update --fix-missing && apt-get upgrade -y
