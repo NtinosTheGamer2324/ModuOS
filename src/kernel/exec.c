@@ -524,6 +524,9 @@ int exec_run(const char *args, int wait_for_exit) {
         }
     }
 
+    /* Ensure interrupts are enabled before returning to shell input */
+    __asm__ volatile("sti" ::: "memory");
+
     com_write_string(COM1_PORT, "[EXEC] ===== END EXEC COMMAND =====\n\n");
     return pid;
 }
