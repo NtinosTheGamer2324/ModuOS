@@ -9,7 +9,7 @@ CC=${CC:-x86_64-elf-gcc}
 LD=${LD:-x86_64-elf-ld}
 
 # Common flags
-GCC_FLAGS_COMMON="-ffreestanding -c -mno-red-zone -O2 -nostdlib"
+GCC_FLAGS_COMMON="-ffreestanding -c -mno-red-zone -O2 -fomit-frame-pointer -nostdlib -I."
 
 # Linker scripts
 LD_SCRIPT_APP="user.ld"        # fixed 0x400000 (ET_EXEC)
@@ -25,12 +25,26 @@ mkdir -p "$BUILD_DIR" "$DIST_DIR"
 # Compile
 for src in *.c; do
     [ -f "$src" ] || continue
+
+    # Stop shipping legacy apps
+    case "$src" in
+        bmpview.c)
+            echo "[BUILD] SKIP legacy $src"
+            continue
+            ;;
+    esac
+
     obj="$BUILD_DIR/${src%.c}.o"
     echo "[BUILD] CC $src -> $obj"
 
     case "$src" in
         lib_*.c)
-            "$CC" $GCC_FLAGS_COMMON -fPIC "$src" -o "$obj"
+            # Libraries must not provide a program entry point.
+            "$CC" $GCC_FLAGS_COMMON -fPIC -DLIBC_NO_START "$src" -o "$obj"
+            ;;
+        emu6502.c|tia_pf.c)
+            # Emulator/core objects are compiled as support objects (no entry point)
+            "$CC" $GCC_FLAGS_COMMON -DLIBC_NO_START "$src" -o "$obj"
             ;;
         *)
             "$CC" $GCC_FLAGS_COMMON "$src" -o "$obj"
@@ -75,12 +89,47 @@ for obj in "$BUILD_DIR"/*.o; do
                 --no-as-needed \
                 -L"$DIST_DIR" -l:demo_gfx.sqrl
             ;;
-        *)
+        paintgfx)
             bin="$DIST_DIR/${base}.sqr"
-            echo "[BUILD] LD(app) $obj -> $bin"
+            echo "[BUILD] LD(app static gfx2d) $obj + lib_gfx2d.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_gfx2d.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        pakman)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static pakman) $obj + libs -> $bin"
+            "$LD" "$obj" \
+                "$BUILD_DIR/lib_json.o" \
+                "$BUILD_DIR/lib_pakzip.o" \
+                -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        atari)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static atari) $obj + emulator objs -> $bin"
+            "$LD" "$obj" \
+                "$BUILD_DIR/lib_gfx2d.o" \
+                "$BUILD_DIR/lib_8bit.o" \
+                "$BUILD_DIR/emu6502.o" \
+                "$BUILD_DIR/tia_pf.o" \
+                "$BUILD_DIR/lib_a2600.o" \
+                -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        minesgfx|calcgfx|snakegfx)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app gfx2d) $obj -> $bin"
             "$LD" "$obj" -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv \
-                --dynamic-linker /ModuOS/shared/usr/lib/ld-moduos.sqr
+                --dynamic-linker /ModuOS/shared/usr/lib/ld-moduos.sqr \
+                --no-as-needed \
+                -L"$DIST_DIR" -l:gfx2d.sqrl
+            ;;
+        *)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static) $obj -> $bin"
+            "$LD" "$obj" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
             ;;
     esac
 

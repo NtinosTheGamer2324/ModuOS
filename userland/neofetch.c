@@ -316,6 +316,7 @@ int md_main(long argc, char** argv) {
     }
 
     if (safe_str(info->gpu_name)[0]) print_kv_color(logo_on, logo, logo_lines, logo_width, line++, use_color, "GPU", info->gpu_name);
+    if (safe_str(info->gpu_driver)[0]) print_kv_color(logo_on, logo, logo_lines, logo_width, line++, use_color, "GPU Driver", info->gpu_driver);
     if (safe_str(info->primary_disk_model)[0]) print_kv_color(logo_on, logo, logo_lines, logo_width, line++, use_color, "Disk", info->primary_disk_model);
     if (mem_line[0]) print_kv_color(logo_on, logo, logo_lines, logo_width, line++, use_color, "Memory", mem_line);
 

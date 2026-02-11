@@ -443,6 +443,7 @@ int md_main(long argc, char **argv) {
     int efd = evt_open();
     if (efd < 0) {
         puts_raw("raygfx: cannot open $/dev/input/event0\n");
+        if (gfx.bb) free(gfx.bb);
         sleep(2);
         return 2;
     }
@@ -489,5 +490,6 @@ int md_main(long argc, char **argv) {
     }
 
     close(efd);
+    if (gfx.bb) free(gfx.bb);
     return 0;
 }

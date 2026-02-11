@@ -1,4 +1,5 @@
 #include "libc.h"
+#include "userman.h"
 #include "string.h"
 
 /*
@@ -121,44 +122,9 @@ static void to_hex_lower(const uint8_t *in, uint32_t n, char *out) {
     out[n*2] = 0;
 }
 
-static int parse_users_db_line(const char *line, char *user, int user_sz, int *uid, char *hex, int hex_sz) {
-    /* username:uid:hex */
-    const char *p1 = strchr(line, ':');
-    if (!p1) return -1;
-    const char *p2 = strchr(p1+1, ':');
-    if (!p2) return -1;
-
-    int ulen = (int)(p1 - line);
-    if (ulen <= 0 || ulen >= user_sz) return -1;
-    memcpy(user, line, (size_t)ulen);
-    user[ulen] = 0;
-
-    char uidbuf[16];
-    int uidlen = (int)(p2 - (p1+1));
-    if (uidlen <= 0 || uidlen >= (int)sizeof(uidbuf)) return -1;
-    memcpy(uidbuf, p1+1, (size_t)uidlen);
-    uidbuf[uidlen] = 0;
-
-    *uid = 0;
-    for (int i=0; uidbuf[i]; i++) {
-        if (uidbuf[i] < '0' || uidbuf[i] > '9') return -1;
-        *uid = (*uid)*10 + (uidbuf[i]-'0');
-    }
-
-    /* strip newline */
-    const char *hstart = p2+1;
-    int hlen = 0;
-    while (hstart[hlen] && hstart[hlen] != '\n' && hstart[hlen] != '\r') hlen++;
-    if (hlen != 64) return -1;
-    if (hlen+1 > hex_sz) return -1;
-    memcpy(hex, hstart, (size_t)hlen);
-    hex[hlen] = 0;
-
-    return 0;
-}
-
 int md_main(long argc, char **argv) {
     (void)argc; (void)argv;
+    puts_raw("login: started\n");
 
     puts_raw("ModuOS login\n");
 
@@ -169,6 +135,7 @@ int md_main(long argc, char **argv) {
      * Flush any pending buffered keystrokes so login doesn't auto-consume previous shell input,
      * AND so the shell doesn't later replay the login keystrokes (shell reads event0).
      */
+retry:
     input_flush();
 
     puts_raw("Username: ");
@@ -189,51 +156,42 @@ int md_main(long argc, char **argv) {
     /* Drain again so password keystrokes aren't replayed as shell input. */
     input_flush();
 
-    /* hash password */
-    sha256_t s;
-    sha256_init(&s);
-    sha256_update(&s, (const uint8_t*)password, (uint32_t)strlen(password));
-    uint8_t digest[32];
-    sha256_final(&s, digest);
-    char hex[65];
-    to_hex_lower(digest, 32, hex);
-
-    int fd = open(USERS_DB, O_RDONLY, 0);
-    if (fd < 0) {
-        puts_raw("login: cannot open users.db\n");
-        return 1;
-    }
-
-    char line[256];
-    int li = 0;
-    int ok = 0;
+        int ok = 0;
     int target_uid = -1;
 
-    for (;;) {
-        char c;
-        ssize_t n = read(fd, &c, 1);
-        if (n != 1) break;
-        if (li < (int)sizeof(line)-1) line[li++] = c;
-        if (c == '\n') {
-            line[li] = 0;
-            li = 0;
-
-            char u2[64];
-            char h2[65];
-            int uid;
-            if (parse_users_db_line(line, u2, sizeof(u2), &uid, h2, sizeof(h2)) == 0) {
-                if (strcmp(u2, username) == 0 && strcmp(h2, hex) == 0) {
-                    ok = 1;
-                    target_uid = uid;
-                    break;
-                }
-            }
-        }
+    // authenticate via userman devfs
+    int authfd = open(USERMAN_DEV_AUTH, 0, 0);
+    if (authfd < 0) {
+        puts_raw("login: userman not available\n");
+        goto retry;
     }
-    close(fd);
+
+    char req[128];
+    safe_strcpy(req, sizeof(req), username);
+    safe_strcat(req, sizeof(req), ":");
+    safe_strcat(req, sizeof(req), password);
+    write(authfd, req, strlen(req));
+    char resp[32];
+    int rr = read(authfd, resp, sizeof(resp)-1);
+    close(authfd);
+    if (rr > 0) {
+        resp[rr] = 0;
+        target_uid = atoi(resp);
+    }
+
+    if (target_uid >= 0) {
+        ok = 1;
+    }
 
     if (!ok) {
         puts_raw("login failed\n");
+        goto retry;
+        return 2;
+    }
+
+    if (target_uid < 0) {
+        puts_raw("login: kernel user not allowed\n");
+        goto retry;
         return 2;
     }
 
@@ -244,7 +202,11 @@ int md_main(long argc, char **argv) {
 
     puts_raw("\nlogin ok\n");
 
-    exec("/Apps/sh.sqr");
+    // After successful login, exec into zenith5 userland shell.
+    char *argv_sh[] = { "zenith5", NULL };
+    char *envp_sh[] = { "PATH=/Apps", "SHELL=ZENITH5", NULL };
+    execve("zenith5", argv_sh, envp_sh);
 
+    puts_raw("login: execve(zenith5) failed\n");
     return 0;
 }

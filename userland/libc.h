@@ -1,4 +1,10 @@
 // libc.h
+#include "errno.h"
+
+/* Linux-ish errno variable (per-process). Since ModuOS user programs are
+ * typically single translation units, a header-defined static is sufficient.
+ */
+static int errno;
 
 #pragma once
 #include <stdarg.h>
@@ -13,6 +19,7 @@
 #include "../include/moduos/kernel/syscall/syscall_numbers.h"
 // MD64API (userland-visible kernel interfaces)
 #include "../include/moduos/kernel/md64api_grp.h"
+#include "../include/moduos/fs/userfs_user_api.h"
 // SYS_WRITEFILE is provided by syscall_numbers.h
 
 // File descriptor constants
@@ -121,7 +128,6 @@ static inline long syscall(long num, long arg1, long arg2, long arg3) {
     );
     return ret;
 }
-
 /*
  * 4-arg syscall wrapper
  * Kernel ABI (see src/arch/AMD64/syscall/syscall_entry.asm):
@@ -148,17 +154,11 @@ static inline long syscall4(long num, long arg1, long arg2, long arg3, long arg4
    BASIC OUTPUT (now matches new SYS_WRITE)
    ============================================================ */
 
-// Writes a single character to VGA
-static inline void putc(char c) {
-    char tmp[2] = {c, 0};
-    syscall(SYS_WRITE, (long)tmp, 0, 0);
-}
+// Writes a single character to STDOUT
+static inline void putc(char c);
 
-// Writes a null-terminated string to VGA
-static inline void puts_raw(const char *s) {
-    if (!s) s = " ";
-    syscall(SYS_WRITE, (long)s, 0, 0);
-}
+// Writes a null-terminated string to STDOUT
+static inline void puts_raw(const char *s);
 
 // Write string + newline
 static inline void puts(const char *s) {
@@ -253,6 +253,18 @@ static inline int get_system_info_u(md64api_sysinfo_data_u *out) {
     return (int)syscall(SYS_SSTATS2, (long)out, (long)sizeof(*out), 0);
 }
 
+#include "../include/moduos/kernel/process/proclist_user.h"
+
+static inline int get_process_list(md_proclist_entry_u *out, size_t out_count) {
+    return (int)syscall(SYS_PROCLIST, (long)out, (long)(out_count * sizeof(*out)), 0);
+}
+
+#include "../include/moduos/kernel/md64api_pidinfo_user.h"
+
+static inline int md64api_get_pid_info(uint32_t pid, md64api_pid_info_u *out) {
+    return (int)syscall(SYS_PIDINFO, (long)pid, (long)out, (long)sizeof(*out));
+}
+
 /* Time API: milliseconds since boot */
 static inline uint64_t time_ms(void) {
     return (uint64_t)syscall(SYS_TIME, 0, 0, 0);
@@ -280,6 +292,35 @@ static inline void vga_reset_color(void) {
 /* ANSI helpers (SGR). Works because kernel VGA driver parses ESC[...m. */
 #define ANSI_ESC "\x1b"
 #define ANSI_RESET ANSI_ESC "[0m"
+
+/* ============================================================
+   FS tracing (kernel-side timing logs)
+   ============================================================ */
+static inline int fs_trace_set(int enabled) {
+    return (int)syscall(SYS_FS_TRACE, (long)enabled, 0, 0);
+}
+
+/* ---- Networking (SQRM 'net' service) ---- */
+
+static inline long net_link_up(void) {
+    return syscall(SYS_NET_LINK_UP, 0, 0, 0);
+}
+
+static inline long net_ipv4_addr(uint32_t *out_be) {
+    return syscall(SYS_NET_IPV4_ADDR, (long)out_be, 0, 0);
+}
+
+static inline long net_ipv4_gw(uint32_t *out_be) {
+    return syscall(SYS_NET_IPV4_GW, (long)out_be, 0, 0);
+}
+
+static inline long net_dns_a(const char *hostname, uint32_t *out_be) {
+    return syscall(SYS_NET_DNS_A, (long)hostname, (long)out_be, 0);
+}
+
+static inline long net_http_get(const char *url, void *buf, size_t bufsz, size_t *out_bytes) {
+    return syscall4(SYS_NET_HTTP_GET, (long)url, (long)buf, (long)bufsz, (long)out_bytes);
+}
 
 /* ============================================================
    FILE I/O OPERATIONS
@@ -327,8 +368,38 @@ static inline int md64api_grp_get_video0_info(md64api_grp_video_info_t *out) {
 }
 
 // Write to a file descriptor (binary safe)
+static inline ssize_t sys_writefile_raw(int fd, const void *buf, size_t count) {
+    long ret;
+    __asm__ volatile (
+        "mov %1, %%rax\n"
+        "mov %2, %%rdi\n"
+        "mov %3, %%rsi\n"
+        "mov %4, %%rdx\n"
+        "int $0x80\n"
+        "mov %%rax, %0"
+        : "=r"(ret)
+        : "r"((long)SYS_WRITEFILE), "r"((long)fd), "r"((long)buf), "r"((long)count)
+        : "rax", "rdi", "rsi", "rdx", "memory"
+    );
+    return (ssize_t)ret;
+}
+
+static inline void putc(char c) {
+    sys_writefile_raw(STDOUT_FILENO, &c, 1);
+}
+
+static inline void puts_raw(const char *s) {
+    if (!s) s = " ";
+    sys_writefile_raw(STDOUT_FILENO, s, strlen(s));
+}
+
+static inline void __rovo_debug_sys_writefile(void) {
+    volatile int *p = (volatile int*)0x0;
+    (void)p;
+}
+
 static inline ssize_t write(int fd, const void *buf, size_t count) {
-    return (ssize_t)syscall(SYS_WRITEFILE, fd, (long)buf, count);
+    return sys_writefile_raw(fd, buf, count);
 }
 
 /* ============================================================
@@ -412,7 +483,7 @@ static void print_long(long n) {
    printf()
    ============================================================ */
 
-int printf(const char *fmt, ...) {
+static int printf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
 
@@ -654,7 +725,7 @@ static inline void* calloc(size_t nmemb, size_t size) {
     if (!p) return NULL;
     memset(p, 0, total);
     return p;
-}
+}  
 
 static inline void* realloc(void *ptr, size_t size) {
     if (!ptr) return malloc(size);
@@ -687,12 +758,91 @@ static inline void exec(const char *str) {
     syscall(SYS_EXEC, (long)str, 0 , 0);
 }
 
+/* POSIX execve wrapper. On failure returns -1 and sets errno.
+ * On success does not return.
+ */
+static inline int execve(const char *path, char *const argv[], char *const envp[]) {
+    long r = syscall(SYS_EXECVE, (long)path, (long)argv, (long)envp);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return (int)r;
+}
+
+/* Environment (kernel-managed per-process) */
+static inline int putenv(const char *kv) {
+    long r = syscall(SYS_PUTENV, (long)kv, 0, 0);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return 0;
+}
+
+/* Returns pointer to a static buffer (overwritten per call), or NULL if missing. */
+static inline const char *getenv(const char *key) {
+    static char buf[256];
+    long r = syscall(SYS_GETENV, (long)key, (long)buf, (long)sizeof(buf));
+    if (r < 0) { errno = (int)(-r); return NULL; }
+    return buf;
+}
+
+/* Serialize env into user-provided buffer as newline-separated KEY=VALUE lines.
+ * Returns bytes written or -1 with errno set.
+ */
+static inline int envlist(char *buf, size_t buflen) {
+    long r = syscall(SYS_ENVLIST, (long)buf, (long)buflen, 0);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return (int)r;
+}
+
+/* Streaming env listing.
+ * offset is an in/out cursor (start at 0). Returns bytes written this call.
+ */
+static inline int envlist2(size_t *offset, char *buf, size_t buflen) {
+    long r = syscall(SYS_ENVLIST2, (long)offset, (long)buf, (long)buflen);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return (int)r;
+}
+
+static inline int unsetenv(const char *key) {
+    long r = syscall(SYS_UNSETENV, (long)key, 0, 0);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return 0;
+}
+
+static inline int setenv(const char *key, const char *val) {
+    if (!key || !val) { errno = EINVAL; return -1; }
+    char kv[512];
+    size_t klen = strlen(key);
+    size_t vlen = strlen(val);
+    if (klen + 1 + vlen + 1 > sizeof(kv)) { errno = E2BIG; return -1; }
+    memcpy(kv, key, klen);
+    kv[klen] = '=';
+    memcpy(kv + klen + 1, val, vlen);
+    kv[klen + 1 + vlen] = 0;
+    return putenv(kv);
+}
+
+static inline int fork(void) {
+    long r = syscall(SYS_FORK, 0, 0, 0);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return (int)r;
+}
+
 static inline int getpid(void) {
     return (int)syscall(SYS_GETPID, 0, 0, 0);
 }
 
 static inline int getppid(void) {
     return (int)syscall(SYS_GETPPID, 0, 0, 0);
+}
+
+/* POSIX waitpid (Linux semantics). */
+#ifndef WNOHANG
+#define WNOHANG 1
+#endif
+static inline int waitpid(int pid, int *status, int options) {
+    int kopt = 0;
+    if (options & WNOHANG) kopt |= 1; /* WAITX_WNOHANG */
+    long r = syscall(SYS_WAITX, (long)pid, (long)status, (long)kopt);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return (int)r;
 }
 
 static inline int getuid(void) {
@@ -792,10 +942,20 @@ static inline int vfs_getpart(const vfs_part_req_t *req, vfs_part_info_t *out) {
     return (int)syscall(SYS_VFS_GETPART, (uint64_t)req, (uint64_t)out, 0);
 }
 
+static inline int vfs_mbrinit(const vfs_mbrinit_req_t *req) {
+    return (int)syscall(SYS_VFS_MBRINIT, (uint64_t)req, 0, 0);
+}
+
+static inline int userfs_register(const userfs_user_node_t *node) {
+    return (int)syscall(SYS_USERFS_REGISTER, (uint64_t)node, 0, 0);
+}
 int md_main(long argc, char** argv);
 
-__attribute__((noreturn)) void _start(long argc, char** argv)
-{
+#ifndef LIBC_NO_START
+__attribute__((noreturn))
+__attribute__((noinline))
+__attribute__((used))
+void _start(long argc, char** argv) {
     // ModuOS start wrapper / ABI
     int mdm = md_main(argc, argv);
 
@@ -805,3 +965,5 @@ __attribute__((noreturn)) void _start(long argc, char** argv)
         exit(0);
     }
 }
+#endif /* LIBC_NO_START */
+
