@@ -1,7 +1,7 @@
 #include "moduos/drivers/graphics/fnt_font.h"
 #include "moduos/kernel/memory/kheap.h"
 #include "moduos/kernel/memory/string.h"
-#include "moduos/kernel/debug.h"
+#include "moduos/kernel/COM/com.h"
 
 /* Helper to read little-endian uint16_t */
 static uint16_t read_le16(const uint8_t *data) {
@@ -16,7 +16,7 @@ static uint32_t read_le32(const uint8_t *data) {
 
 fnt_font_t *fnt_load_font(const void *data, size_t size) {
     if (!data || size < 16) {
-        debug_log("FNT: Invalid data or size\n");
+        com_write_string(COM1_PORT, "[FNT] Invalid data or size\n");
         return NULL;
     }
     
@@ -26,7 +26,7 @@ fnt_font_t *fnt_load_font(const void *data, size_t size) {
     /* Verify magic */
     if (ptr[0] != FNT_MAGIC_0 || ptr[1] != FNT_MAGIC_1 ||
         ptr[2] != FNT_MAGIC_2 || ptr[3] != FNT_MAGIC_3) {
-        debug_log("FNT: Invalid magic number\n");
+        com_write_string(COM1_PORT, "[FNT] Invalid magic number\n");
         return NULL;
     }
     ptr += 4;
@@ -36,14 +36,14 @@ fnt_font_t *fnt_load_font(const void *data, size_t size) {
     ptr += 2;
     
     if (version != FNT_VERSION) {
-        debug_log("FNT: Unsupported version %u\n", version);
+        com_printf(COM1_PORT, "[FNT] Unsupported version %u\n", version);
         return NULL;
     }
     
     /* Allocate font structure */
     fnt_font_t *font = (fnt_font_t *)kmalloc(sizeof(fnt_font_t));
     if (!font) {
-        debug_log("FNT: Failed to allocate font structure\n");
+        com_write_string(COM1_PORT, "[FNT] Failed to allocate font structure\n");
         return NULL;
     }
     
@@ -72,7 +72,7 @@ fnt_font_t *fnt_load_font(const void *data, size_t size) {
     font->header.baseline = read_le16(ptr);
     ptr += 2;
     
-    debug_log("FNT: Loading font '%s' (%ux%u, baseline %u)\n",
+    com_printf(COM1_PORT, "[FNT] Loading font '%s' (%ux%u, baseline %u)\n",
               font->header.name, font->header.glyph_width,
               font->header.glyph_height, font->header.baseline);
     
@@ -81,10 +81,10 @@ fnt_font_t *fnt_load_font(const void *data, size_t size) {
     font->header.glyph_count = read_le32(ptr);
     ptr += 4;
     
-    debug_log("FNT: Font contains %u glyphs\n", font->header.glyph_count);
+    com_printf(COM1_PORT, "[FNT] Font contains %u glyphs\n", font->header.glyph_count);
     
     if (font->header.glyph_count == 0) {
-        debug_log("FNT: Warning - font has no glyphs\n");
+        com_write_string(COM1_PORT, "[FNT] Warning - font has no glyphs\n");
         return font;
     }
     
@@ -129,7 +129,7 @@ fnt_font_t *fnt_load_font(const void *data, size_t size) {
         }
     }
     
-    debug_log("FNT: Successfully loaded %u glyphs\n", font->header.glyph_count);
+    com_printf(COM1_PORT, "[FNT] Successfully loaded %u glyphs\n", font->header.glyph_count);
     
     /* Store header info */
     font->header.magic[0] = FNT_MAGIC_0;
@@ -141,7 +141,7 @@ fnt_font_t *fnt_load_font(const void *data, size_t size) {
     return font;
     
 error:
-    debug_log("FNT: Error loading font\n");
+    com_write_string(COM1_PORT, "[FNT] Error loading font\n");
     fnt_free_font(font);
     return NULL;
 }
