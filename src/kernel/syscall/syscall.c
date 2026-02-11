@@ -552,10 +552,10 @@ int sys_sleep(unsigned int seconds) {
 }
 
 void sys_yield(void) {
-    /* Yield within syscall context without re-enabling IRQs.
-     * The syscall entry path already masks interrupts to protect the iret frame.
+    /* Request a reschedule after returning to userspace.
+     * Avoid context switching on the syscall stack.
      */
-    process_yield();
+    scheduler_request_reschedule();
 }
 
 void* sys_sbrk(intptr_t increment) {
