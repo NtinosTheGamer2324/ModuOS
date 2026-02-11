@@ -81,6 +81,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
     g_last_syscall_args[3] = arg4;
     g_last_syscall_args[4] = arg5;
     // DEBUG: Log all syscalls for early boot userman
+    /* syscall logging disabled by default (noisy) */
+#if 0
     process_t *dbg_proc = process_get_current();
     if (dbg_proc && dbg_proc->pid == 1) {
         com_write_string(COM1_PORT, "[SYSCALL] pid=1 num=");
@@ -92,6 +94,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         com_write_string(COM1_PORT, dbg_buf);
         com_write_string(COM1_PORT, "\n");
     }
+#endif
     char buf[32];
     switch (syscall_num) {
         case SYS_EXIT:    return sys_exit((int)arg1);
