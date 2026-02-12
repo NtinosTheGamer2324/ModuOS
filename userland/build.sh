@@ -118,12 +118,9 @@ for obj in "$BUILD_DIR"/*.o; do
             ;;
         minesgfx|calcgfx|snakegfx)
             bin="$DIST_DIR/${base}.sqr"
-            echo "[BUILD] LD(app gfx2d) $obj -> $bin"
-            "$LD" "$obj" -T "$LD_SCRIPT_APP" -o "$bin" \
-                --hash-style=sysv \
-                --dynamic-linker /ModuOS/shared/usr/lib/ld-moduos.sqr \
-                --no-as-needed \
-                -L"$DIST_DIR" -l:gfx2d.sqrl
+            echo "[BUILD] LD(app static gfx2d) $obj + lib_gfx2d.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_gfx2d.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
             ;;
         *)
             bin="$DIST_DIR/${base}.sqr"
