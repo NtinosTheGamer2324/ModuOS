@@ -45,7 +45,7 @@ int md_main(long argc, char **argv) {
     append_str(req, sizeof(req), ":");
     append_str(req, sizeof(req), pass);
 
-    int fd = open(USERMAN_DEV_PASSWD, 0, 0);
+    int fd = open(USERMAN_DEV_PASSWD, O_RDWR, 0);
     if (fd < 0) {
         printf("passwd: userman not available\n");
         return 2;

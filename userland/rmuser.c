@@ -37,7 +37,7 @@ int md_main(long argc, char **argv) {
         return 1;
     }
 
-    int fd = open(USERMAN_DEV_RM, 0, 0);
+    int fd = open(USERMAN_DEV_RM, O_RDWR, 0);
     if (fd < 0) {
         printf("rmuser: userman not available\n");
         return 2;

@@ -628,8 +628,7 @@ void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame) {
         }
 
         /* Always dump fault details to COM1 for headless debugging. */
-        uint64_t rsp_now;
-        __asm__ volatile("mov %%rsp, %0" : "=r"(rsp_now));
+        uint64_t rsp_now = p ? p->user_rsp : 0;
         char h[32];
         com_write_string(COM1_PORT, "[FAULT] user_pf cr2=");
         format_hex64(faulting_address, h);
@@ -933,6 +932,7 @@ after_heap_demand: ;
         }
 
         /* Always dump fault details to COM1 for headless debugging. */
+        uint64_t rsp_log = p ? p->user_rsp : rsp_now;
         char h[32];
         com_write_string(COM1_PORT, "[FAULT] user_pf cr2=");
         format_hex64(faulting_address, h);
@@ -941,7 +941,7 @@ after_heap_demand: ;
         format_hex64(frame->rip, h);
         com_write_string(COM1_PORT, h);
         com_write_string(COM1_PORT, " rsp=");
-        format_hex64(rsp_now, h);
+        format_hex64(rsp_log, h);
         com_write_string(COM1_PORT, h);
         com_write_string(COM1_PORT, " err=");
         format_hex64(error_code, h);

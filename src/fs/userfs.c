@@ -134,6 +134,26 @@ static const char *userfs_path_next(const char *p, char *seg, size_t seg_sz) {
     return p + i;
 }
 
+static const char *userfs_normalize_path(const char *path) {
+    if (!path) return NULL;
+
+    if (path[0] == '$') {
+        if (path[1] == '/') {
+            path += 2;
+        } else {
+            path += 1;
+        }
+    }
+    while (*path == '/') path++;
+
+    if (strncmp(path, "userland/", 9) == 0) {
+        path += 9;
+    }
+    while (*path == '/') path++;
+
+    return *path ? path : NULL;
+}
+
 static userfs_node_t *userfs_find_node(const char *path) {
     userfs_init_once();
     if (!g_root || !path) return NULL;
@@ -157,18 +177,8 @@ int userfs_register_user_path(const char *path, const char *owner_id) {
     userfs_init_once();
     if (!g_root || !path || !path[0] || !owner_id) return -1;
 
-    if (path[0] == '$') {
-        if (path[1] == '/') {
-            path += 2;
-        } else {
-            path += 1;
-        }
-    }
-    while (*path == '/') path++;
-    if (strncmp(path, "userland/", 9) != 0) return -1;
-    path += 9;
-    while (*path == '/') path++;
-    if (!*path) return -1;
+    path = userfs_normalize_path(path);
+    if (!path) return -1;
 
     userfs_node_t *cur = g_root;
     const char *p = path;
@@ -245,17 +255,9 @@ int userfs_pump(void) {
 
 void *userfs_open_path(const char *path, int flags) {
     if (!path) return NULL;
-    if (path[0] == '$') {
-        if (path[1] == '/') {
-            path += 2;
-        } else {
-            path += 1;
-        }
-    }
-    while (*path == '/') path++;
-    if (strncmp(path, "userland/", 9) != 0) return NULL;
-    path += 9;
-    while (*path == '/') path++;
+
+    path = userfs_normalize_path(path);
+    if (!path) return NULL;
 
     userfs_node_t *node = userfs_find_node(path);
     if (!node || node->type != USERFS_NODE_DEV) {
