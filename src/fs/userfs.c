@@ -28,10 +28,30 @@ typedef struct {
     uint32_t w;
     uint32_t count;
     int flags;
+    char path[128];
 } userfs_node_ctx_t;
 
 static userfs_node_t *g_root = NULL;
 static int g_inited = 0;
+
+static void userfs_log_access(const char *op, const char *path, int flags, int allowed, size_t count) {
+    char buf[32];
+    com_write_string(COM1_PORT, "[USERFS] ");
+    com_write_string(COM1_PORT, op);
+    if (path && *path) {
+        com_write_string(COM1_PORT, " ");
+        com_write_string(COM1_PORT, path);
+    }
+    com_write_string(COM1_PORT, " flags=0x");
+    itoa(flags, buf, 16);
+    com_write_string(COM1_PORT, buf);
+    com_write_string(COM1_PORT, " count=");
+    itoa((int)count, buf, 10);
+    com_write_string(COM1_PORT, buf);
+    com_write_string(COM1_PORT, " allowed=");
+    com_write_string(COM1_PORT, allowed ? "yes" : "no");
+    com_write_string(COM1_PORT, "\n");
+}
 
 static void *userfs_open_ctx(void *ctx, int flags) {
     userfs_node_ctx_t *c = (userfs_node_ctx_t*)ctx;
@@ -42,6 +62,11 @@ static void *userfs_open_ctx(void *ctx, int flags) {
 static ssize_t userfs_read_ctx(void *ctx, void *buf, size_t count) {
     userfs_node_ctx_t *c = (userfs_node_ctx_t*)ctx;
     if (!c || !buf || count == 0) return -1;
+
+    int allowed = ((c->flags & O_WRONLY) == 0);
+    userfs_log_access("read", c->path, c->flags, allowed, count);
+    if (!allowed) return -2;
+
     size_t n = 0;
     uint64_t f = irq_save();
     while (n < count) {
@@ -66,6 +91,11 @@ static ssize_t userfs_read_ctx(void *ctx, void *buf, size_t count) {
 static ssize_t userfs_write_ctx(void *ctx, const void *buf, size_t count) {
     userfs_node_ctx_t *c = (userfs_node_ctx_t*)ctx;
     if (!c || !buf || count == 0) return -1;
+
+    int allowed = ((c->flags & (O_WRONLY | O_RDWR)) != 0);
+    userfs_log_access("write", c->path, c->flags, allowed, count);
+    if (!allowed) return -2;
+
     size_t n = 0;
     uint64_t f = irq_save();
     while (n < count && c->count < sizeof(c->buf)) {
@@ -224,6 +254,8 @@ int userfs_register_user_path(const char *path, const char *owner_id) {
         return -7;
     }
     memset(ctx, 0, sizeof(*ctx));
+    strncpy(ctx->path, path, sizeof(ctx->path) - 1);
+    ctx->path[sizeof(ctx->path) - 1] = 0;
     nd->ctx = ctx;
     nd->ops = g_userfs_ops;
     nd->owner_id = owner_id;
