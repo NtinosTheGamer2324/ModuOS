@@ -395,6 +395,8 @@ int md_main(long argc, char** argv) {
         for (;;) sleep(1000);
     }
 
+    sleep(50);
+
     int fd_auth = open(USERMAN_DEV_AUTH, O_RDWR | O_NONBLOCK, 0);
     int fd_add = open(USERMAN_DEV_ADD, O_RDWR | O_NONBLOCK, 0);
     int fd_rm = open(USERMAN_DEV_RM, O_RDWR | O_NONBLOCK, 0);
