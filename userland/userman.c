@@ -383,10 +383,10 @@ int md_main(long argc, char** argv) {
     (void)argc; (void)argv;
     puts_raw("userman: start\n");
 
-    int rc_auth = register_node(USERMAN_DEV_AUTH);
-    int rc_add = register_node(USERMAN_DEV_ADD);
-    int rc_rm = register_node(USERMAN_DEV_RM);
-    int rc_pw = register_node(USERMAN_DEV_PASSWD);
+    int rc_auth = register_node(USERMAN_NODE_AUTH);
+    int rc_add = register_node(USERMAN_NODE_ADD);
+    int rc_rm = register_node(USERMAN_NODE_RM);
+    int rc_pw = register_node(USERMAN_NODE_PASSWD);
 
     puts_raw("userman: userfs nodes created\n");
 
@@ -413,6 +413,7 @@ int md_main(long argc, char** argv) {
         handle_rmuser(fd_rm);
         handle_passwd(fd_pw);
         sleep(10);
+        yield();
     }
 
     return 0;
