@@ -289,13 +289,32 @@ int exec_run(const char *args, int wait_for_exit) {
             return -1;
         }
 
+        uint64_t kernel_cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(kernel_cr3));
+
+        uint64_t saved_rflags;
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(saved_rflags) :: "memory");
+
+        uint64_t proc_cr3 = paging_create_process_pml4();
+        if (!proc_cr3) {
+            if (saved_rflags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
+            hvfs_free(shell_state.current_slot, interp_path, ibuf);
+            free_argv(new_argv, new_argc);
+            VGA_Write("\crFailed to create interpreter address space\rr\n");
+            return -1;
+        }
+        paging_switch_cr3(proc_cr3);
+
         uint64_t entry_point;
         uint64_t img_base = 0, img_end = 0;
         int elf_result = elf_load_with_args(ibuf, ibread, &entry_point, new_argc, new_argv, &img_base, &img_end);
+
+        paging_switch_cr3(kernel_cr3);
+        if (saved_rflags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
         hvfs_free(shell_state.current_slot, interp_path, ibuf);
 
         if (elf_result != 0) {
-            VGA_Write("\\crFailed to load interpreter ELF\\rr\n");
+            VGA_Write("\crFailed to load interpreter ELF\rr\n");
             free_argv(new_argv, new_argc);
             return -1;
         }
@@ -303,13 +322,23 @@ int exec_run(const char *args, int wait_for_exit) {
         const char *ifn = interp_path;
         for (const char *p = interp_path; *p; p++) if (*p == '/') ifn = p + 1;
 
-        process_t *proc = process_create_with_args(ifn, (void (*)(void))entry_point, 1, new_argc, new_argv);
-        if (proc) { proc->user_image_base = img_base; proc->user_image_end = img_end; }
+        process_t *proc = NULL;
+        paging_switch_cr3(proc_cr3);
+        process_set_build_pml4((uint64_t*)phys_to_virt_kernel(proc_cr3), proc_cr3);
+        proc = process_create_with_args(ifn, (void (*)(void))entry_point, 1, new_argc, new_argv);
+        process_set_build_pml4(NULL, 0);
+        if (proc) {
+            proc->user_image_base = img_base;
+            proc->user_image_end = img_end;
+            proc->page_table = proc_cr3;
+        }
+        paging_switch_cr3(kernel_cr3);
+
         /* process_create_with_args deep-copies argv, so we can free our temporary now. */
         free_argv(new_argv, new_argc);
 
         if (!proc) {
-            VGA_Write("\\crFailed to create interpreter process\\rr\n");
+            VGA_Write("\crFailed to create interpreter process\rr\n");
             return -1;
         }
 
