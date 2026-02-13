@@ -754,6 +754,10 @@ int sys_mkdir(const char *path) {
         return -1;
     }
 
+    if (r.route == FS_ROUTE_USERLAND) {
+        return -30; // userfs has no mkdir support
+    }
+
     int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;
     if (slot < 0) return -1;
 
@@ -896,6 +900,10 @@ int sys_chdir(const char *path) {
         if (r.route == FS_ROUTE_USERLAND) {
             const char *node = r.rel_path;
             while (*node == '/') node++;
+            if (strncmp(node, "userland", 8) == 0 && (node[8] == 0 || node[8] == '/')) {
+                node += 8;
+                while (*node == '/') node++;
+            }
             if (!userfs_directory_exists(node)) return -1;
             strncpy(proc->cwd, p, sizeof(proc->cwd) - 1);
             proc->cwd[sizeof(proc->cwd) - 1] = 0;

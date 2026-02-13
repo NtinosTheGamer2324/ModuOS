@@ -995,7 +995,7 @@ void zenith4_start() {
                                 // $/mnt
                                 int dfd = fd_devvfs_opendir(r.devvfs_kind);
                                 if (dfd < 0) {
-                                    VGA_Writef("\crError: Directory '%s' does not exist\rr\n", args);
+                                    VGA_Writef("\\crError: Directory '%s' does not exist\rr\n", args);
                                 } else {
                                     fd_closedir(dfd);
                                     strcpy(shell_state.cwd, new_path);
@@ -1016,6 +1016,20 @@ void zenith4_start() {
                                 } else {
                                     VGA_Writef("\\crError: Directory '%s' does not exist\\rr\n", args);
                                 }
+                            }
+                        } else if (r.route == FS_ROUTE_USERLAND) {
+                            const char *node = r.rel_path;
+                            while (*node == '/') node++;
+                            if (strncmp(node, "userland", 8) == 0 && (node[8] == 0 || node[8] == '/')) {
+                                node += 8;
+                                while (*node == '/') node++;
+                            }
+                            if (userfs_directory_exists(node)) {
+                                strcpy(shell_state.cwd, new_path);
+                                update_shell_path();
+                                shell_sync_proc_fsctx();
+                            } else {
+                                VGA_Writef("\\crError: Directory '%s' does not exist\\rr\n", args);
                             }
                         } else {
                             VGA_Write("\\crError: Unsupported $/ path\\rr\n");
