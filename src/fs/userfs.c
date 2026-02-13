@@ -176,10 +176,10 @@ static const char *userfs_normalize_path(const char *path) {
     }
     while (*path == '/') path++;
 
-    if (strncmp(path, "userland/", 9) == 0) {
-        path += 9;
+    if (strncmp(path, "userland", 8) == 0 && (path[8] == 0 || path[8] == '/')) {
+        path += 8;
+        while (*path == '/') path++;
     }
-    while (*path == '/') path++;
 
     return *path ? path : NULL;
 }
