@@ -28,6 +28,7 @@
 #include "moduos/fs/path.h"
 #include "moduos/fs/path_norm.h"
 #include "moduos/kernel/exec.h"
+int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *envp_user);
 #include "moduos/drivers/input/input.h"
 
 #include "moduos/kernel/memory/usercopy.h"
@@ -271,8 +272,9 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
 int sys_exit(int status) {
     process_t* proc = process_get_current();
     if (proc) {
-        if (proc->is_user && proc->user_identity[0]) {
-            userfs_owner_exited(proc->user_identity);
+        const char *owner = user_identity_get(proc);
+        if (owner && owner[0]) {
+            userfs_owner_exited(owner);
         }
         fd_close_all(proc->pid);
         com_write_string(COM1_PORT, "[SYS_EXIT] pid=");
