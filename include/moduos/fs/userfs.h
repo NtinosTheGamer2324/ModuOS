@@ -14,6 +14,7 @@ void *userfs_open_path(const char *path, int flags);
 ssize_t userfs_read(void *handle, void *buf, size_t count);
 ssize_t userfs_write(void *handle, const void *buf, size_t count);
 void userfs_close(void *handle);
+int userfs_directory_exists(const char *path);
 int userfs_list_dir_next(const char *path, int *cookie, char *name_buf, size_t buf_size, int *is_dir);
 
 #ifdef __cplusplus

@@ -49,3 +49,8 @@ Thumbs.db
 *.sqr
 *.sqrm
 *.sqrl
+
+#############################################
+# External sources (keep untracked)
+#############################################
+/EXTERNAL/

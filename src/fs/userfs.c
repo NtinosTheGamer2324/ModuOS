@@ -330,3 +330,8 @@ int userfs_list_dir_next(const char *path, int *cookie, char *name_buf, size_t b
     }
     return 0;
 }
+
+int userfs_directory_exists(const char *path) {
+    userfs_node_t *dir = userfs_find_node(path ? path : "");
+    return (dir && dir->type == USERFS_NODE_DIR) ? 1 : 0;
+}

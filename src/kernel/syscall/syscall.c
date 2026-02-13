@@ -211,6 +211,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_KILL:    return sys_kill((int)arg1, (int)arg2);
         case SYS_TIME:    return sys_time();
         case SYS_EXEC:    return sys_exec((const char*)arg1);
+        case SYS_EXECVE:  return sys_execve_impl((const char*)arg1, (char *const*)arg2, (char *const*)arg3);
         case SYS_CHDIR:   return sys_chdir((const char*)arg1);
         case SYS_GETCWD:  return (uint64_t)sys_getcwd((char*)arg1, (size_t)arg2);
         case SYS_STAT:    return sys_stat((const char*)arg1, (void*)arg2, (size_t)arg3);
@@ -892,6 +893,14 @@ int sys_chdir(const char *path) {
         p = norm;
         fs_path_resolved_t r;
         if (fs_resolve_path(proc, p, &r) != 0) return -1;
+        if (r.route == FS_ROUTE_USERLAND) {
+            const char *node = r.rel_path;
+            while (*node == '/') node++;
+            if (!userfs_directory_exists(node)) return -1;
+            strncpy(proc->cwd, p, sizeof(proc->cwd) - 1);
+            proc->cwd[sizeof(proc->cwd) - 1] = 0;
+            return 0;
+        }
         if (r.route != FS_ROUTE_MOUNT) return -1;
         fs_mount_t *mount = fs_get_mount(r.mount_slot);
         if (!mount || !mount->valid) return -1;
@@ -1034,6 +1043,10 @@ int sys_opendir(const char *path) {
             return fd_devvfs_opendir_dev(sub);
         }
         return -1;
+    }
+
+    if (r.route == FS_ROUTE_USERLAND) {
+        return fd_devvfs_opendir(3);
     }
 
     int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;

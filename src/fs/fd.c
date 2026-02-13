@@ -41,7 +41,7 @@ typedef struct {
     void* dir_handle;         /* Directory handle (fs_dir_t*) or DEVVFS handle */
     int is_devvfs;            /* 1 if dir_handle is a DEVVFS pseudo dir */
     int is_devfs;             /* 1 if cached_data is a devfs handle */
-    int is_userfs;            /* 1 if cached_data is a userfs handle */
+    int is_userfs;            /* 1 if cached_data is a userfs handle or userfs dir */
 
     /* FS-specific cache to accelerate repeated writes (MDFS). */
     uint32_t cached_inode;
@@ -841,7 +841,7 @@ int fd_opendir(int mount_slot, const char* path) {
 }
 
 typedef struct {
-    int kind;   /* 0=$/, 1=$/mnt, 2=$/dev */
+    int kind;   /* 0=$/, 1=$/mnt, 2=$/dev, 3=$/userland */
     int index;  /* current index */
     int cookie; /* for devfs directory listing */
     char dev_path[128]; /* for kind=2: subdir path under $/dev ("" for root) */
@@ -904,7 +904,7 @@ int fd_devvfs_opendir_dev(const char *dev_subdir) {
 int fd_devvfs_opendir(int kind) {
     fd_init();
 
-    if (kind != 0 && kind != 1) return -1;
+    if (kind != 0 && kind != 1 && kind != 3) return -1;
 
     int fd = find_free_fd();
     if (fd < 0) return -1;
@@ -1037,6 +1037,18 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
             if (size) *size = 0;
             h->index++;
             return 1;
+        }
+
+        if (h->kind == 3) {
+            // $/userland: list userfs tree
+            int d_is_dir = 0;
+            int rc = userfs_list_dir_next("", &h->cookie, name_buf, buf_size, &d_is_dir);
+            if (rc == 1) {
+                if (is_dir) *is_dir = d_is_dir;
+                if (size) *size = 0;
+                return 1;
+            }
+            return 0;
         }
 
         return 0;
