@@ -11,4 +11,7 @@ static inline int uid_is_kernel(uint32_t uid) {
     return uid == KERNEL_UID;
 }
 
+struct process;
+const char *user_identity_get(const struct process *proc);
+
 #endif /* USER_IDENTITY_H */

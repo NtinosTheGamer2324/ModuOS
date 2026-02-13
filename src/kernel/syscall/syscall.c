@@ -28,7 +28,7 @@
 #include "moduos/fs/path.h"
 #include "moduos/fs/path_norm.h"
 #include "moduos/kernel/exec.h"
-int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *envp_user);
+#include "moduos/kernel/syscall/execve_impl.h"
 #include "moduos/drivers/input/input.h"
 
 #include "moduos/kernel/memory/usercopy.h"
