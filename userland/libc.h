@@ -949,6 +949,15 @@ static inline int vfs_mbrinit(const vfs_mbrinit_req_t *req) {
 static inline int userfs_register(const userfs_user_node_t *node) {
     return (int)syscall(SYS_USERFS_REGISTER, (uint64_t)node, 0, 0);
 }
+
+static inline int userfs_register_path(const char *path, uint32_t perms) {
+    userfs_user_node_t node;
+    memset(&node, 0, sizeof(node));
+    node.path = path;
+    node.owner_id = "userland";
+    node.perms = perms;
+    return userfs_register(&node);
+}
 int md_main(long argc, char** argv);
 
 #ifndef LIBC_NO_START

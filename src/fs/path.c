@@ -250,11 +250,11 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
         return 0;
     }
 
-    if (str_ieq(comp, "userland")) {
+    if (str_ieq(comp, "user")) {
         out->route = FS_ROUTE_USERLAND;
         out->rel_path[0] = '/';
         out->rel_path[1] = 0;
-        strncat(out->rel_path, "userland", sizeof(out->rel_path) - 2);
+        strncat(out->rel_path, "user", sizeof(out->rel_path) - 2);
         if (*rest) {
             strncat(out->rel_path, "/", sizeof(out->rel_path) - 2);
             strncat(out->rel_path, rest, sizeof(out->rel_path) - 2);

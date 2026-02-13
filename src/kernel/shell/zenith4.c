@@ -1020,8 +1020,8 @@ void zenith4_start() {
                         } else if (r.route == FS_ROUTE_USERLAND) {
                             const char *node = r.rel_path;
                             while (*node == '/') node++;
-                            if (strncmp(node, "userland", 8) == 0 && (node[8] == 0 || node[8] == '/')) {
-                                node += 8;
+                            if (strncmp(node, "user", 4) == 0 && (node[4] == 0 || node[4] == '/')) {
+                                node += 4;
                                 while (*node == '/') node++;
                             }
                             if (userfs_directory_exists(node)) {
@@ -1029,7 +1029,7 @@ void zenith4_start() {
                                 update_shell_path();
                                 shell_sync_proc_fsctx();
                             } else {
-                                VGA_Writef("\\crError: Directory '%s' does not exist\\rr\n", args);
+                                VGA_Writef("\\crError: Directory '%s' does not exist\\rr\\n", args);
                             }
                         } else {
                             VGA_Write("\\crError: Unsupported $/ path\\rr\n");

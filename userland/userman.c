@@ -353,9 +353,9 @@ static int handle_passwd(int fd) {
 static int register_node(const char *path) {
     userfs_user_node_t node;
     memset(&node, 0, sizeof(node));
-    // userfs expects full $/userland/... path for userland nodes
     node.path = path;
     node.owner_id = "userman";
+    node.perms = USERFS_PERM_READ_WRITE;
     return userfs_register(&node);
 }
 
@@ -392,7 +392,7 @@ int md_main(long argc, char** argv) {
 
     if (rc_auth != 0 || rc_add != 0 || rc_rm != 0 || rc_pw != 0) {
         puts_raw("userman: register failed\n");
-        for (;;) sleep(1000);
+        return -1; // UserFS Registration FAIL
     }
 
     sleep(50);
@@ -405,6 +405,7 @@ int md_main(long argc, char** argv) {
     if (fd_auth < 0 || fd_add < 0 || fd_rm < 0 || fd_pw < 0) {
         puts_raw("userman: open failed\n");
         for (;;) sleep(1000);
+        return -2; // UserFS OPEN FAIL
     }
 
     for (;;) {

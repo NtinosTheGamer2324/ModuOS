@@ -18,10 +18,17 @@ typedef struct {
     userfs_user_write_fn write;
 } userfs_user_ops_t;
 
+typedef enum {
+    USERFS_PERM_READ_ONLY  = 0x1,
+    USERFS_PERM_WRITE_ONLY = 0x2,
+    USERFS_PERM_READ_WRITE = 0x3,
+} userfs_perm_t;
+
 typedef struct {
-    const char *path;         /* path relative to $/userland */
+    const char *path;         /* path relative to $/user */
     const char *owner_id;     /* owner identity string */
-    userfs_user_ops_t ops;    /* user callbacks */
+    uint32_t perms;           /* USERFS_PERM_* */
+    userfs_user_ops_t ops;    /* user callbacks (unused in-kernel) */
     void *ctx;                /* user context pointer */
 } userfs_user_node_t;
 

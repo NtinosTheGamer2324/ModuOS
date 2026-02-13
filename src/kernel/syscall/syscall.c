@@ -10,6 +10,7 @@
 #include "moduos/kernel/md64api.h"
 #include "moduos/kernel/process/process.h"
 #include "moduos/kernel/user_identity.h"
+#include "moduos/fs/userfs.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/phys.h"
@@ -270,6 +271,9 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
 int sys_exit(int status) {
     process_t* proc = process_get_current();
     if (proc) {
+        if (proc->is_user && proc->user_identity[0]) {
+            userfs_owner_exited(proc->user_identity);
+        }
         fd_close_all(proc->pid);
         com_write_string(COM1_PORT, "[SYS_EXIT] pid=");
         char pbuf[12];
@@ -900,8 +904,8 @@ int sys_chdir(const char *path) {
         if (r.route == FS_ROUTE_USERLAND) {
             const char *node = r.rel_path;
             while (*node == '/') node++;
-            if (strncmp(node, "userland", 8) == 0 && (node[8] == 0 || node[8] == '/')) {
-                node += 8;
+            if (strncmp(node, "user", 4) == 0 && (node[4] == 0 || node[4] == '/')) {
+                node += 4;
                 while (*node == '/') node++;
             }
             if (!userfs_directory_exists(node)) return -1;
@@ -1193,7 +1197,8 @@ int sys_userfs_register(const userfs_user_node_t *user_node) {
     if (!owner_copy) return -12;
     memcpy(owner_copy, kowner, owner_len);
 
-    int rc = userfs_register_user_path(path_in, owner_copy);
+    uint32_t perms = req.perms;
+    int rc = userfs_register_user_path(path_in, owner_copy, perms);
     if (rc != 0) {
         kfree(owner_copy);
     }

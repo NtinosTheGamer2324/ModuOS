@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-int userfs_register_user_path(const char *path, const char *owner_id);
+int userfs_register_user_path(const char *path, const char *owner_id, uint32_t perms);
 void *userfs_open_path(const char *path, int flags);
 ssize_t userfs_read(void *handle, void *buf, size_t count);
 ssize_t userfs_write(void *handle, const void *buf, size_t count);

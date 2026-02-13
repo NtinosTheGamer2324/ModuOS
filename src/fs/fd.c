@@ -841,7 +841,7 @@ int fd_opendir(int mount_slot, const char* path) {
 }
 
 typedef struct {
-    int kind;   /* 0=$/, 1=$/mnt, 2=$/dev, 3=$/userland */
+    int kind;   /* 0=$/, 1=$/mnt, 2=$/dev, 3=$/user */
     int index;  /* current index */
     int cookie; /* for devfs directory listing */
     char dev_path[128]; /* for kind=2: subdir path under $/dev ("" for root) */
@@ -956,7 +956,7 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
 
         if (h->kind == 0) {
             // $/: DEVVFS root
-            const char *names[] = {"dev", "mnt", "userland"};
+            const char *names[] = {"dev", "mnt", "user"};
             const int n_names = 3;
             if (h->index >= n_names) return 0;
             strncpy(name_buf, names[h->index], buf_size - 1);
@@ -1040,7 +1040,7 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
         }
 
         if (h->kind == 3) {
-            // $/userland: list userfs tree
+            // $/user: list userfs tree
             int d_is_dir = 0;
             int rc = userfs_list_dir_next("", &h->cookie, name_buf, buf_size, &d_is_dir);
             if (rc == 1) {

@@ -5,6 +5,12 @@
 #include "moduos/kernel/interrupts/irq_lock.h"
 #include "moduos/kernel/interrupts/hlt_wait.h"
 #include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/process/process.h"
+
+/*
+ * UserFS: DevFS-style tree for user processes.
+ * Paths are rooted at $/user.
+ */
 
 typedef enum {
     USERFS_NODE_DIR = 0,
@@ -17,9 +23,10 @@ typedef struct userfs_node {
     struct userfs_node *parent;
     struct userfs_node *children;
     struct userfs_node *next;
-    userfs_user_ops_t ops;
-    void *ctx;
     const char *owner_id;
+    uint32_t perms;
+    struct userfs_node *owner_next;
+    void *ctx;
 } userfs_node_t;
 
 typedef struct {
@@ -29,9 +36,17 @@ typedef struct {
     uint32_t count;
     int flags;
     char path[128];
+    userfs_node_t *node;
 } userfs_node_ctx_t;
 
+typedef struct userfs_handle {
+    userfs_node_ctx_t *ctx;
+    userfs_node_t *node;
+    int flags;
+} userfs_handle_t;
+
 static userfs_node_t *g_root = NULL;
+static userfs_node_t *g_owned_nodes = NULL;
 static int g_inited = 0;
 
 static void userfs_log_access(const char *op, const char *path, int flags, int allowed, size_t count) {
@@ -52,65 +67,6 @@ static void userfs_log_access(const char *op, const char *path, int flags, int a
     com_write_string(COM1_PORT, allowed ? "yes" : "no");
     com_write_string(COM1_PORT, "\n");
 }
-
-static void *userfs_open_ctx(void *ctx, int flags) {
-    userfs_node_ctx_t *c = (userfs_node_ctx_t*)ctx;
-    if (c) c->flags = flags;
-    return ctx;
-}
-
-static ssize_t userfs_read_ctx(void *ctx, void *buf, size_t count) {
-    userfs_node_ctx_t *c = (userfs_node_ctx_t*)ctx;
-    if (!c || !buf || count == 0) return -1;
-
-    int allowed = ((c->flags & O_WRONLY) == 0);
-    userfs_log_access("read", c->path, c->flags, allowed, count);
-    if (!allowed) return -2;
-
-    size_t n = 0;
-    uint64_t f = irq_save();
-    while (n < count) {
-        if (c->count == 0) {
-            if (c->flags & O_NONBLOCK) {
-                irq_restore(f);
-                return (ssize_t)n;
-            }
-            irq_restore(f);
-            hlt_wait_preserve_if();
-            f = irq_save();
-            continue;
-        }
-        ((uint8_t*)buf)[n++] = c->buf[c->r];
-        c->r = (c->r + 1) % (uint32_t)sizeof(c->buf);
-        c->count--;
-    }
-    irq_restore(f);
-    return (ssize_t)n;
-}
-
-static ssize_t userfs_write_ctx(void *ctx, const void *buf, size_t count) {
-    userfs_node_ctx_t *c = (userfs_node_ctx_t*)ctx;
-    if (!c || !buf || count == 0) return -1;
-
-    int allowed = ((c->flags & (O_WRONLY | O_RDWR)) != 0);
-    userfs_log_access("write", c->path, c->flags, allowed, count);
-    if (!allowed) return -2;
-
-    size_t n = 0;
-    uint64_t f = irq_save();
-    while (n < count && c->count < sizeof(c->buf)) {
-        c->buf[c->w] = ((const uint8_t*)buf)[n++];
-        c->w = (c->w + 1) % (uint32_t)sizeof(c->buf);
-        c->count++;
-    }
-    irq_restore(f);
-    return (ssize_t)n;
-}
-
-static userfs_user_ops_t g_userfs_ops = {
-    .read = userfs_read_ctx,
-    .write = userfs_write_ctx,
-};
 
 static void userfs_init_once(void) {
     if (g_inited) return;
@@ -176,8 +132,8 @@ static const char *userfs_normalize_path(const char *path) {
     }
     while (*path == '/') path++;
 
-    if (strncmp(path, "userland", 8) == 0 && (path[8] == 0 || path[8] == '/')) {
-        path += 8;
+    if (strncmp(path, "user", 4) == 0 && (path[4] == 0 || path[4] == '/')) {
+        path += 4;
         while (*path == '/') path++;
     }
 
@@ -203,7 +159,64 @@ static userfs_node_t *userfs_find_node(const char *path) {
     return cur;
 }
 
-int userfs_register_user_path(const char *path, const char *owner_id) {
+static void userfs_unlink_child(userfs_node_t *parent, userfs_node_t *child) {
+    if (!parent || !child) return;
+    userfs_node_t **pp = &parent->children;
+    while (*pp) {
+        if (*pp == child) {
+            *pp = child->next;
+            child->next = NULL;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+static void userfs_free_node(userfs_node_t *node) {
+    if (!node) return;
+    while (node->children) {
+        userfs_node_t *c = node->children;
+        node->children = c->next;
+        userfs_free_node(c);
+    }
+    if (node->type == USERFS_NODE_DEV) {
+        if (node->ctx) {
+            kfree(node->ctx);
+            node->ctx = NULL;
+        }
+        if (node->owner_id) {
+            kfree((void*)node->owner_id);
+            node->owner_id = NULL;
+        }
+    }
+    kfree(node);
+}
+
+static void userfs_prune_empty_dirs(userfs_node_t *dir) {
+    while (dir && dir->parent && dir->type == USERFS_NODE_DIR && dir->children == NULL) {
+        userfs_node_t *parent = dir->parent;
+        userfs_unlink_child(parent, dir);
+        kfree(dir);
+        dir = parent;
+    }
+}
+
+static void userfs_remove_owner_nodes(const char *owner_id) {
+    userfs_node_t **pp = &g_owned_nodes;
+    while (*pp) {
+        userfs_node_t *node = *pp;
+        if (node->owner_id && strcmp(node->owner_id, owner_id) == 0) {
+            *pp = node->owner_next;
+            if (node->parent) userfs_unlink_child(node->parent, node);
+            userfs_prune_empty_dirs(node->parent);
+            userfs_free_node(node);
+            continue;
+        }
+        pp = &(*pp)->owner_next;
+    }
+}
+
+int userfs_register_user_path(const char *path, const char *owner_id, uint32_t perms) {
     userfs_init_once();
     if (!g_root || !path || !path[0] || !owner_id) return -1;
 
@@ -256,33 +269,30 @@ int userfs_register_user_path(const char *path, const char *owner_id) {
     memset(ctx, 0, sizeof(*ctx));
     strncpy(ctx->path, path, sizeof(ctx->path) - 1);
     ctx->path[sizeof(ctx->path) - 1] = 0;
+    ctx->node = nd;
+
     nd->ctx = ctx;
-    nd->ops = g_userfs_ops;
     nd->owner_id = owner_id;
+    nd->perms = perms ? perms : USERFS_PERM_READ_WRITE;
     userfs_add_child(cur, nd);
+
+    nd->owner_next = g_owned_nodes;
+    g_owned_nodes = nd;
+
     return 0;
 }
 
-int userfs_pump(void) {
-    userfs_init_once();
-    if (!g_root) return 0;
-    int progressed = 0;
+static int userfs_check_access(userfs_node_t *node, int flags) {
+    if (!node) return 0;
+    int want_read = ((flags & O_WRONLY) == 0);
+    int want_write = ((flags & (O_WRONLY | O_RDWR)) != 0);
 
-    // Walk all nodes and allow writers to drain data without explicit reads.
-    // This ensures producer/consumer pairs don't stall if the reader exits.
-    for (userfs_node_t *dir = g_root; dir; dir = dir->next) {
-        if (dir->type != USERFS_NODE_DIR) continue;
-        for (userfs_node_t *c = dir->children; c; c = c->next) {
-            if (c->type != USERFS_NODE_DEV || !c->ctx) continue;
-            userfs_node_ctx_t *ctx = (userfs_node_ctx_t*)c->ctx;
-            if (ctx->count > 0 && (ctx->flags & O_NONBLOCK)) {
-                // Make data available by yielding without clearing; count as progress.
-                progressed = 1;
-            }
-        }
-    }
+    int allow_read = (node->perms & USERFS_PERM_READ_ONLY) || (node->perms & USERFS_PERM_READ_WRITE);
+    int allow_write = (node->perms & USERFS_PERM_WRITE_ONLY) || (node->perms & USERFS_PERM_READ_WRITE);
 
-    return progressed;
+    if (want_read && !allow_read) return 0;
+    if (want_write && !allow_write) return 0;
+    return 1;
 }
 
 void *userfs_open_path(const char *path, int flags) {
@@ -295,20 +305,74 @@ void *userfs_open_path(const char *path, int flags) {
     if (!node || node->type != USERFS_NODE_DEV) {
         return NULL;
     }
-    if (!node->ops.read && !node->ops.write) return NULL;
-    return userfs_open_ctx(node->ctx, flags);
+    if (!userfs_check_access(node, flags)) {
+        userfs_log_access("open", path, flags, 0, 0);
+        return NULL;
+    }
+
+    userfs_handle_t *h = (userfs_handle_t*)kmalloc(sizeof(userfs_handle_t));
+    if (!h) return NULL;
+    memset(h, 0, sizeof(*h));
+    h->ctx = (userfs_node_ctx_t*)node->ctx;
+    h->node = node;
+    h->flags = flags;
+    userfs_log_access("open", path, flags, 1, 0);
+    return h;
 }
 
 ssize_t userfs_read(void *handle, void *buf, size_t count) {
-    return userfs_read_ctx(handle, buf, count);
+    userfs_handle_t *h = (userfs_handle_t*)handle;
+    if (!h || !h->node || !h->ctx) return -1;
+    int allowed = userfs_check_access(h->node, h->flags | O_RDONLY);
+    userfs_log_access("read", h->ctx->path, h->flags, allowed, count);
+    if (!allowed) return -2;
+
+    userfs_node_ctx_t *c = h->ctx;
+    if (!buf || count == 0) return -1;
+    size_t n = 0;
+    uint64_t f = irq_save();
+    while (n < count) {
+        if (c->count == 0) {
+            if (h->flags & O_NONBLOCK) {
+                irq_restore(f);
+                return (ssize_t)n;
+            }
+            irq_restore(f);
+            hlt_wait_preserve_if();
+            f = irq_save();
+            continue;
+        }
+        ((uint8_t*)buf)[n++] = c->buf[c->r];
+        c->r = (c->r + 1) % (uint32_t)sizeof(c->buf);
+        c->count--;
+    }
+    irq_restore(f);
+    return (ssize_t)n;
 }
 
 ssize_t userfs_write(void *handle, const void *buf, size_t count) {
-    return userfs_write_ctx(handle, buf, count);
+    userfs_handle_t *h = (userfs_handle_t*)handle;
+    if (!h || !h->node || !h->ctx) return -1;
+    int allowed = userfs_check_access(h->node, h->flags | O_WRONLY);
+    userfs_log_access("write", h->ctx->path, h->flags, allowed, count);
+    if (!allowed) return -2;
+
+    userfs_node_ctx_t *c = h->ctx;
+    if (!buf || count == 0) return -1;
+    size_t n = 0;
+    uint64_t f = irq_save();
+    while (n < count && c->count < sizeof(c->buf)) {
+        c->buf[c->w] = ((const uint8_t*)buf)[n++];
+        c->w = (c->w + 1) % (uint32_t)sizeof(c->buf);
+        c->count++;
+    }
+    irq_restore(f);
+    return (ssize_t)n;
 }
 
 void userfs_close(void *handle) {
-    (void)handle;
+    if (!handle) return;
+    kfree(handle);
 }
 
 int userfs_list_dir_next(const char *path, int *cookie, char *name_buf, size_t buf_size, int *is_dir) {
@@ -334,4 +398,9 @@ int userfs_list_dir_next(const char *path, int *cookie, char *name_buf, size_t b
 int userfs_directory_exists(const char *path) {
     userfs_node_t *dir = userfs_find_node(path ? path : "");
     return (dir && dir->type == USERFS_NODE_DIR) ? 1 : 0;
+}
+
+void userfs_owner_exited(const char *owner_id) {
+    if (!owner_id) return;
+    userfs_remove_owner_nodes(owner_id);
 }

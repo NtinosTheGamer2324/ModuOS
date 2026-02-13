@@ -16,7 +16,7 @@
 // Forward declarations
 static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count);
 
-#define DEVFS_MAX_DEVICES 32
+#define DEVFS_MAX_DEVICES 256
 
 typedef enum {
     DEVFS_NODE_DIR = 0,
@@ -136,7 +136,7 @@ static void devfs_free_user_ctx(devfs_node_t *node) {
 static const char *devfs_normalize_path(const char *path) {
     if (!path) return NULL;
 
-    // Normalize accepted prefixes: allow $/dev, /dev, or raw userland paths.
+    // Normalize accepted prefixes: allow $/dev, /dev, or raw user paths.
     if (strncmp(path, "$/dev", 5) == 0) {
         path += 5;
         if (*path == '/') path++;
