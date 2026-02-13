@@ -956,8 +956,8 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
 
         if (h->kind == 0) {
             // $/: DEVVFS root
-            const char *names[] = {"dev", "mnt"};
-            const int n_names = 2;
+            const char *names[] = {"dev", "mnt", "userland"};
+            const int n_names = 3;
             if (h->index >= n_names) return 0;
             strncpy(name_buf, names[h->index], buf_size - 1);
             name_buf[buf_size - 1] = 0;
