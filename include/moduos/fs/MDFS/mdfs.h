@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 #define MDFS_MAGIC 0x5346444Du /* 'MDFS' little-endian */
-#define MDFS_VERSION 2
+#define MDFS_VERSION 3
 #define MDFS_BLOCK_SIZE 4096u
 
 #define MDFS_INODE_SIZE 256u
@@ -35,13 +35,14 @@ typedef struct __attribute__((packed)) {
     uint64_t indirect1; /* single indirect: block full of uint64_t block numbers */
     uint64_t indirect2; /* double indirect */
     uint64_t indirect3; /* triple indirect */
+    uint64_t indirect4; /* quadruple indirect - supports up to 256 PB files */
 
     /* ACL (Access Control List) - 68 bytes */
     uint8_t  acl_count;        /* Number of ACEs (0-16) */
     uint8_t  acl_reserved[3];  /* Padding for alignment */
     uint32_t acl_aces[16];     /* ACE array (64 bytes) */
 
-    uint8_t  _pad[MDFS_INODE_SIZE - 2 - 2 - 4 - 4 - 8 - 4 - 4 - (8*MDFS_MAX_DIRECT) - 8 - 8 - 8 - 68];
+    uint8_t  _pad[MDFS_INODE_SIZE - 2 - 2 - 4 - 4 - 8 - 4 - 4 - (8*MDFS_MAX_DIRECT) - 8 - 8 - 8 - 8 - 68];
 } mdfs_inode_t;
 
 // Primary directory record (32 bytes)

@@ -195,7 +195,7 @@ int mdfs_mount(int vdrive_id, uint32_t start_lba) {
     mdfs_buffer_release((uint8_t*)buf);
 
     if (sb.magic != MDFS_MAGIC) return -3;
-    if (sb.version != MDFS_VERSION) return -4; /* requires v2 */
+    if (sb.version < 2 || sb.version > MDFS_VERSION) return -4; /* accept v2 or v3 */
     if (sb.block_size != MDFS_BLOCK_SIZE) return -5;
 
     // Verify checksum (best-effort; placeholder hash)
