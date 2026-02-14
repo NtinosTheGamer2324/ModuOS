@@ -506,6 +506,9 @@ int mdfs_mkfs(int vdrive_id, uint32_t start_lba, uint32_t sectors, const char *l
 
     mdfs_buffer_release(blk);
     
+    /* Flush vdrive cache to ensure superblock writes are committed */
+    (void)vdrive_flush((uint8_t)vdrive_id);
+    
     com_write_string(COM1_PORT, "[MDFS] mkfs: successfully created filesystem\n");
     return 0;
 }
