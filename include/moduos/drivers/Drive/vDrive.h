@@ -161,6 +161,9 @@ void vdrive_print_table(void);
 // Flush write cache
 int vdrive_flush(uint8_t vdrive_id);
 
+// Invalidate all cache entries for a drive
+void vdrive_cache_invalidate_all(uint8_t vdrive_id);
+
 // Get drive statistics
 void vdrive_get_stats(uint8_t vdrive_id, uint64_t *reads, uint64_t *writes, uint64_t *errors);
 
