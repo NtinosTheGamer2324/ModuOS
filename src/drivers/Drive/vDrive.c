@@ -133,11 +133,25 @@ static void vdrive_cache_invalidate_range(uint8_t vdrive_id, uint64_t lba, uint3
 }
 
 void vdrive_cache_invalidate_all(uint8_t vdrive_id) {
+    if (vdrive_id >= VDRIVE_MAX_DRIVES) return;
+    
     vdrive_cache_t *c = &g_vdrive_cache[vdrive_id];
-    if (!c->inited) return;
+    if (!c->inited) {
+        /* Cache not initialized yet - nothing to invalidate */
+        com_printf(COM1_PORT, "[vDrive] cache_invalidate_all: vdrive %u cache not initialized\n", vdrive_id);
+        return;
+    }
+    
+    com_printf(COM1_PORT, "[vDrive] cache_invalidate_all: vdrive %u invalidating %u entries\n", 
+               vdrive_id, c->entries);
     
     /* Invalidate all cache entries for this drive */
     memset(c->valid, 0, (size_t)c->entries);
+    
+    /* Also zero out the data to ensure no stale data remains */
+    if (c->data) {
+        memset(c->data, 0, (size_t)c->entries * (size_t)c->sector_size);
+    }
 }
 
 // ===========================================================================
