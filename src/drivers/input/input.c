@@ -147,8 +147,16 @@ char* input(void) {
     if (!h) {
         // fallback for legacy flat DEVFS
         h = devfs_open("kbd0", O_RDONLY);
+        if (h) {
+            com_write_string(COM1_PORT, "[INPUT] Opened kbd0 via legacy flat DEVFS\n");
+        }
+    } else {
+        com_write_string(COM1_PORT, "[INPUT] Opened kbd0 via devfs_open_path\n");
     }
-    if (!h) return g_line_buf;
+    if (!h) {
+        com_write_string(COM1_PORT, "[INPUT] ERROR: Failed to open kbd0!\n");
+        return g_line_buf;
+    }
 
     for (;;) {
         char c;
