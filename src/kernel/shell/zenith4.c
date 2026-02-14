@@ -782,12 +782,16 @@ void zenith4_start() {
                     fs_type = FS_TYPE_FAT32;
                 } else if (strcmp(type_str, "iso9660") == 0 || strcmp(type_str, "ISO9660") == 0) {
                     fs_type = FS_TYPE_ISO9660;
+                } else if (strcmp(type_str, "ext2") == 0 || strcmp(type_str, "EXT2") == 0) {
+                    fs_type = FS_TYPE_EXT2;
+                } else if (strcmp(type_str, "mdfs") == 0 || strcmp(type_str, "MDFS") == 0) {
+                    fs_type = FS_TYPE_MDFS;
                 } else {
                     // Common mistake: users pass a size here (mkfs style)
                     if (type_str[0] >= '0' && type_str[0] <= '9') {
                         VGA_Write("\\crError: mount does not take a size argument. Use: mount <vd> <lba|pN> [type]\\rr\n");
                     } else {
-                        VGA_Write("\\crError: Unknown filesystem type\\rr\n");
+                        VGA_Write("\\crError: Unknown filesystem type (supported: fat32, iso9660, ext2, mdfs)\\rr\n");
                     }
                     goto mount_done;
                 }
