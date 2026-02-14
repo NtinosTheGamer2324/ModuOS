@@ -100,9 +100,11 @@ static void fb_fill_rect(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32
 }
 
 static void fb_draw_gradient_bg(const framebuffer_t *fb) {
+    if (!fb || !fb->addr || fb->height == 0) return;
+    
     for (uint32_t y = 0; y < fb->height; y++) {
         /* vertical gradient: deep navy -> near-black */
-        uint8_t t = (uint8_t)((y * 255u) / (fb->height ? fb->height : 1));
+        uint8_t t = (uint8_t)((y * 255u) / fb->height);
         uint8_t r = (uint8_t)(10 + (t * 8u) / 255u);
         uint8_t g = (uint8_t)(16 + (t * 10u) / 255u);
         uint8_t b = (uint8_t)(35 + (t * 20u) / 255u);
@@ -112,8 +114,11 @@ static void fb_draw_gradient_bg(const framebuffer_t *fb) {
 }
 
 static void fb_draw_glyph_scaled(const framebuffer_t *fb, uint32_t x, uint32_t y, uint8_t ch, uint32_t fg, uint32_t scale) {
+    if (!fb || !fb->addr || scale == 0) return;
+    
     const uint8_t *g = bitmap_font_glyph8x16(ch);
     if (!g) return;
+    
     for (uint32_t yy = 0; yy < 16; yy++) {
         uint8_t row = g[yy];
         for (uint32_t xx = 0; xx < 8; xx++) {
@@ -125,12 +130,14 @@ static void fb_draw_glyph_scaled(const framebuffer_t *fb, uint32_t x, uint32_t y
 }
 
 static void fb_draw_text(const framebuffer_t *fb, uint32_t x, uint32_t y, const char *s, uint32_t fg, uint32_t scale, uint32_t max_w_px) {
+    if (!fb || !fb->addr || !s || scale == 0) return;
+    
     uint32_t cx = x;
     uint32_t cy = y;
     uint32_t cell_w = 8 * scale;
     uint32_t cell_h = 16 * scale;
 
-    while (s && *s) {
+    while (*s) {
         char ch = *s++;
         if (ch == '\n') {
             cx = x;
@@ -211,30 +218,83 @@ static void panic_draw_gui(const char* title, const char* message, const char* t
         y += 86;
     }
 
-    /* error code + footer */
+    /* error code + footer with safe bounds checking */
     char code_line[256];
-    code_line[0] = 0;
-    strcat(code_line, "ERR_CODE_CAT: ");
-    strcat(code_line, err_cat);
-    strcat(code_line, " | ERR_CODE: ");
-    strcat(code_line, err_code);
+    size_t pos = 0;
+    const char* prefix1 = "ERR_CODE_CAT: ";
+    const char* sep = " | ERR_CODE: ";
+    
+    /* Safely build code_line */
+    while (*prefix1 && pos < sizeof(code_line) - 1) {
+        code_line[pos++] = *prefix1++;
+    }
+    const char* cat_ptr = err_cat ? err_cat : "UNKNOWN";
+    while (*cat_ptr && pos < sizeof(code_line) - 1) {
+        code_line[pos++] = *cat_ptr++;
+    }
+    while (*sep && pos < sizeof(code_line) - 1) {
+        code_line[pos++] = *sep++;
+    }
+    const char* code_ptr = err_code ? err_code : "UNKNOWN";
+    while (*code_ptr && pos < sizeof(code_line) - 1) {
+        code_line[pos++] = *code_ptr++;
+    }
+    code_line[pos] = '\0';
 
     fb_draw_text(&fb, card_x + 28, card_y + card_h - 140, code_line, fg2, 1, card_w - 56);
     fb_draw_text(&fb, card_x + 28, card_y + card_h - 110,
                  "If this issue repeats, please contact customer support at support.new-tech.com", fg2, 1, card_w - 56);
 
-    char reboot_line[64];
-    reboot_line[0] = 0;
-    strcat(reboot_line, "The system will reboot shortly. Rebooting in ");
+    /* Safely build reboot message */
+    char reboot_line[128];
+    pos = 0;
+    const char* prefix2 = "The system will reboot shortly. Rebooting in ";
+    while (*prefix2 && pos < sizeof(reboot_line) - 20) {
+        reboot_line[pos++] = *prefix2++;
+    }
+    
+    /* Convert seconds to string safely */
     char num[16];
-    itoa(seconds_left, num, 10);
-    strcat(reboot_line, num);
-    strcat(reboot_line, " seconds...");
+    int n = seconds_left;
+    int i = 0;
+    if (n < 0) {
+        num[i++] = '-';
+        n = -n;
+    }
+    if (n == 0) {
+        num[i++] = '0';
+    } else {
+        char tmp[16];
+        int j = 0;
+        while (n > 0 && j < 15) {
+            tmp[j++] = '0' + (n % 10);
+            n /= 10;
+        }
+        while (j > 0 && i < 15) {
+            num[i++] = tmp[--j];
+        }
+    }
+    num[i] = '\0';
+    
+    /* Append number */
+    i = 0;
+    while (num[i] && pos < sizeof(reboot_line) - 15) {
+        reboot_line[pos++] = num[i++];
+    }
+    
+    /* Append suffix */
+    const char* suffix = " seconds...";
+    while (*suffix && pos < sizeof(reboot_line) - 1) {
+        reboot_line[pos++] = *suffix++;
+    }
+    reboot_line[pos] = '\0';
+    
     fb_draw_text(&fb, card_x + 28, card_y + card_h - 80, reboot_line, fg2, 1, card_w - 56);
 }
 
 void panic(const char* title, const char* message, const char* tips, const char* err_cat, const char* err_code, int reboot_delay)
 {
+    __asm__ volatile("cli" ::: "memory");
     for (int i = reboot_delay; i >= 0; i--) {
         panic_header(title);
         panic_draw_gui(title, message, tips, err_cat, err_code, i);
