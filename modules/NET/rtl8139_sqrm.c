@@ -247,10 +247,11 @@ static int rtl8139_init_device(rtl8139_device_t *dev) {
     // Configure TX: Max DMA burst, default IFG
     rtl_write32(dev, RTL_TCR, (7 << 8) | (3 << 24));
     
-    // Enable interrupts
-    rtl_write16(dev, RTL_IMR, RTL_INT_ROK | RTL_INT_RER | RTL_INT_TOK | 
-                             RTL_INT_TER | RTL_INT_RXOVW | RTL_INT_PUN |
-                             RTL_INT_FOVW);
+    // Clear any pending interrupts (do not enable yet)
+    rtl_write16(dev, RTL_ISR, 0xFFFF);
+    
+    // Disable interrupts during initialization
+    rtl_write16(dev, RTL_IMR, 0x0000);
     
     // Lock config
     rtl_write8(dev, RTL_CR9346, 0x00);
@@ -434,6 +435,12 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     if (api->irq_install_handler) {
         api->irq_install_handler(dev->irq, rtl8139_irq_handler);
     }
+    
+    // Now it's safe to enable interrupts after handler is installed
+    rtl_write16(dev, RTL_ISR, 0xFFFF);  // Clear any pending interrupts again
+    rtl_write16(dev, RTL_IMR, RTL_INT_ROK | RTL_INT_RER | RTL_INT_TOK | 
+                             RTL_INT_TER | RTL_INT_RXOVW | RTL_INT_PUN |
+                             RTL_INT_FOVW);
     
     // Register service
     if (api->sqrm_service_register) {
