@@ -2,6 +2,7 @@
 #include "moduos/fs/mkfs.h"
 #include "moduos/fs/part.h"
 #include "moduos/fs/MDFS/mdfs.h"
+#include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/fs/devfs.h"
 #include "moduos/fs/userfs_user_api.h"
 #include "moduos/fs/userfs.h"
@@ -61,6 +62,7 @@ volatile uint64_t g_syscall_entry_rbp = 0;
 
 static int sys_vfs_mkfs(const vfs_mkfs_req_t *user_req);
 static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user_out);
+static int sys_vfs_mbrinit(const vfs_mbrinit_req_t *user_req);
 static int sys_pidinfo(uint32_t pid, md64api_pid_info_u *out, size_t out_size);
 static int sys_proclist(md_proclist_entry_u *out, size_t out_bytes);
 
@@ -248,6 +250,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             return (uint64_t)sys_vfs_mkfs((const vfs_mkfs_req_t*)arg1);
         case SYS_VFS_GETPART:
             return (uint64_t)sys_vfs_getpart((const vfs_part_req_t*)arg1, (vfs_part_info_t*)arg2);
+        case SYS_VFS_MBRINIT:
+            return (uint64_t)sys_vfs_mbrinit((const vfs_mbrinit_req_t*)arg1);
         case SYS_USERFS_REGISTER:
             return (uint64_t)sys_userfs_register((const userfs_user_node_t*)arg1);
         case SYS_PROCLIST:
@@ -1163,6 +1167,82 @@ static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user
 
     if (usercopy_to_user(user_out, &out, sizeof(out)) != 0) return -1;
     return 0;
+}
+
+static void write_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static int sys_vfs_mbrinit(const vfs_mbrinit_req_t *user_req) {
+    if (!user_req) return -1;
+
+    vfs_mbrinit_req_t req;
+    if (usercopy_from_user(&req, user_req, sizeof(req)) != 0) return -1;
+
+    if (req.vdrive_id < 0) return -2;
+
+    vdrive_t *d = vdrive_get((uint8_t)req.vdrive_id);
+    if (!d || !d->present) return -3;
+    if (d->read_only) return -4;
+    if (d->sector_size != 512) return -5;
+
+    uint8_t *mbr = (uint8_t*)kmalloc(512);
+    if (!mbr) return -6;
+
+    memset(mbr, 0, 512);
+
+    int force = (req.flags & 1) != 0;
+    if (!force) {
+        if (vdrive_read_sector((uint8_t)req.vdrive_id, 0, mbr) == VDRIVE_SUCCESS) {
+            if (mbr[510] == 0x55 && mbr[511] == 0xAA) {
+                kfree(mbr);
+                return -7;
+            }
+        }
+        memset(mbr, 0, 512);
+    }
+
+    uint32_t start_lba = req.start_lba;
+    uint32_t sectors = req.sectors;
+    if (sectors == 0) {
+        uint64_t total_sectors = d->total_sectors;
+        if (total_sectors > start_lba) {
+            uint64_t avail = total_sectors - (uint64_t)start_lba;
+            sectors = (avail > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)avail;
+        } else {
+            kfree(mbr);
+            return -8;
+        }
+    }
+
+    uint8_t type = req.type ? req.type : 0x83;
+    uint8_t bootable = req.bootable ? 0x80 : 0x00;
+
+    uint8_t *ent = mbr + 0x1BE;
+    ent[0] = bootable;
+    ent[1] = 0x00;
+    ent[2] = 0x02;
+    ent[3] = 0x00;
+    ent[4] = type;
+    ent[5] = 0xFF;
+    ent[6] = 0xFF;
+    ent[7] = 0xFF;
+    write_le32(ent + 8, start_lba);
+    write_le32(ent + 12, sectors);
+
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+
+    int rc = 0;
+    if (vdrive_write_sector((uint8_t)req.vdrive_id, 0, mbr) != VDRIVE_SUCCESS) {
+        rc = -9;
+    }
+
+    kfree(mbr);
+    return rc;
 }
 
 int sys_closedir(int fd) {
