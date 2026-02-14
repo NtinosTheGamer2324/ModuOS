@@ -186,6 +186,7 @@ int mdfs_mount(int vdrive_id, uint32_t start_lba) {
     memset(buf, 0, MDFS_BLOCK_SIZE);
 
     if (mdfs_read_block(vdrive_id, start_lba, 1, buf) != VDRIVE_SUCCESS) {
+        com_write_string(COM1_PORT, "[MDFS] mount: read_block failed\n");
         mdfs_buffer_release((uint8_t*)buf);
         return -2;
     }
@@ -194,9 +195,21 @@ int mdfs_mount(int vdrive_id, uint32_t start_lba) {
     memcpy(&sb, buf, sizeof(sb));
     mdfs_buffer_release((uint8_t*)buf);
 
-    if (sb.magic != MDFS_MAGIC) return -3;
-    if (sb.version < 2 || sb.version > MDFS_VERSION) return -4; /* accept v2 or v3 */
-    if (sb.block_size != MDFS_BLOCK_SIZE) return -5;
+    com_printf(COM1_PORT, "[MDFS] mount: magic=0x%08x version=%u block_size=%u\n", 
+               sb.magic, sb.version, sb.block_size);
+
+    if (sb.magic != MDFS_MAGIC) {
+        com_printf(COM1_PORT, "[MDFS] mount: magic mismatch (expected 0x%08x)\n", MDFS_MAGIC);
+        return -3;
+    }
+    if (sb.version < 2 || sb.version > MDFS_VERSION) {
+        com_printf(COM1_PORT, "[MDFS] mount: version %u out of range (2-%u)\n", sb.version, MDFS_VERSION);
+        return -4;
+    }
+    if (sb.block_size != MDFS_BLOCK_SIZE) {
+        com_printf(COM1_PORT, "[MDFS] mount: block_size %u != %u\n", sb.block_size, MDFS_BLOCK_SIZE);
+        return -5;
+    }
 
     // Verify checksum (best-effort; placeholder hash)
     uint32_t saved = sb.checksum;
