@@ -611,6 +611,9 @@ int fs_unmount_slot(int slot) {
         case FS_TYPE_ISO9660:
             iso9660_unmount(mount->handle);
             break;
+        case FS_TYPE_MDFS:
+            mdfs_unmount(mount->handle);
+            break;
         case FS_TYPE_EXTERNAL:
             if (mount->ext_ops && mount->ext_ops->unmount) {
                 mount->ext_ops->unmount(mount);

@@ -113,6 +113,7 @@ typedef struct {
 } mdfs_fs_t;
 
 int mdfs_mount(int vdrive_id, uint32_t start_lba);
+void mdfs_unmount(int handle);
 int mdfs_mkfs(int vdrive_id, uint32_t start_lba, uint32_t sectors, const char *label);
 const mdfs_fs_t *mdfs_get_fs(int handle);
 

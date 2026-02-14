@@ -236,6 +236,19 @@ int mdfs_mount(int vdrive_id, uint32_t start_lba) {
     return handle;
 }
 
+void mdfs_unmount(int handle) {
+    if (handle < 0 || handle >= MDFS_MAX_MOUNTS) return;
+    if (!g_mdfs[handle].in_use) return;
+    
+    /* Flush any cached data for this mount */
+    mdfs_block_cache_flush(handle);
+    mdfs_inode_cache_flush(handle);
+    
+    /* Mark slot as available */
+    memset(&g_mdfs[handle], 0, sizeof(g_mdfs[handle]));
+    g_mdfs[handle].in_use = 0;
+}
+
 void mdfs_cache_init(void) {
     if (g_mdfs_cache_initialized) return;
     
