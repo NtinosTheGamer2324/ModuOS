@@ -250,8 +250,8 @@ static int pcnet_init_device(pcnet_device_t *dev) {
         return -1;
     }
     
-    // Enable interrupts and start
-    pcnet_write_csr(dev, 0, CSR0_IDON | CSR0_STRT | CSR0_INEA);
+    // Start device but do not enable interrupts yet
+    pcnet_write_csr(dev, 0, CSR0_IDON | CSR0_STRT);
     
     dev->link_up = 1;
     
@@ -420,6 +420,10 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     if (api->irq_install_handler) {
         api->irq_install_handler(dev->irq, pcnet_irq_handler);
     }
+    
+    // Now enable interrupts after handler is installed
+    uint16_t csr0 = pcnet_read_csr(dev, 0);
+    pcnet_write_csr(dev, 0, csr0 | CSR0_INEA);
     
     // Register network service
     if (api->sqrm_service_register) {

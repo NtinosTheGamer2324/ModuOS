@@ -275,8 +275,8 @@ static int am79_init_chip(am79_device_t *dev) {
     
     if (timeout <= 0) return -1;
     
-    // Clear IDON and start
-    write_csr(dev, 0, CSR0_IDON | CSR0_STRT | CSR0_INEA);
+    // Clear IDON and start (do not enable interrupts yet)
+    write_csr(dev, 0, CSR0_IDON | CSR0_STRT);
     
     // Check link status
     uint16_t bcr18 = read_bcr(dev, 18);
@@ -471,6 +471,10 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     if (api->irq_install_handler) {
         api->irq_install_handler(dev->irq, am79_irq_handler);
     }
+    
+    // Now enable interrupts after handler is installed
+    uint16_t csr0 = read_csr(dev, 0);
+    write_csr(dev, 0, csr0 | CSR0_INEA);
     
     // Register service
     if (api->sqrm_service_register) {

@@ -279,9 +279,8 @@ static int ne2000_init_device(ne2000_device_t *dev) {
     // Clear ISR
     ne_write(dev, NE_ISR, 0xFF);
     
-    // Enable interrupts
-    ne_write(dev, NE_IMR, NE_ISR_PRX | NE_ISR_PTX | NE_ISR_RXE | 
-                          NE_ISR_TXE | NE_ISR_OVW);
+    // Disable interrupts during initialization
+    ne_write(dev, NE_IMR, 0x00);
     
     // Switch to page 1
     ne_select_page(dev, NE_CMD_PAGE1);
@@ -472,6 +471,11 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     if (api->irq_install_handler) {
         api->irq_install_handler(dev->irq, ne2000_irq_handler);
     }
+    
+    // Now enable interrupts after handler is installed
+    ne_write(dev, NE_ISR, 0xFF);  // Clear any pending interrupts
+    ne_write(dev, NE_IMR, NE_ISR_PRX | NE_ISR_PTX | NE_ISR_RXE | 
+                          NE_ISR_TXE | NE_ISR_OVW);
     
     // Register service
     if (api->sqrm_service_register) {
