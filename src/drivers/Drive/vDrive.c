@@ -132,7 +132,7 @@ static void vdrive_cache_invalidate_range(uint8_t vdrive_id, uint64_t lba, uint3
     }
 }
 
-static void vdrive_cache_invalidate_all(uint8_t vdrive_id) {
+void vdrive_cache_invalidate_all(uint8_t vdrive_id) {
     vdrive_cache_t *c = &g_vdrive_cache[vdrive_id];
     if (!c->inited) return;
     
