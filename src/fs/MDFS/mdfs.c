@@ -495,9 +495,17 @@ int mdfs_mkfs(int vdrive_id, uint32_t start_lba, uint32_t sectors, const char *l
     sb.checksum = mdfs_crc32(&sb, sizeof(sb));
     memset(blk, 0, MDFS_BLOCK_SIZE);
     memcpy(blk, &sb, sizeof(sb));
-    if (vdrive_write((uint8_t)vdrive_id, (uint64_t)start_lba + (uint64_t)(1 * (MDFS_BLOCK_SIZE/512u)), (MDFS_BLOCK_SIZE/512u), blk) != VDRIVE_SUCCESS) { mdfs_buffer_release((uint8_t*)blk); return -14; }
-    if (vdrive_write((uint8_t)vdrive_id, (uint64_t)start_lba + (uint64_t)(2 * (MDFS_BLOCK_SIZE/512u)), (MDFS_BLOCK_SIZE/512u), blk) != VDRIVE_SUCCESS) { mdfs_buffer_release((uint8_t*)blk); return -15; }
+    if (vdrive_write((uint8_t)vdrive_id, (uint64_t)start_lba + (uint64_t)(1 * (MDFS_BLOCK_SIZE/512u)), (MDFS_BLOCK_SIZE/512u), blk) != VDRIVE_SUCCESS) { 
+        mdfs_buffer_release(blk);
+        return -14;
+    }
+    if (vdrive_write((uint8_t)vdrive_id, (uint64_t)start_lba + (uint64_t)(2 * (MDFS_BLOCK_SIZE/512u)), (MDFS_BLOCK_SIZE/512u), blk) != VDRIVE_SUCCESS) { 
+        mdfs_buffer_release(blk);
+        return -15;
+    }
 
-    mdfs_buffer_release((uint8_t*)blk);
+    mdfs_buffer_release(blk);
+    
+    com_write_string(COM1_PORT, "[MDFS] mkfs: successfully created filesystem\n");
     return 0;
 }
