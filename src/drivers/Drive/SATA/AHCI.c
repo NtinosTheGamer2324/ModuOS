@@ -39,10 +39,8 @@ static int ahci_force_poll = 0;
 static void ahci_irq_handler(void);
 
 // Memory allocation helper for DMA buffers
-static void* ahci_alloc_dma(size_t size) {
-    // Allocate aligned memory for DMA
-    // In a real implementation, you'd want physically contiguous memory
-    void *ptr = kmalloc(size);
+static void* ahci_alloc_dma(size_t size, size_t alignment) {
+    void *ptr = kmalloc_aligned(size, alignment);
     if (ptr) {
         // Zero the memory
         uint8_t *p = (uint8_t*)ptr;
@@ -282,13 +280,16 @@ void ahci_start_cmd(hba_port_t *port) {
     // Set FRE (bit 4) and ST (bit 0)
     port->cmd |= HBA_PxCMD_FRE;
     port->cmd |= HBA_PxCMD_ST;
+    
+    // Posted read to ensure writes complete
+    (void)port->cmd;
 }
 
 int ahci_port_rebase(hba_port_t *port, int portno) {
     ahci_stop_cmd(port);
     
-    // Allocate command list (1K aligned)
-    void *clb = ahci_alloc_dma(1024);
+    // Allocate command list (1K aligned per AHCI spec)
+    void *clb = ahci_alloc_dma(1024, 1024);
     if (!clb) {
         COM_LOG_ERROR(COM1_PORT, "Failed to allocate command list");
         return -1;
@@ -302,8 +303,8 @@ int ahci_port_rebase(hba_port_t *port, int portno) {
     
     ahci_controller.ports[portno].cmd_list = (hba_cmd_header_t*)clb;
     
-    // Allocate FIS (256 byte aligned)
-    void *fb = ahci_alloc_dma(256);
+    // Allocate FIS (256 byte aligned per AHCI spec)
+    void *fb = ahci_alloc_dma(256, 256);
     if (!fb) {
         COM_LOG_ERROR(COM1_PORT, "Failed to allocate FIS");
         return -1;
@@ -316,7 +317,7 @@ int ahci_port_rebase(hba_port_t *port, int portno) {
     
     ahci_controller.ports[portno].fis = (hba_fis_t*)fb;
     
-    // Allocate command tables (256 bytes each, 32 slots)
+    // Allocate command tables (128 byte aligned per AHCI spec, 32 slots)
     hba_cmd_header_t *cmdheader = (hba_cmd_header_t*)clb;
     for (int i = 0; i < 32; i++) {
         cmdheader[i].prdtl = AHCI_PRDT_MAX_ENTRIES;
@@ -324,7 +325,7 @@ int ahci_port_rebase(hba_port_t *port, int portno) {
         /* Allocate command table big enough for a large PRDT.
          * hba_cmd_table_t includes prdt_entry[1] already.
          */
-        void *ctba = ahci_alloc_dma(sizeof(hba_cmd_table_t) + (AHCI_PRDT_MAX_ENTRIES - 1) * sizeof(hba_prdt_entry_t));
+        void *ctba = ahci_alloc_dma(sizeof(hba_cmd_table_t) + (AHCI_PRDT_MAX_ENTRIES - 1) * sizeof(hba_prdt_entry_t), 128);
         if (!ctba) {
             COM_LOG_ERROR(COM1_PORT, "Failed to allocate command table");
             return -1;
@@ -360,6 +361,7 @@ static void ahci_irq_handler(void) {
         return;
     }
 
+    /* Clear port interrupt status first (bottom-up), then global status (top-down) */
     for (int p = 0; p < AHCI_MAX_PORTS; p++) {
         if ((is & (1u << p)) == 0) continue;
 
@@ -368,7 +370,12 @@ static void ahci_irq_handler(void) {
         if (!port) continue;
 
         uint32_t pis = port->is;
-        port->is = pis; /* ack */
+        
+        /* Clear port interrupt status (write-1-to-clear) */
+        port->is = pis;
+        
+        /* Posted read to ensure the write completes before continuing */
+        (void)port->is;
 
         uint32_t ci_now = port->ci;
         uint32_t ci_prev = pi->last_ci;
@@ -384,8 +391,11 @@ static void ahci_irq_handler(void) {
         }
     }
 
-    /* Clear HBA interrupt status */
+    /* Clear global HBA interrupt status (write-1-to-clear) */
     ahci_controller.abar->is = is;
+    
+    /* Posted read to ensure the write completes */
+    (void)ahci_controller.abar->is;
 
     if (ahci_irq_line >= 0) pic_send_eoi((uint8_t)ahci_irq_line);
 }
@@ -509,8 +519,8 @@ int ahci_identify_device(uint8_t port_num) {
         
         hba_cmd_table_t *cmdtbl = port_info->cmd_tables[slot];
         
-        // Allocate buffer for IDENTIFY PACKET data (512 bytes)
-        uint16_t *identify_buf = (uint16_t*)ahci_alloc_dma(512);
+        // Allocate buffer for IDENTIFY PACKET data (512 bytes, 2-byte aligned is sufficient)
+        uint16_t *identify_buf = (uint16_t*)ahci_alloc_dma(512, 2);
         if (!identify_buf) {
             com_write_string(COM1_PORT, "[AHCI] Failed to allocate SATAPI identify buffer\n");
             return 0; // Return success with default model
@@ -551,6 +561,9 @@ int ahci_identify_device(uint8_t port_num) {
         // Issue command
         port->ci = 1u << slot;
         port_info->last_ci |= (1u << slot);
+        
+        // Posted read to ensure command register write completes
+        (void)port->ci;
 
         // Wait for completion (prefer fast polling with a real timeout; IRQs may not fire on some hypervisors)
         port_info->completed_slots &= ~(1u << slot);
@@ -610,8 +623,8 @@ int ahci_identify_device(uint8_t port_num) {
     
     hba_cmd_table_t *cmdtbl = port_info->cmd_tables[slot];
     
-    // Allocate buffer for IDENTIFY data (512 bytes)
-    uint16_t *identify_buf = (uint16_t*)ahci_alloc_dma(512);
+    // Allocate buffer for IDENTIFY data (512 bytes, 2-byte aligned is sufficient)
+    uint16_t *identify_buf = (uint16_t*)ahci_alloc_dma(512, 2);
     if (!identify_buf) {
         COM_LOG_ERROR(COM1_PORT, "Failed to allocate identify buffer");
         return -1;
@@ -652,6 +665,9 @@ int ahci_identify_device(uint8_t port_num) {
     // Issue command
     port->ci = 1u << slot;
     ahci_controller.ports[port_num].last_ci |= (1u << slot);
+    
+    // Posted read to ensure command register write completes
+    (void)port->ci;
     
     // Wait for completion (prefer fast polling with a real timeout; IRQs may not fire on some hypervisors)
     port_info->completed_slots &= ~(1u << slot);
@@ -785,6 +801,9 @@ int ahci_read_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, void
     // Issue command
     port->ci = 1u << slot;
     ahci_controller.ports[port_num].last_ci |= (1u << slot);
+    
+    // Posted read to ensure command register write completes
+    (void)port->ci;
 
     // Wait for completion
     ahci_controller.ports[port_num].completed_slots &= ~(1u << slot);
@@ -879,6 +898,9 @@ int ahci_write_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, con
     // Issue command
     port->ci = 1u << slot;
     ahci_controller.ports[port_num].last_ci |= (1u << slot);
+    
+    // Posted read to ensure command register write completes
+    (void)port->ci;
 
     // Wait for completion
     ahci_controller.ports[port_num].completed_slots &= ~(1u << slot);
@@ -986,16 +1008,16 @@ int ahci_probe_ports(void) {
                 com_write_string(COM1_PORT, port_str);
                 com_write_string(COM1_PORT, "\n");
                 
-                // Enable port interrupts (completion + error)
-                port->ie = HBA_PxIS_DHRS | HBA_PxIS_PSS | HBA_PxIS_DPS | HBA_PxIS_SDBS | HBA_PxIS_TFES;
-
+                // Clear any pending/stale interrupts before initialization
+                port->is = (uint32_t)-1;
+                
+                // Disable port interrupts during initialization
+                port->ie = 0;
+                
                 // Init slot completion tracking
                 ahci_controller.ports[i].last_ci = port->ci;
                 ahci_controller.ports[i].completed_slots = 0;
                 ahci_controller.ports[i].error_slots = 0;
-                
-                // Clear any pending interrupts
-                port->is = (uint32_t)-1;
                 
                 // Rebase port
                 if (ahci_port_rebase(port, i) == 0) {
@@ -1005,6 +1027,12 @@ int ahci_probe_ports(void) {
                         com_write_string(COM1_PORT, ahci_controller.ports[i].model);
                         com_write_string(COM1_PORT, "\n");
                     }
+                    
+                    // Clear status again after device initialization
+                    port->is = (uint32_t)-1;
+                    
+                    // Now enable port interrupts (completion + error)
+                    port->ie = HBA_PxIS_DHRS | HBA_PxIS_PSS | HBA_PxIS_DPS | HBA_PxIS_SDBS | HBA_PxIS_TFES;
                 } else {
                     COM_LOG_ERROR(COM1_PORT, "Failed to rebase port");
                 }
@@ -1188,29 +1216,10 @@ int ahci_init(void) {
         }
     }
 
-    if (ahci_force_poll) {
-        com_write_string(COM1_PORT, "[AHCI] Boot arg ahci-poll set: forcing polling mode (interrupts disabled)\n");
-        ahci_irq_line = -1;
-        ahci_controller.abar->ghc &= ~HBA_GHC_IE;
-    } else {
-        // Install INTx IRQ handler (PIC) and enable AHCI interrupts
-        if (pci_dev && pci_dev->interrupt_line < 16) {
-            ahci_irq_line = (int)pci_dev->interrupt_line;
-            irq_install_handler(ahci_irq_line, ahci_irq_handler);
-            com_printf(COM1_PORT, "[AHCI] Installed INTx handler on IRQ %d\n", ahci_irq_line);
-        } else {
-            com_write_string(COM1_PORT, "[AHCI] WARNING: No valid PCI interrupt line; staying in polling mode\n");
-            ahci_irq_line = -1;
-        }
-
-        ahci_controller.abar->ghc |= HBA_GHC_IE;
-        com_write_string(COM1_PORT, "[AHCI] AHCI mode enabled, interrupts enabled\n");
-    }
-    
     // Wait for controller to be ready
     ahci_usleep(1000);
     
-    // Probe ports
+    // Probe ports first (before enabling global interrupts)
     com_write_string(COM1_PORT, "[AHCI] Probing ports...\n");
     int ports = ahci_probe_ports();
     
@@ -1220,6 +1229,31 @@ int ahci_init(void) {
     }
     
     com_printf(COM1_PORT, "[AHCI] Detected %d drive(s)\n", ports);
+    
+    // Now that all ports are initialized, enable interrupts
+    if (ahci_force_poll) {
+        com_write_string(COM1_PORT, "[AHCI] Boot arg ahci-poll set: forcing polling mode (interrupts disabled)\n");
+        ahci_irq_line = -1;
+        ahci_controller.abar->ghc &= ~HBA_GHC_IE;
+    } else {
+        // Install INTx IRQ handler (PIC) before enabling interrupts
+        if (pci_dev && pci_dev->interrupt_line < 16) {
+            ahci_irq_line = (int)pci_dev->interrupt_line;
+            irq_install_handler(ahci_irq_line, ahci_irq_handler);
+            com_printf(COM1_PORT, "[AHCI] Installed INTx handler on IRQ %d\n", ahci_irq_line);
+        } else {
+            com_write_string(COM1_PORT, "[AHCI] WARNING: No valid PCI interrupt line; staying in polling mode\n");
+            ahci_irq_line = -1;
+        }
+
+        // Enable global interrupts only after all ports are ready
+        if (ahci_irq_line >= 0) {
+            ahci_controller.abar->ghc |= HBA_GHC_IE;
+            (void)ahci_controller.abar->ghc;
+            com_write_string(COM1_PORT, "[AHCI] Global interrupts enabled\n");
+        }
+    }
+    
     com_write_string(COM1_PORT, "[AHCI] Driver initialized successfully\n");
     
     return 0;
