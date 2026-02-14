@@ -776,6 +776,9 @@ void zenith4_start() {
                 }
             }
             
+            com_printf(COM1_PORT, "[MOUNT] drive_str='%s' lba_str='%s' type_str='%s' (len=%u)\n",
+                       drive_str, lba_str, type_str, (unsigned)strlen(type_str));
+            
             fs_type_t fs_type = FS_TYPE_UNKNOWN;
             if (strlen(type_str) > 0) {
                 if (strcmp(type_str, "fat32") == 0 || strcmp(type_str, "FAT32") == 0) {
