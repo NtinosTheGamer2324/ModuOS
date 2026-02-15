@@ -549,3 +549,56 @@ int mdfs_write_file_by_path(int handle, const char *path, const void *buffer, si
     kfree(blk);
     return 0;
 }
+
+/* Additional functions required by newer kernel API */
+
+int mdfs_unmount(int handle) {
+    /* Old MDFS doesn't have explicit unmount, just mark as unused */
+    const mdfs_fs_t *fs = mdfs_get_fs(handle);
+    if (!fs) return -1;
+    /* The mount slot is managed by kernel, we don't need to do anything */
+    return 0;
+}
+
+int mdfs_flush_inode(int handle, uint32_t inode) {
+    /* Old MDFS writes through immediately, no buffering to flush */
+    (void)handle;
+    (void)inode;
+    return 0;
+}
+
+int mdfs_create_file_trunc(int handle, const char *path, int truncate, uint32_t *out_inode) {
+    /* For now, just create/truncate via write_file_by_path with empty buffer */
+    const mdfs_fs_t *fs = mdfs_get_fs(handle);
+    if (!fs || !path || !out_inode) return -1;
+    
+    /* Write empty file (creates or truncates) */
+    int rc = mdfs_write_file_by_path(handle, path, NULL, 0);
+    if (rc != 0) return rc;
+    
+    /* Look up the inode we just created */
+    const char *base = mdfs_basename_only(path);
+    uint32_t ino = 0;
+    uint8_t typ = 0;
+    if (mdfs_v2_dir_lookup(fs, (uint32_t)fs->sb.root_inode, base, &ino, &typ) != 0) {
+        return -2;
+    }
+    *out_inode = ino;
+    return 0;
+}
+
+int mdfs_write_file_at_by_path(int handle, const char *path, const void *buffer, size_t size, uint64_t offset) {
+    /* Old MDFS doesn't support offset writes, only full rewrites */
+    if (offset != 0) return -1; /* Not supported */
+    return mdfs_write_file_by_path(handle, path, buffer, size);
+}
+
+int mdfs_write_file_at_by_inode(int handle, uint32_t inode, const void *buffer, size_t size, uint64_t offset) {
+    /* Old MDFS doesn't support writing by inode or offsets */
+    (void)handle;
+    (void)inode;
+    (void)buffer;
+    (void)size;
+    (void)offset;
+    return -1; /* Not supported */
+}

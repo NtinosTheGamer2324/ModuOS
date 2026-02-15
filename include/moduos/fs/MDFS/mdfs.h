@@ -111,4 +111,11 @@ int mdfs_mkdir_by_path(int handle, const char *path);
 int mdfs_rmdir_by_path(int handle, const char *path);
 int mdfs_unlink_by_path(int handle, const char *path);
 
+/* Additional API functions for newer kernel compatibility */
+int mdfs_unmount(int handle);
+int mdfs_flush_inode(int handle, uint32_t inode);
+int mdfs_create_file_trunc(int handle, const char *path, int truncate, uint32_t *out_inode);
+int mdfs_write_file_at_by_path(int handle, const char *path, const void *buffer, size_t size, uint64_t offset);
+int mdfs_write_file_at_by_inode(int handle, uint32_t inode, const void *buffer, size_t size, uint64_t offset);
+
 #endif
