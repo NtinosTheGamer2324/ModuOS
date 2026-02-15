@@ -533,15 +533,20 @@ void sata_dump_all_devices(void) {
 
 int sata_flush(uint8_t port) {
     if (!sata_device_ready(port)) {
+        com_printf(COM1_PORT, "[SATA] flush: port %u not ready\n", port);
         return SATA_ERR_NOT_READY;
     }
 
+    com_printf(COM1_PORT, "[SATA] flush: port %u issuing FLUSH CACHE\n", port);
+
     int rc = ahci_flush_cache(port);
     if (rc != 0) {
+        com_printf(COM1_PORT, "[SATA] flush: port %u failed rc=%d\n", port, rc);
         device_last_error[port] = SATA_ERR_HARDWARE;
         return SATA_ERR_HARDWARE;
     }
 
+    com_printf(COM1_PORT, "[SATA] flush: port %u completed\n", port);
     return SATA_SUCCESS;
 }
 

@@ -926,6 +926,8 @@ int ahci_flush_cache(uint8_t port_num) {
 
     if (!port || port_info->type != AHCI_DEV_SATA) return -1;
 
+    com_printf(COM1_PORT, "[AHCI] flush: port %u issuing ATA FLUSH CACHE\n", port_num);
+
     // Clear pending interrupts
     port->is = (uint32_t)-1;
 

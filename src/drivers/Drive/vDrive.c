@@ -1048,9 +1048,13 @@ void vdrive_print_table(void) {
 int vdrive_flush(uint8_t vdrive_id) {
     vdrive_t *drive = vdrive_get(vdrive_id);
     if (!drive || !vdrive_is_ready(vdrive_id)) {
+        com_printf(COM1_PORT, "[vDrive] flush: vdrive %u not ready\n", vdrive_id);
         return VDRIVE_ERR_NOT_READY;
     }
     
+    com_printf(COM1_PORT, "[vDrive] flush: vdrive %u backend=%u id=%u\n",
+               vdrive_id, drive->backend, drive->backend_id);
+
     if (drive->backend == VDRIVE_BACKEND_SATA) {
         return sata_flush(drive->backend_id);
     }
