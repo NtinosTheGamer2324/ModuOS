@@ -529,6 +529,9 @@ int mdfs_mkfs(int vdrive_id, uint32_t start_lba, uint32_t sectors, const char *l
     /* Invalidate all vdrive cache entries to ensure fresh reads after mkfs */
     vdrive_cache_invalidate_all((uint8_t)vdrive_id);
     
+    /* Flush device write cache to persist the superblock */
+    vdrive_flush((uint8_t)vdrive_id);
+    
     com_write_string(COM1_PORT, "[MDFS] mkfs: successfully created filesystem\n");
     return 0;
 }
