@@ -576,13 +576,13 @@ int mdfs_create_file_trunc(int handle, const char *path, int truncate, uint32_t 
     int rc = mdfs_write_file_by_path(handle, path, NULL, 0);
     if (rc != 0) return rc;
     
-    /* Look up the inode we just created */
-    const char *base = mdfs_basename_only(path);
+    /* Look up the inode we just created using mdfs_lookup_path */
     uint32_t ino = 0;
     uint8_t typ = 0;
-    if (mdfs_v2_dir_lookup(fs, (uint32_t)fs->sb.root_inode, base, &ino, &typ) != 0) {
+    if (mdfs_lookup_path(fs, path, &ino, &typ) != 0) {
         return -2;
     }
+    if (typ != 1) return -3; /* Not a file */
     *out_inode = ino;
     return 0;
 }

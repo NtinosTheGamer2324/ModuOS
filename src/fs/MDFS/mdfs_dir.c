@@ -299,3 +299,13 @@ int mdfs_v2_dir_add(const mdfs_fs_t *fs, uint32_t dir_ino, const char *name, uin
 // Exported wrappers used by mdfs_api.c can call these helpers by reusing the root-only bringup.
 // (To keep symbols minimal, we expose only list/lookup/add via these names.)
 
+int mdfs_v2_root_lookup_export(const mdfs_fs_t *fs, const char *name, uint32_t *out_ino, uint8_t *out_type) {
+    if (!fs) return -1;
+    return mdfs_v2_dir_lookup(fs, (uint32_t)fs->sb.root_inode, name, out_ino, out_type);
+}
+
+int mdfs_v2_root_add_export(const mdfs_fs_t *fs, const char *name, uint32_t ino, uint8_t type) {
+    if (!fs) return -1;
+    return mdfs_v2_dir_add(fs, (uint32_t)fs->sb.root_inode, name, ino, type);
+}
+
