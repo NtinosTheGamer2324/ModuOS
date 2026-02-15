@@ -524,6 +524,16 @@ int mdfs_mkfs(int vdrive_id, uint32_t start_lba, uint32_t sectors, const char *l
         return -15;
     }
 
+    /* Read back superblock to verify write */
+    memset(blk, 0, MDFS_BLOCK_SIZE);
+    if (mdfs_read_block(vdrive_id, start_lba, 1, blk) == VDRIVE_SUCCESS) {
+        const mdfs_superblock_t *verify = (const mdfs_superblock_t *)blk;
+        com_printf(COM1_PORT, "[MDFS] mkfs: verify magic=0x%08x version=%u\n",
+                   verify->magic, verify->version);
+    } else {
+        com_write_string(COM1_PORT, "[MDFS] mkfs: verify read failed\n");
+    }
+
     mdfs_buffer_release(blk);
     
     /* Invalidate all vdrive cache entries to ensure fresh reads after mkfs */
