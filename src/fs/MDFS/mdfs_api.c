@@ -151,6 +151,9 @@ static const char *mdfs_basename_only(const char *path) {
 int mdfs_stat_by_path(int handle, const char *path, uint32_t *out_size, int *out_is_dir) {
     const mdfs_fs_t *fs = mdfs_get_fs(handle);
     if (!fs || !path) return -1;
+    
+    com_printf(COM1_PORT, "[MDFS] stat_by_path: path='%s'\n", path);
+    
     if (path[0] == 0 || (path[0] == '/' && path[1] == 0)) {
         if (out_size) *out_size = 0;
         if (out_is_dir) *out_is_dir = 1;
@@ -159,7 +162,9 @@ int mdfs_stat_by_path(int handle, const char *path, uint32_t *out_size, int *out
 
     uint32_t ino_n = 0;
     uint8_t typ = 0;
-    if (mdfs_lookup_path(fs, path, &ino_n, &typ) != 0) return -2;
+    int lookup_rc = mdfs_lookup_path(fs, path, &ino_n, &typ);
+    com_printf(COM1_PORT, "[MDFS] stat lookup_path returned %d, ino=%u, type=%u\n", lookup_rc, ino_n, typ);
+    if (lookup_rc != 0) return -2;
 
     if (out_is_dir) *out_is_dir = (typ == 2);
     if (out_size) {
