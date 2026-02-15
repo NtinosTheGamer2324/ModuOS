@@ -46,6 +46,8 @@ int hvfs_read(int drvmnt, const char* path, void **outbuf, size_t *out_size) {
         /* Treat stat failure as "not found" for HVFS semantics */
         return 1;
     }
+    
+    com_printf(COM1_PORT, "[HVFS] hvfs_read: path='%s' size=%u is_dir=%d\n", path, (uint32_t)info.size, info.is_directory);
 
     if (info.is_directory) {
         return 2;
