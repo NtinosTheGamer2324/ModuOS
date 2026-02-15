@@ -4,6 +4,7 @@
 #include "moduos/kernel/memory/string.h"
 #include "moduos/fs/MDFS/mdfs_dir.h"
 #include "moduos/fs/MDFS/mdfs_disk.h"
+#include "moduos/kernel/COM/com.h"
 
 // Implementations live in mdfs.c (helpers are static there), but we expose a minimal
 // API for the VFS. To keep this first version simple, we implement root-only
