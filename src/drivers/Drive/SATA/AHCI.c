@@ -918,6 +918,64 @@ int ahci_write_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, con
     return 0;
 }
 
+int ahci_flush_cache(uint8_t port_num) {
+    if (port_num >= AHCI_MAX_PORTS) return -1;
+
+    ahci_port_info_t *port_info = &ahci_controller.ports[port_num];
+    hba_port_t *port = port_info->port;
+
+    if (!port || port_info->type != AHCI_DEV_SATA) return -1;
+
+    // Clear pending interrupts
+    port->is = (uint32_t)-1;
+
+    int slot = ahci_find_cmdslot(port);
+    if (slot == -1) {
+        COM_LOG_ERROR(COM1_PORT, "No free command slot");
+        return -1;
+    }
+
+    hba_cmd_header_t *cmdheader = &port_info->cmd_list[slot];
+    cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
+    cmdheader->w = 0;  // Non-data command
+    cmdheader->prdtl = 0;
+
+    hba_cmd_table_t *cmdtbl = port_info->cmd_tables[slot];
+
+    fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t*)(&cmdtbl->cfis);
+    cmdfis->fis_type = FIS_TYPE_REG_H2D;
+    cmdfis->c = 1;
+    cmdfis->command = ATA_CMD_FLUSH_CACHE;
+
+    cmdfis->lba0 = 0;
+    cmdfis->lba1 = 0;
+    cmdfis->lba2 = 0;
+    cmdfis->device = 1 << 6;
+    cmdfis->lba3 = 0;
+    cmdfis->lba4 = 0;
+    cmdfis->lba5 = 0;
+    cmdfis->countl = 0;
+    cmdfis->counth = 0;
+
+    if (ahci_wait_tfd_clear(port, (0x80 | 0x08), 500 /*ms*/) != 0) {
+        COM_LOG_ERROR(COM1_PORT, "Port hung");
+        return -1;
+    }
+
+    port->ci = 1u << slot;
+    ahci_controller.ports[port_num].last_ci |= (1u << slot);
+    (void)port->ci;
+
+    ahci_controller.ports[port_num].completed_slots &= ~(1u << slot);
+    ahci_controller.ports[port_num].error_slots &= ~(1u << slot);
+    if (ahci_wait_cmd_done(port_num, slot, 5000 /*ms*/) != 0) {
+        COM_LOG_ERROR(COM1_PORT, "Flush cache timeout/error");
+        return -1;
+    }
+
+    return 0;
+}
+
 // ===========================================================================
 // HBA Reset and BIOS Handoff
 // ===========================================================================

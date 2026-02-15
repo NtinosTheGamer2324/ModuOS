@@ -532,13 +532,16 @@ void sata_dump_all_devices(void) {
 // ===========================================================================
 
 int sata_flush(uint8_t port) {
-    // Placeholder for flush cache command
-    // Would need to implement FLUSH CACHE EXT command via AHCI
     if (!sata_device_ready(port)) {
         return SATA_ERR_NOT_READY;
     }
-    
-    // For now, just return success
+
+    int rc = ahci_flush_cache(port);
+    if (rc != 0) {
+        device_last_error[port] = SATA_ERR_HARDWARE;
+        return SATA_ERR_HARDWARE;
+    }
+
     return SATA_SUCCESS;
 }
 
