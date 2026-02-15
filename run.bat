@@ -55,7 +55,7 @@ start "cmdQEMU" qemu-system-x86_64 ^
     -device ide-cd,drive=cdrom0,bus=ahci0.0 ^
     -device ide-hd,drive=disk0,bus=ahci0.1 ^
     -device ide-hd,drive=disk1,bus=ahci0.2 ^
-    -device ide-hd,drive=disk2,bus=ide.1 ^
+    -device ide-hd,drive=disk2,bus=ahci0.3 ^
     -boot d
 
 timeout /t 1 /nobreak >nul
