@@ -1,7 +1,5 @@
 #include "moduos/fs/MDFS/mdfs.h"
-#include "moduos/fs/MDFS/mdfs_cache.h"
 #include "moduos/fs/MDFS/mdfs_disk.h"
-#include "moduos/fs/MDFS/mdfs_cache.h"
 #include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/string.h"
@@ -40,13 +38,13 @@ int mdfs_v2_dir_list(const mdfs_fs_t *fs, uint32_t dir_ino, mdfs_dirent_t *out, 
     if (irc != 0) return -2;
 
     int outc = 0;
-    uint8_t *blk = mdfs_buffer_acquire();
+    uint8_t *blk = (uint8_t*)kmalloc(MDFS_BLOCK_SIZE);
     if (!blk) return -3;
 
     for (uint32_t di = 0; di < MDFS_MAX_DIRECT; di++) {
         uint64_t bno = root.direct[di];
         if (!bno) continue;
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { mdfs_buffer_release((uint8_t*)blk); return -4; }
+        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { kfree(blk); return -4; }
 
         for (uint32_t off = 0; off + MDFS_DIR_REC_SIZE <= MDFS_BLOCK_SIZE;) {
             mdfs_dir_primary_t *pr = (mdfs_dir_primary_t*)(blk + off);
@@ -96,7 +94,7 @@ int mdfs_v2_dir_list(const mdfs_fs_t *fs, uint32_t dir_ino, mdfs_dirent_t *out, 
         }
     }
 
-    mdfs_buffer_release((uint8_t*)blk);
+    kfree(blk);
     return outc;
 }
 
@@ -109,13 +107,13 @@ int mdfs_v2_dir_lookup(const mdfs_fs_t *fs, uint32_t dir_ino, const char *name, 
     int irc = mdfs_v2_dir_read_inode(fs, dir_ino, &root);
     if (irc != 0) return -3;
 
-    uint8_t *blk = mdfs_buffer_acquire();
+    uint8_t *blk = (uint8_t*)kmalloc(MDFS_BLOCK_SIZE);
     if (!blk) return -4;
 
     for (uint32_t di = 0; di < MDFS_MAX_DIRECT; di++) {
         uint64_t bno = root.direct[di];
         if (!bno) continue;
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { mdfs_buffer_release((uint8_t*)blk); return -5; }
+        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { kfree(blk); return -5; }
 
         for (uint32_t off = 0; off + MDFS_DIR_REC_SIZE <= MDFS_BLOCK_SIZE;) {
             mdfs_dir_primary_t *pr = (mdfs_dir_primary_t*)(blk + off);
@@ -149,7 +147,7 @@ int mdfs_v2_dir_lookup(const mdfs_fs_t *fs, uint32_t dir_ino, const char *name, 
                             if (strcmp(tmp, name) == 0) {
                                 if (out_ino) *out_ino = pr->inode;
                                 if (out_type) *out_type = pr->entry_type;
-                                mdfs_buffer_release((uint8_t*)blk);
+                                kfree(blk);
                                 return 0;
                             }
                         }
@@ -161,7 +159,7 @@ int mdfs_v2_dir_lookup(const mdfs_fs_t *fs, uint32_t dir_ino, const char *name, 
         }
     }
 
-    mdfs_buffer_release((uint8_t*)blk);
+    kfree(blk);
     return -6;
 }
 
@@ -174,13 +172,13 @@ int mdfs_v2_dir_remove(const mdfs_fs_t *fs, uint32_t dir_ino, const char *name) 
     int irc = mdfs_v2_dir_read_inode(fs, dir_ino, &root);
     if (irc != 0) return -3;
 
-    uint8_t *blk = mdfs_buffer_acquire();
+    uint8_t *blk = (uint8_t*)kmalloc(MDFS_BLOCK_SIZE);
     if (!blk) return -4;
 
     for (uint32_t di = 0; di < MDFS_MAX_DIRECT; di++) {
         uint64_t bno = root.direct[di];
         if (!bno) continue;
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { mdfs_buffer_release((uint8_t*)blk); return -5; }
+        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { kfree(blk); return -5; }
 
         for (uint32_t off = 0; off + MDFS_DIR_REC_SIZE <= MDFS_BLOCK_SIZE;) {
             mdfs_dir_primary_t *pr = (mdfs_dir_primary_t*)(blk + off);
@@ -217,8 +215,8 @@ int mdfs_v2_dir_remove(const mdfs_fs_t *fs, uint32_t dir_ino, const char *name) 
                                 pr->checksum = 0;
                                 uint32_t crc = mdfs_entry_crc32(blk + off, set_bytes);
                                 pr->checksum = crc;
-                                if (mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { mdfs_buffer_release((uint8_t*)blk); return -6; }
-                                mdfs_buffer_release((uint8_t*)blk);
+                                if (mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { kfree(blk); return -6; }
+                                kfree(blk);
                                 return 0;
                             }
                         }
@@ -230,7 +228,7 @@ int mdfs_v2_dir_remove(const mdfs_fs_t *fs, uint32_t dir_ino, const char *name) 
         }
     }
 
-    mdfs_buffer_release((uint8_t*)blk);
+    kfree(blk);
     return -7;
 }
 
@@ -243,7 +241,7 @@ int mdfs_v2_dir_add(const mdfs_fs_t *fs, uint32_t dir_ino, const char *name, uin
     int irc = mdfs_v2_dir_read_inode(fs, dir_ino, &root);
     if (irc != 0) return -3;
 
-    uint8_t *blk = mdfs_buffer_acquire();
+    uint8_t *blk = (uint8_t*)kmalloc(MDFS_BLOCK_SIZE);
     if (!blk) return -4;
 
     uint8_t rec_cnt = mdfs_calc_record_count((uint16_t)nl_req);
@@ -253,7 +251,7 @@ int mdfs_v2_dir_add(const mdfs_fs_t *fs, uint32_t dir_ino, const char *name, uin
     for (uint32_t di = 0; di < MDFS_MAX_DIRECT; di++) {
         uint64_t bno = root.direct[di];
         if (!bno) continue;
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { mdfs_buffer_release((uint8_t*)blk); return -5; }
+        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { kfree(blk); return -5; }
 
         for (uint32_t off = 0; off + set_bytes <= MDFS_BLOCK_SIZE; off += MDFS_DIR_REC_SIZE) {
             mdfs_dir_primary_t *pr = (mdfs_dir_primary_t*)(blk + off);
@@ -288,13 +286,13 @@ int mdfs_v2_dir_add(const mdfs_fs_t *fs, uint32_t dir_ino, const char *name, uin
             uint32_t crc = mdfs_entry_crc32(blk + off, set_bytes);
             w->checksum = crc;
 
-            if (mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { mdfs_buffer_release((uint8_t*)blk); return -6; }
-            mdfs_buffer_release((uint8_t*)blk);
+            if (mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { kfree(blk); return -6; }
+            kfree(blk);
             return 0;
         }
     }
 
-    mdfs_buffer_release((uint8_t*)blk);
+    kfree(blk);
     return -7;
 }
 
