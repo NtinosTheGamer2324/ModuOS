@@ -907,8 +907,13 @@ int ahci_write_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, con
     ahci_controller.ports[port_num].error_slots &= ~(1u << slot);
     if (ahci_wait_cmd_done(port_num, slot, 5000 /*ms*/) != 0) {
         COM_LOG_ERROR(COM1_PORT, "Write command timeout/error");
+        com_printf(COM1_PORT, "[AHCI] write fail: port %u CI=0x%08x TFD=0x%08x IS=0x%08x SERR=0x%08x\n",
+                   port_num, port->ci, port->tfd, port->is, port->serr);
         return -1;
     }
+
+    com_printf(COM1_PORT, "[AHCI] write ok: port %u LBA=%llu count=%u\n",
+               port_num, (unsigned long long)start_lba, (unsigned)this_count);
 
     buf8 += (this_count * 512u);
     start_lba += this_count;
