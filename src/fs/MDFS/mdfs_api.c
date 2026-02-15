@@ -517,11 +517,11 @@ int mdfs_write_file_by_path(int handle, const char *path, const void *buffer, si
         ino_num = existing_ino;
     } else {
         if (mdfs_alloc_inode_simple(fs, &ino_num) != 0) return -7;
-        mdfs_inode_t ino;
-        memset(&ino, 0, sizeof(ino));
-        ino.mode = 0x8000;
-        ino.link_count = 1;
-        if (mdfs_disk_write_inode(fs->vdrive_id, fs->start_lba, &fs->sb, ino_num, &ino) != 0) return -8;
+        mdfs_inode_t new_ino;
+        memset(&new_ino, 0, sizeof(new_ino));
+        new_ino.mode = 0x8000;
+        new_ino.link_count = 1;
+        if (mdfs_disk_write_inode(fs->vdrive_id, fs->start_lba, &fs->sb, ino_num, &new_ino) != 0) return -8;
         if (mdfs_v2_dir_add(fs, dir_ino, base, ino_num, 1) != 0) return -9;
     }
 
