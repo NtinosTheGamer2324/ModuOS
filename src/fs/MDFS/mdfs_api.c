@@ -177,9 +177,15 @@ int mdfs_read_file_by_path(int handle, const char *path, void *buffer, size_t bu
     const mdfs_fs_t *fs = mdfs_get_fs(handle);
     if (!fs || !path || !buffer || !bytes_read) return -1;
     *bytes_read = 0;
+    
+    /* Debug: log the path being looked up */
+    com_printf(COM1_PORT, "[MDFS] read_file_by_path: path='%s'\n", path);
+    
     uint32_t ino_n = 0;
     uint8_t typ = 0;
-    if (mdfs_lookup_path(fs, path, &ino_n, &typ) != 0) return -2;
+    int lookup_rc = mdfs_lookup_path(fs, path, &ino_n, &typ);
+    com_printf(COM1_PORT, "[MDFS] lookup_path returned %d, ino=%u, type=%u\n", lookup_rc, ino_n, typ);
+    if (lookup_rc != 0) return -2;
     if (typ != 1) return -3;
 
     mdfs_inode_t ino;
