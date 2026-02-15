@@ -73,6 +73,7 @@ int ata_init();
 int ata_read_sector_lba28(int drive_index, uint32_t lba, void* buffer);
 int ata_write_sector_lba28(int drive_index, uint32_t lba, const void* buffer);
 int ata_read_sectors(int drive_index, uint32_t lba, void* buffer, uint32_t sector_count);
+int ata_flush_cache(int drive_index);
 void ata_print_drives(void);
 const ata_drive_t* ata_get_drive(int drive_index);
 

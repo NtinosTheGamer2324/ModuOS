@@ -102,6 +102,11 @@ static int ata_identify_drive(int drive_index) {
 
     select_drive(base, drive, 0);
     io_wait();
+    
+    /* Additional delay for drive selection - some drives need more time */
+    for (volatile int i = 0; i < 10000; i++) {
+        io_wait();
+    }
 
     /* clear registers as per spec */
     outb(base + REG_SECCNT, 0);
@@ -245,6 +250,21 @@ int ata_init(void) {
     if (prim_status == 0xFF && sec_status == 0xFF) {
         /* Floating bus - no ATA controller present */
         return -2;
+    }
+
+    /* Software reset both channels as per ATA spec */
+    if (prim_status != 0xFF) {
+        write_control(ATA_PRIMARY_CTRL, 0x04);  /* Set SRST bit */
+        for (volatile int i = 0; i < 1000; i++) io_wait();
+        write_control(ATA_PRIMARY_CTRL, 0x00);  /* Clear SRST bit */
+        for (volatile int i = 0; i < 1000; i++) io_wait();
+    }
+    
+    if (sec_status != 0xFF) {
+        write_control(ATA_SECONDARY_CTRL, 0x04);  /* Set SRST bit */
+        for (volatile int i = 0; i < 1000; i++) io_wait();
+        write_control(ATA_SECONDARY_CTRL, 0x00);  /* Clear SRST bit */
+        for (volatile int i = 0; i < 1000; i++) io_wait();
     }
 
     for (int i = 0; i < 4; ++i) {
@@ -397,13 +417,39 @@ int ata_write_sector_lba28(int drive_index, uint32_t lba, const void* buffer) {
     /* Wait for drive to be ready for data */
     if (ata_wait_drq(base) < 0) return -6;
 
+    /* Ensure buffer data is in RAM before PIO reads it */
+    __asm__ volatile("mfence" ::: "memory");
+
     /* Transfer 512 bytes (256 words) to DATA port */
     outsw(base + REG_DATA, buffer, 256);
 
-    /* Issue cache flush to ensure data hits the disk */
+    /* Wait until write completes (BSY clears) */
+    if (ata_wait_not_busy(base) < 0) return -7;
+
+    /* NOTE: Cache flush removed from here - it should be done explicitly
+     * via vdrive_flush() when needed, not after every sector write.
+     * Flushing after every write is extremely slow and can cause timeouts. */
+
+    return 0; /* success */
+}
+
+/* Flush write cache to disk */
+int ata_flush_cache(int drive_index) {
+    if (drive_index < 0 || drive_index >= 4) return -2;
+    if (!ata_drives[drive_index].exists) return -3;
+    if (ata_drives[drive_index].is_atapi) return -4;
+
+    uint16_t base = ata_base_for(drive_index);
+    uint8_t drive = ata_drive_bit_for(drive_index);
+
+    /* Select drive */
+    select_drive(base, drive, 0);
+    io_wait();
+
+    /* Issue CACHE FLUSH command */
     write_command(base, ATA_CMD_CACHE_FLUSH);
 
-    /* Wait until not busy */
+    /* Wait for completion (can take a while on real hardware) */
     if (ata_wait_not_busy(base) < 0) return -7;
 
     return 0; /* success */

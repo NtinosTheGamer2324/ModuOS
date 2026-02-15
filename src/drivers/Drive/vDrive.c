@@ -1057,6 +1057,13 @@ int vdrive_flush(uint8_t vdrive_id) {
 
     if (drive->backend == VDRIVE_BACKEND_SATA) {
         return sata_flush(drive->backend_id);
+    } else if (drive->backend == VDRIVE_BACKEND_ATA) {
+        int rc = ata_flush_cache(drive->backend_id);
+        if (rc != 0) {
+            com_printf(COM1_PORT, "[vDrive] ATA flush failed: rc=%d\n", rc);
+            return VDRIVE_ERR_WRITE_FAILED;
+        }
+        return VDRIVE_SUCCESS;
     }
     
     return VDRIVE_SUCCESS;

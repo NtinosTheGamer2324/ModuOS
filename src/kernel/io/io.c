@@ -44,6 +44,7 @@ void outsb(uint16_t port, const void *addr, int count) {
         "rep outsb"
         : "+S"(addr), "+c"(count)
         : "d"(port)
+        : "memory"
     );
 }
 
@@ -61,6 +62,7 @@ void outsw(uint16_t port, const void *addr, int count) {
         "rep outsw"
         : "+S"(addr), "+c"(count)
         : "d"(port)
+        : "memory"
     );
 }
 
@@ -78,6 +80,7 @@ void outsl(uint16_t port, const void *addr, int count) {
         "rep outsl"
         : "+S"(addr), "+c"(count)
         : "d"(port)
+        : "memory"
     );
 }
 

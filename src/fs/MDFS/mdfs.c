@@ -512,8 +512,11 @@ int mdfs_mkfs(int vdrive_id, uint32_t start_lba, uint32_t sectors, const char *l
     memset(blk, 0, MDFS_BLOCK_SIZE);
     memcpy(blk, &sb, sizeof(sb));
     
-    com_printf(COM1_PORT, "[MDFS] mkfs: writing superblock to block 1 (LBA %u)\n", 
-               (unsigned)(start_lba + (1 * (MDFS_BLOCK_SIZE/512u))));
+    com_printf(COM1_PORT, "[MDFS] mkfs: writing superblock to block 1 (LBA %u) vdrive=%d start_lba=%u\n", 
+               (unsigned)(start_lba + (1 * (MDFS_BLOCK_SIZE/512u))), vdrive_id, (unsigned)start_lba);
+    
+    com_printf(COM1_PORT, "[MDFS] mkfs: superblock magic=0x%08x version=%u free_blocks=%llu\n",
+               sb.magic, sb.version, sb.free_blocks);
     
     if (mdfs_write_block(vdrive_id, start_lba, 1, blk) != VDRIVE_SUCCESS) { 
         mdfs_buffer_release(blk);
@@ -524,23 +527,32 @@ int mdfs_mkfs(int vdrive_id, uint32_t start_lba, uint32_t sectors, const char *l
         return -15;
     }
 
+    com_write_string(COM1_PORT, "[MDFS] mkfs: superblock written, releasing buffer\n");
+    mdfs_buffer_release(blk);
+    
+    /* Flush device write cache to persist the superblock BEFORE verify */
+    com_write_string(COM1_PORT, "[MDFS] mkfs: flushing vdrive cache\n");
+    vdrive_flush((uint8_t)vdrive_id);
+    
+    /* Invalidate all vdrive cache entries to ensure fresh reads after mkfs */
+    com_write_string(COM1_PORT, "[MDFS] mkfs: invalidating vdrive cache\n");
+    vdrive_cache_invalidate_all((uint8_t)vdrive_id);
+    
     /* Read back superblock to verify write */
+    com_write_string(COM1_PORT, "[MDFS] mkfs: acquiring new buffer for verify\n");
+    blk = mdfs_buffer_acquire();
+    if (!blk) return -16;
     memset(blk, 0, MDFS_BLOCK_SIZE);
+    com_printf(COM1_PORT, "[MDFS] mkfs: reading back from vdrive=%d start_lba=%u block=1\n", 
+               vdrive_id, (unsigned)start_lba);
     if (mdfs_read_block(vdrive_id, start_lba, 1, blk) == VDRIVE_SUCCESS) {
         const mdfs_superblock_t *verify = (const mdfs_superblock_t *)blk;
-        com_printf(COM1_PORT, "[MDFS] mkfs: verify magic=0x%08x version=%u\n",
-                   verify->magic, verify->version);
+        com_printf(COM1_PORT, "[MDFS] mkfs: verify magic=0x%08x version=%u free_blocks=%llu\n",
+                   verify->magic, verify->version, verify->free_blocks);
     } else {
         com_write_string(COM1_PORT, "[MDFS] mkfs: verify read failed\n");
     }
-
     mdfs_buffer_release(blk);
-    
-    /* Invalidate all vdrive cache entries to ensure fresh reads after mkfs */
-    vdrive_cache_invalidate_all((uint8_t)vdrive_id);
-    
-    /* Flush device write cache to persist the superblock */
-    vdrive_flush((uint8_t)vdrive_id);
     
     com_write_string(COM1_PORT, "[MDFS] mkfs: successfully created filesystem\n");
     return 0;

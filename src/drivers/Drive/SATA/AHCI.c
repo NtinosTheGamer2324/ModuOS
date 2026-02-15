@@ -813,6 +813,16 @@ int ahci_read_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, void
         return -1;
     }
 
+    /* DMA writes bypass CPU cache. Flush cache to ensure CPU reads fresh data.
+     * Without this, the CPU might read stale cached data instead of the DMA-transferred data. */
+    __asm__ volatile("mfence" ::: "memory");
+    
+    /* Invalidate cache lines for the DMA buffer to force CPU to read from RAM */
+    for (uint32_t i = 0; i < this_count * 512u; i += 64) {
+        __asm__ volatile("clflush (%0)" :: "r"(buf8 + i) : "memory");
+    }
+    __asm__ volatile("mfence" ::: "memory");
+
     /* Advance */
     buf8 += (this_count * 512u);
     start_lba += this_count;
@@ -870,6 +880,17 @@ int ahci_write_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, con
         }
         cmdheader->prdtl = prdtl;
 
+        /* DMA reads data from RAM. Flush CPU cache to ensure data is visible to DMA.
+         * Without this, the DMA controller might read stale data from RAM while the
+         * fresh data sits in CPU cache. */
+        __asm__ volatile("mfence" ::: "memory");
+        
+        /* Flush cache lines for the write buffer to push data to RAM */
+        for (uint32_t i = 0; i < this_count * 512u; i += 64) {
+            __asm__ volatile("clflush (%0)" :: "r"(buf8 + i) : "memory");
+        }
+        __asm__ volatile("mfence" ::: "memory");
+
         // Setup command FIS
         fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t*)(&cmdtbl->cfis);
     
@@ -888,6 +909,20 @@ int ahci_write_sectors(uint8_t port_num, uint64_t start_lba, uint32_t count, con
     
     cmdfis->countl = (uint8_t)this_count;
     cmdfis->counth = (uint8_t)(this_count >> 8);
+    
+    /* Flush command structures to RAM before DMA reads them.
+     * The HBA needs to read the command FIS and PRDT from RAM. */
+    __asm__ volatile("mfence" ::: "memory");
+    
+    /* Flush command table (includes FIS and PRDT) */
+    for (uintptr_t addr = (uintptr_t)cmdtbl; addr < (uintptr_t)cmdtbl + sizeof(hba_cmd_table_t) + (prdtl * sizeof(hba_prdt_entry_t)); addr += 64) {
+        __asm__ volatile("clflush (%0)" :: "r"(addr) : "memory");
+    }
+    
+    /* Flush command header */
+    __asm__ volatile("clflush (%0)" :: "r"(cmdheader) : "memory");
+    
+    __asm__ volatile("mfence" ::: "memory");
     
     // Wait for port to be ready (BSY/DRQ clear)
     if (ahci_wait_tfd_clear(port, (0x80 | 0x08), 500 /*ms*/) != 0) {
@@ -952,7 +987,9 @@ int ahci_flush_cache(uint8_t port_num) {
     fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t*)(&cmdtbl->cfis);
     cmdfis->fis_type = FIS_TYPE_REG_H2D;
     cmdfis->c = 1;
-    cmdfis->command = ATA_CMD_FLUSH_CACHE;
+    /* Use FLUSH CACHE EXT (0xEA) to match the extended write commands.
+     * Using legacy FLUSH CACHE (0xE7) with extended writes can cause data loss. */
+    cmdfis->command = ATA_CMD_FLUSH_CACHE_EXT;
 
     cmdfis->lba0 = 0;
     cmdfis->lba1 = 0;
@@ -1158,7 +1195,7 @@ int ahci_init(void) {
     
     com_printf(COM1_PORT, "[AHCI] ABAR physical = 0x%08x\n", (uint32_t)abar_phys);
     
-    // CRITICAL: Ensure paging is initialized
+    // Ensure paging is initialized
     com_write_string(COM1_PORT, "[AHCI] Checking paging initialization...\n");
     if (!paging_get_pml4()) {
         com_write_string(COM1_PORT, "[AHCI] Paging not initialized, calling paging_init()...\n");
@@ -1197,7 +1234,7 @@ int ahci_init(void) {
     
     ahci_controller.abar = (hba_mem_t*)abar_virt;
     
-    // CRITICAL: Add memory barriers before accessing MMIO
+    // Add memory barriers before accessing MMIO
     __asm__ volatile("mfence" ::: "memory");
     
     // Test read with error handling

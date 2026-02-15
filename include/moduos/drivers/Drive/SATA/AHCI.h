@@ -22,7 +22,8 @@
 #define ATA_CMD_READ_DMA_EX     0x25
 #define ATA_CMD_WRITE_DMA_EX    0x35
 #define ATA_CMD_IDENTIFY        0xEC
-#define ATA_CMD_FLUSH_CACHE     0xE7
+#define ATA_CMD_FLUSH_CACHE     0xE7  // 28-bit legacy flush
+#define ATA_CMD_FLUSH_CACHE_EXT 0xEA  // 48-bit extended flush (use with EXT commands)
 
 // Port Signature Values
 #define SATA_SIG_ATA            0x00000101  // SATA drive
