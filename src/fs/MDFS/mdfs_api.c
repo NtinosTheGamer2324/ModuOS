@@ -6,7 +6,7 @@
 #include "moduos/fs/MDFS/mdfs_dir.h"
 #include "moduos/fs/MDFS/mdfs_disk.h"
 #include "moduos/fs/MDFS/mdfs_cache.h"
-#include "moduos/fs/MDFS/mdfs_acl_helpers.h"
+/* ACL support removed for simplicity */
 #include "moduos/kernel/process/process.h"
 
 /* Forward declarations (used by indirect helpers) */
@@ -1129,7 +1129,7 @@ int mdfs_mkdir_by_path(int handle, const char *path) {
     if (mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, bno, blk) != VDRIVE_SUCCESS) { mdfs_buffer_release((uint8_t*)blk); return -10; }
     mdfs_buffer_release((uint8_t*)blk);
 
-    // Write inode with ACL
+    // Write inode
     mdfs_inode_t ino;
     memset(&ino, 0, sizeof(ino));
     ino.mode = 0x4000;
@@ -1137,15 +1137,12 @@ int mdfs_mkdir_by_path(int handle, const char *path) {
     ino.size_bytes = 0;
     ino.direct[0] = bno;
     
-    // Get current process identity for ACL initialization
+    // Get current process identity
     process_t *proc = process_get_current();
     uint32_t owner_uid = proc ? proc->uid : 0;
     uint32_t owner_gid = proc ? proc->gid : 0;
     ino.uid = owner_uid;
     ino.gid = owner_gid;
-    
-    // Initialize default ACL
-    mdfs_inode_init_acl(&ino, owner_uid, owner_gid);
 
     if (mdfs_disk_write_inode(fs->vdrive_id, fs->start_lba, &fs->sb, ino_num, &ino) != 0) return -11;
 
@@ -1415,15 +1412,12 @@ int mdfs_create_file_trunc(int handle, const char *path, int truncate, uint32_t 
     ino.mode = 0x8000;
     ino.link_count = 1;
     
-    // Get current process identity for ACL initialization
+    // Get current process identity
     process_t *proc = process_get_current();
     uint32_t owner_uid = proc ? proc->uid : 0;
     uint32_t owner_gid = proc ? proc->gid : 0;
     ino.uid = owner_uid;
     ino.gid = owner_gid;
-    
-    // Initialize default ACL
-    mdfs_inode_init_acl(&ino, owner_uid, owner_gid);
     
     if (mdfs_disk_write_inode(fs->vdrive_id, fs->start_lba, &fs->sb, ino_num, &ino) != 0) return -8;
     if (mdfs_v2_dir_add(fs, dir_ino, base, ino_num, 1) != 0) return -9;
