@@ -35,7 +35,7 @@ typedef struct __attribute__((packed)) {
     uint64_t indirect1; /* single indirect: block full of uint64_t block numbers */
     uint64_t indirect2; /* double indirect */
     uint64_t indirect3; /* triple indirect */
-    uint64_t indirect4; /* quadruple indirect - supports up to 256 PB files */
+    uint64_t _reserved_indirect; /* reserved for future use */
 
     /* ACL (Access Control List) - 68 bytes */
     uint8_t  acl_count;        /* Number of ACEs (0-16) */

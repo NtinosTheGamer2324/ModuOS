@@ -308,91 +308,6 @@ static uint64_t mdfs_get_block_ptr(const mdfs_fs_t *fs, const mdfs_inode_t *in, 
         mdfs_buffer_release((uint8_t*)lvl3);
         return v;
     }
-    lbn -= (uint64_t)ppb * (uint64_t)ppb * (uint64_t)ppb;
-
-    /* quadruple indirect - supports up to 256 PB files */
-    if (lbn < (uint64_t)ppb * (uint64_t)ppb * (uint64_t)ppb * (uint64_t)ppb) {
-        if (!in->indirect4) return 0;
-        uint64_t *lvl1 = (uint64_t*)mdfs_buffer_acquire();
-        uint64_t *lvl2 = (uint64_t*)mdfs_buffer_acquire();
-        uint64_t *lvl3 = (uint64_t*)mdfs_buffer_acquire();
-        uint64_t *lvl4 = (uint64_t*)mdfs_buffer_acquire();
-        if (!lvl1 || !lvl2 || !lvl3 || !lvl4) {
-            if (lvl1) mdfs_buffer_release((uint8_t*)lvl1);
-            if (lvl2) mdfs_buffer_release((uint8_t*)lvl2);
-            if (lvl3) mdfs_buffer_release((uint8_t*)lvl3);
-            if (lvl4) mdfs_buffer_release((uint8_t*)lvl4);
-            return 0;
-        }
-
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, in->indirect4, lvl1) != VDRIVE_SUCCESS) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return 0;
-        }
-
-        uint64_t ppb2 = (uint64_t)ppb * (uint64_t)ppb;
-        uint64_t ppb3 = ppb2 * (uint64_t)ppb;
-        uint64_t idx1 = lbn / ppb3;
-        uint64_t rem1 = lbn % ppb3;
-        uint64_t idx2 = rem1 / ppb2;
-        uint64_t rem2 = rem1 % ppb2;
-        uint64_t idx3 = rem2 / ppb;
-        uint64_t idx4 = rem2 % ppb;
-
-        if (idx1 >= ppb) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return 0;
-        }
-
-        uint64_t b1 = lvl1[idx1];
-        if (!b1) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return 0;
-        }
-
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, b1, lvl2) != VDRIVE_SUCCESS) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return 0;
-        }
-
-        uint64_t b2 = lvl2[idx2];
-        if (!b2) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return 0;
-        }
-
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, b2, lvl3) != VDRIVE_SUCCESS) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return 0;
-        }
-
-        uint64_t b3 = lvl3[idx3];
-        if (!b3) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return 0;
-        }
-
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, b3, lvl4) != VDRIVE_SUCCESS) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return 0;
-        }
-
-        uint64_t v = lvl4[idx4];
-        mdfs_buffer_release((uint8_t*)lvl1);
-        mdfs_buffer_release((uint8_t*)lvl2);
-        mdfs_buffer_release((uint8_t*)lvl3);
-        mdfs_buffer_release((uint8_t*)lvl4);
-        return v;
-    }
-
     return 0;
 }
 
@@ -701,122 +616,13 @@ static int mdfs_set_block_ptr(const mdfs_fs_t *fs, mdfs_inode_t *in, uint64_t lb
     }
     lbn -= (uint64_t)ppb * (uint64_t)ppb * (uint64_t)ppb;
 
-    /* quadruple indirect - supports up to 256 PB files */
-    if (lbn < (uint64_t)ppb * (uint64_t)ppb * (uint64_t)ppb * (uint64_t)ppb) {
-        if (in->indirect4 == 0) {
-            uint64_t ind = 0;
-            if (mdfs_alloc_block_simple(fs, &ind) != 0) return -24;
-            in->indirect4 = ind;
-            uint8_t *z = mdfs_buffer_acquire();
-            if (!z) return -25;
-            memset(z, 0, MDFS_BLOCK_SIZE);
-            (void)mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, ind, z);
-            mdfs_buffer_release((uint8_t*)z);
-        }
-
-        uint64_t ppb2 = (uint64_t)ppb * (uint64_t)ppb;
-        uint64_t ppb3 = ppb2 * (uint64_t)ppb;
-        uint64_t idx1 = lbn / ppb3;
-        uint64_t rem1 = lbn % ppb3;
-        uint64_t idx2 = rem1 / ppb2;
-        uint64_t rem2 = rem1 % ppb2;
-        uint64_t idx3 = rem2 / ppb;
-        uint64_t idx4 = rem2 % ppb;
-
-        uint64_t *lvl1 = (uint64_t*)mdfs_buffer_acquire();
-        uint64_t *lvl2 = (uint64_t*)mdfs_buffer_acquire();
-        uint64_t *lvl3 = (uint64_t*)mdfs_buffer_acquire();
-        uint64_t *lvl4 = (uint64_t*)mdfs_buffer_acquire();
-        if (!lvl1 || !lvl2 || !lvl3 || !lvl4) {
-            if (lvl1) mdfs_buffer_release((uint8_t*)lvl1);
-            if (lvl2) mdfs_buffer_release((uint8_t*)lvl2);
-            if (lvl3) mdfs_buffer_release((uint8_t*)lvl3);
-            if (lvl4) mdfs_buffer_release((uint8_t*)lvl4);
-            return -26;
-        }
-
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, in->indirect4, lvl1) != VDRIVE_SUCCESS) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return -27;
-        }
-
-        if (lvl1[idx1] == 0) {
-            uint64_t b = 0;
-            if (mdfs_alloc_block_simple(fs, &b) != 0) {
-                mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-                mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-                return -28;
-            }
-            lvl1[idx1] = b;
-            memset(lvl2, 0, MDFS_BLOCK_SIZE);
-            (void)mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, b, lvl2);
-            (void)mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, in->indirect4, lvl1);
-        }
-        uint64_t b1 = lvl1[idx1];
-
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, b1, lvl2) != VDRIVE_SUCCESS) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return -29;
-        }
-
-        if (lvl2[idx2] == 0) {
-            uint64_t b = 0;
-            if (mdfs_alloc_block_simple(fs, &b) != 0) {
-                mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-                mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-                return -30;
-            }
-            lvl2[idx2] = b;
-            memset(lvl3, 0, MDFS_BLOCK_SIZE);
-            (void)mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, b, lvl3);
-            (void)mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, b1, lvl2);
-        }
-        uint64_t b2 = lvl2[idx2];
-
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, b2, lvl3) != VDRIVE_SUCCESS) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return -31;
-        }
-
-        if (lvl3[idx3] == 0) {
-            uint64_t b = 0;
-            if (mdfs_alloc_block_simple(fs, &b) != 0) {
-                mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-                mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-                return -32;
-            }
-            lvl3[idx3] = b;
-            memset(lvl4, 0, MDFS_BLOCK_SIZE);
-            (void)mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, b, lvl4);
-            (void)mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, b2, lvl3);
-        }
-        uint64_t b3 = lvl3[idx3];
-
-        if (mdfs_disk_read_block(fs->vdrive_id, fs->start_lba, b3, lvl4) != VDRIVE_SUCCESS) {
-            mdfs_buffer_release((uint8_t*)lvl1); mdfs_buffer_release((uint8_t*)lvl2);
-            mdfs_buffer_release((uint8_t*)lvl3); mdfs_buffer_release((uint8_t*)lvl4);
-            return -33;
-        }
-
-        lvl4[idx4] = pblk;
-        int rc = mdfs_disk_write_block(fs->vdrive_id, fs->start_lba, b3, lvl4);
-        mdfs_buffer_release((uint8_t*)lvl1);
-        mdfs_buffer_release((uint8_t*)lvl2);
-        mdfs_buffer_release((uint8_t*)lvl3);
-        mdfs_buffer_release((uint8_t*)lvl4);
-        return (rc == VDRIVE_SUCCESS) ? 0 : -34;
-    }
-
-    return -35;
+    return -18;
 }
 
 static int mdfs_free_indirect_chain_accum(const mdfs_fs_t *fs, uint64_t ind_blk, int level, mdfs_free_accum_t *a) {
     if (!fs) return -1;
     if (!ind_blk) return 0;
-    if (level < 1 || level > 3) return -2;
+    if (level < 1 || level > 3) return -2; /* max level 3 (triple indirect) */
 
     uint32_t ppb = MDFS_PTRS_PER_BLOCK;
     uint64_t *tbl = (uint64_t*)mdfs_buffer_acquire();
@@ -1188,7 +994,6 @@ int mdfs_unlink_by_path(int handle, const char *path) {
     if (fin.indirect1) (void)mdfs_free_indirect_chain_accum(fs, fin.indirect1, 1, &acc);
     if (fin.indirect2) (void)mdfs_free_indirect_chain_accum(fs, fin.indirect2, 2, &acc);
     if (fin.indirect3) (void)mdfs_free_indirect_chain_accum(fs, fin.indirect3, 3, &acc);
-    if (fin.indirect4) (void)mdfs_free_indirect_chain_accum(fs, fin.indirect4, 4, &acc);
 
     (void)mdfs_free_accum_flush(fs, &acc);
 
@@ -1258,7 +1063,6 @@ int mdfs_rmdir_by_path(int handle, const char *path) {
     if (din.indirect1) (void)mdfs_free_indirect_chain_accum(fs, din.indirect1, 1, &acc);
     if (din.indirect2) (void)mdfs_free_indirect_chain_accum(fs, din.indirect2, 2, &acc);
     if (din.indirect3) (void)mdfs_free_indirect_chain_accum(fs, din.indirect3, 3, &acc);
-    if (din.indirect4) (void)mdfs_free_indirect_chain_accum(fs, din.indirect4, 4, &acc);
 
     (void)mdfs_free_accum_flush(fs, &acc);
 
