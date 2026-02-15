@@ -185,6 +185,9 @@ int mdfs_mount(int vdrive_id, uint32_t start_lba) {
     if (!buf) return -1;
     memset(buf, 0, MDFS_BLOCK_SIZE);
 
+    com_printf(COM1_PORT, "[MDFS] mount: reading superblock from block 1 (LBA %u)\n", 
+               (unsigned)(start_lba + (1 * (MDFS_BLOCK_SIZE/512u))));
+
     if (mdfs_read_block(vdrive_id, start_lba, 1, buf) != VDRIVE_SUCCESS) {
         com_write_string(COM1_PORT, "[MDFS] mount: read_block failed\n");
         mdfs_buffer_release((uint8_t*)buf);
@@ -508,11 +511,15 @@ int mdfs_mkfs(int vdrive_id, uint32_t start_lba, uint32_t sectors, const char *l
     sb.checksum = mdfs_crc32(&sb, sizeof(sb));
     memset(blk, 0, MDFS_BLOCK_SIZE);
     memcpy(blk, &sb, sizeof(sb));
-    if (vdrive_write((uint8_t)vdrive_id, (uint64_t)start_lba + (uint64_t)(1 * (MDFS_BLOCK_SIZE/512u)), (MDFS_BLOCK_SIZE/512u), blk) != VDRIVE_SUCCESS) { 
+    
+    com_printf(COM1_PORT, "[MDFS] mkfs: writing superblock to block 1 (LBA %u)\n", 
+               (unsigned)(start_lba + (1 * (MDFS_BLOCK_SIZE/512u))));
+    
+    if (mdfs_write_block(vdrive_id, start_lba, 1, blk) != VDRIVE_SUCCESS) { 
         mdfs_buffer_release(blk);
         return -14;
     }
-    if (vdrive_write((uint8_t)vdrive_id, (uint64_t)start_lba + (uint64_t)(2 * (MDFS_BLOCK_SIZE/512u)), (MDFS_BLOCK_SIZE/512u), blk) != VDRIVE_SUCCESS) { 
+    if (mdfs_write_block(vdrive_id, start_lba, 2, blk) != VDRIVE_SUCCESS) { 
         mdfs_buffer_release(blk);
         return -15;
     }
