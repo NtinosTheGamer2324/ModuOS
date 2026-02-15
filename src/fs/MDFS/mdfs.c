@@ -25,16 +25,13 @@ static uint32_t mdfs_crc32(const void *data, size_t len) {
     return ~crc;
 }
 
+/* Use disk I/O functions from mdfs_disk.c to ensure consistency */
 static int mdfs_read_block(int vdrive_id, uint32_t start_lba, uint64_t block_no, void *out) {
-    uint64_t lba = (uint64_t)start_lba + (block_no * (uint64_t)(MDFS_BLOCK_SIZE / 512u));
-    uint32_t count = MDFS_BLOCK_SIZE / 512u;
-    return vdrive_read((uint8_t)vdrive_id, lba, count, out);
+    return mdfs_disk_read_block(vdrive_id, start_lba, block_no, out);
 }
 
 static int mdfs_write_block(int vdrive_id, uint32_t start_lba, uint64_t block_no, const void *in) {
-    uint64_t lba = (uint64_t)start_lba + (block_no * (uint64_t)(MDFS_BLOCK_SIZE / 512u));
-    uint32_t count = MDFS_BLOCK_SIZE / 512u;
-    return vdrive_write((uint8_t)vdrive_id, lba, count, in);
+    return mdfs_disk_write_block(vdrive_id, start_lba, block_no, in);
 }
 
 static uint64_t mdfs_meta_end(const mdfs_superblock_t *sb) {
