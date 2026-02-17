@@ -169,6 +169,14 @@ void schedule(void);
 void scheduler_tick(void);
 void scheduler_request_reschedule(void);
 int  scheduler_take_reschedule(void);
+uint64_t scheduler_get_min_vruntime(void);
+uint32_t scheduler_nice_to_weight(int nice);
+uint64_t scheduler_get_clock_ticks(void);
+void debug_print_ready_queue(void);
+
+/* Internal process management helpers */
+void set_curproc(process_t *p);
+void do_switch_and_reap(process_t *old, process_t *newp);
 
 /* Free user-space mappings tracked by process (image/heap/mmap/stack). */
 void process_free_user_memory(struct process *p);
