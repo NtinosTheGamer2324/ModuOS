@@ -51,6 +51,7 @@ typedef enum {
     THEME_EUROPE,
     THEME_NORTH_AMERICA,
     THEME_SOUTH_AMERICA,
+    THEME_TEXTMODE,
     THEME_COUNT
 } Theme;
 
@@ -175,6 +176,17 @@ static const uint32_t THEME_COLORS[THEME_COUNT][8] = {
         0xFFFF0000, // Z (Red)
         0xFF002776, // J (Blue)
         0xFFFFDF00  // L (Yellow)
+    },
+    // THEME_TEXTMODE - Original Tetris monochrome style
+    {
+        0xFF000000, // Empty (Black)
+        0xFFCCCCCC, // I (Light Gray)
+        0xFFCCCCCC, // O (Light Gray)
+        0xFFCCCCCC, // T (Light Gray)
+        0xFFCCCCCC, // S (Light Gray)
+        0xFFCCCCCC, // Z (Light Gray)
+        0xFFCCCCCC, // J (Light Gray)
+        0xFFCCCCCC  // L (Light Gray)
     }
 };
 
@@ -189,7 +201,8 @@ static const char* THEME_NAMES[THEME_COUNT] = {
     "Japan",
     "Europe",
     "North America",
-    "South America"
+    "South America",
+    "Textmode"
 };
 
 static Theme current_theme = THEME_CLASSIC;
@@ -207,6 +220,7 @@ static fnt_font_t *game_font = NULL;
 
 typedef enum {
     STATE_MENU,
+    STATE_LOBBY,
     STATE_PLAYING,
     STATE_GAME_OVER,
     STATE_PAUSED
@@ -301,6 +315,7 @@ typedef struct {
 static float cosf_approx(float x) { return 1.0f - x*x/2.0f; }
 static float sinf_approx(float x) { return x; }
 
+
 typedef struct {
     int board[BOARD_HEIGHT][BOARD_WIDTH];
     int current_piece;
@@ -348,12 +363,16 @@ static int selected_mode = 0;
 static int selected_theme = 0;
 static int selected_challenge = 0;
 
+#define MAX_PLAYERS 4
+
 // Multiplayer states
-static PlayerState player1;
-static PlayerState player2;
-static int mp_winner = 0; // 0=none, 1=p1, 2=p2
-static char player1_name[32] = "Player 1";
-static char player2_name[32] = "Player 2";
+static PlayerState players[MAX_PLAYERS];
+static int num_players = 2; // Default 2 players
+static int mp_winner = 0; // 0=none, 1-4=player number
+static char player_names[MAX_PLAYERS][32] = {
+    "Player 1", "Player 2", "Player 3", "Player 4"
+};
+
 
 
 static int chaos_timer = 0;
@@ -766,6 +785,22 @@ int mp_get_ghost_y(PlayerState *p) {
 void draw_block(Gfx *g, int x, int y, uint32_t color) {
     int px = OFFSET_X + x * BLOCK_SIZE;
     int py = OFFSET_Y + y * BLOCK_SIZE;
+    
+    if (current_theme == THEME_TEXTMODE) {
+        // Textmode: ASCII-style blocks with thick borders
+        if (color == COLORS[0]) {
+            // Empty cell - just black
+            gfx_fill_rect(g, px, py, BLOCK_SIZE, BLOCK_SIZE, 0xFF000000);
+        } else {
+            // Filled cell - light gray with thick black border (like [])
+            gfx_fill_rect(g, px, py, BLOCK_SIZE, BLOCK_SIZE, 0xFF000000);
+            gfx_fill_rect(g, px + 2, py + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4, color);
+            // Add inner border for ASCII effect
+            gfx_fill_rect(g, px + 3, py + 3, BLOCK_SIZE - 6, BLOCK_SIZE - 6, 0xFF000000);
+            gfx_fill_rect(g, px + 4, py + 4, BLOCK_SIZE - 8, BLOCK_SIZE - 8, color);
+        }
+        return;
+    }
     
     if (color == COLORS[0]) {
         gfx_fill_rect(g, px, py, BLOCK_SIZE, BLOCK_SIZE, 0xFF0A0A0A);
@@ -1197,6 +1232,27 @@ void draw_board(Gfx *g) {
     }
     
     switch (current_theme) {
+        case THEME_TEXTMODE: {
+            // Retro text-mode style background
+            gfx_fill_rect(g, 0, 0, g->vi.width, g->vi.height, 0xFF000000);
+            
+            // Draw heavy grid lines like ASCII art
+            for (int x = 0; x <= BOARD_WIDTH; x++) {
+                int px = OFFSET_X + x * BLOCK_SIZE;
+                gfx_fill_rect(g, px, OFFSET_Y, 1, BOARD_HEIGHT * BLOCK_SIZE, 0xFF444444);
+            }
+            for (int y = 0; y <= BOARD_HEIGHT; y++) {
+                int py = OFFSET_Y + y * BLOCK_SIZE;
+                gfx_fill_rect(g, OFFSET_X, py, BOARD_WIDTH * BLOCK_SIZE, 1, 0xFF444444);
+            }
+            
+            // CRT scanlines effect
+            for (uint32_t y = 0; y < g->vi.height; y += 2) {
+                gfx_fill_rect(g, 0, y, g->vi.width, 1, 0x20000000);
+            }
+            
+            break;
+        }
         case THEME_RUSSIA: {
             for (int y = 0; y < g->vi.height; y += 3) {
                 gfx_fill_rect(g, 0, y, g->vi.width, 2, 0xFF1A0A0A);
@@ -1545,10 +1601,21 @@ void draw_menu_piece(Gfx *g, MenuPiece *mp) {
 }
 
 void draw_menu(Gfx *g) {
-    gfx_fill_rect(g, 0, 0, g->vi.width, g->vi.height, 0xFF000000);
+    // Animated gradient background
+    static uint32_t bg_anim = 0;
+    bg_anim++;
     
-    for (uint32_t y = 0; y < g->vi.height; y += 4) {
-        gfx_fill_rect(g, 0, y, g->vi.width, 2, 0xFF0A0A0A);
+    for (uint32_t y = 0; y < g->vi.height; y++) {
+        uint8_t r = (uint8_t)((y + bg_anim / 2) % 60);
+        uint8_t g_val = (uint8_t)((y * 2 + bg_anim / 3) % 40);
+        uint8_t b = (uint8_t)((y + bg_anim) % 80);
+        uint32_t color = 0xFF000000 | (r << 16) | (g_val << 8) | b;
+        gfx_fill_rect(g, 0, y, g->vi.width, 1, color);
+    }
+    
+    // Scanlines for depth
+    for (uint32_t y = 0; y < g->vi.height; y += 3) {
+        gfx_fill_rect(g, 0, y, g->vi.width, 1, 0x30000000);
     }
     
     for (int i = 0; i < MAX_MENU_PIECES; i++) {
@@ -1910,16 +1977,31 @@ int md_main(long argc, char **argv) {
                         }
                     } else if (kc == KEY_ENTER || ch == ' ') {
                         current_mode = selected_mode;
+                        current_challenge = selected_challenge;
                         if (current_mode == MODE_MULTIPLAYER) {
-                            init_player_state(&player1);
-                            init_player_state(&player2);
-                            mp_winner = 0;
+                            game_state = STATE_LOBBY;
                         } else {
                             init_game();
+                            game_state = STATE_PLAYING;
                         }
-                        game_state = STATE_PLAYING;
                     } else if (kc == KEY_ESCAPE || ch == 0x1b) {
                         quit = 1;
+                    }
+                } else if (game_state == STATE_LOBBY) {
+                    // Lobby input - player count selection
+                    if (kc == KEY_ARROW_UP && num_players < MAX_PLAYERS) {
+                        num_players++;
+                    } else if (kc == KEY_ARROW_DOWN && num_players > 2) {
+                        num_players--;
+                    } else if (kc == KEY_ENTER || ch == ' ') {
+                        // Start multiplayer game
+                        for (int i = 0; i < num_players; i++) {
+                            init_player_state(&players[i]);
+                        }
+                        mp_winner = 0;
+                        game_state = STATE_PLAYING;
+                    } else if (kc == KEY_ESCAPE || ch == 0x1b) {
+                        game_state = STATE_MENU;
                     }
                 } else if (game_state == STATE_PAUSED) {
                     if (ch == 'p' || ch == 'P') {
@@ -1929,7 +2011,15 @@ int md_main(long argc, char **argv) {
                         game_over = 0;
                         mp_winner = 0;
                     }
-                } else if (game_state == STATE_PLAYING && current_mode != MODE_MULTIPLAYER && !game_over) {
+                } else if (game_state == STATE_PLAYING && current_mode != MODE_MULTIPLAYER) {
+                    // Handle input during game over
+                    if (game_over) {
+                        if (ch == 'r' || ch == 'R') {
+                            init_game();
+                        } else if (kc == KEY_ESCAPE || ch == 0x1b) {
+                            game_state = STATE_MENU;
+                        }
+                    } else {
                     // Single-player input
                     if (kc == KEY_ARROW_LEFT || ch == 'a' || ch == 'A') {
                         if (!check_collision(current_piece, current_rotation, current_x - 1, current_y)) {
@@ -1958,8 +2048,22 @@ int md_main(long argc, char **argv) {
                         game_state = STATE_PAUSED;
                     } else if (kc == KEY_ESCAPE || ch == 0x1b) {
                         game_state = STATE_MENU;
+                    } else if (ch == 'r' || ch == 'R') {
+                        init_game();
+                    }
                     }
                 } else if (current_mode == MODE_MULTIPLAYER && game_state == STATE_PLAYING) {
+                    // Handle input when game is over (winner declared)
+                    if (mp_winner != 0) {
+                        if (ch == 'r' || ch == 'R') {
+                            init_player_state(&player1);
+                            init_player_state(&player2);
+                            mp_winner = 0;
+                        } else if (kc == KEY_ESCAPE || ch == 0x1b) {
+                            game_state = STATE_MENU;
+                            mp_winner = 0;
+                        }
+                    } else {
                     // Multiplayer input - Player 1
                     if (ch == 'a' || ch == 'A') {
                         if (!mp_check_collision(&player1, player1.current_piece, player1.current_rotation, player1.current_x - 1, player1.current_y)) {
@@ -2018,10 +2122,14 @@ int md_main(long argc, char **argv) {
                     } else if (kc == KEY_ESCAPE || ch == 0x1b) {
                         game_state = STATE_MENU;
                         mp_winner = 0;
+                    } else if (ch == 'r' || ch == 'R') {
+                        init_player_state(&player1);
+                        init_player_state(&player2);
+                        mp_winner = 0;
+                    }
                     }
                 }
                 
-            } // end if (ev.type == EVENT_KEY_PRESSED)
         } // end while read events
         
         uint64_t now = time_ms();
@@ -2189,7 +2297,7 @@ int md_main(long argc, char **argv) {
         
         yield();
     }
-
+    
     printf("\nExiting...\n");
     input_flush();
 
