@@ -108,7 +108,7 @@ static void cfs_dequeue_process(process_t *proc) {
 }
 
 static void cfs_update_curr(process_t *cp, uint64_t delta_exec) {
-    if (!cp || cp->pid == 0) return;
+    if (!cp) return;
     if (delta_exec == 0) return;
     cp->sum_exec_runtime += delta_exec;
     uint64_t vruntime_delta = (delta_exec * NICE_0_LOAD) / (cp->weight ? cp->weight : NICE_0_LOAD);
@@ -203,14 +203,12 @@ void scheduler_tick(void) {
     process_t *cp = process_get_current();
     if (!cp) return;
 
-    if (cp->pid != 0) {
-        uint64_t delta = sched_clock_ticks - cp->exec_start;
-        cfs_update_curr(cp, delta);
-        cp->exec_start = sched_clock_ticks;
-        uint64_t slice = cfs_calc_slice(cp);
-        if (delta >= slice) {
-            scheduler_request_reschedule();
-        }
+    uint64_t delta = sched_clock_ticks - cp->exec_start;
+    cfs_update_curr(cp, delta);
+    cp->exec_start = sched_clock_ticks;
+    uint64_t slice = cfs_calc_slice(cp);
+    if (delta >= slice) {
+        scheduler_request_reschedule();
     }
 }
 
