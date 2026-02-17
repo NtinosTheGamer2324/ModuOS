@@ -219,14 +219,12 @@ void keyboard_irq_handler() {
     // Handle extended scancode prefix (0xE0)
     if (scancode == 0xE0) {
         extended = true;
-        pic_send_eoi(1);
         return;
     }
 
     // Handle break code prefix (0xF0)
     if (scancode == 0xF0) {
         break_code = true;
-        pic_send_eoi(1);
         return;
     }
 
@@ -268,7 +266,6 @@ void keyboard_irq_handler() {
         shifted = !break_code;
         break_code = false;
         extended = false;
-        pic_send_eoi(1);
         return;
     }
 
@@ -276,7 +273,6 @@ void keyboard_irq_handler() {
     if (break_code) {
         break_code = false;
         extended = false;
-        pic_send_eoi(1);
         return;
     }
 
@@ -286,7 +282,6 @@ void keyboard_irq_handler() {
     // Character/line editing is handled in input subsystem (via DEVFS).
     (void)c;
     extended = false;
-    pic_send_eoi(1);
 }
 
 // --------- New function to get current PS/2 scancode set ---------
