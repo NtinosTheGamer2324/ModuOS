@@ -159,7 +159,6 @@ static void update_curr(process_t *p, uint64_t delta_ns) {
 // Main scheduler function - pick next process to run
 void schedule(void) {
     if (!scheduler_enabled) {
-        com_write_string(COM1_PORT, "[SCHED] Scheduler not enabled\n");
         return;
     }
     
@@ -168,43 +167,17 @@ void schedule(void) {
     process_t *prev = current;
     process_t *next = NULL;
     
-    com_write_string(COM1_PORT, "[SCHED] schedule() called, current PID=");
-    if (prev) {
-        char buf[16];
-        itoa(prev->pid, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, " state=");
-        itoa(prev->state, buf, 10);
-        com_write_string(COM1_PORT, buf);
-    } else {
-        com_write_string(COM1_PORT, "NULL");
-    }
-    com_write_string(COM1_PORT, "\n");
-    
     // If current process is still runnable, add it back to queue
     if (prev && prev->state == PROCESS_STATE_RUNNING) {
         prev->state = PROCESS_STATE_RUNNABLE;
         scheduler_add_locked(prev);  // Use _locked version since we hold the lock
-        com_write_string(COM1_PORT, "[SCHED] Added prev process back to queue\n");
     }
     
     // Pick next task
     next = pick_next_task();
     
-    com_write_string(COM1_PORT, "[SCHED] pick_next_task returned ");
-    if (next) {
-        char buf[16];
-        com_write_string(COM1_PORT, "PID=");
-        itoa(next->pid, buf, 10);
-        com_write_string(COM1_PORT, buf);
-    } else {
-        com_write_string(COM1_PORT, "NULL");
-    }
-    com_write_string(COM1_PORT, "\n");
-    
     if (!next) {
         // No runnable tasks, switch to idle (PID 0)
-        com_write_string(COM1_PORT, "[SCHED] No runnable tasks, finding idle (PID 0)\n");
         next = process_find(0);
     }
     
@@ -213,36 +186,14 @@ void schedule(void) {
         next->state = PROCESS_STATE_RUNNING;
         next->exec_start = 0;  // Will be set by scheduler_tick
         current = next;
-        
-        com_write_string(COM1_PORT, "[SCHED] Selected next PID=");
-        char buf[16];
-        itoa(next->pid, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, "\n");
     }
     
     spinlock_release(&sched_lock);
     
     // Context switch if needed
     if (prev != next && next) {
-        com_write_string(COM1_PORT, "[SCHED] Context switching from ");
-        if (prev) {
-            char buf[16];
-            itoa(prev->pid, buf, 10);
-            com_write_string(COM1_PORT, buf);
-        } else {
-            com_write_string(COM1_PORT, "NULL");
-        }
-        com_write_string(COM1_PORT, " to ");
-        char buf[16];
-        itoa(next->pid, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, "\n");
-        
         extern void switch_to(process_t *prev, process_t *next);
         switch_to(prev, next);
-    } else {
-        com_write_string(COM1_PORT, "[SCHED] No context switch needed (prev == next)\n");
     }
 }
 
