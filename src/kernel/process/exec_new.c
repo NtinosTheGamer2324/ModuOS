@@ -179,4 +179,9 @@ int do_exec(const char *path, char **argv, char **envp) {
     char hex_buf[20];
     utoa((uint32_t)(entry_point >> 32), hex_buf, 16);
     com_write_string(COM1_PORT, hex_buf);
-    utoa((uint32_t)(entry_point & 0xFFFFFFFF), he
+    utoa((uint32_t)(entry_point & 0xFFFFFFFF), hex_buf, 16);
+    com_write_string(COM1_PORT, hex_buf);
+    com_write_string(COM1_PORT, "\n");
+    
+    return 0;
+}
