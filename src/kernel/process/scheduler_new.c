@@ -49,11 +49,9 @@ void scheduler_init(void) {
     com_write_string(COM1_PORT, "[SCHED] CFS scheduler initialized\n");
 }
 
-// Add process to run queue (sorted by vruntime)
-void scheduler_add(process_t *p) {
+// Internal add (lock must be held by caller)
+static void scheduler_add_locked(process_t *p) {
     if (!p) return;
-    
-    spinlock_acquire(&sched_lock);
     
     // Set weight if not set
     if (p->weight == 0) {
@@ -98,15 +96,20 @@ void scheduler_add(process_t *p) {
     }
     
     p->state = PROCESS_STATE_RUNNABLE;
-    
-    spinlock_release(&sched_lock);
 }
 
-// Remove process from run queue
-void scheduler_remove(process_t *p) {
+// Add process to run queue (sorted by vruntime)
+void scheduler_add(process_t *p) {
     if (!p) return;
     
     spinlock_acquire(&sched_lock);
+    scheduler_add_locked(p);
+    spinlock_release(&sched_lock);
+}
+
+// Internal remove (lock must be held by caller)
+static void scheduler_remove_locked(process_t *p) {
+    if (!p) return;
     
     if (p->sched_prev) {
         p->sched_prev->sched_next = p->sched_next;
@@ -121,7 +124,14 @@ void scheduler_remove(process_t *p) {
     }
     
     p->sched_next = p->sched_prev = NULL;
+}
+
+// Remove process from run queue
+void scheduler_remove(process_t *p) {
+    if (!p) return;
     
+    spinlock_acquire(&sched_lock);
+    scheduler_remove_locked(p);
     spinlock_release(&sched_lock);
 }
 
@@ -174,7 +184,7 @@ void schedule(void) {
     // If current process is still runnable, add it back to queue
     if (prev && prev->state == PROCESS_STATE_RUNNING) {
         prev->state = PROCESS_STATE_RUNNABLE;
-        scheduler_add(prev);
+        scheduler_add_locked(prev);  // Use _locked version since we hold the lock
         com_write_string(COM1_PORT, "[SCHED] Added prev process back to queue\n");
     }
     
@@ -199,7 +209,7 @@ void schedule(void) {
     }
     
     if (next) {
-        scheduler_remove(next);
+        scheduler_remove_locked(next);  // Use _locked version since we hold the lock
         next->state = PROCESS_STATE_RUNNING;
         next->exec_start = 0;  // Will be set by scheduler_tick
         current = next;

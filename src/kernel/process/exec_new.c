@@ -143,7 +143,9 @@ int do_exec(const char *path, char **argv, char **envp) {
     
     com_write_string(COM1_PORT, "[EXEC] Loaded, entry point: 0x");
     char hex_buf[20];
-    snprintf(hex_buf, sizeof(hex_buf), "%016llx", (unsigned long long)entry_point);
+    utoa((uint32_t)(entry_point >> 32), hex_buf, 16);
+    com_write_string(COM1_PORT, hex_buf);
+    utoa((uint32_t)(entry_point & 0xFFFFFFFF), hex_buf, 16);
     com_write_string(COM1_PORT, hex_buf);
     com_write_string(COM1_PORT, "\n");
     
