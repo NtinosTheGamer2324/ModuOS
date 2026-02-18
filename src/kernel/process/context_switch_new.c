@@ -33,32 +33,7 @@ static inline uint64_t stack_top(void *stack_base) {
 // High-level context switch
 void switch_to(process_t *prev, process_t *next) {
     if (!next) {
-        com_write_string(COM1_PORT, "[SWITCH] ERROR: next is NULL\n");
         return;
-    }
-    
-    // Debug output
-    static int switch_count = 0;
-    switch_count++;
-    if (switch_count <= 20) {  // Increased from 10 to 20
-        com_write_string(COM1_PORT, "[SWITCH] Context switch #");
-        char buf[16];
-        itoa(switch_count, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        if (prev) {
-            com_write_string(COM1_PORT, " from PID ");
-            itoa(prev->pid, buf, 10);
-            com_write_string(COM1_PORT, buf);
-        } else {
-            com_write_string(COM1_PORT, " from NULL");
-        }
-        com_write_string(COM1_PORT, " to PID ");
-        itoa(next->pid, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, " RIP=0x");
-        snprintf(buf, sizeof(buf), "%llx", (unsigned long long)next->context.rip);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, "\n");
     }
     
     // Disable interrupts during critical transition
