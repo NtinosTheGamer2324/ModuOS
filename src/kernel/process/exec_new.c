@@ -31,7 +31,11 @@ static inline uint64_t alloc_physical_page(void) {
 static inline void map_user_page(uint64_t cr3, uint64_t vaddr, uint64_t paddr, int writable) {
     uint64_t flags = 0x07;  // Present, R/W, User
     if (!writable) flags &= ~0x02;  // Clear write bit
-    uint64_t *pml4_virt = (uint64_t *)(cr3 + 0xFFFF800000000000ULL);  // Convert phys to virt
+    
+    // Use phys_to_virt_kernel to properly convert CR3 physical address to virtual
+    extern void *phys_to_virt_kernel(uint64_t phys);
+    uint64_t *pml4_virt = (uint64_t *)phys_to_virt_kernel(cr3);
+    
     paging_map_range_to_pml4(pml4_virt, vaddr, paddr, 0x1000, flags);
 }
 
@@ -123,9 +127,39 @@ int do_exec(const char *path, char **argv, char **envp) {
     
     // Update process fields
     current->entry_point = entry_point;
-    current->user_sp = USER_STACK_TOP;
     current->user_image_base = image_base;
     current->user_image_end = image_end;
+    
+    // Allocate and map user stack
+    com_write_string(COM1_PORT, "[EXEC] Allocating user stack\n");
+    uint64_t stack_pages = USER_STACK_SIZE / 0x1000;  // Number of 4KB pages
+    uint64_t stack_base = USER_STACK_TOP - USER_STACK_SIZE;
+    
+    // Get process CR3 (create if needed)
+    if (!current->cr3) {
+        current->cr3 = create_user_page_table();
+        if (!current->cr3) {
+            com_write_string(COM1_PORT, "[EXEC] Failed to create page table\n");
+            kfree(file_data);
+            return -1;
+        }
+        com_write_string(COM1_PORT, "[EXEC] Created user page table\n");
+    }
+    
+    // Allocate and map stack pages
+    for (uint64_t i = 0; i < stack_pages; i++) {
+        uint64_t vaddr = stack_base + (i * 0x1000);
+        uint64_t paddr = alloc_physical_page();
+        if (!paddr) {
+            com_write_string(COM1_PORT, "[EXEC] Failed to allocate stack page\n");
+            kfree(file_data);
+            return -1;
+        }
+        map_user_page(current->cr3, vaddr, paddr, 1);  // writable
+    }
+    
+    current->user_sp = USER_STACK_TOP;
+    com_write_string(COM1_PORT, "[EXEC] User stack allocated and mapped\n");
     
     // Set up CPU context for user mode entry
     memset(&current->context, 0, sizeof(cpu_context_t));
@@ -145,9 +179,4 @@ int do_exec(const char *path, char **argv, char **envp) {
     char hex_buf[20];
     utoa((uint32_t)(entry_point >> 32), hex_buf, 16);
     com_write_string(COM1_PORT, hex_buf);
-    utoa((uint32_t)(entry_point & 0xFFFFFFFF), hex_buf, 16);
-    com_write_string(COM1_PORT, hex_buf);
-    com_write_string(COM1_PORT, "\n");
-    
-    return 0;
-}
+    utoa((uint32_t)(entry_point & 0xFFFFFFFF), he
