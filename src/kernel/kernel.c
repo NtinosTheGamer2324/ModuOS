@@ -622,9 +622,11 @@ void kernel_main(uint64_t mb2_ptr)
     schedule();
     
     com_write_string(COM1_PORT, "[KERNEL] Back from schedule(), entering idle loop...\n");
+    com_write_string(COM1_PORT, "[KERNEL] Idle loop will wait for timer to schedule init\n");
     
     /* PID 0 (kernel) becomes the idle loop */
     for (;;) {
+        schedule();  // Explicitly call schedule periodically
         __asm__ volatile("hlt");
     }
 }
