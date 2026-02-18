@@ -1,6 +1,7 @@
 #include "moduos/kernel/exec.h"
 #include "moduos/kernel/COM/com.h"
-#include "moduos/kernel/process/process.h"
+// #include "moduos/kernel/process/process.h"  // OLD
+#include "moduos/kernel/process/process_new.h"
 #include "moduos/fs/hvfs.h"
 #include "moduos/fs/fs.h"
 #include "moduos/fs/devfs.h"
@@ -61,7 +62,9 @@ static void strip_comments_inplace(char *line, int *in_block_comment) {
             continue;
         }
         if (in[0] == '/' && in[1] == '/') {
-            break; // line comment
+            if (in == line || is_space(in[-1])) {
+                break; // line comment only if at start or after whitespace
+            }
         }
         *out++ = *in++;
     }
@@ -177,27 +180,20 @@ static void wait_for_pid(uint32_t pid) {
     }
 }
 
-void kernel_run_autostart(int boot_slot) {
-    void *buf = NULL;
-    size_t sz = 0;
+static int g_autostart_boot_slot = -1;
+static char *g_autostart_text = NULL;
 
-    int rc = hvfs_read(boot_slot, AUTOSTART_PATH, &buf, &sz);
-    if (rc != 0 || !buf || sz == 0) {
-        com_write_string(COM1_PORT, "[AUTO] no autostart list\n");
+void autostart_process_entry(void) {
+    int boot_slot = g_autostart_boot_slot;
+    char *text = g_autostart_text;
+    
+    if (!text) {
+        com_write_string(COM1_PORT, "[AUTO] no autostart text\n");
+        process_exit(0);
         return;
     }
 
     fs_mount_t *boot_mount = fs_get_mount(boot_slot);
-
-    // Ensure NUL terminated
-    char *text = (char*)kmalloc(sz + 1);
-    if (!text) {
-        hvfs_free(boot_slot, AUTOSTART_PATH, buf);
-        return;
-    }
-    for (size_t i = 0; i < sz; i++) text[i] = ((char*)buf)[i];
-    text[sz] = 0;
-    hvfs_free(boot_slot, AUTOSTART_PATH, buf);
 
     com_write_string(COM1_PORT, "[AUTO] running autostart entries\n");
 
@@ -380,4 +376,48 @@ void kernel_run_autostart(int boot_slot) {
     }
 
     kfree(text);
+    g_autostart_text = NULL;
+    
+    com_write_string(COM1_PORT, "[AUTO] autostart process complete\n");
+    process_exit(0);
+}
+
+void kernel_run_autostart(int boot_slot) {
+    void *buf = NULL;
+    size_t sz = 0;
+
+    int rc = hvfs_read(boot_slot, AUTOSTART_PATH, &buf, &sz);
+    if (rc != 0 || !buf || sz == 0) {
+        com_write_string(COM1_PORT, "[AUTO] no autostart list\n");
+        return;
+    }
+
+    // Ensure NUL terminated
+    char *text = (char*)kmalloc(sz + 1);
+    if (!text) {
+        hvfs_free(boot_slot, AUTOSTART_PATH, buf);
+        return;
+    }
+    for (size_t i = 0; i < sz; i++) text[i] = ((char*)buf)[i];
+    text[sz] = 0;
+    hvfs_free(boot_slot, AUTOSTART_PATH, buf);
+
+    // Store in globals for autostart process
+    g_autostart_boot_slot = boot_slot;
+    g_autostart_text = text;
+
+    // Create autostart as a kernel process
+    process_t *autostart_proc = process_create("autostart", autostart_process_entry, 5);
+    if (!autostart_proc) {
+        com_write_string(COM1_PORT, "[AUTO] Failed to create autostart process\n");
+        kfree(text);
+        g_autostart_text = NULL;
+        return;
+    }
+
+    com_write_string(COM1_PORT, "[AUTO] autostart process created (PID ");
+    char pidbuf[16];
+    itoa(autostart_proc->pid, pidbuf, 10);
+    com_write_string(COM1_PORT, pidbuf);
+    com_write_string(COM1_PORT, ")\n");
 }

@@ -49,7 +49,7 @@ int md_main(long argc, char **argv) {
     append_str(req, sizeof(req), ":");
     append_str(req, sizeof(req), uid_str);
 
-    int fd = open(USERMAN_DEV_ADD, O_RDWR, 0);
+    int fd = open(USERMAN_NODE_ADD, O_RDWR, 0);
     if (fd < 0) {
         printf("adduser: userman not available\n");
         return 2;

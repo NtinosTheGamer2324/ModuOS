@@ -160,7 +160,7 @@ retry:
     int target_uid = -1;
 
     // authenticate via userman devfs
-    int authfd = open(USERMAN_DEV_AUTH, O_RDWR, 0);
+    int authfd = open("$/user/users/auth", O_RDWR, 0);
     if (authfd < 0) {
         puts_raw("login: userman not available\n");
         goto retry;

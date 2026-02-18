@@ -24,15 +24,26 @@
 #define PHYS_TO_VIRT(addr) ((uint64_t)(addr) + HIGHER_HALF_OFFSET)
 #define VIRT_TO_PHYS(addr) ((uint64_t)(addr) - HIGHER_HALF_OFFSET)
 
-static process_t *process_table[MAX_PROCESSES];
-static process_t *current_process = NULL; /* legacy; BSP init uses per-CPU field */
-static process_t *ready_queue_head = NULL;
+/* Process table management moved to process_table.c */
+extern process_t **get_process_table(void);
+extern uint32_t process_alloc_pid(void);
+extern int process_register(process_t *proc);
+extern int process_unregister(uint32_t pid);
+extern process_t *process_get_by_pid(uint32_t pid);
+extern void process_table_init(void);
 
-static spinlock_t sched_lock __attribute__((aligned(64)));
-static rwlock_t process_table_rwlock __attribute__((aligned(64)));  /* RWLock for process_table (read-heavy) */
-static spinlock_t next_pid_lock __attribute__((aligned(64)));        /* Separate lock for PID allocation */
-static uint32_t next_pid = 1;
-static int g_resched_requested = 0;
+static process_t *current_process = NULL; /* legacy; BSP init uses per-CPU field */
+
+/* Scheduler variables moved to scheduler.c:
+ * - ready_queue_head
+ * - sched_lock
+ * - g_resched_requested
+ * - scheduler_enabled
+ * - sched_clock_ticks
+ * - min_vruntime
+ * - total_weight
+ * - nr_running
+ */
 
 extern void process_return_trampoline(void);
 
@@ -69,48 +80,14 @@ static inline process_t *get_curproc(void) {
     return current_process;
 }
 
-static inline void set_curproc(process_t *p) {
+void set_curproc(process_t *p) {
     current_process = p;
 }
 
 /* forward decls for helpers used early in this file */
 static void free_argv(int argc, char **argv);
 
-uint32_t process_alloc_pid(void) {
-    // PID 0 is reserved for idle.
-    for (;;) {
-        spinlock_lock(&next_pid_lock);
-        uint32_t pid = next_pid++;
-        if (pid == 0 || pid >= MAX_PROCESSES) {
-            next_pid = 1;
-            pid = next_pid++;
-        }
-        if (pid < MAX_PROCESSES && process_table[pid] == NULL) { spinlock_unlock(&next_pid_lock); return pid; }
-    }
-}
-
-int process_register(process_t *proc) {
-    if (!proc) return -1;
-    if (proc->pid >= MAX_PROCESSES) return -1;
-    rwlock_write_lock(&process_table_rwlock);
-    if (process_table[proc->pid] != NULL) {
-        rwlock_write_unlock(&process_table_rwlock);
-        return -1;
-    }
-    process_table[proc->pid] = proc;
-    rwlock_write_unlock(&process_table_rwlock);
-    scheduler_add_process(proc);
-    return 0;
-}
-
-int process_unregister(uint32_t pid) {
-    if (pid >= MAX_PROCESSES) return -1;
-    rwlock_write_lock(&process_table_rwlock);
-    if (!process_table[pid]) return -1;
-    process_table[pid] = NULL;
-    rwlock_write_unlock(&process_table_rwlock);
-    return 0;
-}
+/* process_alloc_pid, process_register, process_unregister moved to process_table.c */
 
 void process_destroy(process_t *proc) {
     if (!proc) return;
@@ -123,28 +100,9 @@ void process_destroy(process_t *proc) {
     kfree(proc);
 }
 
-static int scheduler_enabled = 0;
-#define NICE_0_LOAD 1024
-#define SCHED_LATENCY_TICKS 20
-#define SCHED_MIN_GRAN_TICKS 4
+/* scheduler_enabled moved to scheduler.c */
 
-static uint64_t sched_clock_ticks = 0;
-static uint64_t min_vruntime = 0;
-static uint32_t total_weight = 0;
-static uint32_t nr_running = 0;
-
-static const uint32_t nice_to_weight_table[40] = {
-    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
-    9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586, 1277,
-    1024, 820, 655, 526, 423, 335, 272, 215, 172, 137,
-    110, 87, 70, 56, 45, 36, 29, 23, 18, 15
-};
-
-static uint32_t nice_to_weight(int nice) {
-    if (nice < -20) nice = -20;
-    if (nice > 19) nice = 19;
-    return nice_to_weight_table[nice + 20];
-}
+/* nice_to_weight_table and nice_to_weight() moved to scheduler.c */
 /* Linux-like: processes become zombies on exit and are reaped by parent wait.
  * We no longer auto-free processes immediately on exit.
  */
@@ -179,111 +137,21 @@ extern void process_return_trampoline(void);
 void process_exit(int exit_code);
 
 /* Debug helper to print ready queue */
-static void debug_print_ready_queue(void) {
-    if (!kernel_debug_is_on()) return;
-    com_write_string(COM1_PORT, "[SCHED-DEBUG] Ready queue: ");
-    if (!ready_queue_head) {
-        com_write_string(COM1_PORT, "EMPTY\n");
-        return;
-    }
-    process_t *p = ready_queue_head;
-    while (p) {
-        com_write_string(COM1_PORT, "PID ");
-        char buf[12];
-        itoa(p->pid, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, "(");
-        com_write_string(COM1_PORT, p->name);
-        com_write_string(COM1_PORT, ")");
-        if (p->next) com_write_string(COM1_PORT, " -> ");
-        p = p->next;
-    }
-    com_write_string(COM1_PORT, "\n");
-}
+/* debug_print_ready_queue moved to scheduler.c */
 
-static void cfs_update_min_vruntime(void) {
-    if (ready_queue_head) {
-        min_vruntime = ready_queue_head->vruntime;
-    }
-}
+/* cfs_update_min_vruntime moved to scheduler.c */
 
-static void cfs_enqueue_process(process_t *proc) {
-    proc->next = NULL;
-    if (!ready_queue_head) {
-        ready_queue_head = proc;
-    } else if (proc->vruntime < ready_queue_head->vruntime) {
-        proc->next = ready_queue_head;
-        ready_queue_head = proc;
-    } else {
-        process_t *cur = ready_queue_head;
-        while (cur->next && cur->next->vruntime <= proc->vruntime) {
-            cur = cur->next;
-        }
-        proc->next = cur->next;
-        cur->next = proc;
-    }
-    nr_running++;
-    total_weight += proc->weight;
-    cfs_update_min_vruntime();
-}
+/* cfs_enqueue_process moved to scheduler.c */
 
-static void cfs_dequeue_process(process_t *proc) {
-    if (!ready_queue_head || !proc) return;
-    if (ready_queue_head == proc) {
-        ready_queue_head = proc->next;
-    } else {
-        process_t *cur = ready_queue_head;
-        while (cur->next) {
-            if (cur->next == proc) {
-                cur->next = proc->next;
-                break;
-            }
-            cur = cur->next;
-        }
-    }
-    proc->next = NULL;
-    if (nr_running > 0) nr_running--;
-    if (total_weight >= proc->weight) total_weight -= proc->weight;
-    cfs_update_min_vruntime();
-}
+/* cfs_dequeue_process moved to scheduler.c */
 
-static void cfs_update_curr(process_t *cp, uint64_t delta_exec) {
-    if (!cp || cp->pid == 0) return;
-    if (delta_exec == 0) return;
-    cp->sum_exec_runtime += delta_exec;
-    uint64_t vruntime_delta = (delta_exec * NICE_0_LOAD) / (cp->weight ? cp->weight : NICE_0_LOAD);
-    cp->vruntime += vruntime_delta;
-}
+/* cfs_update_curr moved to scheduler.c */
 
-static uint64_t cfs_calc_slice(process_t *cp) {
-    if (!cp || total_weight == 0) return SCHED_MIN_GRAN_TICKS;
-    uint64_t slice = (SCHED_LATENCY_TICKS * (uint64_t)cp->weight) / total_weight;
-    if (slice < SCHED_MIN_GRAN_TICKS) slice = SCHED_MIN_GRAN_TICKS;
-    return slice;
-}
+/* cfs_calc_slice moved to scheduler.c */
 
-void scheduler_add_process(process_t *proc) {
-    spinlock_lock(&sched_lock);
-    if (!proc) { spinlock_unlock(&sched_lock); return; }
-    if (proc->state == PROCESS_STATE_ZOMBIE || proc->state == PROCESS_STATE_TERMINATED) {
-        spinlock_unlock(&sched_lock);
-        return;
-    }
-    if (proc->weight == 0) proc->weight = nice_to_weight(proc->nice);
-    if (proc->vruntime < min_vruntime) proc->vruntime = min_vruntime;
-    cfs_enqueue_process(proc);
-    proc->state = PROCESS_STATE_READY;
-    debug_print_ready_queue();
-    spinlock_unlock(&sched_lock);
-}
+/* scheduler_add_process moved to scheduler.c */
 
-void scheduler_remove_process(process_t *proc) {
-    spinlock_lock(&sched_lock);
-    if (!proc) { spinlock_unlock(&sched_lock); return; }
-    cfs_dequeue_process(proc);
-    debug_print_ready_queue();
-    spinlock_unlock(&sched_lock);
-}
+/* scheduler_remove_process moved to scheduler.c */
 
 static void free_user_range(uint64_t start, uint64_t end) {
     if (end <= start) return;
@@ -351,7 +219,7 @@ static int parent_waiting_for_child(process_t *parent, process_t *child) {
     return (child->pgid == pg);
 }
 
-static void do_switch_and_reap(process_t *old, process_t *newp) {
+void do_switch_and_reap(process_t *old, process_t *newp) {
     char buf[12];
 
     /* Sanity: never jump to NULL/low memory. */
@@ -360,6 +228,16 @@ static void do_switch_and_reap(process_t *old, process_t *newp) {
         for(;;) { __asm__ volatile("hlt"); }
     }
 
+    static uint64_t switch_count = 0;
+    switch_count++;
+    if (switch_count <= 10 || (switch_count % 50) == 0) {
+        com_write_string(COM1_PORT, "[SWITCH] do_switch_and_reap called, count=");
+        char scbuf[32];
+        itoa((int)switch_count, scbuf, 10);
+        com_write_string(COM1_PORT, scbuf);
+        com_write_string(COM1_PORT, "\n");
+    }
+    
     if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[SWITCH] Calling context_switch asm...\n");
 
     /* Prevent IRQs from firing while the stack/CR3/TSS are in transition. */
@@ -417,73 +295,9 @@ static void do_switch_and_reap(process_t *old, process_t *newp) {
     if (kernel_debug_is_on()) com_write_string(COM1_PORT, "[SWITCH] do_switch_and_reap returning to caller\n");
 }
 
-void schedule(void) {
-    if (!scheduler_enabled) return;
-
-    process_t *old = get_curproc();
-    process_t *newp = ready_queue_head ? ready_queue_head : process_table[0];
-    if (!newp) return;
-
-    /* Dequeue the next process from the ready queue if it's the head */
-    if (ready_queue_head && newp == ready_queue_head) {
-        cfs_dequeue_process(newp);
-    }
-
-    /* If old process is still running and not idle, re-enqueue it */
-    if (old && old->state == PROCESS_STATE_RUNNING && old->pid != 0) {
-        uint64_t delta = sched_clock_ticks - old->exec_start;
-        cfs_update_curr(old, delta);
-        old->exec_start = sched_clock_ticks;
-        old->state = PROCESS_STATE_READY;
-        cfs_enqueue_process(old);
-    }
-
-    /* NOW check if we're switching to the same process.
-     * This must be done AFTER dequeuing/re-enqueuing to avoid getting stuck.
-     * If old == newp, there's nothing else to run, so just return.
-     */
-    if (old == newp) return;
-
-    newp->state = PROCESS_STATE_RUNNING;
-    newp->exec_start = sched_clock_ticks;
-    set_curproc(newp);
-
-    if (newp && newp->kernel_stack) {
-        uint64_t top = ((uint64_t)(uintptr_t)newp->kernel_stack + KERNEL_STACK_SIZE - 16) & ~0xFULL;
-        amd64_syscall_set_kernel_stack(top);
-    }
-
-    do_switch_and_reap(old, newp);
-}
-
-void scheduler_tick(void) {
-    if (!scheduler_enabled) return;
-    sched_clock_ticks++;
-    process_t *cp = get_curproc();
-    if (!cp) return;
-
-    if (cp->pid != 0) {
-        uint64_t delta = sched_clock_ticks - cp->exec_start;
-        cfs_update_curr(cp, delta);
-        cp->exec_start = sched_clock_ticks;
-        uint64_t slice = cfs_calc_slice(cp);
-        if (delta >= slice) {
-            scheduler_request_reschedule();
-        }
-    }
-}
-
 /* Lock-free fast path - no spinlock overhead! */
 process_t* process_get_current(void) {
     return get_curproc();  // Already per-CPU, no lock needed
-}
-
-process_t* process_get_by_pid(uint32_t pid) {
-    if (pid >= MAX_PROCESSES) return NULL;
-    rwlock_read_lock(&process_table_rwlock);
-    process_t *p = process_table[pid];
-    rwlock_read_unlock(&process_table_rwlock);
-    return p;
 }
 
 void process_exit(int exit_code) {
@@ -554,7 +368,7 @@ void process_kill(uint32_t pid) {
         if (p->argv) free_argv(p->argc, p->argv);
         if (p->envp) free_argv(p->envc, p->envp);
 
-        process_table[pid] = NULL;
+        process_unregister(pid);
         kfree(p);
     }
 }
@@ -597,10 +411,25 @@ void process_yield(void) {
 void process_sleep(uint64_t milliseconds) {
     process_t *cp = get_curproc();
     if (!cp) return;
+    
+    com_write_string(COM1_PORT, "[SLEEP] Process ");
+    char buf[12];
+    itoa(cp->pid, buf, 10);
+    com_write_string(COM1_PORT, buf);
+    com_write_string(COM1_PORT, " sleeping for ");
+    itoa((int)milliseconds, buf, 10);
+    com_write_string(COM1_PORT, buf);
+    com_write_string(COM1_PORT, " ms\n");
+    
     cp->state = PROCESS_STATE_SLEEPING;
     cp->time_slice = milliseconds;
     scheduler_remove_process(cp);
     schedule();
+    
+    com_write_string(COM1_PORT, "[SLEEP] Process ");
+    itoa(cp->pid, buf, 10);
+    com_write_string(COM1_PORT, buf);
+    com_write_string(COM1_PORT, " woke up\n");
 }
 
 void process_wake(uint32_t pid) {
@@ -613,7 +442,7 @@ void process_wake(uint32_t pid) {
 void process_init(void) {
     COM_LOG_INFO(COM1_PORT, "Initializing process manager");
 
-    for (int i = 0; i < MAX_PROCESSES; i++) process_table[i] = NULL;
+    process_table_init();
 
     process_t *idle = (process_t*)kmalloc(sizeof(process_t));
     if (!idle) {
@@ -652,11 +481,12 @@ void process_init(void) {
     idle->cpu_state.rflags = 0x202;
 
     idle->nice = 0;
-    idle->weight = nice_to_weight(0);
+    idle->weight = scheduler_nice_to_weight(0);
     idle->vruntime = 0;
     idle->sum_exec_runtime = 0;
     idle->exec_start = 0;
 
+    process_t **process_table = get_process_table();
     process_table[0] = idle;
     current_process = idle;
 
@@ -672,7 +502,7 @@ process_t* process_create(const char *name, void (*entry_point)(void), int prior
 extern void amd64_enter_user_trampoline(void);
 
 process_t* process_create_with_args(const char *name, void (*entry_point)(void), int priority, int argc, char **argv) {
-    uint32_t pid = next_pid++;
+    uint32_t pid = process_alloc_pid();
     if (pid >= MAX_PROCESSES) {
         COM_LOG_ERROR(COM1_PORT, "Process table full");
         return NULL;
@@ -939,10 +769,10 @@ argv_done:
     proc->time_slice = 0;
     proc->total_time = 0;
     proc->nice = 0;
-    proc->weight = nice_to_weight(0);
-    proc->vruntime = min_vruntime;
+    proc->weight = scheduler_nice_to_weight(0);
+    proc->vruntime = scheduler_get_min_vruntime();
     proc->sum_exec_runtime = 0;
-    proc->exec_start = sched_clock_ticks;
+    proc->exec_start = scheduler_get_clock_ticks();
 
     com_write_string(COM1_PORT, "[PROC] Created process: ");
     com_write_string(COM1_PORT, name);
@@ -952,27 +782,10 @@ argv_done:
     com_write_string(COM1_PORT, pidbuf);
     com_write_string(COM1_PORT, ")\n");
 
-    process_table[pid] = proc;
+    process_register(proc);
+    
+    /* Add the new process to the scheduler's ready queue so it can be scheduled */
     scheduler_add_process(proc);
 
     return proc;
 }
-
-void scheduler_init(void) {
-    COM_LOG_INFO(COM1_PORT, "Initializing scheduler");
-    ready_queue_head = NULL;
-    spinlock_init(&sched_lock);
-    rwlock_init(&process_table_rwlock);
-    spinlock_init(&next_pid_lock);
-    scheduler_enabled = 1;
-    total_weight = 0;
-    nr_running = 0;
-    min_vruntime = 0;
-    sched_clock_ticks = 0;
-    COM_LOG_OK(COM1_PORT, "Scheduler initialized");
-}
-
-void scheduler_request_reschedule(void) { g_resched_requested = 1; }
-
-int scheduler_take_reschedule(void) { int v = g_resched_requested; g_resched_requested = 0; return v; }
-

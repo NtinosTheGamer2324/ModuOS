@@ -155,10 +155,39 @@ extern void amd64_syscall_set_kernel_stack(uint64_t top);
 process_t **get_process_table(void); // Defined in process.c
 
 void schedule(void) {
-    if (!scheduler_enabled) return;
+    static uint64_t schedule_count = 0;
+    schedule_count++;
+    
+    if (schedule_count == 1 || (schedule_count % 100) == 0) {
+        com_write_string(COM1_PORT, "[SCHEDULE] schedule() called, count=");
+        char buf[32];
+        itoa((int)schedule_count, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, "\n");
+    }
+    
+    if (!scheduler_enabled) {
+        com_write_string(COM1_PORT, "[SCHEDULE] Scheduler not enabled!\n");
+        return;
+    }
 
     process_t *old = process_get_current();
     process_t **process_table = get_process_table();
+    
+    if (schedule_count <= 5 || (schedule_count % 100) == 0) {
+        com_write_string(COM1_PORT, "[SCHEDULE] old PID=");
+        char buf2[12];
+        if (old) {
+            itoa(old->pid, buf2, 10);
+            com_write_string(COM1_PORT, buf2);
+            com_write_string(COM1_PORT, " state=");
+            itoa(old->state, buf2, 10);
+            com_write_string(COM1_PORT, buf2);
+        } else {
+            com_write_string(COM1_PORT, "NULL");
+        }
+        com_write_string(COM1_PORT, "\n");
+    }
 
     /* If old process is still running, re-enqueue it FIRST (including idle/PID 0) */
     if (old && old->state == PROCESS_STATE_RUNNING) {
@@ -170,12 +199,43 @@ void schedule(void) {
         /* Ensure weight is set before enqueueing */
         if (old->weight == 0) old->weight = nice_to_weight(old->nice);
         
+        if (schedule_count <= 5 || (schedule_count % 100) == 0) {
+            com_write_string(COM1_PORT, "[SCHEDULE] Re-enqueueing old PID ");
+            char buf4[12];
+            itoa(old->pid, buf4, 10);
+            com_write_string(COM1_PORT, buf4);
+            com_write_string(COM1_PORT, "\n");
+        }
+        
         cfs_enqueue_process(old);
+    }
+    
+    if (schedule_count <= 5 || (schedule_count % 100) == 0) {
+        com_write_string(COM1_PORT, "[SCHEDULE] Ready queue: ");
+        if (!ready_queue_head) {
+            com_write_string(COM1_PORT, "EMPTY");
+        } else {
+            process_t *p = ready_queue_head;
+            int count = 0;
+            while (p && count < 5) {
+                char buf5[12];
+                itoa(p->pid, buf5, 10);
+                com_write_string(COM1_PORT, buf5);
+                if (p->next) com_write_string(COM1_PORT, " -> ");
+                p = p->next;
+                count++;
+            }
+            if (p) com_write_string(COM1_PORT, "...");
+        }
+        com_write_string(COM1_PORT, "\n");
     }
 
     /* NOW pick the next process (after old was re-enqueued) */
     process_t *newp = ready_queue_head ? ready_queue_head : process_table[0];
-    if (!newp) return;
+    if (!newp) {
+        com_write_string(COM1_PORT, "[SCHEDULE] No process to switch to!\n");
+        return;
+    }
 
     /* Dequeue the next process from the ready queue if it's the head */
     if (ready_queue_head && newp == ready_queue_head) {
@@ -183,7 +243,27 @@ void schedule(void) {
     }
 
     /* NOW check if we're switching to the same process. */
-    if (old == newp) return;
+    if (old == newp) {
+        if (schedule_count <= 5 || (schedule_count % 100) == 0) {
+            com_write_string(COM1_PORT, "[SCHEDULE] Same process, no switch needed\n");
+        }
+        return;
+    }
+
+    if (schedule_count <= 5 || (schedule_count % 100) == 0) {
+        com_write_string(COM1_PORT, "[SCHEDULE] Switching: PID ");
+        char buf3[12];
+        if (old) {
+            itoa(old->pid, buf3, 10);
+            com_write_string(COM1_PORT, buf3);
+        } else {
+            com_write_string(COM1_PORT, "NULL");
+        }
+        com_write_string(COM1_PORT, " -> PID ");
+        itoa(newp->pid, buf3, 10);
+        com_write_string(COM1_PORT, buf3);
+        com_write_string(COM1_PORT, "\n");
+    }
 
     newp->state = PROCESS_STATE_RUNNING;
     newp->exec_start = sched_clock_ticks;
@@ -197,11 +277,35 @@ void schedule(void) {
     do_switch_and_reap(old, newp);
 }
 
+/* Forward declaration for PIT frequency */
+extern uint32_t get_pit_frequency(void);
+
 void scheduler_tick(void) {
+    static uint64_t tick_count = 0;
+    tick_count++;
+    if (tick_count == 1 || (tick_count % 100) == 0) {
+        com_write_string(COM1_PORT, "[TICK] scheduler_tick called, count=");
+        char buf[32];
+        itoa((int)tick_count, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, "\n");
+    }
+    
     if (!scheduler_enabled) return;
     sched_clock_ticks++;
     process_t *cp = process_get_current();
-    if (!cp) return;
+    if (!cp) {
+        static uint64_t null_proc_count = 0;
+        null_proc_count++;
+        if (null_proc_count == 1 || (null_proc_count % 1000) == 0) {
+            com_write_string(COM1_PORT, "[SCHED-WARN] get_current() returned NULL, count=");
+            char nbuf[32];
+            itoa((int)null_proc_count, nbuf, 10);
+            com_write_string(COM1_PORT, nbuf);
+            com_write_string(COM1_PORT, "\n");
+        }
+        return;
+    }
 
     uint64_t delta = sched_clock_ticks - cp->exec_start;
     cfs_update_curr(cp, delta);
@@ -209,6 +313,72 @@ void scheduler_tick(void) {
     uint64_t slice = cfs_calc_slice(cp);
     if (delta >= slice) {
         scheduler_request_reschedule();
+    }
+
+    /* Wake up sleeping processes whose time has expired */
+    static uint64_t wake_attempt_count = 0;
+    wake_attempt_count++;
+    if (wake_attempt_count == 1 || (wake_attempt_count % 100) == 0) {
+        com_write_string(COM1_PORT, "[SCHED] Wake attempt, count=");
+        char wbuf[32];
+        itoa((int)wake_attempt_count, wbuf, 10);
+        com_write_string(COM1_PORT, wbuf);
+        com_write_string(COM1_PORT, "\n");
+    }
+    
+    process_t **process_table = get_process_table();
+    if (process_table) {
+        static uint64_t wake_check_count = 0;
+        wake_check_count++;
+        if (wake_check_count == 1 || (wake_check_count % 500) == 0) {
+            com_write_string(COM1_PORT, "[SCHED] Wake check running (ptable valid), count=");
+            char wbuf2[32];
+            itoa((int)wake_check_count, wbuf2, 10);
+            com_write_string(COM1_PORT, wbuf2);
+            com_write_string(COM1_PORT, "\n");
+        }
+        /* Calculate tick duration in milliseconds based on PIT frequency */
+        uint32_t hz = get_pit_frequency();
+        if (hz == 0) hz = 100;
+        uint64_t tick_ms = (hz >= 1000) ? 1 : (1000 / hz);
+        
+        static uint64_t last_sleep_debug = 0;
+        if ((sched_clock_ticks - last_sleep_debug) >= 100) {
+            for (int i = 0; i < MAX_PROCESSES; i++) {
+                process_t *p = process_table[i];
+                if (p && p->state == PROCESS_STATE_SLEEPING) {
+                    com_write_string(COM1_PORT, "[SCHED-DEBUG] PID ");
+                    char buf[12];
+                    itoa(p->pid, buf, 10);
+                    com_write_string(COM1_PORT, buf);
+                    com_write_string(COM1_PORT, " sleeping, time_slice=");
+                    itoa((int)p->time_slice, buf, 10);
+                    com_write_string(COM1_PORT, buf);
+                    com_write_string(COM1_PORT, "\n");
+                }
+            }
+            last_sleep_debug = sched_clock_ticks;
+        }
+        
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            process_t *p = process_table[i];
+            if (p && p->state == PROCESS_STATE_SLEEPING) {
+                if (p->time_slice > 0) {
+                    if (p->time_slice <= tick_ms) {
+                        p->time_slice = 0;
+                        p->state = PROCESS_STATE_READY;
+                        com_write_string(COM1_PORT, "[SCHED] Waking process ");
+                        char buf[12];
+                        itoa(p->pid, buf, 10);
+                        com_write_string(COM1_PORT, buf);
+                        com_write_string(COM1_PORT, "\n");
+                        scheduler_add_process(p);
+                    } else {
+                        p->time_slice -= tick_ms;
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -25,9 +25,9 @@ X26Display *X26OpenDisplay(void) {
     memset(dpy, 0, sizeof(X26Display));
     
     /* Open communication channels */
-    dpy->fd_gfx = open(NODE_DEV_GFX, O_RDWR);
-    dpy->fd_event = open(NODE_DEV_EVENT, O_RDONLY);
-    dpy->fd_windows = open(NODE_DEV_WINDOWS, O_RDWR);
+    dpy->fd_gfx = open(NODE_DEV_GFX, O_RDWR, 0);
+    dpy->fd_event = open(NODE_DEV_EVENT, O_RDONLY, 0);
+    dpy->fd_windows = open(NODE_DEV_WINDOWS, O_RDWR, 0);
     
     if (dpy->fd_gfx < 0 || dpy->fd_event < 0 || dpy->fd_windows < 0) {
         if (dpy->fd_gfx >= 0) close(dpy->fd_gfx);
@@ -38,7 +38,7 @@ X26Display *X26OpenDisplay(void) {
     }
     
     /* Get display size from graphics device */
-    int gfx_fd = open("$/dev/graphics/video0", O_RDONLY);
+    int gfx_fd = open("$/dev/graphics/video0", O_RDONLY, 0);
     if (gfx_fd >= 0) {
         uint8_t info_buf[64];
         if (read(gfx_fd, info_buf, sizeof(info_buf)) >= (ssize_t)sizeof(md64api_grp_video_info_t)) {
@@ -143,6 +143,15 @@ int X26DestroyWindow(X26Display *dpy, X26Window win) {
     return write(dpy->fd_windows, &msg, sizeof(msg)) == sizeof(msg) ? 0 : -1;
 }
 
+int X26SetWindowTitle(X26Display *dpy, X26Window win, const char *title) {
+    if (!dpy || !title) return -1;
+    
+    /* For now, this is a stub - title setting will be implemented later */
+    (void)win;
+    (void)title;
+    return 0;
+}
+
 int X26MoveWindow(X26Display *dpy, X26Window win, int x, int y) {
     if (!dpy) return -1;
     
@@ -153,6 +162,20 @@ int X26MoveWindow(X26Display *dpy, X26Window win, int x, int y) {
     msg.hdr.window_id = win;
     msg.x = (int16_t)x;
     msg.y = (int16_t)y;
+    
+    return write(dpy->fd_windows, &msg, sizeof(msg)) == sizeof(msg) ? 0 : -1;
+}
+
+int X26ResizeWindow(X26Display *dpy, X26Window win, int width, int height) {
+    if (!dpy) return -1;
+    
+    xapi_win_geometry_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.hdr.type = XAPI_WIN_RESIZE;
+    msg.hdr.size = sizeof(msg);
+    msg.hdr.window_id = win;
+    msg.w = (uint16_t)width;
+    msg.h = (uint16_t)height;
     
     return write(dpy->fd_windows, &msg, sizeof(msg)) == sizeof(msg) ? 0 : -1;
 }
@@ -260,8 +283,7 @@ int X26NextEvent(X26Display *dpy, X26Event *event) {
     if (!dpy || !event) return -1;
     
     /* TODO: Read event from $/user/xapi/event */
-    /* For now, just block */
-    sleep(1);
+    /* Note: No explicit yield() needed - kernel has preemptive scheduling */
     return 0;
 }
 

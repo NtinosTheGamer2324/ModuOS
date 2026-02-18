@@ -1,4 +1,5 @@
-#include "moduos/kernel/process/process.h"
+// #include "moduos/kernel/process/process.h"  // OLD
+#include "moduos/kernel/process/process_new.h"
 #include <stdint.h>
 
 /* Lazy FPU switching support.

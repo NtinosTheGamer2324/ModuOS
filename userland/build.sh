@@ -116,6 +116,15 @@ for obj in "$BUILD_DIR"/*.o; do
                 -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
+        teseraris|pacmangfx|neontank)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static $base) $obj + lib_fnt.o -> $bin"
+            if [ "$base" = "teseraris" ]; then
+                echo "  (Source: EXTERNAL/Teseraris/)"
+            fi
+            "$LD" "$obj" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
         minesgfx|calcgfx|snakegfx)
             bin="$DIST_DIR/${base}.sqr"
             echo "[BUILD] LD(app static gfx2d) $obj + lib_gfx2d.o -> $bin"

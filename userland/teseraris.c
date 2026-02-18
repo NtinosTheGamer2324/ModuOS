@@ -373,6 +373,12 @@ static char player_names[MAX_PLAYERS][32] = {
     "Player 1", "Player 2", "Player 3", "Player 4"
 };
 
+// Compatibility aliases for existing 2-player code
+#define player1 players[0]
+#define player2 players[1]
+#define player1_name player_names[0]
+#define player2_name player_names[1]
+
 
 
 static int chaos_timer = 0;
@@ -1183,37 +1189,56 @@ void draw_board(Gfx *g) {
     if (current_mode == MODE_MULTIPLAYER && game_state == STATE_PLAYING) {
         gfx_fill_rect(g, 0, 0, g->vi.width, g->vi.height, 0xFF000000);
         
-        // Calculate positions for split screen
-        int p1_offset_x = 40;
-        int p2_offset_x = g->vi.width / 2 + 20;
-        int board_offset_y = 60;
-        
-        // Draw center divider line
-        int center_x = g->vi.width / 2;
-        for(int y = 0; y < g->vi.height; y += 8) {
-            gfx_fill_rect(g, center_x - 2, y, 4, 4, 0xFF444444);
+        if (num_players == 2) {
+            // 2-player side-by-side layout
+            int p1_offset_x = 40;
+            int p2_offset_x = g->vi.width / 2 + 20;
+            int board_offset_y = 60;
+            
+            // Draw center divider line
+            int center_x = g->vi.width / 2;
+            for(int y = 0; y < g->vi.height; y += 8) {
+                gfx_fill_rect(g, center_x - 2, y, 4, 4, 0xFF444444);
+            }
+            
+            // Draw "VS" in the center top
+            draw_text(g, center_x - 10, 20, "VS", 0xFFFFFF00);
+            
+            // Draw both player boards
+            draw_player_board(g, &players[0], p1_offset_x, board_offset_y, player_names[0], 1);
+            draw_player_board(g, &players[1], p2_offset_x, board_offset_y, player_names[1], 1);
+            
+            // Draw controls for both players
+            int ctrl_y = board_offset_y + (BOARD_HEIGHT * BLOCK_SIZE) + 25;
+            draw_text(g, p1_offset_x + 45, ctrl_y, "WASD+C+SPC", 0xFF888888);
+            draw_text(g, p2_offset_x + 55, ctrl_y, "Arrows+N+0", 0xFF888888);
+        } else {
+            // 3-4 player 2x2 grid layout
+            int grid_w = g->vi.width / 2;
+            int grid_h = g->vi.height / 2;
+            
+            int offsets[4][2] = {
+                {15, 10},                    // Top-left
+                {grid_w + 15, 10},           // Top-right
+                {15, grid_h + 10},           // Bottom-left
+                {grid_w + 15, grid_h + 10}   // Bottom-right
+            };
+            
+            // Draw grid dividers
+            int center_x = g->vi.width / 2;
+            int center_y = g->vi.height / 2;
+            for(int x = 0; x < g->vi.width; x += 8) {
+                gfx_fill_rect(g, x, center_y - 2, 4, 4, 0xFF444444);
+            }
+            for(int y = 0; y < g->vi.height; y += 8) {
+                gfx_fill_rect(g, center_x - 2, y, 4, 4, 0xFF444444);
+            }
+            
+            // Draw all active players (compact, no controls shown)
+            for (int i = 0; i < num_players; i++) {
+                draw_player_board(g, &players[i], offsets[i][0], offsets[i][1], player_names[i], 0);
+            }
         }
-        
-        // Draw "VS" in the center top
-        draw_text(g, center_x - 10, 20, "VS", 0xFFFFFF00);
-        
-        // Draw both player boards with controls
-        draw_player_board(g, &player1, p1_offset_x, board_offset_y, player1_name, 1);
-        draw_player_board(g, &player2, p2_offset_x, board_offset_y, player2_name, 1);
-        
-        // Draw controls for both players
-        int ctrl_y = board_offset_y + (BOARD_HEIGHT * BLOCK_SIZE) + 25;
-        // Player 1 controls
-        draw_text(g, p1_offset_x + 45, ctrl_y, "WASD", 0xFFFFFFFF);
-        draw_text(g, p1_offset_x + 45, ctrl_y + 10, "W", 0xFFFFFFFF);
-        draw_text(g, p1_offset_x + 45, ctrl_y + 20, "C", 0xFFFFFFFF);
-        draw_text(g, p1_offset_x + 45, ctrl_y + 30, "SPACE", 0xFFFFFFFF);
-        
-        // Player 2 controls
-        draw_text(g, p2_offset_x + 55, ctrl_y, "Arrows", 0xFFFFFFFF);
-        draw_text(g, p2_offset_x + 55, ctrl_y + 10, "Up", 0xFFFFFFFF);
-        draw_text(g, p2_offset_x + 55, ctrl_y + 20, "N", 0xFFFFFFFF);
-        draw_text(g, p2_offset_x + 55, ctrl_y + 30, "0", 0xFFFFFFFF);
         
         // Draw winner message
         if (mp_winner > 0) {
@@ -1803,8 +1828,8 @@ void update_particles(PlayerState *p) {
 
 void init_game() {
     if (current_mode == MODE_MULTIPLAYER) {
-        init_player_state(&player1);
-        init_player_state(&player2);
+        init_player_state(&players[0]);
+        init_player_state(&players[1]);
         mp_winner = 0;
         game_state = STATE_PLAYING;
         return;
@@ -2056,15 +2081,16 @@ int md_main(long argc, char **argv) {
                     // Handle input when game is over (winner declared)
                     if (mp_winner != 0) {
                         if (ch == 'r' || ch == 'R') {
-                            init_player_state(&player1);
-                            init_player_state(&player2);
+                            for (int i = 0; i < num_players; i++) {
+                                init_player_state(&players[i]);
+                            }
                             mp_winner = 0;
                         } else if (kc == KEY_ESCAPE || ch == 0x1b) {
                             game_state = STATE_MENU;
                             mp_winner = 0;
                         }
                     } else {
-                    // Multiplayer input - Player 1
+                    // Multiplayer input - Player 1 (WASD + C + Space)
                     if (ch == 'a' || ch == 'A') {
                         if (!mp_check_collision(&player1, player1.current_piece, player1.current_rotation, player1.current_x - 1, player1.current_y)) {
                             player1.current_x--;
@@ -2116,6 +2142,62 @@ int md_main(long argc, char **argv) {
                         mp_hold_piece(&player2);
                     }
                     
+                    // Player 3 input (TFGH + V + B) - if active
+                    if (num_players >= 3) {
+                        if (ch == 'f' || ch == 'F') {
+                            if (!mp_check_collision(&players[2], players[2].current_piece, players[2].current_rotation, players[2].current_x - 1, players[2].current_y)) {
+                                players[2].current_x--;
+                            }
+                        } else if (ch == 'h' || ch == 'H') {
+                            if (!mp_check_collision(&players[2], players[2].current_piece, players[2].current_rotation, players[2].current_x + 1, players[2].current_y)) {
+                                players[2].current_x++;
+                            }
+                        } else if (ch == 'g' || ch == 'G') {
+                            if (!mp_check_collision(&players[2], players[2].current_piece, players[2].current_rotation, players[2].current_x, players[2].current_y + 1)) {
+                                players[2].current_y++;
+                            }
+                        } else if (ch == 't' || ch == 'T') {
+                            int new_rot = (players[2].current_rotation + 1) % 4;
+                            if (!mp_check_collision(&players[2], players[2].current_piece, new_rot, players[2].current_x, players[2].current_y)) {
+                                players[2].current_rotation = new_rot;
+                            }
+                        } else if (ch == 'b' || ch == 'B') {
+                            while (!mp_check_collision(&players[2], players[2].current_piece, players[2].current_rotation, players[2].current_x, players[2].current_y + 1)) {
+                                players[2].current_y++;
+                            }
+                        } else if (ch == 'v' || ch == 'V') {
+                            mp_hold_piece(&players[2]);
+                        }
+                    }
+                    
+                    // Player 4 input (IJKL + M + ,) - if active
+                    if (num_players >= 4) {
+                        if (ch == 'j' || ch == 'J') {
+                            if (!mp_check_collision(&players[3], players[3].current_piece, players[3].current_rotation, players[3].current_x - 1, players[3].current_y)) {
+                                players[3].current_x--;
+                            }
+                        } else if (ch == 'l' || ch == 'L') {
+                            if (!mp_check_collision(&players[3], players[3].current_piece, players[3].current_rotation, players[3].current_x + 1, players[3].current_y)) {
+                                players[3].current_x++;
+                            }
+                        } else if (ch == 'k' || ch == 'K') {
+                            if (!mp_check_collision(&players[3], players[3].current_piece, players[3].current_rotation, players[3].current_x, players[3].current_y + 1)) {
+                                players[3].current_y++;
+                            }
+                        } else if (ch == 'i' || ch == 'I') {
+                            int new_rot = (players[3].current_rotation + 1) % 4;
+                            if (!mp_check_collision(&players[3], players[3].current_piece, new_rot, players[3].current_x, players[3].current_y)) {
+                                players[3].current_rotation = new_rot;
+                            }
+                        } else if (ch == ',' || ch == '<') {
+                            while (!mp_check_collision(&players[3], players[3].current_piece, players[3].current_rotation, players[3].current_x, players[3].current_y + 1)) {
+                                players[3].current_y++;
+                            }
+                        } else if (ch == 'm' || ch == 'M') {
+                            mp_hold_piece(&players[3]);
+                        }
+                    }
+                    
                     // Pause and exit in multiplayer
                     if (ch == 'p' || ch == 'P') {
                         game_state = STATE_PAUSED;
@@ -2127,8 +2209,8 @@ int md_main(long argc, char **argv) {
                         init_player_state(&player2);
                         mp_winner = 0;
                     }
-                    }
                 }
+                } // end multiplayer input
                 
         } // end while read events
         
@@ -2144,70 +2226,72 @@ int md_main(long argc, char **argv) {
         
         // Multiplayer game logic
         if (game_state == STATE_PLAYING && current_mode == MODE_MULTIPLAYER && mp_winner == 0) {
-            // Calculate fall interval based on average level
-            int avg_level = (player1.level + player2.level) / 2;
+            // Calculate fall interval based on average level of active players
+            int total_level = 0;
+            for (int i = 0; i < num_players; i++) {
+                total_level += players[i].level;
+            }
+            int avg_level = total_level / num_players;
             int fall_interval = 500 - (avg_level * 30);
             if (fall_interval < 100) fall_interval = 100;
             
             if (now - last_fall >= (uint64_t)fall_interval) {
-                // Update player 1
-                if (!player1.game_over) {
-                    if (!mp_check_collision(&player1, player1.current_piece, player1.current_rotation, player1.current_x, player1.current_y + 1)) {
-                        player1.current_y++;
-                    } else {
-                        mp_lock_piece(&player1);
-                        int cleared = mp_clear_lines(&player1, &player2);
-                        if (cleared > 0) {
-                            player1.lines_cleared += cleared;
-                            int line_score = cleared * cleared * 100;
-                            int combo_bonus = (player1.combo_count - 1) * 50;
-                            player1.score += line_score + combo_bonus;
+                // Update all active players
+                for (int i = 0; i < num_players; i++) {
+                    if (!players[i].game_over) {
+                        if (!mp_check_collision(&players[i], players[i].current_piece, players[i].current_rotation, players[i].current_x, players[i].current_y + 1)) {
+                            players[i].current_y++;
+                        } else {
+                            mp_lock_piece(&players[i]);
+                            // Find opponent for garbage (cycle to next player)
+                            PlayerState *opponent = &players[(i + 1) % num_players];
+                            int cleared = mp_clear_lines(&players[i], opponent);
+                            if (cleared > 0) {
+                                players[i].lines_cleared += cleared;
+                                int line_score = cleared * cleared * 100;
+                                int combo_bonus = (players[i].combo_count - 1) * 50;
+                                players[i].score += line_score + combo_bonus;
+                            }
+                            mp_spawn_piece(&players[i]);
                         }
-                        mp_spawn_piece(&player1);
                     }
                 }
                 
-                // Update player 2
-                if (!player2.game_over) {
-                    if (!mp_check_collision(&player2, player2.current_piece, player2.current_rotation, player2.current_x, player2.current_y + 1)) {
-                        player2.current_y++;
-                    } else {
-                        mp_lock_piece(&player2);
-                        int cleared = mp_clear_lines(&player2, &player1);
-                        if (cleared > 0) {
-                            player2.lines_cleared += cleared;
-                            int line_score = cleared * cleared * 100;
-                            int combo_bonus = (player2.combo_count - 1) * 50;
-                            player2.score += line_score + combo_bonus;
-                        }
-                        mp_spawn_piece(&player2);
+                // Update particles and effects for all players
+                for (int i = 0; i < num_players; i++) {
+                    update_particles(&players[i]);
+                    
+                    // Decay screen shake
+                    if (players[i].shake_x != 0) players[i].shake_x = players[i].shake_x * 8 / 10;
+                    if (players[i].shake_y != 0) players[i].shake_y = players[i].shake_y * 8 / 10;
+                    
+                    // Decay flash effects
+                    if (players[i].attack_flash > 0) players[i].attack_flash--;
+                    if (players[i].receive_flash > 0) players[i].receive_flash--;
+                }
+                
+                // Check for winner - find last player standing
+                int alive_count = 0;
+                int last_alive = -1;
+                for (int i = 0; i < num_players; i++) {
+                    if (!players[i].game_over) {
+                        alive_count++;
+                        last_alive = i;
                     }
                 }
                 
-                // Update particles and effects
-                update_particles(&player1);
-                update_particles(&player2);
-                
-                // Decay screen shake
-                if (player1.shake_x != 0) player1.shake_x = player1.shake_x * 8 / 10;
-                if (player1.shake_y != 0) player1.shake_y = player1.shake_y * 8 / 10;
-                if (player2.shake_x != 0) player2.shake_x = player2.shake_x * 8 / 10;
-                if (player2.shake_y != 0) player2.shake_y = player2.shake_y * 8 / 10;
-                
-                // Decay flash effects
-                if (player1.attack_flash > 0) player1.attack_flash--;
-                if (player1.receive_flash > 0) player1.receive_flash--;
-                if (player2.attack_flash > 0) player2.attack_flash--;
-                if (player2.receive_flash > 0) player2.receive_flash--;
-                
-                // Check for winner
-                if (player1.game_over && !player2.game_over) {
-                    mp_winner = 2;
-                } else if (player2.game_over && !player1.game_over) {
-                    mp_winner = 1;
-                } else if (player1.game_over && player2.game_over) {
-                    // Both died - higher score wins
-                    mp_winner = (player1.score >= player2.score) ? 1 : 2;
+                // Declare winner if only one player left
+                if (alive_count == 1) {
+                    mp_winner = last_alive + 1;
+                } else if (alive_count == 0) {
+                    // All died - highest score wins
+                    int highest_score = -1;
+                    for (int i = 0; i < num_players; i++) {
+                        if (players[i].score > highest_score) {
+                            highest_score = players[i].score;
+                            mp_winner = i + 1;
+                        }
+                    }
                 }
                 
                 last_fall = now;
@@ -2276,6 +2360,26 @@ int md_main(long argc, char **argv) {
         
         if (game_state == STATE_MENU) {
             draw_menu(&gfx);
+        } else if (game_state == STATE_LOBBY) {
+            // Draw lobby screen
+            gfx_fill_rect(&gfx, 0, 0, gfx.vi.width, gfx.vi.height, 0xFF001020);
+            
+            int center_x = gfx.vi.width / 2;
+            int center_y = gfx.vi.height / 2;
+            
+            draw_text_scaled(&gfx, center_x - 150, center_y - 100, "MULTIPLAYER LOBBY", 0xFF00FFFF, 2);
+            
+            // Player count selector
+            draw_text(&gfx, center_x - 100, center_y - 30, "Number of Players:", 0xFFFFFFFF);
+            
+            char count_str[4];
+            itoa(num_players, count_str, 10);
+            draw_text_scaled(&gfx, center_x + 20, center_y - 40, count_str, 0xFFFFDD00, 3);
+            
+            // Instructions
+            draw_text(&gfx, center_x - 120, center_y + 30, "UP/DOWN - Change player count", 0xFF888888);
+            draw_text(&gfx, center_x - 120, center_y + 50, "ENTER - Start game", 0xFF00FF00);
+            draw_text(&gfx, center_x - 120, center_y + 70, "ESC - Back to menu", 0xFFFF8888);
         } else if (game_state == STATE_PAUSED) {
             gfx_fill_rect(&gfx, 0, 0, gfx.vi.width, gfx.vi.height, 0xFF000000);
             draw_board(&gfx);
@@ -2297,19 +2401,17 @@ int md_main(long argc, char **argv) {
         
         yield();
     }
+    }
     
     printf("\nExiting...\n");
     input_flush();
-
     close(efd);
-    
     if (game_font) {
         fnt_free_font(game_font);
     }
-    
     if (gfx.bb) {
         free(gfx.bb);
     }
-    
     return 0;
+    
 }

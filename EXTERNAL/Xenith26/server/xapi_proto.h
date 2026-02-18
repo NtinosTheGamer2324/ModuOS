@@ -21,6 +21,7 @@ typedef enum {
     XAPI_CMD_BLIT = 3,      /* Blit bitmap/buffer */
     XAPI_CMD_LINE = 4,      /* Draw line */
     XAPI_CMD_PIXEL = 5,     /* Set pixel */
+    XAPI_CMD_TEXT_FNT = 6,  /* Draw text with FNT font */
     XAPI_CMD_COMMIT = 10,   /* Commit/present window buffer */
     
     /* Window Management */
@@ -84,6 +85,18 @@ typedef struct __attribute__((packed)) {
     uint16_t text_len;     /* Length of following text */
     /* char text[text_len] follows */
 } xapi_cmd_text_t;
+
+/* Draw text with FNT font */
+typedef struct __attribute__((packed)) {
+    xapi_msg_hdr_t hdr;
+    int16_t x, y;
+    uint32_t fg_color;     /* ARGB8888 foreground */
+    uint32_t bg_color;     /* ARGB8888 background (0 = transparent) */
+    uint8_t scale;         /* Font scale: 1=normal, 2=2x, etc. */
+    uint8_t reserved[3];
+    uint16_t text_len;     /* Length of following text */
+    /* char text[text_len] follows */
+} xapi_cmd_text_fnt_t;
 
 /* Blit buffer/bitmap */
 typedef struct __attribute__((packed)) {

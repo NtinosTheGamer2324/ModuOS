@@ -50,7 +50,8 @@ void hid_debug_poll_early(void);
 #include "moduos/fs/fd.h"
 #include "moduos/fs/devfs.h"
 
-#include "moduos/kernel/process/process.h"
+// #include "moduos/kernel/process/process.h"  // OLD - temporarily disabled
+#include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/syscall/syscall.h"
 #include "moduos/kernel/shell/zenith4.h"
 
@@ -602,8 +603,8 @@ static void init(uint64_t mb2_ptr_init) {
     /* Install kernel-owned GDT+TSS with user segments before any ring3 work. */
     amd64_gdt_init();
 
-    process_init();
-    scheduler_init();
+    // Use new POSIX-compliant process system
+    process_management_init();
     syscall_init();
     COM_LOG_OK(COM1_PORT, "Process management initialized");
 

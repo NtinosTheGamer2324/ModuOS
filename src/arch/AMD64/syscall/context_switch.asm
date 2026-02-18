@@ -65,6 +65,24 @@ context_switch:
     push rdx
     popfq
     
+    ; DEBUG: Verify interrupts are enabled after popfq
+    pushfq
+    pop rdx
+    test rdx, 0x200
+    jnz .if_enabled
+    ; IF is NOT set - this should never happen!
+    push rax
+    push rdi
+    push rsi
+    mov rdi, 0x3F8
+    lea rsi, [rel .if_disabled_msg]
+    extern com_write_string
+    call com_write_string
+    pop rsi
+    pop rdi
+    pop rax
+.if_enabled:
+    
     ; NOTE:
     ; User-mode entry goes through amd64_enter_user_trampoline.
     ; That trampoline expects argc/argv in r12/r13 (callee-saved), not rdi/rsi.
@@ -79,3 +97,5 @@ context_switch:
     
     ; Jump to new RIP
     jmp rax
+
+.if_disabled_msg: db "[CONTEXT_SWITCH] IF NOT ENABLED AFTER POPFQ!", 10, 0

@@ -132,10 +132,16 @@ build-$(ARCH): $(kernel_object_files) $(drivers_object_files) $(fs_object_files)
 	sed -i 's/\r$$//' userland/build.sh
 	cd userland && sh ./build.sh
 	cp -f userland/dist/*.sqr targets/$(ARCH)/iso/Apps/
+	# Copy automan to System64
+	cp -f userland/dist/automan.sqr targets/$(ARCH)/iso/ModuOS/System64/automan.sqr 2>/dev/null || true
 	# Copy userland dynamic linker + shared libraries
 	mkdir -p targets/$(ARCH)/iso/ModuOS/shared/usr/lib
 	cp -f userland/dist/*.sqrl targets/$(ARCH)/iso/ModuOS/shared/usr/lib/ 2>/dev/null || true
 	cp -f userland/dist/ld-moduos.sqr targets/$(ARCH)/iso/ModuOS/shared/usr/lib/ 2>/dev/null || true
+	@echo Building Xenith26 display server and applications
+	$(MAKE) -C EXTERNAL/Xenith26 ARCH=$(ARCH)
+	mkdir -p targets/$(ARCH)/iso/Apps
+	cp -f EXTERNAL/Xenith26/build/*.sqr targets/$(ARCH)/iso/Apps/ 2>/dev/null || true
 	@echo Building BIOS ISO
 	grub-mkrescue -o dist/$(ARCH)/kernel.iso targets/$(ARCH)/iso
 
@@ -153,6 +159,7 @@ build-$(ARCH)-uefi: iso-$(ARCH)-uefi
 .PHONY: clean
 clean:
 	rm -rf build dist
+	$(MAKE) -C EXTERNAL/Xenith26 clean
 
 .PHONY: check
 check:

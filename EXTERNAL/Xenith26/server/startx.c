@@ -2,6 +2,7 @@
 #include "string.h"
 #include "userfs.h"
 #include "nodes.h"
+#include "../lib/lib_fnt.h"
 #include "xapi_proto.h"
 
 /* Display server state */
@@ -34,7 +35,7 @@ static xserver_display_t g_display;
 static int init_display() {
     printf("[xenith26d] Opening graphics device...\n");
     
-    g_display.fb_fd = open("$/dev/graphics/video0", O_RDWR);
+    g_display.fb_fd = open("$/dev/graphics/video0", O_RDWR, 0);
     if (g_display.fb_fd < 0) {
         printf("[xenith26d] ERROR: Could not open $/dev/graphics/video0\n");
         return -1;
@@ -57,23 +58,35 @@ static int init_display() {
         return -1;
     }
     
-    g_display.fb = (uint32_t *)info->fb_addr;
     g_display.width = info->width;
     g_display.height = info->height;
     g_display.pitch = info->pitch;
     g_display.bpp = info->bpp;
     
+    /* Allocate backbuffer in userspace memory */
+    uint32_t bpp_bytes = (g_display.bpp == 16) ? 2 : 4;
+    uint32_t pitch = g_display.width * bpp_bytes;
+    uint32_t buf_size = pitch * g_display.height;
+    
+    g_display.fb = (uint32_t *)malloc(buf_size);
+    if (!g_display.fb) {
+        printf("[xenith26d] ERROR: Could not allocate backbuffer\n");
+        close(g_display.fb_fd);
+        return -1;
+    }
+    
     printf("[xenith26d] Display initialized: %ux%u @ %u bpp\n", 
            g_display.width, g_display.height, g_display.bpp);
-    printf("[xenith26d] Framebuffer at: 0x%lx\n", (uint64_t)g_display.fb);
+    printf("[xenith26d] Backbuffer allocated at %p\n", (void*)g_display.fb);
     
-    /* Clear screen to dark blue */
-    for (uint32_t y = 0; y < g_display.height; y++) {
-        uint32_t *row = (uint32_t *)((uint8_t *)g_display.fb + y * g_display.pitch);
-        for (uint32_t x = 0; x < g_display.width; x++) {
-            row[x] = 0xFF1A1A2E; /* Dark blue background */
-        }
+    /* Clear screen to dark blue using gfx_blit */
+    for (uint32_t i = 0; i < g_display.width * g_display.height; i++) {
+        g_display.fb[i] = 0xFF1A1A2E; /* Dark blue background */
     }
+    
+    /* Blit to screen */
+    gfx_blit(g_display.fb, (uint16_t)g_display.width, (uint16_t)g_display.height,
+             0, 0, (uint16_t)pitch, (uint16_t)MD64API_GRP_FMT_XRGB8888);
     
     return 0;
 }
@@ -284,9 +297,14 @@ int md_main(long argc, char** argv) {
     while (1) {
         /* Poll for messages from clients */
         /* TODO: Implement actual message reading from UserFS nodes */
-        /* For now, just sleep */
-        sleep(1);
+        /* Note: No explicit yield() needed - kernel has preemptive scheduling via timer */
     }
+    
+    /* Cleanup (unreachable for now, but good practice) */
+    if (g_display.fb) {
+        free(g_display.fb);
+    }
+    close(g_display.fb_fd);
     
     return 0;
 }

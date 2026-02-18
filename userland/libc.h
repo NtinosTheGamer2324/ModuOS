@@ -178,6 +178,10 @@ static inline int close(int fd);
 
 // Drain the structured input queue ($/dev/input/event0).
 // Useful because the kernel shell and some apps consume event0, while libc's input() reads kbd0.
+static inline void yield(void) {
+    syscall(SYS_YIELD, 0, 0, 0);
+}
+
 static inline void input_flush_events(void) {
     int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
     if (efd >= 0) {
@@ -220,7 +224,10 @@ static inline char* input() {
     int n = 0;
     for (;;) {
         char c;
-        if (read(fd, &c, 1) != 1) continue;
+        if (read(fd, &c, 1) != 1) {
+            yield();  /* Yield CPU while waiting for input */
+            continue;
+        }
         if (c == '\r') continue;
         if (c == '\n') {
             input_buf[n] = 0;
@@ -871,10 +878,6 @@ static inline void sleep(unsigned int sec) {
     syscall(SYS_SLEEP, sec, 0, 0);
 }
 
-static inline void yield(void) {
-    syscall(SYS_YIELD, 0, 0, 0);
-}
-
 static inline int kill(int pid, int sig) {
     return (int)syscall(SYS_KILL, pid, sig, 0);
 }
@@ -967,6 +970,8 @@ __attribute__((used))
 void _start(long argc, char** argv) {
     // ModuOS start wrapper / ABI
     int mdm = md_main(argc, argv);
+
+    input_flush();
 
     if (mdm) {
         exit(mdm);

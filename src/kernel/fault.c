@@ -3,7 +3,8 @@
 #include "moduos/kernel/interrupts/idt.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/COM/com.h"
-#include "moduos/kernel/process/process.h"  /* process_exit, schedule */
+// #include "moduos/kernel/process/process.h"  /* process_exit, schedule */  // OLD
+#include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/panic.h"

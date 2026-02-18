@@ -15,12 +15,51 @@ static void append_str(char *dst, size_t dst_sz, const char *src) {
     dst[len + copy] = 0;
 }
 
+static void to_hex_lower(const uint8_t *in, uint32_t n, char *out) {
+    static const char *hex = "0123456789abcdef";
+    for (uint32_t i=0;i<n;i++) {
+        out[i*2] = hex[(in[i] >> 4) & 0xF];
+        out[i*2+1] = hex[in[i] & 0xF];
+    }
+    out[n*2] = 0;
+}
 
 typedef struct {
     char user[32];
     char pass[64];
+    char salt[33]; // 16 bytes as 32 hex chars + null
     int uid;
 } user_entry_t;
+
+/* ---------------- RDRAND for secure random salt ---------------- */
+static int rdrand64(uint64_t *result) {
+    unsigned char ok;
+    __asm__ __volatile__(
+        "rdrand %0; setc %1"
+        : "=r" (*result), "=qm" (ok)
+    );
+    return ok;
+}
+
+static void generate_salt_hex(char *salt_hex, size_t salt_hex_sz) {
+    if (!salt_hex || salt_hex_sz < 33) return;
+    uint8_t salt_bytes[16];
+    
+    // Generate 16 random bytes using rdrand
+    for (int i = 0; i < 2; i++) {
+        uint64_t rand_val;
+        int attempts = 0;
+        while (!rdrand64(&rand_val) && attempts++ < 10);
+        if (attempts >= 10) {
+            // Fallback to timestamp-based if rdrand fails
+            rand_val = (uint64_t)__builtin_ia32_rdtsc();
+        }
+        memcpy(salt_bytes + i * 8, &rand_val, 8);
+    }
+    
+    to_hex_lower(salt_bytes, 16, salt_hex);
+    salt_hex[32] = 0;
+}
 
 /* ---------------- SHA-256 (small, self-contained) ---------------- */
 typedef struct {
@@ -115,29 +154,25 @@ static void sha256_final(sha256_t *s, uint8_t out[32]) {
     for (int i=0;i<8;i++) wr32be(out + i*4, s->h[i]);
 }
 
-static void to_hex_lower(const uint8_t *in, uint32_t n, char *out) {
-    static const char *hex = "0123456789abcdef";
-    for (uint32_t i=0;i<n;i++) {
-        out[i*2] = hex[(in[i] >> 4) & 0xF];
-        out[i*2+1] = hex[in[i] & 0xF];
-    }
-    out[n*2] = 0;
-}
-
 static int parse_line(const char *line, user_entry_t *out) {
     if (!line || !out) return -1;
     char buf[MAX_LINE];
     safe_strcpy(buf, sizeof(buf), line);
-    // format: username:uid:sha256_hex(password)
+    // format: username:uid:salt:sha256_hex(salt+password)
     char *p1 = strchr(buf, ':');
     if (!p1) return -1;
     *p1++ = 0;
     char *p2 = strchr(p1, ':');
     if (!p2) return -1;
     *p2++ = 0;
+    char *p3 = strchr(p2, ':');
+    if (!p3) return -1;
+    *p3++ = 0;
+    
     safe_strcpy(out->user, sizeof(out->user), buf);
     out->uid = atoi(p1);
-    safe_strcpy(out->pass, sizeof(out->pass), p2);
+    safe_strcpy(out->salt, sizeof(out->salt), p2);
+    safe_strcpy(out->pass, sizeof(out->pass), p3);
     return 0;
 }
 
@@ -165,10 +200,12 @@ static int user_lookup(const char *name, user_entry_t *out) {
     return -1;
 }
 
-static void hash_password_hex(const char *password, char *hex_out, size_t hex_sz) {
-    if (!password || !hex_out || hex_sz < 65) return;
+static void hash_password_hex(const char *password, const char *salt_hex, char *hex_out, size_t hex_sz) {
+    if (!password || !salt_hex || !hex_out || hex_sz < 65) return;
     sha256_t s;
     sha256_init(&s);
+    // Hash: salt + password
+    sha256_update(&s, (const uint8_t*)salt_hex, (uint32_t)strlen(salt_hex));
     sha256_update(&s, (const uint8_t*)password, (uint32_t)strlen(password));
     uint8_t digest[32];
     sha256_final(&s, digest);
@@ -180,7 +217,7 @@ static int user_auth(const char *user, const char *pass, int *uid_out) {
     user_entry_t e;
     if (user_lookup(user, &e) != 0) return -1;
     char hex[65];
-    hash_password_hex(pass, hex, sizeof(hex));
+    hash_password_hex(pass, e.salt, hex, sizeof(hex));
     if (strcmp(e.pass, hex) != 0) return -2;
     if (uid_out) *uid_out = e.uid;
     return 0;
@@ -236,8 +273,11 @@ static int handle_adduser(int fd) {
 
     if (user_lookup(req, NULL) == 0) return -2; // exists
 
+    char salt_hex[33];
+    generate_salt_hex(salt_hex, sizeof(salt_hex));
+    
     char hex[65];
-    hash_password_hex(p1, hex, sizeof(hex));
+    hash_password_hex(p1, salt_hex, hex, sizeof(hex));
 
     char buf[4096];
     int n = load_users(buf, sizeof(buf));
@@ -250,6 +290,8 @@ static int handle_adduser(int fd) {
     char uidbuf[16];
     itoa(uid, uidbuf, 10);
     append_str(line, sizeof(line), uidbuf);
+    append_str(line, sizeof(line), ":");
+    append_str(line, sizeof(line), salt_hex);
     append_str(line, sizeof(line), ":");
     append_str(line, sizeof(line), hex);
     append_str(buf, sizeof(buf), line);
@@ -304,9 +346,13 @@ static int handle_passwd(int fd) {
     char *p1 = strchr(req, ':');
     if (!p1) return -1;
     *p1++ = 0;
-
+    
+    // Lookup user to get their salt
+    user_entry_t existing;
+    if (user_lookup(req, &existing) != 0) return -3; // user not found
+    
     char hex[65];
-    hash_password_hex(p1, hex, sizeof(hex));
+    hash_password_hex(p1, existing.salt, hex, sizeof(hex));
 
     char buf[4096];
     int n = load_users(buf, sizeof(buf));
@@ -330,6 +376,8 @@ static int handle_passwd(int fd) {
                 itoa(e.uid, uidbuf2, 10);
                 append_str(newline, sizeof(newline), uidbuf2);
                 append_str(newline, sizeof(newline), ":");
+                append_str(newline, sizeof(newline), e.salt);
+                append_str(newline, sizeof(newline), ":");
                 append_str(newline, sizeof(newline), hex);
                 if (out[0]) append_str(out, sizeof(out), "\n");
                 append_str(out, sizeof(out), newline);
@@ -350,7 +398,7 @@ static int handle_passwd(int fd) {
     return 0;
 }
 
-static int register_node(const char *path) {
+static int userman_register_node(const char *path) {
     userfs_user_node_t node;
     memset(&node, 0, sizeof(node));
     node.path = path;
@@ -383,10 +431,10 @@ int md_main(long argc, char** argv) {
     (void)argc; (void)argv;
     puts_raw("userman: start\n");
 
-    int rc_auth = register_node(USERMAN_NODE_AUTH);
-    int rc_add = register_node(USERMAN_NODE_ADD);
-    int rc_rm = register_node(USERMAN_NODE_RM);
-    int rc_pw = register_node(USERMAN_NODE_PASSWD);
+    int rc_auth = userman_register_node(USERMAN_NODE_AUTH);
+    int rc_add = userman_register_node(USERMAN_NODE_ADD);
+    int rc_rm = userman_register_node(USERMAN_NODE_RM);
+    int rc_pw = userman_register_node(USERMAN_NODE_PASSWD);
 
     puts_raw("userman: userfs nodes created\n");
 

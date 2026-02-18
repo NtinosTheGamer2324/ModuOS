@@ -5,7 +5,8 @@
 // NOTE: this file is included by syscall.c (kept local to syscalls for now)
 
 #include "moduos/kernel/errno.h"
-#include "moduos/kernel/process/process.h"
+// #include "moduos/kernel/process/process.h"  // OLD
+#include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/memory/usercopy.h"

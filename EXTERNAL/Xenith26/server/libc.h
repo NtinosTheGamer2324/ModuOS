@@ -16,10 +16,176 @@ static int errno;
 #include "string.h"
 
 // Syscall numbers (shared with kernel)
-#include "../include/moduos/kernel/syscall/syscall_numbers.h"
+#ifndef SYSCALL_NUMBERS_H
+#define SYSCALL_NUMBERS_H
+// This file can be included by both kernel and userspace programs
+#define SYS_EXIT        0
+#define SYS_FORK        1
+#define SYS_READ        2
+#define SYS_WRITE       3
+#define SYS_OPEN        4
+#define SYS_CLOSE       5
+#define SYS_WAIT        6
+#define SYS_EXEC        7
+#define SYS_WAITX       42 /* waitpid-like: (pid, status*, options) */
+#define SYS_EXECVE      43 /* execve(path, argv, envp) */
+#define SYS_PUTENV      44 /* putenv("KEY=VALUE") */
+#define SYS_GETENV      45 /* getenv(key, buf, buflen) -> len or -errno */
+#define SYS_ENVLIST     46 /* envlist(buf, buflen) -> bytes_written or -errno */
+#define SYS_ENVLIST2    47 /* envlist2(offset_inout, buf, buflen) -> bytes_written or -errno */
+#define SYS_UNSETENV    48 /* unsetenv(key) -> 0 or -errno */
+#define SYS_PROCLIST    49 /* procs(buf, buflen) -> count or -errno */
+#define SYS_PIDINFO     50 /* md64api_get_pid_info(pid, out, out_size) -> 0 or -errno */
+#define SYS_GETPID      8
+#define SYS_GETPPID     9
+#define SYS_SLEEP       10
+#define SYS_YIELD       11
+#define SYS_MALLOC      12
+#define SYS_FREE        13
+#define SYS_SBRK        14
+#define SYS_KILL        15
+#define SYS_TIME        16
+#define SYS_CHDIR       17
+#define SYS_GETCWD      18
+#define SYS_STAT        19
+#define SYS_MKDIR       20
+#define SYS_RMDIR       21
+#define SYS_UNLINK      22
+#define SYS_LSEEK       23
+#define SYS_WRITEFILE   24
+#define SYS_INPUT       28
+#define SYS_SSTATS      29
+#define SYS_SSTATS2     38 /* fill user buffer with md64api_sysinfo_data_u */
+// VFS formatting / mkfs
+#define SYS_VFS_MKFS    36
+#define SYS_VFS_GETPART 37
+#define SYS_VFS_MBRINIT 41
+/* User identity */
+#define SYS_GETUID      33
+#define SYS_SETUID      34
+/* Graphics blit */
+#define SYS_GFX_BLIT    35
+// VGA / Console
+#define SYS_VGA_SET_COLOR  30  // arg1=fg (0-15), arg2=bg (0-15)
+#define SYS_VGA_GET_COLOR  31  // returns (bg<<4)|fg
+#define SYS_VGA_RESET_COLOR 32 // reset to default (0x07 on 0x00)
+/* Virtual memory mapping (userland dynamic linker support) */
+#define SYS_MMAP        39
+#define SYS_MUNMAP      40
+/* Xenith26 shared buffers */
+#define SYS_X26_SHM_CREATE  51
+#define SYS_X26_SHM_MAP     52
+#define SYS_X26_SHM_UNMAP   53
+#define SYS_X26_SHM_DESTROY 54
+/* Networking (via SQRM 'net' service; returns -ENOSYS if unavailable) */
+#define SYS_NET_LINK_UP     59 /* () -> 0/1 or -errno */
+#define SYS_NET_IPV4_ADDR   60 /* (out_u32_be*) -> 0 or -errno */
+#define SYS_NET_IPV4_GW     61 /* (out_u32_be*) -> 0 or -errno */
+#define SYS_NET_DNS_A       62 /* (hostname, out_u32_be*) -> 0 or -errno */
+#define SYS_NET_HTTP_GET    63 /* (url, buf, bufsz, out_bytes*) -> 0 or -errno */
+/* FS tracing (timing) */
+#define SYS_FS_TRACE        55 /* arg1=0/1 set, returns previous state */
+#define SYS_OPENDIR         56 /* opendir(path) -> dirfd */
+#define SYS_READDIR         57 /* readdir(dirfd, namebuf, bufsz, is_dir*, size*) */
+#define SYS_CLOSEDIR        58 /* closedir(dirfd) */
+
+/* Userland USERFS nodes */
+#define SYS_USERFS_REGISTER 64
+
+#endif
+
 // MD64API (userland-visible kernel interfaces)
-#include "../include/moduos/kernel/md64api_grp.h"
-#include "../include/moduos/fs/userfs_user_api.h"
+#ifndef MODUOS_KERNEL_MD64API_GRP_H
+#define MODUOS_KERNEL_MD64API_GRP_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * MD64API Graphics (GRP)
+ *
+ * This is a small, file-based API that targets devices under:
+ *   $/dev/graphics/
+ *
+ * The canonical primary device is:
+ *   $/dev/graphics/video0
+ */
+
+#define MD64API_GRP_DEFAULT_DEVICE "$/dev/graphics/video0"
+
+typedef enum {
+    MD64API_GRP_MODE_TEXT     = 0,
+    MD64API_GRP_MODE_GRAPHICS = 1,
+} md64api_grp_mode_t;
+
+typedef enum {
+    MD64API_GRP_FMT_UNKNOWN   = 0,
+    MD64API_GRP_FMT_RGB565    = 1,
+    MD64API_GRP_FMT_XRGB8888  = 2,
+} md64api_grp_format_t;
+
+/* Binary payload returned by reading from $/dev/graphics/video0 */
+typedef struct __attribute__((packed)) {
+    uint64_t fb_addr;     /* virtual address of linear framebuffer (0 in text mode) */
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint8_t  bpp;
+    uint8_t  mode;        /* md64api_grp_mode_t */
+    uint8_t  fmt;         /* md64api_grp_format_t */
+    uint8_t  reserved;
+} md64api_grp_video_info_t;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+#ifndef MODUOS_FS_USERFS_USER_API_H
+#define MODUOS_FS_USERFS_USER_API_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+typedef int64_t ssize_t;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef ssize_t (*userfs_user_read_fn)(void *ctx, void *buf, size_t count);
+typedef ssize_t (*userfs_user_write_fn)(void *ctx, const void *buf, size_t count);
+
+typedef struct {
+    userfs_user_read_fn read;
+    userfs_user_write_fn write;
+} userfs_user_ops_t;
+
+typedef enum {
+    USERFS_PERM_READ_ONLY  = 0x1,
+    USERFS_PERM_WRITE_ONLY = 0x2,
+    USERFS_PERM_READ_WRITE = 0x3,
+} userfs_perm_t;
+
+typedef struct {
+    const char *path;         /* path relative to $/user */
+    const char *owner_id;     /* owner identity string */
+    uint32_t perms;           /* USERFS_PERM_* */
+    userfs_user_ops_t ops;    /* user callbacks (unused in-kernel) */
+    void *ctx;                /* user context pointer */
+} userfs_user_node_t;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
 // SYS_WRITEFILE is provided by syscall_numbers.h
 
 // File descriptor constants
@@ -48,7 +214,75 @@ typedef const char* string;
 
 // ---------------- MD64API SysInfo ----------------
 
-#include "../include/moduos/kernel/md64api_user.h"
+#ifndef MD64API_USER_H
+#define MD64API_USER_H
+
+#include <stdint.h>
+
+/*
+ * User-safe system info structure.
+ * No pointers: all strings are copied into fixed-size buffers.
+ */
+
+typedef struct md64api_sysinfo_data_u {
+    uint64_t sys_available_ram;
+    uint64_t sys_total_ram;
+
+    /* Version strings (copied from kernel; user-safe) */
+    char SystemVersion[32];
+    char KernelVersion[64];
+
+    char KernelVendor[64];
+    char os_name[32];
+    char os_arch[16];
+
+    char pcname[128];
+    char username[32];
+    char domain[32];
+    char kconsole[64];
+
+    char cpu[16];
+    char cpu_manufacturer[16];
+    char cpu_model[64];
+    int cpu_cores;
+    int cpu_threads;
+    int cpu_hyperthreading_enabled;
+    int cpu_base_mhz;
+    int cpu_max_mhz;
+    int cpu_cache_l1_kb;
+    int cpu_cache_l2_kb;
+    int cpu_cache_l3_kb;
+    char cpu_flags[128];
+
+    int is_virtual_machine;
+    char virtualization_vendor[32];
+
+    char gpu_name[128];
+    char gpu_driver[64];
+    int gpu_vram_mb;
+
+    uint64_t storage_total_mb;
+    uint64_t storage_free_mb;
+    char primary_disk_model[128];
+
+    char bios_vendor[64];
+    char bios_version[64];
+    char motherboard_model[64];
+
+    int secure_boot_enabled;
+    int tpm_version;
+
+    /* RTC date/time snapshot (from kernel RTC). */
+    uint8_t rtc_second;
+    uint8_t rtc_minute;
+    uint8_t rtc_hour;
+    uint8_t rtc_day;
+    uint8_t rtc_month;
+    uint16_t rtc_year;
+} md64api_sysinfo_data_u;
+
+#endif
+
 
 /* Legacy pointer-based struct kept for older apps (unsafe in ring3).
  * Prefer md64api_sysinfo_data_u + SYS_SSTATS2.
@@ -253,13 +487,72 @@ static inline int get_system_info_u(md64api_sysinfo_data_u *out) {
     return (int)syscall(SYS_SSTATS2, (long)out, (long)sizeof(*out), 0);
 }
 
-#include "../include/moduos/kernel/process/proclist_user.h"
+#pragma once
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define MD_PROCLIST_NAME_MAX 64
+
+typedef struct md_proclist_entry_u {
+    uint32_t pid;
+    uint32_t ppid;
+    uint32_t state;
+    uint64_t total_time;     // scheduler ticks (see process_t.total_time)
+    char name[MD_PROCLIST_NAME_MAX];
+} md_proclist_entry_u;
+
+#ifdef __cplusplus
+}
+#endif
+
 
 static inline int get_process_list(md_proclist_entry_u *out, size_t out_count) {
     return (int)syscall(SYS_PROCLIST, (long)out, (long)(out_count * sizeof(*out)), 0);
 }
 
-#include "../include/moduos/kernel/md64api_pidinfo_user.h"
+#pragma once
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define MD64API_PID_NAME_MAX 64
+#define MD64API_CWD_MAX 256
+#define MD64API_MAX_PROCESSES 256
+
+typedef struct md64api_pid_info_u {
+    uint32_t pid;
+    uint32_t ppid;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t state;        // process_state_t
+    uint32_t priority;
+    uint64_t total_time;   // scheduler ticks
+    uint64_t user_rip;
+    uint64_t user_rsp;
+    uint8_t  is_user;
+
+    // Approx memory usage (bytes), derived from tracked ranges.
+    uint64_t mem_image_bytes;
+    uint64_t mem_heap_bytes;
+    uint64_t mem_mmap_bytes;
+    uint64_t mem_stack_bytes;
+    uint64_t mem_total_bytes;
+
+    char name[MD64API_PID_NAME_MAX];
+    char cwd[MD64API_CWD_MAX];
+} md64api_pid_info_u;
+
+#ifdef __cplusplus
+}
+#endif
+
 
 static inline int md64api_get_pid_info(uint32_t pid, md64api_pid_info_u *out) {
     return (int)syscall(SYS_PIDINFO, (long)pid, (long)out, (long)sizeof(*out));
@@ -867,6 +1160,11 @@ static inline int gfx_blit(const void *src, uint16_t w, uint16_t h,
     return (int)syscall4(SYS_GFX_BLIT, (long)src, (long)wh, (long)xy, (long)pf);
 }
 
+/* Graphics pixel formats for gfx_blit */
+#define MD64API_GRP_FMT_UNKNOWN   0
+#define MD64API_GRP_FMT_XRGB8888  1
+#define MD64API_GRP_FMT_RGB565    2
+
 static inline void sleep(unsigned int sec) {
     syscall(SYS_SLEEP, sec, 0, 0);
 }
@@ -932,8 +1230,67 @@ static inline int unlink(const char *path) {
     return (int)syscall(SYS_UNLINK, (uint64_t)path, 0, 0);
 }
 
-#include "../include/moduos/fs/mkfs.h"
-#include "../include/moduos/fs/part.h"
+#ifndef MODUOS_FS_MKFS_H
+#define MODUOS_FS_MKFS_H
+
+#include <stdint.h>
+
+// mkfs request for SYS_VFS_MKFS.
+// Strings are NUL-terminated.
+typedef struct {
+    char fs_name[16];        // e.g. "fat32", "ext2"
+    char label[16];          // volume label (optional)
+
+    int32_t vdrive_id;
+    uint32_t start_lba;
+    uint32_t sectors;        // partition length in 512-byte sectors
+
+    uint32_t flags;          // vfs_mkfs_req_t flags
+
+    // flags bits
+    //  - allows fat32 mkfs on volumes >32GiB when auto-picking cluster size
+    //    (Windows formatter typically refuses without special tooling)
+    #define VFS_MKFS_FLAG_FORCE  (1u << 0)
+
+    // FAT32-specific (0 => kernel decides default)
+    uint32_t fat32_sectors_per_cluster;
+} vfs_mkfs_req_t;
+
+#endif
+
+#ifndef MODUOS_FS_PART_H
+#define MODUOS_FS_PART_H
+
+#include <stdint.h>
+
+// Request/response for SYS_VFS_GETPART
+
+typedef struct {
+    int32_t vdrive_id;
+    int32_t part_no; // 1..4
+} vfs_part_req_t;
+
+typedef struct {
+    uint32_t start_lba;
+    uint32_t sectors;
+    uint8_t type;
+    uint8_t _pad[3];
+} vfs_part_info_t;
+
+// Request for SYS_VFS_MBRINIT: write a minimal MBR with a single primary partition.
+// sectors==0 means "use disk size - start_lba".
+// flags bit0: force overwrite even if a valid MBR signature exists.
+typedef struct {
+    int32_t vdrive_id;
+    uint32_t start_lba;   // typically 2048
+    uint32_t sectors;     // 0=auto
+    uint8_t type;         // MBR partition type (0 => default 0x83)
+    uint8_t bootable;     // 0/1
+    uint16_t flags;       // bit0=force
+} vfs_mbrinit_req_t;
+
+#endif
+
 static inline int vfs_mkfs(const vfs_mkfs_req_t *req) {
     return (int)syscall(SYS_VFS_MKFS, (uint64_t)req, 0, 0);
 }

@@ -1,5 +1,6 @@
 #include "moduos/kernel/xenith26_shm.h"
-#include "moduos/kernel/process/process.h"
+// #include "moduos/kernel/process/process.h"  // OLD
+#include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/memory/usercopy.h"

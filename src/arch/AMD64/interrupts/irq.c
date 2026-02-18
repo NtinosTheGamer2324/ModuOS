@@ -45,6 +45,16 @@ void irq_uninstall_handler(int irq) {
 }
 
 void irq_dispatch(uint8_t irq) {
+    static uint64_t dispatch_count = 0;
+    dispatch_count++;
+    if (irq == 0 && (dispatch_count % 1000) == 0) {
+        com_write_string(COM1_PORT, "[IRQ-DISPATCH] IRQ 0 dispatched, count=");
+        char buf[32];
+        itoa((int)dispatch_count, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, "\n");
+    }
+    
     if (irq < 16 && irq_handlers[irq]) {
         irq_handlers[irq]();
     }

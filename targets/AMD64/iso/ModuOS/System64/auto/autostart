@@ -1,3 +1,6 @@
-//bg /Apps/userman.sqr
+// bg /Apps/userman.sqr
 // ?exists /ModuOS/System64/OOBE/oobe-bt fg /Apps/oobe.sqr
-//fg /Apps/login.sqr
+// fg /Apps/login.sqr
+bg /Apps/xenith26d.sqr
+sleep 1s
+bg /Apps/hello_x26.sqr

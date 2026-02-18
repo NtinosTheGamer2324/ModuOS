@@ -6,7 +6,8 @@
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/loader/elf.h"
-#include "moduos/kernel/process/process.h"
+// #include "moduos/kernel/process/process.h"  // OLD
+#include "moduos/kernel/process/process_new.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/memory/usercopy.h"
@@ -524,6 +525,9 @@ int exec_run(const char *args, int wait_for_exit) {
                 break;
             }
         }
+    } else {
+        /* Background exec: yield once to let the new process start running */
+        process_yield();
     }
 
     if (wait_for_exit) {

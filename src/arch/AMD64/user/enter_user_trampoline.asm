@@ -35,6 +35,20 @@ amd64_enter_user_now:
     jmp amd64_enter_user_trampoline
 
 amd64_enter_user_trampoline:
+    ; DEBUG: Log entry to trampoline
+    push rax
+    push rdi
+    push rsi
+    push rdx
+    extern com_write_string
+    mov rdi, 0x3F8          ; COM1_PORT = 0x3F8
+    lea rsi, [rel .msg]
+    call com_write_string
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
+    
     ; Pass argc/argv into userland following SysV: rdi=argc, rsi=argv
     ; We stored them in callee-saved regs r12/r13 in the process cpu_state.
     mov rdi, r12
@@ -50,4 +64,11 @@ amd64_enter_user_trampoline:
     push qword 0x202
     push qword USER_CS_SEL
     push r14
+    
+    ; Ensure interrupts are enabled before iretq
+    ; (iretq will restore RFLAGS from stack, but we need IF=1 *now* in CPL0)
+    sti
+    
     iretq
+
+.msg: db "[TRAMPOLINE] Entering user mode", 10, 0

@@ -2,7 +2,10 @@
 #include "moduos/arch/AMD64/interrupts/irq.h"
 #include "moduos/arch/AMD64/interrupts/pic.h"
 #include "moduos/kernel/io/io.h"
-#include "moduos/kernel/process/process.h"
+// #include "moduos/kernel/process/process.h"  // OLD - temporarily disabled
+#include "moduos/kernel/process/process_new.h"
+#include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/memory/string.h"
 #define PIT_CHANNEL0 0x40
 #define PIT_COMMAND  0x43
 
@@ -37,6 +40,17 @@ void pit_init(uint32_t frequency)
 }
 
 void timer_irq_handler(void) {
+    static uint64_t handler_count = 0;
+    handler_count++;
+    
+    if (handler_count == 1 || (handler_count % 5000) == 0) {
+        com_write_string(COM1_PORT, "[TIMER-IRQ] handler called, count=");
+        char buf[32];
+        itoa((int)handler_count, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, "\n");
+    }
+    
     if (in_timer_handler) {
         // EOI is handled by irq_dispatch() (PIC or LAPIC depending on mode).
         return;
@@ -50,9 +64,13 @@ void timer_irq_handler(void) {
     // EOI is handled by irq_dispatch(); do not send PIC EOI here (breaks IOAPIC mode).
     in_timer_handler = 0;
 
-    // Request scheduling / accounting.
+    // Use new scheduler
     scheduler_tick();
-    scheduler_request_reschedule();
+    
+    // Check if reschedule is needed and do it
+    if (should_reschedule()) {
+        schedule();
+    }
 }
 
 uint64_t get_system_ticks(void) {

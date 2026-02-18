@@ -5,7 +5,8 @@
 // Included by syscall.c
 
 #include "moduos/kernel/errno.h"
-#include "moduos/kernel/process/process.h"
+// #include "moduos/kernel/process/process.h"  // OLD
+#include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/memory/paging.h"

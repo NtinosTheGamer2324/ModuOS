@@ -21,7 +21,8 @@
 #include "moduos/kernel/kernel.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/phys.h"
-#include "moduos/kernel/process/process.h"
+// #include "moduos/kernel/process/process.h"  // OLD - temporarily disabled
+#include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/syscall/syscall.h"
 #include "moduos/drivers/PCI/pci.h"
 #include "moduos/fs/fd.h" 
@@ -607,13 +608,22 @@ void kernel_main(uint64_t mb2_ptr)
     }
     */
     VGA_Clear();
-    // Start configured services/apps before launching login.
-    extern void kernel_run_autostart(int boot_slot);
-    kernel_run_autostart(boot_drive_slot);
+    
+    // Create init process (PID 1) using new POSIX system
+    com_write_string(COM1_PORT, "[KERNEL] Creating init process...\n");
+    create_init_process("/ModuOS/System64/automan.sqr");
 
-    shell_process_entry();
-
-    /* Should never be reached */
+    /* Enable interrupts and start scheduling */
+    com_write_string(COM1_PORT, "[KERNEL] Starting scheduler...\n");
+    __asm__ volatile("sti");
+    
+    /* Switch to init process */
+    com_write_string(COM1_PORT, "[KERNEL] Calling schedule() to start init...\n");
+    schedule();
+    
+    com_write_string(COM1_PORT, "[KERNEL] Back from schedule(), entering idle loop...\n");
+    
+    /* PID 0 (kernel) becomes the idle loop */
     for (;;) {
         __asm__ volatile("hlt");
     }

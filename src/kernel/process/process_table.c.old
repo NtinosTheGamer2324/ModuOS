@@ -1,0 +1,84 @@
+// process_table.c - Process table management
+#include "moduos/kernel/process/process.h"
+#include "moduos/kernel/rwlock.h"
+#include "moduos/kernel/spinlock.h"
+#include "moduos/kernel/COM/com.h"
+#include <stdint.h>
+
+/* Process table and PID allocation */
+static process_t *process_table[MAX_PROCESSES];
+static rwlock_t process_table_rwlock __attribute__((aligned(64)));
+static spinlock_t next_pid_lock __attribute__((aligned(64)));
+static uint32_t next_pid = 1;
+
+/* Accessor for other modules */
+process_t **get_process_table(void) {
+    return process_table;
+}
+
+/* Allocate a new PID */
+uint32_t process_alloc_pid(void) {
+    // PID 0 is reserved for idle.
+    for (;;) {
+        spinlock_lock(&next_pid_lock);
+        uint32_t pid = next_pid++;
+        if (pid == 0 || pid >= MAX_PROCESSES) {
+            next_pid = 1;
+            pid = next_pid++;
+        }
+        if (pid < MAX_PROCESSES && process_table[pid] == NULL) { 
+            spinlock_unlock(&next_pid_lock); 
+            return pid; 
+        }
+        spinlock_unlock(&next_pid_lock);
+    }
+}
+
+/* Forward declaration from scheduler.c */
+extern void scheduler_add_process(process_t *proc);
+
+/* Register a process in the table */
+int process_register(process_t *proc) {
+    if (!proc) return -1;
+    if (proc->pid >= MAX_PROCESSES) return -1;
+    rwlock_write_lock(&process_table_rwlock);
+    if (process_table[proc->pid] != NULL) {
+        rwlock_write_unlock(&process_table_rwlock);
+        return -1;
+    }
+    process_table[proc->pid] = proc;
+    rwlock_write_unlock(&process_table_rwlock);
+    scheduler_add_process(proc);
+    return 0;
+}
+
+/* Unregister a process from the table */
+int process_unregister(uint32_t pid) {
+    if (pid >= MAX_PROCESSES) return -1;
+    rwlock_write_lock(&process_table_rwlock);
+    if (!process_table[pid]) {
+        rwlock_write_unlock(&process_table_rwlock);
+        return -1;
+    }
+    process_table[pid] = NULL;
+    rwlock_write_unlock(&process_table_rwlock);
+    return 0;
+}
+
+/* Get process by PID (lock-free read) */
+process_t *process_get_by_pid(uint32_t pid) {
+    if (pid >= MAX_PROCESSES) return NULL;
+    rwlock_read_lock(&process_table_rwlock);
+    process_t *p = process_table[pid];
+    rwlock_read_unlock(&process_table_rwlock);
+    return p;
+}
+
+/* Initialize process table */
+void process_table_init(void) {
+    rwlock_init(&process_table_rwlock);
+    spinlock_init(&next_pid_lock);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_table[i] = NULL;
+    }
+}

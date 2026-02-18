@@ -9,7 +9,8 @@
 #include "moduos/kernel/syscall/userfs_user.h"
 #include "moduos/kernel/syscall/syscall_numbers.h"
 #include "moduos/kernel/md64api.h"
-#include "moduos/kernel/process/process.h"
+// #include "moduos/kernel/process/process.h"  // OLD - temporarily disabled
+#include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/user_identity.h"
 #include "moduos/fs/userfs.h"
 #include "moduos/kernel/memory/memory.h"
@@ -292,19 +293,16 @@ int sys_exit(int status) {
         com_write_string(COM1_PORT, "\n");
     }
 
-    /*
-     * This syscall must never return to userspace.
-     * process_exit() switches away and halts.
-     */
-    process_exit(status);
+    // Use new POSIX-compliant exit
+    do_exit(status);
 
-    /* Fallback: if process_exit ever returns, halt. */
+    /* Fallback: if do_exit ever returns, halt. */
     for (;;) { __asm__ volatile("hlt"); }
 }
 
 int sys_fork(void) {
-    COM_LOG_WARN(COM1_PORT, "fork() not yet implemented");
-    return -1;
+    // Use new POSIX-compliant fork
+    return do_fork();
 }
 
 ssize_t sys_read(int fd, void *buf, size_t count) {
@@ -545,7 +543,17 @@ int sys_open(const char *pathname, int flags, int mode) {
 
 int sys_close(int fd) { return fd_close(fd); }
 
-int sys_wait(int *status) { (void)status; return -1; }
+int sys_wait(int *status) {
+    // Use new POSIX-compliant wait
+    int exit_status = 0;
+    pid_t child_pid = do_wait(&exit_status);
+    if (child_pid > 0 && status) {
+        if (usercopy_to_user(status, &exit_status, sizeof(exit_status)) != 0) {
+            return -1;
+        }
+    }
+    return child_pid;
+}
 
 int sys_getpid(void) {
     process_t *proc = process_get_current();
@@ -589,10 +597,22 @@ void* sys_sbrk(intptr_t increment) {
         size_t pages = (size_t)((map_end - map_start) / 0x1000ULL);
         uint64_t phys = phys_alloc_contiguous(pages);
         if (!phys) return (void*)-1;
-        if (paging_map_range(map_start, phys, (uint64_t)pages * 0x1000ULL, PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
+        
+        /* Get current process's page table */
+        uint64_t proc_cr3 = p->page_table;
+        uint64_t *proc_pml4 = (uint64_t*)phys_to_virt_kernel(proc_cr3 & 0xFFFFFFFFFFFFF000ULL);
+        if (!proc_pml4) {
             for (size_t i = 0; i < pages; i++) phys_free_frame(phys + (uint64_t)i * 0x1000ULL);
             return (void*)-1;
         }
+        
+        if (paging_map_range_to_pml4(proc_pml4, map_start, phys, (uint64_t)pages * 0x1000ULL, PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
+            for (size_t i = 0; i < pages; i++) phys_free_frame(phys + (uint64_t)i * 0x1000ULL);
+            return (void*)-1;
+        }
+        
+        /* Zero the allocated pages */
+        memset((void*)(uintptr_t)map_start, 0, (size_t)((map_end - map_start)));
     }
 
     p->user_heap_end = new_end;

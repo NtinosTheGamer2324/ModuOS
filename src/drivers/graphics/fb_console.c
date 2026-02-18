@@ -669,23 +669,6 @@ static void fbcon_emit_codepoint(fb_console_t *c, uint32_t cp) {
     /* Skip variation selector */
     if (cp == 0xFE0F) return;
 
-#if FBCON_DEBUG
-    if (cp >= 0x80) {
-        char enc[4] = {0,0,0,0};
-        size_t elen = fbcon_utf8_encode(cp, enc);
-        com_printf(COM1_PORT, "[FBCON][UTF8] cp=U+%04x bytes=", (unsigned)cp);
-        for (size_t i = 0; i < elen; i++) {
-            com_printf(COM1_PORT, "%02x", (unsigned)(uint8_t)enc[i]);
-            if (i + 1 < elen) com_write_string(COM1_PORT, " ");
-        }
-        for (size_t i = 0; i < elen; i++) {
-            char tmp[2] = {enc[i], 0};
-            com_write_string(COM1_PORT, tmp);
-        }
-        com_write_string(COM1_PORT, "'\n");
-    }
-#endif
-
     if (cp == '\n') {
         fbcon_newline(c);
         return;

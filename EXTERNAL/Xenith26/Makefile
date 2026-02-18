@@ -8,8 +8,8 @@ LD = x86_64-elf-ld
 
 # Compiler flags
 CFLAGS = -Wall -Wextra -O2 -ffreestanding -nostdlib -mcmodel=large \
-         -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -I../userland
-LDFLAGS = -T ../userland/user.ld -nostdlib
+         -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -I../../userland
+LDFLAGS = -T ../../userland/user.ld -nostdlib
 
 # Source directories
 SERVER_DIR = server
@@ -23,7 +23,9 @@ ISO_APPS = ../../targets/AMD64/iso/Apps
 # Targets
 SERVER = $(BUILD_DIR)/xenith26d.sqr
 LIBX26 = $(BUILD_DIR)/libX26.a
-EXAMPLES = $(BUILD_DIR)/hello_x26.sqr $(BUILD_DIR)/xclock.sqr
+EXAMPLES = $(BUILD_DIR)/hello_x26.sqr
+# Note: xclock requires math library (cosf/sinf) - disabled for now
+# EXAMPLES += $(BUILD_DIR)/xclock.sqr
 
 .PHONY: all clean install server lib examples
 
@@ -41,10 +43,11 @@ $(SERVER): $(SERVER_DIR)/startx.c $(SERVER_DIR)/*.h
 
 # ========== Client Library ==========
 
-$(LIBX26): $(LIB_DIR)/libX26.c $(LIB_DIR)/libX26.h
+$(LIBX26): $(LIB_DIR)/libX26.c $(LIB_DIR)/libX26.h $(LIB_DIR)/lib_fnt.c $(LIB_DIR)/lib_fnt.h
 	@echo "Building libX26 client library..."
-	$(CC) $(CFLAGS) -c $(LIB_DIR)/libX26.c -o $(BUILD_DIR)/libX26.o
-	$(AR) rcs $@ $(BUILD_DIR)/libX26.o
+	$(CC) $(CFLAGS) -DLIBC_NO_START -c $(LIB_DIR)/libX26.c -o $(BUILD_DIR)/libX26.o
+	$(CC) $(CFLAGS) -DLIBC_NO_START -c $(LIB_DIR)/lib_fnt.c -o $(BUILD_DIR)/lib_fnt.o
+	$(AR) rcs $@ $(BUILD_DIR)/libX26.o $(BUILD_DIR)/lib_fnt.o
 	@echo "Built: $@"
 
 # ========== Examples ==========

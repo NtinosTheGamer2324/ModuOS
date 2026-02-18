@@ -78,4 +78,7 @@ syscall_entry_return:
     pop r14
     pop r15
 
+    ; DEBUG: Force enable interrupts before iretq
+    sti
+    
     iretq
