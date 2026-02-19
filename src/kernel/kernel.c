@@ -617,12 +617,33 @@ void kernel_main(uint64_t mb2_ptr)
     com_write_string(COM1_PORT, "[KERNEL] Starting scheduler...\n");
     __asm__ volatile("sti");
     
-    com_write_string(COM1_PORT, "[KERNEL] Entering idle loop - timer IRQ will schedule init...\n");
+    com_write_string(COM1_PORT, "[KERNEL] Checking for runnable processes...\n");
     
-    /* PID 0 (kernel) becomes the idle loop */
-    /* DO NOT call schedule() here - PID 0 has no proper context for switching! */
-    /* The timer IRQ will call scheduler_tick() which will call schedule() */
+    /* PID 0 (kernel) idle loop */
+    /* We need to explicitly check for and switch to runnable processes */
     for (;;) {
+        /* Check if there are any runnable processes */
+        extern process_t *pick_next_task(void);
+        process_t *next = pick_next_task();
+        
+        if (next && next != current) {
+            /* There's a runnable process - switch to it */
+            com_write_string(COM1_PORT, "[KERNEL] Found runnable process, switching...\n");
+            extern void switch_to(process_t *prev, process_t *next);
+            
+            /* Mark next as running */
+            extern void scheduler_remove(process_t *p);
+            scheduler_remove(next);
+            next->state = PROCESS_STATE_RUNNING;
+            process_t *prev = current;
+            current = next;
+            
+            /* Context switch */
+            switch_to(prev, next);
+            /* When we return here, we've been scheduled again */
+        }
+        
+        /* No runnable processes, sleep */
         __asm__ volatile("hlt");
     }
 }
