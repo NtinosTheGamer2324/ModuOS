@@ -617,16 +617,12 @@ void kernel_main(uint64_t mb2_ptr)
     com_write_string(COM1_PORT, "[KERNEL] Starting scheduler...\n");
     __asm__ volatile("sti");
     
-    /* Switch to init process */
-    com_write_string(COM1_PORT, "[KERNEL] Calling schedule() to start init...\n");
-    schedule();
-    
-    com_write_string(COM1_PORT, "[KERNEL] Back from schedule(), entering idle loop...\n");
-    com_write_string(COM1_PORT, "[KERNEL] Idle loop will wait for timer to schedule init\n");
+    com_write_string(COM1_PORT, "[KERNEL] Entering idle loop - timer IRQ will schedule init...\n");
     
     /* PID 0 (kernel) becomes the idle loop */
+    /* DO NOT call schedule() here - PID 0 has no proper context for switching! */
+    /* The timer IRQ will call scheduler_tick() which will call schedule() */
     for (;;) {
-        schedule();  // Explicitly call schedule periodically
         __asm__ volatile("hlt");
     }
 }

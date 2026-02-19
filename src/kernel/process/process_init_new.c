@@ -106,7 +106,7 @@ void create_init_process(const char *path) {
     // Default parameters
     init->nice = 0;
     init->weight = 1024;
-    init->vruntime = 0;
+    init->vruntime = 0;  // Will be set to min_vruntime by scheduler_add
     strncpy(init->cwd, "/", PROCESS_MAX_PATH - 1);
     
     // Set as child of idle
