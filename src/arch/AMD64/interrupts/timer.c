@@ -68,9 +68,12 @@ void timer_irq_handler(void) {
     scheduler_tick();
     
     // Check if reschedule is needed and do it
-    if (should_reschedule()) {
-        schedule();
-    }
+    // SAFETY: Do NOT call schedule() from IRQ context!
+    // The scheduler will be called from the main loop or other safe points
+    // Calling schedule() from here causes triple faults due to context corruption
+    // if (should_reschedule()) {
+    //     schedule();
+    // }
 }
 
 uint64_t get_system_ticks(void) {
