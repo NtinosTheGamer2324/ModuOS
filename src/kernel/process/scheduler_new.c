@@ -136,7 +136,8 @@ void scheduler_remove(process_t *p) {
 }
 
 // Pick next process to run
-static process_t *pick_next_task(void) {
+// Made non-static so kernel.c can call it
+process_t *pick_next_task(void) {
     // CFS: pick process with minimum vruntime
     return runqueue_head;
 }
