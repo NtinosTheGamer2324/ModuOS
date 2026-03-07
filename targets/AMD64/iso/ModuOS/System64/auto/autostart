@@ -1,6 +1,12 @@
-// bg /Apps/userman.sqr
-// ?exists /ModuOS/System64/OOBE/oobe-bt fg /Apps/oobe.sqr
-// fg /Apps/login.sqr
-bg /Apps/xenith26d.sqr
-sleep 1s
-bg /Apps/hello_x26.sqr
+// ModuOS System Services
+// This file is read by automan (PID 1) on boot
+
+// Core system services
+// bg /Apps/ntosiux_ttyman.sqr
+// bg /Apps/netman.sqr
+
+// User services
+//bg /Apps/userman.sqr
+
+// Login shell on TTY1
+fg /Apps/zenith5.1.sqr
