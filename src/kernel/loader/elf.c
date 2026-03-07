@@ -1,7 +1,7 @@
 // elf.c - With argument passing support
 
 #include "moduos/kernel/loader/elf.h"
-#include "moduos/kernel/process/process.h"
+#include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/phys.h"
@@ -184,6 +184,23 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
                     phys_ref_dec(phys_base + p * PAGE_SIZE);
                 }
                 return -1;
+            }
+
+            /* Also map the segment into the process PML4 (with final flags,
+             * not the temporary writable flags used for loading). The kernel
+             * CR3 mapping above is used only for the memset/memcpy below;
+             * the process switches to its own CR3 on entry, so without this
+             * the segment pages are invisible to the running process. */
+            {
+                uint64_t *build_pml4 = process_get_build_pml4();
+                if (build_pml4) {
+                    if (paging_map_range_to_pml4(build_pml4, vaddr_aligned,
+                                                 phys_base, aligned_size,
+                                                 final_flags | PFLAG_WRITABLE) != 0) {
+                        COM_LOG_ERROR(COM1_PORT, "Failed to map segment into process PML4");
+                        return -1;
+                    }
+                }
             }
             
             // Flush TLB
