@@ -22,9 +22,8 @@
 #define SYS_GETPPID     9
 #define SYS_SLEEP       10
 #define SYS_YIELD       11
-#define SYS_MALLOC      12
-#define SYS_FREE        13
-#define SYS_SBRK        14
+/* SYS_MALLOC/FREE removed - handled by userland libc */
+#define SYS_SBRK        14  /* Low-level heap expansion only */
 #define SYS_KILL        15
 #define SYS_TIME        16
 #define SYS_CHDIR       17
@@ -45,26 +44,11 @@
 /* User identity */
 #define SYS_GETUID      33
 #define SYS_SETUID      34
-/* Graphics blit */
-#define SYS_GFX_BLIT    35
-// VGA / Console
-#define SYS_VGA_SET_COLOR  30  // arg1=fg (0-15), arg2=bg (0-15)
-#define SYS_VGA_GET_COLOR  31  // returns (bg<<4)|fg
-#define SYS_VGA_RESET_COLOR 32 // reset to default (0x07 on 0x00)
+/* Graphics/VGA - REMOVED: Use $/dev/graphics/video0 or $/dev/console instead */
 /* Virtual memory mapping (userland dynamic linker support) */
 #define SYS_MMAP        39
 #define SYS_MUNMAP      40
-/* Xenith26 shared buffers */
-#define SYS_X26_SHM_CREATE  51
-#define SYS_X26_SHM_MAP     52
-#define SYS_X26_SHM_UNMAP   53
-#define SYS_X26_SHM_DESTROY 54
-/* Networking (via SQRM 'net' service; returns -ENOSYS if unavailable) */
-#define SYS_NET_LINK_UP     59 /* () -> 0/1 or -errno */
-#define SYS_NET_IPV4_ADDR   60 /* (out_u32_be*) -> 0 or -errno */
-#define SYS_NET_IPV4_GW     61 /* (out_u32_be*) -> 0 or -errno */
-#define SYS_NET_DNS_A       62 /* (hostname, out_u32_be*) -> 0 or -errno */
-#define SYS_NET_HTTP_GET    63 /* (url, buf, bufsz, out_bytes*) -> 0 or -errno */
+/* Networking - REMOVED: Use $/user/network/* (NetMan service) instead */
 /* FS tracing (timing) */
 #define SYS_FS_TRACE        55 /* arg1=0/1 set, returns previous state */
 #define SYS_OPENDIR         56 /* opendir(path) -> dirfd */
@@ -74,4 +58,68 @@
 /* Userland USERFS nodes */
 #define SYS_USERFS_REGISTER 64
 
+/* Filesystem mount/unmount */
+#define SYS_MOUNT       65  /* mount(vdrive_id, partition_lba, fs_type) -> slot or -errno */
+#define SYS_UNMOUNT     66  /* unmount(slot) -> 0 or -errno */
+#define SYS_MOUNTS      67  /* mounts(buf, buflen) -> count or -errno */
+
+/* POSIX fd operations */
+#define SYS_DUP         68  /* dup(oldfd) -> newfd or -errno */
+#define SYS_DUP2        69  /* dup2(oldfd, newfd) -> newfd or -errno */
+#define SYS_PIPE        70  /* pipe(fds[2]) -> 0 or -errno */
+#define SYS_FCNTL       71  /* fcntl(fd, cmd, arg) -> result or -errno */
+
+/* POSIX process identity */
+#define SYS_GETGID      72  /* getgid() -> gid */
+#define SYS_SETGID      73  /* setgid(gid) -> 0 or -errno */
+#define SYS_GETEUID     74  /* geteuid() -> euid */
+#define SYS_GETEGID     75  /* getegid() -> egid */
+
+/* GPU Core - REMOVED: Use $/dev/graphics/video0 (DevFS) instead */
+
+/* POSIX Signals */
+#define SYS_SIGNAL             87  /* signal(signum, handler) -> old_handler or -errno */
+#define SYS_RAISE              88  /* raise(signum) -> 0 or -errno */
+#define SYS_SIGACTION          89  /* sigaction(signum, act*, oldact*) -> 0 or -errno */
+
+/* File Descriptor Injection (for TTY manager) */
+#define SYS_FD_INJECT          90  /* fd_inject(pid, fd, fd_obj) -> 0 or -errno */
+
+/* POSIX Sessions and Process Groups */
+#define SYS_SETSID             91  /* setsid() -> new SID or -errno */
+#define SYS_SETPGID            92  /* setpgid(pid, pgid) -> 0 or -errno */
+#define SYS_GETPGID            93  /* getpgid(pid) -> pgid or -errno */
+#define SYS_GETSID             94  /* getsid(pid) -> sid or -errno */
+
+/* ioctl commands for controlling terminal */
+#define TIOCSCTTY              0x540E  /* Set controlling terminal */
+#define TIOCNOTTY              0x5422  /* Give up controlling terminal */
+
+/* Signal numbers (POSIX-compatible) */
+#define SIGHUP     1   /* Hangup */
+#define SIGINT     2   /* Interrupt (Ctrl+C) */
+#define SIGQUIT    3   /* Quit */
+#define SIGILL     4   /* Illegal instruction */
+#define SIGTRAP    5   /* Trace trap */
+#define SIGABRT    6   /* Abort */
+#define SIGBUS     7   /* Bus error */
+#define SIGFPE     8   /* Floating point exception */
+#define SIGKILL    9   /* Kill (uncatchable) */
+#define SIGUSR1    10  /* User-defined 1 */
+#define SIGSEGV    11  /* Segmentation fault */
+#define SIGUSR2    12  /* User-defined 2 */
+#define SIGPIPE    13  /* Broken pipe */
+#define SIGALRM    14  /* Alarm */
+#define SIGTERM    15  /* Termination */
+#define SIGCHLD    17  /* Child process status */
+#define SIGCONT    18  /* Continue */
+#define SIGSTOP    19  /* Stop (uncatchable) */
+#define SIGTSTP    20  /* Terminal stop (Ctrl+Z) */
+
+/* Signal handler types */
+#define SIG_DFL    ((void (*)(int))0)  /* Default action */
+#define SIG_IGN    ((void (*)(int))1)  /* Ignore signal */
+#define SIG_ERR    ((void (*)(int))-1) /* Error return */
+
 #endif
+

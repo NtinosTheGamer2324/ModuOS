@@ -28,6 +28,9 @@
 extern void amd64_enter_user_now(uint64_t user_rip, uint64_t user_rsp,
                                 uint64_t argc, uint64_t argv, uint64_t envp);
 
+// streq_prefix: retained for future PATH-prefix matching use.
+// Suppressed unused-function warning intentionally - do not remove.
+__attribute__((unused))
 static int streq_prefix(const char *s, const char *pfx) {
     while (*pfx) {
         if (*s++ != *pfx++) return 0;
@@ -330,12 +333,19 @@ static int build_user_stack(process_t *p, int argc, char **kargv, int envc, char
     const uint64_t user_stack_base  = user_stack_guard - initial_pages * PAGE_SIZE;
     const uint64_t user_stack_limit = user_stack_top - max_pages * PAGE_SIZE;
 
-    // Allocate and map initial stack pages.
+    // Allocate and map initial stack pages into current process's page table
     uint64_t phys_base = phys_alloc_contiguous((size_t)initial_pages);
     if (!phys_base) return -ENOMEM;
 
-    if (paging_map_range(user_stack_base, phys_base, initial_pages * PAGE_SIZE,
-                         PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
+    // Get current process's PML4 (not the kernel's global PML4)
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *proc_pml4 = (uint64_t*)phys_to_virt_kernel(pml4_phys);
+    
+    if (!proc_pml4 || paging_map_range_to_pml4(proc_pml4, user_stack_base, phys_base, 
+                                               initial_pages * PAGE_SIZE,
+                                               PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
         for (size_t i = 0; i < (size_t)initial_pages; i++) phys_ref_dec(phys_base + (uint64_t)i * PAGE_SIZE);
         return -ENOMEM;
     }
@@ -345,7 +355,8 @@ static int build_user_stack(process_t *p, int argc, char **kargv, int envc, char
     p->user_stack_low = user_stack_base;
     p->user_stack_limit = user_stack_limit;
 
-    uint64_t sp = user_stack_guard - 16;
+    // Start SP at top of allocated stack (not guard page)
+    uint64_t sp = user_stack_base + (initial_pages * PAGE_SIZE) - 16;
 
     // Copy strings top-down.
     uint64_t *argv_str_ptrs = NULL;
@@ -421,8 +432,20 @@ static int build_user_stack(process_t *p, int argc, char **kargv, int envc, char
 }
 
 int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *envp_user) {
+    extern volatile process_t *current;
+    com_write_string(COM1_PORT, "[EXECVE] Entry: current=0x");
+    com_write_hex64(COM1_PORT, (uint64_t)(uintptr_t)current);
+    com_write_string(COM1_PORT, "\n");
+    
     process_t *p = process_get_current();
-    if (!p) return -ESRCH;
+    com_write_string(COM1_PORT, "[EXECVE] process_get_current()=0x");
+    com_write_hex64(COM1_PORT, (uint64_t)(uintptr_t)p);
+    com_write_string(COM1_PORT, "\n");
+    
+    if (!p) {
+        com_write_string(COM1_PORT, "[EXECVE] ERROR: current is NULL!\n");
+        return -ESRCH;
+    }
     if (!p->is_user) return -EACCES;
 
     // Copy path string
@@ -502,26 +525,95 @@ int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *
         return -ENOENT;
     }
 
-    // Replace image: free old user mappings, reset ranges.
+    // Create a fresh PML4 for the new image BEFORE switching to process CR3.
+    // CRITICAL: paging_create_process_pml4() must copy kernel mappings from
+    // the current kernel CR3, not from a process CR3 with incomplete mappings!
+    extern void process_set_build_pml4(uint64_t *virt, uint64_t phys);
+    uint64_t new_cr3 = paging_create_process_pml4();
+    if (!new_cr3) {
+        kfree(elf_buf);
+        free_strv(kargv, argc);
+        free_strv(kenvp, envc);
+        return -ENOMEM;
+    }
+    
+    // NOW switch to this process's own CR3 before freeing so that
+    // paging_virt_to_phys() and paging_unmap_page() walk this process's
+    // page tables, not whatever PML4 was last switched in.
+    extern void paging_switch_cr3(uint64_t);
+    paging_switch_cr3(p->cr3);
     process_free_user_memory(p);
     p->user_image_base = 0;
-    p->user_image_end = 0;
-    p->user_heap_end = p->user_heap_base;
-    p->user_mmap_end = p->user_mmap_base;
+    p->user_image_end  = 0;
+    p->user_heap_end   = p->user_heap_base;
+    p->user_mmap_end   = p->user_mmap_base;
+    
+    // Set up the build PML4 pointer for ELF loading
+    uint64_t *new_pml4_virt = (uint64_t *)phys_to_virt_kernel(new_cr3 & ~0xFFFULL);
+    process_set_build_pml4(new_pml4_virt, new_cr3);
 
-    // Load ELF into current process address space.
+    // Load ELF — segments go into new_pml4 via g_build_pml4.
     uint64_t entry = 0;
     uint64_t img_base = 0, img_end = 0;
     rc = elf_load_with_args(elf_buf, rd, &entry, 0, NULL, &img_base, &img_end);
     kfree(elf_buf);
+    process_set_build_pml4(NULL, 0);   // clear so stale pointer isn't reused
     if (rc != 0) {
         free_strv(kargv, argc);
         free_strv(kenvp, envc);
         return -ENOEXEC;
     }
 
+    // Commit the new address space to the process and switch CR3 now so that
+    // build_user_stack() and amd64_enter_user_now() see the correct mappings.
+    // Use paging_switch_cr3() to keep paging.c's internal pml4 pointer in sync;
+    // a raw CR3 write would leave paging_map_page() targeting the old PML4.
+    com_write_string(COM1_PORT, "[EXECVE] PID=");
+    char ebuf[16];
+    itoa((int)p->pid, ebuf, 10);
+    com_write_string(COM1_PORT, ebuf);
+    com_write_string(COM1_PORT, " setting cr3=0x");
+    com_write_hex64(COM1_PORT, new_cr3);
+    com_write_string(COM1_PORT, " old_cr3=0x");
+    com_write_hex64(COM1_PORT, p->cr3);
+    com_write_string(COM1_PORT, "\n");
+    
+    p->cr3        = new_cr3;
+    p->page_table = new_cr3;
+    
+    // DEBUG: Check PID 2 BEFORE switching CR3
+    extern process_t *process_get_by_pid(uint32_t);
+    process_t *parent = process_get_by_pid(p->ppid);
+    if (parent && parent->pid == 2) {
+        com_write_string(COM1_PORT, "[EXECVE] BEFORE paging_switch_cr3: parent PID 2 page_table=0x");
+        com_write_hex64(COM1_PORT, parent->page_table);
+        com_write_string(COM1_PORT, "\n");
+    }
+    
+    paging_switch_cr3(new_cr3);
+    
+    // DEBUG: Check PID 2 AFTER switching CR3
+    if (parent && parent->pid == 2) {
+        com_write_string(COM1_PORT, "[EXECVE] AFTER paging_switch_cr3: parent PID 2 page_table=0x");
+        com_write_hex64(COM1_PORT, parent->page_table);
+        com_write_string(COM1_PORT, "\n");
+        
+        // Check if PID 2's struct address is user-writable in child's page table
+        extern uint64_t paging_get_pte(uint64_t);
+        uint64_t pid2_addr = (uint64_t)parent;
+        uint64_t pte = paging_get_pte(pid2_addr);
+        com_write_string(COM1_PORT, "[EXECVE] PID 2 struct @0x");
+        com_write_hex64(COM1_PORT, pid2_addr);
+        com_write_string(COM1_PORT, " PTE=0x");
+        com_write_hex64(COM1_PORT, pte);
+        if (pte & 0x4) { // PFLAG_USER
+            com_write_string(COM1_PORT, " **USER-WRITABLE**");
+        }
+        com_write_string(COM1_PORT, "\n");
+    }
+
     p->user_image_base = img_base;
-    p->user_image_end = img_end;
+    p->user_image_end  = img_end;
 
     // Build new user stack with argv/envp
     uint64_t user_rsp = 0, user_argv = 0, user_envp = 0;

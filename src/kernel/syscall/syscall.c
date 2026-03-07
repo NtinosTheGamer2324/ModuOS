@@ -9,7 +9,6 @@
 #include "moduos/kernel/syscall/userfs_user.h"
 #include "moduos/kernel/syscall/syscall_numbers.h"
 #include "moduos/kernel/md64api.h"
-// #include "moduos/kernel/process/process.h"  // OLD - temporarily disabled
 #include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/user_identity.h"
 #include "moduos/fs/userfs.h"
@@ -32,8 +31,14 @@
 #include "moduos/kernel/exec.h"
 #include "moduos/kernel/syscall/execve_impl.h"
 #include "moduos/drivers/input/input.h"
-
 #include "moduos/kernel/memory/usercopy.h"
+#include "moduos/kernel/errno.h"
+#include "moduos/arch/AMD64/syscall/syscall64.h"
+
+/* Forward declarations */
+uint64_t sys_signal(int sig, uint64_t handler);
+int sys_raise(int sig);
+int sys_fd_inject(uint32_t pid, int fd, void *arg);
 
 /* Helper: Copy string from userspace to kernel buffer */
 static int copy_string_from_user(const char *user_str, char *kernel_buf, size_t max_len) {
@@ -66,16 +71,23 @@ static int sys_vfs_getpart(const vfs_part_req_t *user_req, vfs_part_info_t *user
 static int sys_vfs_mbrinit(const vfs_mbrinit_req_t *user_req);
 static int sys_pidinfo(uint32_t pid, md64api_pid_info_u *out, size_t out_size);
 static int sys_proclist(md_proclist_entry_u *out, size_t out_bytes);
+static int sys_mount(int vdrive_id, uint32_t partition_lba, int fs_type);
+static int sys_unmount(int slot);
+static int sys_mounts(char *user_buf, size_t buflen);
 
 void syscall_init(void) {
     COM_LOG_INFO(COM1_PORT, "Initializing system calls");
 
-    /* Use INT 0x80 for now (SYSCALL/SYSRET needs more debugging) */
+    /* AMD64 SYSCALL/SYSRET (faster ~3-10x than INT 0x80) */
+    amd64_syscall_init();
     idt_set_entry(0x80, syscall_entry, 0xEF);
 
     fd_init();
-    COM_LOG_OK(COM1_PORT, "System calls initialized (INT 0x80)");
+    COM_LOG_OK(COM1_PORT, "System calls initialized (SYSCALL/SYSRET) plus 0x80");
 }
+
+/* Forward declaration — defined in signals_new.c */
+extern void check_signals(void);
 
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
                          uint64_t arg3, uint64_t arg4, uint64_t arg5) {
@@ -85,24 +97,32 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
     g_last_syscall_args[2] = arg3;
     g_last_syscall_args[3] = arg4;
     g_last_syscall_args[4] = arg5;
-    // DEBUG: Log all syscalls for early boot userman
-    /* syscall logging disabled by default (noisy) */
-#if 0
-    process_t *dbg_proc = process_get_current();
-    if (dbg_proc && dbg_proc->pid == 1) {
-        com_write_string(COM1_PORT, "[SYSCALL] pid=1 num=");
-        char dbg_buf[16];
-        itoa((int)syscall_num, dbg_buf, 10);
-        com_write_string(COM1_PORT, dbg_buf);
-        com_write_string(COM1_PORT, " arg1=");
-        itoa((int)(uint64_t)arg1, dbg_buf, 10);
-        com_write_string(COM1_PORT, dbg_buf);
-        com_write_string(COM1_PORT, "\n");
+    
+    // DEBUG: Check PID 2 before each syscall from PID 4
+    extern process_t *process_get_by_pid(uint32_t);
+    extern volatile process_t *current;
+    if (current && current->pid == 4) {
+        process_t *pid2 = process_get_by_pid(2);
+        if (pid2 && pid2->page_table == 0) {
+            com_write_string(COM1_PORT, "[SYSCALL] PID 2 corrupted BEFORE syscall ");
+            char sbuf[16];
+            itoa((int)syscall_num, sbuf, 10);
+            com_write_string(COM1_PORT, sbuf);
+            com_write_string(COM1_PORT, " from PID 4\n");
+            for(;;) __asm__("hlt");
+        }
     }
-#endif
+    /* Deliver any pending signals from the previous syscall or IRQ before
+     * dispatching the new syscall.  This is the earliest safe point where
+     * we have a valid kernel stack and can call do_exit() if needed. */
+    if (syscall_num != SYS_EXIT)
+        check_signals();
+
     char buf[32];
     switch (syscall_num) {
-        case SYS_EXIT:    return sys_exit((int)arg1);
+        case SYS_EXIT:    
+            // com_printf(COM1_PORT, "[EXIT] PID %d exiting with status %d\n", current->pid, (int)arg1);
+            return sys_exit((int)arg1);
         case SYS_FORK:    return sys_fork();
         case SYS_READ:    return sys_read((int)arg1, (void*)arg2, (size_t)arg3);
         case SYS_WRITEFILE: return sys_writefile((int)arg1, (const char*)arg2, (size_t)arg3);
@@ -118,105 +138,27 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         }
         case SYS_SETUID: {
             process_t *p = process_get_current();
-            if (!p) return -1;
-            if (p->uid == KERNEL_UID) return -2; /* EPERM */
-            if ((uint32_t)arg1 == KERNEL_UID) return -2; /* EPERM */
-            if (p->uid != 0) return -2; /* EPERM */
+            if (!p) return (uint64_t)-(int64_t)EPERM;
+            if (p->uid == KERNEL_UID) return (uint64_t)-(int64_t)EPERM;
+            if ((uint32_t)arg1 == KERNEL_UID) return (uint64_t)-(int64_t)EPERM;
+            if (p->uid != 0) return (uint64_t)-(int64_t)EPERM;
             p->uid = (uint32_t)arg1;
+            p->euid = (uint32_t)arg1;
             return 0;
         }
 
-        case SYS_GFX_BLIT: {
-            /* args:
-             *  arg1 = src_ptr
-             *  arg2 = packed (src_w<<16 | src_h)
-             *  arg3 = packed (dst_x<<16 | dst_y)
-             *  arg4 = packed (src_pitch_bytes<<16 | fmt)
-             */
-            const uint8_t *src = (const uint8_t*)arg1;
-            uint32_t wh = (uint32_t)arg2;
-            uint32_t xy = (uint32_t)arg3;
-            uint32_t pf = (uint32_t)arg4;
-
-            uint32_t src_w = (wh >> 16) & 0xFFFFu;
-            uint32_t src_h = (wh) & 0xFFFFu;
-            uint32_t dst_x = (xy >> 16) & 0xFFFFu;
-            uint32_t dst_y = (xy) & 0xFFFFu;
-            uint32_t src_pitch = (pf >> 16) & 0xFFFFu;
-            framebuffer_format_t fmt = (framebuffer_format_t)(pf & 0xFFFFu);
-
-            if (!src || src_w == 0 || src_h == 0) return -1;
-
-            framebuffer_t fb;
-            if (VGA_GetFrameBufferMode() != FB_MODE_GRAPHICS) return -2;
-            if (VGA_GetFrameBuffer(&fb) != 0 || !fb.addr) return -2;
-
-            /*
-             * Format negotiation:
-             * The blit is fundamentally determined by bytes-per-pixel.
-             * Some code paths may not initialize fb.fmt reliably, so validate against fb.bpp.
-             */
-            framebuffer_format_t expected_fmt = FB_FMT_UNKNOWN;
-            if (fb.bpp == 32) expected_fmt = FB_FMT_XRGB8888;
-            else if (fb.bpp == 16) expected_fmt = FB_FMT_RGB565;
-
-            if (expected_fmt == FB_FMT_UNKNOWN || fmt != expected_fmt) {
-                if (kernel_debug_is_on()) {
-                    /* Debug to COM1 to help diagnose real hardware mismatches */
-                    com_write_string(COM1_PORT, "[SYS_GFX_BLIT] fmt mismatch: user=");
-                    itoa((int)fmt, buf, 10); com_write_string(COM1_PORT, buf);
-                    com_write_string(COM1_PORT, " fb.bpp=");
-                    itoa((int)fb.bpp, buf, 10); com_write_string(COM1_PORT, buf);
-                    com_write_string(COM1_PORT, " fb.fmt=");
-                    itoa((int)fb.fmt, buf, 10); com_write_string(COM1_PORT, buf);
-                    com_write_string(COM1_PORT, " expected=");
-                    itoa((int)expected_fmt, buf, 10); com_write_string(COM1_PORT, buf);
-                    com_write_string(COM1_PORT, "\n");
-                }
-                return -3; /* format mismatch */
-            }
-
-            uint32_t bpp = (fb.bpp / 8u);
-            if (bpp != 2 && bpp != 4) return -4;
-
-            if (src_pitch == 0) {
-                src_pitch = src_w * bpp;
-            }
-
-            if (dst_x >= fb.width || dst_y >= fb.height) return -5;
-            if (dst_x + src_w > fb.width) src_w = fb.width - dst_x;
-            if (dst_y + src_h > fb.height) src_h = fb.height - dst_y;
-
-            uint8_t *dst_base = (uint8_t*)fb.addr + (uint64_t)dst_y * fb.pitch + (uint64_t)dst_x * bpp;
-            size_t row_bytes = (size_t)src_w * bpp;
-
-            if (src_pitch < row_bytes) return -6;
-
-            uint8_t *rowbuf = (uint8_t*)kmalloc(row_bytes);
-            if (!rowbuf) return -1;
-
-            for (uint32_t y = 0; y < src_h; y++) {
-                const uint8_t *srow = src + (uint64_t)y * src_pitch;
-                uint8_t *drow = dst_base + (uint64_t)y * fb.pitch;
-                if (usercopy_from_user(rowbuf, srow, row_bytes) != 0) {
-                    kfree(rowbuf);
-                    return -1;
-                }
-                memcpy(drow, rowbuf, row_bytes);
-            }
-
-            kfree(rowbuf);
-            return 0;
-        }
         case SYS_SLEEP:   return sys_sleep((unsigned int)arg1);
         case SYS_YIELD:   sys_yield(); return 0;
-        case SYS_MALLOC:  return (uint64_t)-1;
-        case SYS_FREE:    return (uint64_t)-1;
         case SYS_SBRK:    return (uint64_t)sys_sbrk((intptr_t)arg1);
         case SYS_KILL:    return sys_kill((int)arg1, (int)arg2);
+        case SYS_SIGNAL:  return sys_signal((int)arg1, (uint64_t)arg2);
+        case SYS_RAISE:   return sys_raise((int)arg1);
+        case SYS_FD_INJECT: return sys_fd_inject((uint32_t)arg1, (int)arg2, (void*)arg3);
         case SYS_TIME:    return sys_time();
         case SYS_EXEC:    return sys_exec((const char*)arg1);
-        case SYS_EXECVE:  return sys_execve_impl((const char*)arg1, (char *const*)arg2, (char *const*)arg3);
+        case SYS_EXECVE:  
+            // com_printf(COM1_PORT, "[SYSCALL] PID %d calling SYS_EXECVE path=%s\n", current->pid, (const char*)arg1);
+            return sys_execve_impl((const char*)arg1, (char *const*)arg2, (char *const*)arg3);
         case SYS_CHDIR:   return sys_chdir((const char*)arg1);
         case SYS_GETCWD:  return (uint64_t)sys_getcwd((char*)arg1, (size_t)arg2);
         case SYS_STAT:    return sys_stat((const char*)arg1, (void*)arg2, (size_t)arg3);
@@ -228,24 +170,12 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_READDIR: return sys_readdir((int)arg1, (char*)arg2, (size_t)arg3, (int*)arg4, (uint32_t*)arg5);
         case SYS_CLOSEDIR: return sys_closedir((int)arg1);
         case SYS_INPUT:   return (uint64_t)sys_input((char*)arg1, (size_t)arg2);
-        case SYS_SSTATS:
-            return (uint64_t)sys_get_sysinfo();
-        case SYS_SSTATS2:
-            return (uint64_t)sys_get_sysinfo2((md64api_sysinfo_data_u*)arg1, (size_t)arg2);
+        /* SYS_SSTATS (29) removed — use $/dev/md64api/sysinfo via DevFS instead. */
 
         case SYS_MMAP:
             return (uint64_t)sys_mmap((void*)arg1, (size_t)arg2, (int)arg3, (int)arg4);
         case SYS_MUNMAP:
             return (uint64_t)sys_munmap((void*)arg1, (size_t)arg2);
-
-        case SYS_VGA_SET_COLOR:
-            VGA_SetTextColor((uint8_t)arg1, (uint8_t)arg2);
-            return 0;
-        case SYS_VGA_GET_COLOR:
-            return (uint64_t)VGA_GetTextColor();
-        case SYS_VGA_RESET_COLOR:
-            VGA_ResetTextColor();
-            return 0;
 
         case SYS_VFS_MKFS:
             return (uint64_t)sys_vfs_mkfs((const vfs_mkfs_req_t*)arg1);
@@ -259,6 +189,72 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             return (uint64_t)sys_proclist((md_proclist_entry_u*)arg1, (size_t)arg2);
         case SYS_PIDINFO:
             return (uint64_t)sys_pidinfo((uint32_t)arg1, (md64api_pid_info_u*)arg2, (size_t)arg3);
+        case SYS_MOUNT:
+            return (uint64_t)sys_mount((int)arg1, (uint32_t)arg2, (int)arg3);
+        case SYS_UNMOUNT:
+            return (uint64_t)sys_unmount((int)arg1);
+        case SYS_MOUNTS:
+            return (uint64_t)sys_mounts((char*)arg1, (size_t)arg2);
+
+        case SYS_DUP: {
+            extern int fd_dup(int);
+            return (uint64_t)fd_dup((int)arg1);
+        }
+
+        case SYS_DUP2: {
+            extern int fd_dup2(int, int);
+            return (uint64_t)fd_dup2((int)arg1, (int)arg2);
+        }
+
+        case SYS_PIPE: {
+            extern int fd_pipe(int[2]);
+            int k_fds[2] = {-1, -1};
+            int rc = fd_pipe(k_fds);
+            if (rc == 0 && arg1)
+                usercopy_to_user((void*)arg1, k_fds, sizeof(k_fds));
+            return (uint64_t)(int64_t)rc;
+        }
+
+        case SYS_GETGID: {
+            process_t *p = process_get_current();
+            return p ? p->gid : 0;
+        }
+
+        case SYS_SETGID: {
+            process_t *p = process_get_current();
+            if (!p) return (uint64_t)-(int64_t)EPERM;
+            if (p->uid != 0) return (uint64_t)-(int64_t)EPERM;
+            p->gid = (uint32_t)arg1;
+            p->egid = (uint32_t)arg1;
+            return 0;
+        }
+
+        case SYS_GETEUID: {
+            process_t *p = process_get_current();
+            return p ? p->euid : 0;
+        }
+
+        case SYS_GETEGID: {
+            process_t *p = process_get_current();
+            return p ? p->egid : 0;
+        }
+
+        case SYS_WAITX: {
+            com_write_string(COM1_PORT, "[SYSCALL] SYS_WAITX entered, status ptr=0x");
+            com_write_hex64(COM1_PORT, arg2);
+            com_write_string(COM1_PORT, "\n");
+            int wstatus = 0;
+            pid_t r = do_waitpid((int32_t)arg1, &wstatus, (int)arg3);
+            com_write_string(COM1_PORT, "[SYSCALL] do_waitpid returned, about to copy to userspace\n");
+            if (arg2 && r > 0)
+                usercopy_to_user((void*)arg2, &wstatus, sizeof(wstatus));
+            com_write_string(COM1_PORT, "[SYSCALL] SYS_WAITX about to return\n");
+            return (uint64_t)(int64_t)r;
+        }
+
+        // GPU Core syscalls (like Linux DRM) - Simple primitives, driver-agnostic
+        // TODO: Implement basic GPU memory/command syscalls
+        
         default:
             if (kernel_debug_is_med()) {
                 com_write_string(COM1_PORT, "[SYSCALL] Unknown syscall: ");
@@ -266,8 +262,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
                 com_write_string(COM1_PORT, buf);
                 com_write_string(COM1_PORT, "\n");
             }
-            return (uint64_t)-1;
+            return (uint64_t)(-(int64_t)ENOSYS);
     }
+    
+    // NOTE: Code never reaches here - all cases return directly
 }
 
 /* ============================================================
@@ -301,8 +299,10 @@ int sys_exit(int status) {
 }
 
 int sys_fork(void) {
-    // Use new POSIX-compliant fork
-    return do_fork();
+    // sys_fork_impl() copies the kernel stack and resumes the child at
+    // syscall_entry_return with rax=0 — the correct POSIX fork() semantics.
+    extern int sys_fork_impl(void);
+    return sys_fork_impl();
 }
 
 ssize_t sys_read(int fd, void *buf, size_t count) {
@@ -338,14 +338,6 @@ ssize_t sys_read(int fd, void *buf, size_t count) {
     return result;
 }
 
-md64api_sysinfo_data* sys_get_sysinfo(void) {
-    /* Legacy: returns a pointer to a kernel struct containing kernel pointers.
-     * Unsafe for ring3 userland. Use SYS_SSTATS2 instead.
-     */
-    static md64api_sysinfo_data info;
-    info = get_system_info();
-    return &info;
-}
 
 static void safe_strcpy(char *dst, size_t dst_sz, const char *src) {
     if (!dst || dst_sz == 0) return;
@@ -355,58 +347,6 @@ static void safe_strcpy(char *dst, size_t dst_sz, const char *src) {
     dst[i] = 0;
 }
 
-int sys_get_sysinfo2(md64api_sysinfo_data_u *out, size_t out_size) {
-    if (!out) return -1;
-    if (out_size < sizeof(*out)) return -1;
-
-    md64api_sysinfo_data k = get_system_info();
-
-    md64api_sysinfo_data_u out_tmp;
-    memset(&out_tmp, 0, sizeof(out_tmp));
-
-    /* Copy scalars */
-    out_tmp.sys_available_ram = k.sys_available_ram;
-    out_tmp.sys_total_ram = k.sys_total_ram;
-    /* Version strings (user-safe). */
-    safe_strcpy(out_tmp.SystemVersion, sizeof(out_tmp.SystemVersion), k.SystemVersion);
-    safe_strcpy(out_tmp.KernelVersion, sizeof(out_tmp.KernelVersion), k.KernelVersion);
-    out_tmp.cpu_cores = k.cpu_cores;
-    out_tmp.cpu_threads = k.cpu_threads;
-    out_tmp.cpu_hyperthreading_enabled = k.cpu_hyperthreading_enabled;
-    out_tmp.cpu_base_mhz = k.cpu_base_mhz;
-    out_tmp.cpu_max_mhz = k.cpu_max_mhz;
-    out_tmp.cpu_cache_l1_kb = k.cpu_cache_l1_kb;
-    out_tmp.cpu_cache_l2_kb = k.cpu_cache_l2_kb;
-    out_tmp.cpu_cache_l3_kb = k.cpu_cache_l3_kb;
-    out_tmp.is_virtual_machine = k.is_virtual_machine;
-    out_tmp.gpu_vram_mb = k.gpu_vram_mb;
-    out_tmp.storage_total_mb = k.storage_total_mb;
-    out_tmp.storage_free_mb = k.storage_free_mb;
-    out_tmp.secure_boot_enabled = k.secure_boot_enabled;
-    out_tmp.tpm_version = k.tpm_version;
-
-    /* Copy strings from kernel pointers into user buffer */
-    safe_strcpy(out_tmp.KernelVendor, sizeof(out_tmp.KernelVendor), k.KernelVendor);
-    safe_strcpy(out_tmp.os_name, sizeof(out_tmp.os_name), k.os_name);
-    safe_strcpy(out_tmp.os_arch, sizeof(out_tmp.os_arch), k.os_arch);
-    safe_strcpy(out_tmp.pcname, sizeof(out_tmp.pcname), k.pcname);
-    safe_strcpy(out_tmp.username, sizeof(out_tmp.username), k.username);
-    safe_strcpy(out_tmp.domain, sizeof(out_tmp.domain), k.domain);
-    safe_strcpy(out_tmp.kconsole, sizeof(out_tmp.kconsole), k.kconsole);
-    safe_strcpy(out_tmp.cpu, sizeof(out_tmp.cpu), k.cpu);
-    safe_strcpy(out_tmp.cpu_manufacturer, sizeof(out_tmp.cpu_manufacturer), k.cpu_manufacturer);
-    safe_strcpy(out_tmp.cpu_model, sizeof(out_tmp.cpu_model), k.cpu_model);
-    safe_strcpy(out_tmp.cpu_flags, sizeof(out_tmp.cpu_flags), k.cpu_flags);
-    safe_strcpy(out_tmp.virtualization_vendor, sizeof(out_tmp.virtualization_vendor), k.virtualization_vendor);
-    safe_strcpy(out_tmp.gpu_name, sizeof(out_tmp.gpu_name), k.gpu_name);
-    safe_strcpy(out_tmp.primary_disk_model, sizeof(out_tmp.primary_disk_model), k.primary_disk_model);
-    safe_strcpy(out_tmp.bios_vendor, sizeof(out_tmp.bios_vendor), k.bios_vendor);
-    safe_strcpy(out_tmp.bios_version, sizeof(out_tmp.bios_version), k.bios_version);
-    safe_strcpy(out_tmp.motherboard_model, sizeof(out_tmp.motherboard_model), k.motherboard_model);
-
-    if (usercopy_to_user(out, &out_tmp, sizeof(out_tmp)) != 0) return -1;
-    return 0;
-}
 
 ssize_t sys_writefile(int fd, const char *user_buf, size_t count) {
     if (!user_buf) return -1;
@@ -455,10 +395,22 @@ int sys_write(const char *str) {
         return -1;
     }
 
+    /* LEGACY SYSCALL: sys_write(str) is deprecated!
+     * New code should use: write(fd, buf, count) via fd_write()
+     * This legacy path writes to stdout (FD 1) for backwards compatibility.
+     */
+    
     char tmp[512];
     if (usercopy_string_from_user(tmp, str, sizeof(tmp)) != 0) return -1;
-    VGA_Write(tmp);
-    return 0;
+    
+    size_t len = strlen(tmp);
+    
+    /* Write to stdout (FD 1) using proper FD routing.
+     * This will route to $/dev/console, $/dev/graphics/video0, or $/user/ttyman/tty1/stdin
+     * depending on what the process has FD 1 pointed to. */
+    ssize_t written = fd_write(1, tmp, len);
+    
+    return (written >= 0) ? 0 : -1;
 }
 
 ssize_t sys_input(char *user_buf, size_t max_len) {
@@ -557,12 +509,12 @@ int sys_wait(int *status) {
 
 int sys_getpid(void) {
     process_t *proc = process_get_current();
-    return proc ? proc->pid : -1;
+    return proc ? (int)proc->pid : -1;
 }
 
 int sys_getppid(void) {
     process_t *proc = process_get_current();
-    return proc ? proc->parent_pid : -1;
+    return proc ? (int)proc->parent_pid : -1;
 }
 
 int sys_sleep(unsigned int seconds) {
@@ -685,9 +637,7 @@ int sys_munmap(void *addr, size_t size) {
 }
 
 int sys_kill(int pid, int sig) {
-    process_kill(pid);
-    (void)sig;
-    return 0;
+    return send_signal((uint32_t)pid, sig);
 }
 
 #include "moduos/arch/AMD64/interrupts/timer.h"
@@ -974,8 +924,8 @@ int sys_chdir(const char *path) {
         }
     }
     
-    // Handle special cases
-    if (strcmp(path, "..") == 0) {
+    // Handle special cases (use kernel copy kpath, not the user pointer path)
+    if (strcmp(kpath, "..") == 0) {
         // Go to parent directory
         char *last_slash = NULL;
         for (char *p = proc->cwd; *p; p++) {
@@ -989,8 +939,7 @@ int sys_chdir(const char *path) {
         } else {
             strcpy(new_path, "/");
         }
-    } else if (strcmp(path, ".") == 0) {
-        // Stay in current directory
+    } else if (strcmp(kpath, ".") == 0) {
         return 0;
     }
     
@@ -1269,6 +1218,27 @@ int sys_closedir(int fd) {
     return fd_closedir(fd);
 }
 
+// Signal syscalls
+extern uint64_t do_signal(int sig, uint64_t handler);
+
+uint64_t sys_signal(int sig, uint64_t handler) {
+    return do_signal(sig, handler);
+}
+
+int sys_raise(int sig) {
+    process_t *p = process_get_current();
+    if (!p) return -1;
+    return sys_kill((int)p->pid, sig);
+}
+
+// FD injection syscall (for privileged processes like TTY manager)
+extern int process_inject_fd(uint32_t pid, int fd, void *fd_obj);
+
+int sys_fd_inject(uint32_t pid, int fd, void *fd_obj) {
+    // TODO: Add permission check - only allow root or TTY manager
+    return process_inject_fd(pid, fd, fd_obj);
+}
+
 int sys_userfs_register(const userfs_user_node_t *user_node) {
     if (!user_node) return -1;
 
@@ -1382,4 +1352,59 @@ static int sys_pidinfo(uint32_t pid, md64api_pid_info_u *out, size_t out_size) {
 
     if (usercopy_to_user(out, &info, sizeof(info)) != 0) return -1;
     return 0;
+}
+
+/* Mount a filesystem on a drive/partition */
+static int sys_mount(int vdrive_id, uint32_t partition_lba, int fs_type) {
+    /* Basic validation */
+    if (vdrive_id < 0 || vdrive_id >= 16) return -1;
+    if (fs_type < 0 || fs_type > 10) return -1;
+    
+    /* Call kernel fs_mount_drive */
+    int slot = fs_mount_drive(vdrive_id, partition_lba, (fs_type_t)fs_type);
+    return slot;
+}
+
+/* Unmount a filesystem slot */
+static int sys_unmount(int slot) {
+    if (slot < 0) return -1;
+    return fs_unmount_slot(slot);
+}
+
+/* List mounted filesystems */
+static int sys_mounts(char *user_buf, size_t buflen) {
+    if (!user_buf || buflen == 0) return -1;
+    
+    /* Build mount list string in kernel buffer */
+    char kbuf[2048];
+    int pos = 0;
+    int count = fs_get_mount_count();
+    
+    for (int slot = 0; slot < 16 && pos < (int)sizeof(kbuf) - 128; slot++) {
+        int vdrive_id = -1;
+        uint32_t partition_lba = 0;
+        fs_type_t type = FS_TYPE_UNKNOWN;
+        
+        if (fs_get_mount_info(slot, &vdrive_id, &partition_lba, &type) == 0) {
+            char label[64] = "";
+            fs_get_mount_label(slot, label, sizeof(label));
+            
+            /* Format: "slot=X vdrive=Y lba=Z type=N label=L\n" */
+            pos += snprintf(kbuf + pos, sizeof(kbuf) - pos,
+                           "slot=%d vdrive=%d lba=%u type=%d label=%s\n",
+                           slot, vdrive_id, partition_lba, (int)type, label);
+        }
+    }
+    
+    /* Copy to userspace */
+    size_t copy_len = (size_t)pos;
+    if (copy_len > buflen - 1) copy_len = buflen - 1;
+    
+    if (usercopy_to_user(user_buf, kbuf, copy_len) != 0) return -1;
+    
+    /* Null terminate */
+    char nul = 0;
+    if (usercopy_to_user(user_buf + copy_len, &nul, 1) != 0) return -1;
+    
+    return count;
 }
