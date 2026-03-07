@@ -1,0 +1,13 @@
+.PHONY: blit blit-clean blit-install
+
+blit:
+	@echo "Building Blit Engine..."
+	$(MAKE) -C EXTERNAL/Blit all
+
+blit-install: blit
+	@echo "Installing Blit Engine..."
+	$(MAKE) -C EXTERNAL/Blit install
+
+blit-clean:
+	@echo "Cleaning Blit Engine..."
+	$(MAKE) -C EXTERNAL/Blit clean

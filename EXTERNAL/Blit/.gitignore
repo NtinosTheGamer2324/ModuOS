@@ -1,0 +1,20 @@
+# Build outputs
+build/
+*.o
+*.a
+*.sqr
+
+# Editor temporary files
+*.dat
+level.c
+
+# OS files
+.DS_Store
+Thumbs.db
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
