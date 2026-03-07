@@ -9,7 +9,6 @@
 extern void (*irq_stubs[16])(); // from isr.asm
 
 static irq_handler_t irq_handlers[16] = { 0 };
-static spinlock_t irq_handlers_lock;
 
 // REMOVE timer_irq_handler from here - it's in timer.c now
 
@@ -44,23 +43,22 @@ void irq_uninstall_handler(int irq) {
         irq_handlers[irq] = 0;
 }
 
+// Tracks IRQ nesting depth. Incremented on IRQ entry, decremented on exit.
+// schedule() checks this to avoid being called from IRQ context.
+volatile int irq_depth = 0;
+
 void irq_dispatch(uint8_t irq) {
     static uint64_t dispatch_count = 0;
     dispatch_count++;
-    if (irq == 0 && (dispatch_count % 1000) == 0) {
-        com_write_string(COM1_PORT, "[IRQ-DISPATCH] IRQ 0 dispatched, count=");
-        char buf[32];
-        itoa((int)dispatch_count, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, "\n");
-    }
-    
+
+    irq_depth++;
+
     if (irq < 16 && irq_handlers[irq]) {
         irq_handlers[irq]();
     }
 
-    // Ack interrupt.
-    // If IOAPIC is enabled, EOI must be sent to LAPIC; otherwise send PIC EOI.
+    irq_depth--;
+
     if (ioapic_is_enabled()) {
         ioapic_eoi();
     } else {

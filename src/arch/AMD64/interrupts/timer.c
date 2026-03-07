@@ -43,14 +43,6 @@ void timer_irq_handler(void) {
     static uint64_t handler_count = 0;
     handler_count++;
     
-    if (handler_count == 1 || (handler_count % 5000) == 0) {
-        com_write_string(COM1_PORT, "[TIMER-IRQ] handler called, count=");
-        char buf[32];
-        itoa((int)handler_count, buf, 10);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, "\n");
-    }
-    
     if (in_timer_handler) {
         // EOI is handled by irq_dispatch() (PIC or LAPIC depending on mode).
         return;
@@ -66,14 +58,6 @@ void timer_irq_handler(void) {
 
     // Use new scheduler
     scheduler_tick();
-    
-    // Check if reschedule is needed and do it
-    // SAFETY: Do NOT call schedule() from IRQ context!
-    // The scheduler will be called from the main loop or other safe points
-    // Calling schedule() from here causes triple faults due to context corruption
-    // if (should_reschedule()) {
-    //     schedule();
-    // }
 }
 
 uint64_t get_system_ticks(void) {

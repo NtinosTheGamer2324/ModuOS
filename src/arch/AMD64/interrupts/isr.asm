@@ -6,7 +6,13 @@ extern irq_dispatch
 %macro IRQ_STUB 1
 global irq_stub%1
 irq_stub%1:
-    ; Save ALL registers to preserve state
+    cld
+
+    test word [rsp + 8], 3
+    jz .from_kernel_%1
+    swapgs
+
+.from_kernel_%1:
     push rax
     push rbx
     push rcx
@@ -22,12 +28,10 @@ irq_stub%1:
     push r13
     push r14
     push r15
-    
-    ; IRQ number -> first argument (rdi)
+
     mov rdi, %1
     call irq_dispatch
-    
-    ; Restore ALL registers
+
     pop r15
     pop r14
     pop r13
@@ -43,7 +47,12 @@ irq_stub%1:
     pop rcx
     pop rbx
     pop rax
-    
+
+    test word [rsp + 8], 3
+    jz .return_to_kernel_%1
+    swapgs
+
+.return_to_kernel_%1:
     iretq
 %endmacro
 

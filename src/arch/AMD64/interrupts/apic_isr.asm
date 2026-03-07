@@ -50,21 +50,22 @@ section .text
 
 apic_timer_stub:
     SAVE_REGS
-    ; Align stack for SysV ABI call. After an interrupt, RSP alignment is not guaranteed.
-    mov rax, rsp
+    ; SysV ABI: RSP must be 16-byte aligned at the point of the call instruction.
+    ; 'call' will then push the 8-byte return address, leaving RSP misaligned by 8
+    ; inside the callee — which is exactly what the ABI requires.
+    ; Save pre-alignment RSP in a callee-saved register so it survives the call.
+    mov rbx, rsp
     and rsp, -16
-    sub rsp, 8
     call apic_timer_irq_handler_c
-    mov rsp, rax
+    mov rsp, rbx
     RESTORE_REGS
     iretq
 
 apic_spurious_stub:
     SAVE_REGS
-    mov rax, rsp
+    mov rbx, rsp
     and rsp, -16
-    sub rsp, 8
     call apic_spurious_irq_handler_c
-    mov rsp, rax
+    mov rsp, rbx
     RESTORE_REGS
     iretq
