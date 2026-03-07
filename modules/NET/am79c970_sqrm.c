@@ -12,7 +12,7 @@ SQRM_DEFINE_MODULE(SQRM_TYPE_NET, "am79c970");
 // PCI IDs
 #define PCI_VENDOR_AMD              0x1022
 #define PCI_DEVICE_AM79C970         0x2000  // PCnet-PCI II
-#define PCI_DEVICE_AM79C973         0x2625  // PCnet-FAST III
+#define PCI_DEVICE_AM79C973         0x25  // PCnet-FAST III
 
 // Register offsets (DWIO - 32-bit I/O mode)
 #define AM79_DWIO_APROM     0x00
@@ -487,3 +487,4 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     
     return 0;
 }
+

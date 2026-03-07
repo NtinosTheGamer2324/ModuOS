@@ -191,7 +191,7 @@ static int e1000e_detect_and_init(void) {
                 uint16_t device = (vd >> 16) & 0xFFFF;
                 
                 if (vendor == E1000E_VENDOR_ID) {
-                    for (int i = 0; i < sizeof(e1000e_devices) / sizeof(uint16_t); i++) {
+                    for (int i = 0; i < (int)(sizeof(e1000e_devices) / sizeof(uint16_t)); i++) {
                         if (device == e1000e_devices[i]) {
                             found = 1;
                             break;

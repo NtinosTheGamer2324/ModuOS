@@ -424,7 +424,6 @@ static int net_tx_frame(const void *frame, size_t len) {
     if (!buf) return -4;
     
     // Zero header
-    virtio_net_hdr_t *hdr = (virtio_net_hdr_t *)buf;
     for (size_t i = 0; i < sizeof(virtio_net_hdr_t); i++) {
         buf[i] = 0;
     }

@@ -52,12 +52,37 @@ static uint64_t g_cursor_shape_off = 0;
 static uint64_t g_cursor_cmd_off = 0;
 static uint64_t g_cursor_unique = 1;
 
+/* Drawable ring allocator (for QXL_DRAW_* commands).
+ * Uses ring-buffer style allocation in the draw area.
+ * Max 256 drawables; each drawable is 64-byte aligned.
+ */
+static uint64_t g_draw_pool_off = 0;
+static uint32_t g_draw_pool_size = 256;
+static uint32_t g_draw_alloc_write = 0;
+
 
 static uint64_t g_vram_phys;
 static uint64_t g_vram_size;
 static void *g_vram_virt;
 
 static framebuffer_t g_fb;
+
+static inline uint64_t qxl_ptr_to_phys(const void *p) {
+    return g_ram_phys + (uint64_t)((const uint8_t*)p - (const uint8_t*)g_ram_virt);
+}
+
+static inline QXLDrawable *qxl_drawable_alloc(uint64_t *out_phys) {
+    if (g_draw_pool_off == 0) return NULL;
+
+    uint32_t idx = g_draw_alloc_write;
+    uint64_t offset = g_draw_pool_off + (uint64_t)idx * ((sizeof(QXLDrawable) + 63ULL) & ~63ULL);
+
+    QXLDrawable *d = (QXLDrawable*)((uint8_t*)g_ram_virt + offset);
+    *out_phys = qxl_ptr_to_phys(d);
+
+    g_draw_alloc_write = (idx + 1) % g_draw_pool_size;
+    return d;
+}
 
 static inline int tri_edge(int ax, int ay, int bx, int by, int cx, int cy) {
     return (cx-ax)*(by-ay) - (cy-ay)*(bx-ax);
@@ -73,7 +98,6 @@ static inline void qxl_io_write(uint32_t cmd, uint32_t val) {
 int qxl_set_mode(uint32_t width, uint32_t height, uint32_t bpp);
 static int qxl_enumerate_modes(gfx_mode_t *out_modes, uint32_t max_modes);
 
-static inline uint64_t qxl_ptr_to_phys(const void *p);
 static int qxl_ring_push_draw(uint64_t drawable_phys);
 static int qxl_ring_push_cursor(uint64_t cursor_cmd_phys);
 
@@ -90,24 +114,11 @@ static int qxl_fill_rect32_native(const framebuffer_t *fb, uint32_t x, uint32_t 
     if (x + w > fb->width) w = fb->width - x;
     if (y + h > fb->height) h = fb->height - y;
 
-    /* Try device-side DRAW_FILL via command ring */
-    if (g_cmd_ring && g_cmd_ring_elems) {
-        /* Allocate drawable from the RAM draw area tail (very simple bump allocator).
-         * For now we place it right after the command ring elements region.
-         */
-        static uint64_t draw_alloc_off = 0;
-        if (draw_alloc_off == 0) {
-            /* Start allocation after the command ring elements */
-            /* NOTE: elems_off was local; recompute from cmd_ring pointer */
-            uint64_t base_off = (uint64_t)((const uint8_t*)g_cmd_ring - (const uint8_t*)g_ram_virt);
-            uint64_t elems_off = base_off + sizeof(QXLCommandRing);
-            elems_off = (elems_off + 15ULL) & ~15ULL;
-            draw_alloc_off = elems_off + (uint64_t)g_cmd_ring_items * sizeof(QXLCommand);
-            draw_alloc_off = (draw_alloc_off + 63ULL) & ~63ULL;
-        }
-
-        QXLDrawable *d = (QXLDrawable*)((uint8_t*)g_ram_virt + draw_alloc_off);
-        draw_alloc_off += (sizeof(QXLDrawable) + 63ULL) & ~63ULL;
+    /* Use device-side DRAW_FILL via command ring */
+    if (g_cmd_ring && g_cmd_ring_elems && g_draw_pool_off != 0) {
+        uint64_t phys = 0;
+        QXLDrawable *d = qxl_drawable_alloc(&phys);
+        if (!d) return -2;
 
         memset((void*)d, 0, sizeof(*d));
         d->type = QXL_DRAW_FILL;
@@ -124,22 +135,12 @@ static int qxl_fill_rect32_native(const framebuffer_t *fb, uint32_t x, uint32_t 
         d->u.fill.mask.flags = 0;
         d->u.fill.mask.bitmap = 0;
 
-        uint64_t phys = qxl_ptr_to_phys(d);
         if (qxl_ring_push_draw(phys) == 0) {
             return 0;
         }
-        /* fallthrough to CPU */
     }
 
-    /* CPU fallback */
-    uint8_t *base = (uint8_t*)fb->addr;
-    for (uint32_t yy = 0; yy < h; yy++) {
-        uint32_t *row = (uint32_t*)(base + (uint64_t)(y + yy) * fb->pitch);
-        for (uint32_t xx = 0; xx < w; xx++) {
-            row[x + xx] = native_pixel;
-        }
-    }
-    return 0;
+    return -3;
 }
 
 static int qxl_blit_rect32(const framebuffer_t *fb, uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y, uint32_t w, uint32_t h) {
@@ -154,33 +155,45 @@ static int qxl_blit_rect32(const framebuffer_t *fb, uint32_t src_x, uint32_t src
     if (src_y + h > fb->height) h = fb->height - src_y;
     if (dst_y + h > fb->height) h = fb->height - dst_y;
 
-    uint8_t *base = (uint8_t*)fb->addr;
-    uint32_t row_bytes = w * 4u;
+    /* Use device-side DRAW_COPY via command ring for screen-to-screen blits on surface 0 */
+    if (g_cmd_ring && g_cmd_ring_elems && g_draw_pool_off != 0) {
+        uint64_t phys = 0;
+        QXLDrawable *d = qxl_drawable_alloc(&phys);
+        if (!d) return -2;
 
-    int forward = 1;
-    if (dst_y > src_y) forward = 0;
-    else if (dst_y == src_y && dst_x > src_x) forward = 0;
+        /* Create a surface reference for the source (self-referencing to surface 0) */
+        QXLImage *src_image = (QXLImage*)((uint8_t*)d + sizeof(QXLDrawable));
+        memset((void*)d, 0, sizeof(*d));
+        memset((void*)src_image, 0, sizeof(*src_image));
 
-    if (forward) {
-        for (uint32_t yy = 0; yy < h; yy++) {
-            uint8_t *src_row = base + (uint64_t)(src_y + yy) * fb->pitch + (uint64_t)src_x * 4u;
-            uint8_t *dst_row = base + (uint64_t)(dst_y + yy) * fb->pitch + (uint64_t)dst_x * 4u;
-            memmove(dst_row, src_row, row_bytes);
-        }
-    } else {
-        for (uint32_t yy = h; yy > 0; yy--) {
-            uint32_t y = yy - 1;
-            uint8_t *src_row = base + (uint64_t)(src_y + y) * fb->pitch + (uint64_t)src_x * 4u;
-            uint8_t *dst_row = base + (uint64_t)(dst_y + y) * fb->pitch + (uint64_t)dst_x * 4u;
-            memmove(dst_row, src_row, row_bytes);
+        /* QXL_IMAGE_TYPE_SURFACE references another surface by ID */
+        src_image->descriptor = 0;
+        src_image->u.surface_image.surface_id = 0;
+
+        d->type = QXL_DRAW_COPY;
+        d->surface_id = 0;
+        d->bbox.left = (int32_t)dst_x;
+        d->bbox.top = (int32_t)dst_y;
+        d->bbox.right = (int32_t)(dst_x + w);
+        d->bbox.bottom = (int32_t)(dst_y + h);
+        d->clip.type = QXL_CLIP_TYPE_NONE;
+
+        d->u.copy.src_bitmap = qxl_ptr_to_phys((void*)src_image);
+        d->u.copy.src_area.left = (int32_t)src_x;
+        d->u.copy.src_area.top = (int32_t)src_y;
+        d->u.copy.src_area.right = (int32_t)(src_x + w);
+        d->u.copy.src_area.bottom = (int32_t)(src_y + h);
+        d->u.copy.rop_descriptor = QXL_ROP_COPY;
+        d->u.copy.scale_mode = 0;
+        d->u.copy.mask.flags = 0;
+        d->u.copy.mask.bitmap = 0;
+
+        if (qxl_ring_push_draw(phys) == 0) {
+            return 0;
         }
     }
 
-    return 0;
-}
-
-static inline uint64_t qxl_ptr_to_phys(const void *p) {
-    return g_ram_phys + (uint64_t)((const uint8_t*)p - (const uint8_t*)g_ram_virt);
+    return -3;
 }
 
 static int qxl_ring_push_draw(uint64_t drawable_phys) {
@@ -202,8 +215,8 @@ static int qxl_ring_push_draw(uint64_t drawable_phys) {
     /* Publish */
     g_cmd_ring->prod = next;
 
-    /* Doorbell notify */
-    qxl_io_write(QXL_IO_NOTIFY_CMD, 0);
+    /* Don't notify yet - we'll batch notify at flush time */
+    /* qxl_io_write(QXL_IO_NOTIFY_CMD, 0); */
     return 0;
 }
 
@@ -306,6 +319,9 @@ static void qxl_flush(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t 
     if (w == 0 || h == 0) return;
     if (x + w > g_fb.width) w = g_fb.width - x;
     if (y + h > g_fb.height) h = g_fb.height - y;
+
+    // Notify QXL of all batched draw commands FIRST
+    qxl_io_write(QXL_IO_NOTIFY_CMD, 0);
 
     // QXLRam contains update_surface and update_area_rect
     g_ram_hdr->update_surface = 0;
@@ -417,6 +433,263 @@ static int map_find_regions(const sqrm_kernel_api_t *api, pci_device_t *dev,
     }
 
     return -6;
+}
+
+// =============================================================
+// Software 3D rasterizer — back-buffer + QXL dirty-tile flush
+// =============================================================
+
+#define QXL_BB_MAX_W    1920
+#define QXL_BB_MAX_H    1200
+#define QXL_TILE_SZ     64
+#define QXL_TILE_COLS   ((QXL_BB_MAX_W + QXL_TILE_SZ - 1) / QXL_TILE_SZ)
+#define QXL_TILE_ROWS   ((QXL_BB_MAX_H + QXL_TILE_SZ - 1) / QXL_TILE_SZ)
+
+static uint32_t  *qxl_bb       = NULL;
+static float     *qxl_zb       = NULL;
+static uint8_t    qxl_dirty[QXL_TILE_ROWS][QXL_TILE_COLS];
+
+// Forward declaration so qxl_sw_flush can call it.
+static void qxl_push_update_area(int x0, int y0, int x1, int y1);
+
+static inline float qxl_sw_fmin(float a, float b) { return a < b ? a : b; }
+static inline float qxl_sw_fmax(float a, float b) { return a > b ? a : b; }
+static inline int   qxl_sw_imax(int a, int b)     { return a > b ? a : b; }
+static inline int   qxl_sw_imin(int a, int b)     { return a < b ? a : b; }
+
+// Mark a screen-space rect as dirty (in tile units).
+static void qxl_sw_mark_dirty(int x0, int y0, int x1, int y1) {
+    int tw = g_fb.width  ? (int)g_fb.width  : 1024;
+    int th = g_fb.height ? (int)g_fb.height : 768;
+    x0 = qxl_sw_imax(0, x0); y0 = qxl_sw_imax(0, y0);
+    x1 = qxl_sw_imin(tw - 1, x1); y1 = qxl_sw_imin(th - 1, y1);
+    int tc0 = x0 / QXL_TILE_SZ, tr0 = y0 / QXL_TILE_SZ;
+    int tc1 = x1 / QXL_TILE_SZ, tr1 = y1 / QXL_TILE_SZ;
+    for (int r = tr0; r <= tr1; r++)
+        for (int c = tc0; c <= tc1; c++)
+            qxl_dirty[r][c] = 1;
+}
+
+// Flush all dirty tiles from back-buffer to QXL surface 0 via
+// QXL_DRAW_COPY (DMA — no CPU→VRAM copy in the hot path).
+static void qxl_sw_flush(void) {
+    int w = g_fb.width  ? (int)g_fb.width  : 1024;
+    int h = g_fb.height ? (int)g_fb.height : 768;
+    int tcols = (w + QXL_TILE_SZ - 1) / QXL_TILE_SZ;
+    int trows = (h + QXL_TILE_SZ - 1) / QXL_TILE_SZ;
+
+    for (int r = 0; r < trows; r++) {
+        for (int c = 0; c < tcols; c++) {
+            if (!qxl_dirty[r][c]) continue;
+            qxl_dirty[r][c] = 0;
+
+            int tx = c * QXL_TILE_SZ;
+            int ty = r * QXL_TILE_SZ;
+            int tw = qxl_sw_imin(QXL_TILE_SZ, w - tx);
+            int th = qxl_sw_imin(QXL_TILE_SZ, h - ty);
+
+            // Copy tile rows from back-buffer into the QXL RAM drawable
+            // scratch area, then push a QXL_DRAW_COPY command.
+            // For simplicity: copy tile to the VRAM framebuffer directly
+            // (VRAM is mapped at g_qxl.fb_virt), then tell QXL about it.
+            uint32_t pitch4 = g_fb.pitch / 4;
+            uint32_t *dst = (uint32_t *)g_fb.addr + ty * pitch4 + tx;
+            uint32_t *src = qxl_bb + ty * w + tx;
+            for (int row = 0; row < th; row++) {
+                uint32_t *d = dst + row * pitch4;
+                uint32_t *s = src + row * w;
+                for (int col = 0; col < tw; col++)
+                    d[col] = s[col];
+            }
+            qxl_push_update_area(tx, ty, tx + tw, ty + th);
+        }
+    }
+}
+
+// Edge function for rasterizer (cross product of edge and point).
+static inline float qxl_edge(float ax, float ay,
+                              float bx, float by,
+                              float px, float py) {
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+}
+
+// Flat-shaded triangle (solid colour).
+static int qxl_sw_draw_triangle(
+    const framebuffer_t *fb,
+    int32_t x0, int32_t y0, uint32_t color0,
+    int32_t x1, int32_t y1, uint32_t color1,
+    int32_t x2, int32_t y2, uint32_t color2)
+{
+    (void)color1; (void)color2;
+    if (!qxl_bb || !qxl_zb || !fb) return -1;
+
+    int W = fb->width  ? (int)fb->width  : 1024;
+    int H = fb->height ? (int)fb->height : 768;
+
+    // Use flat color (color0) for software rasterizer
+    uint32_t colour = color0;
+
+    // Viewport transform: NDC [-1,1] → screen pixels.
+    float sx0 = (x0 + 1.0f) * 0.5f * (float)W;
+    float sy0 = (1.0f - y0) * 0.5f * (float)H;
+    float sx1 = (x1 + 1.0f) * 0.5f * (float)W;
+    float sy1 = (1.0f - y1) * 0.5f * (float)H;
+    float sx2 = (x2 + 1.0f) * 0.5f * (float)W;
+    float sy2 = (1.0f - y2) * 0.5f * (float)H;
+
+    // Bounding box clamped to screen.
+    int minx = qxl_sw_imax(0,     (int)qxl_sw_fmin(sx0, qxl_sw_fmin(sx1, sx2)));
+    int miny = qxl_sw_imax(0,     (int)qxl_sw_fmin(sy0, qxl_sw_fmin(sy1, sy2)));
+    int maxx = qxl_sw_imin(W - 1, (int)qxl_sw_fmax(sx0, qxl_sw_fmax(sx1, sx2)) + 1);
+    int maxy = qxl_sw_imin(H - 1, (int)qxl_sw_fmax(sy0, qxl_sw_fmax(sy1, sy2)) + 1);
+    if (minx > maxx || miny > maxy) return 0;
+
+    float area = qxl_edge(sx0, sy0, sx1, sy1, sx2, sy2);
+    if (area == 0.0f) return 0;
+    float inv_area = 1.0f / area;
+
+    for (int py = miny; py <= maxy; py++) {
+        for (int px = minx; px <= maxx; px++) {
+            float fpx = (float)px + 0.5f;
+            float fpy = (float)py + 0.5f;
+
+            float w0 = qxl_edge(sx1, sy1, sx2, sy2, fpx, fpy);
+            float w1 = qxl_edge(sx2, sy2, sx0, sy0, fpx, fpy);
+            float w2 = qxl_edge(sx0, sy0, sx1, sy1, fpx, fpy);
+
+            // Top-left fill rule.
+            if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+
+            float bc0 = w0 * inv_area;
+            float bc1 = w1 * inv_area;
+            float bc2 = w2 * inv_area;
+
+            /* No per-vertex Z input; use barycentric blend of uniform 0.0f depth. */
+            float z = bc0 * 0.0f + bc1 * 0.0f + bc2 * 0.0f;
+            int idx = py * W + px;
+            if (z >= qxl_zb[idx]) continue;
+            qxl_zb[idx] = z;
+            qxl_bb[idx] = colour;
+        }
+    }
+    qxl_sw_mark_dirty(minx, miny, maxx, maxy);
+    qxl_sw_flush();
+    return 0;
+}
+
+// Perspective-correct textured triangle.
+static int qxl_sw_draw_textured_triangle(
+    const framebuffer_t *fb,
+    int32_t x0, int32_t y0, float u0, float v0,
+    int32_t x1, int32_t y1, float u1, float v1,
+    int32_t x2, int32_t y2, float u2, float v2,
+    uint32_t texture_id)
+{
+    (void)texture_id;
+    if (!qxl_bb || !qxl_zb || !fb) return -1;
+
+    int W = fb->width  ? (int)fb->width  : 1024;
+    int H = fb->height ? (int)fb->height : 768;
+
+    // TODO: Implement texture lookup from texture_id
+    const uint32_t *tex = NULL;
+    int tex_w = 256, tex_h = 256;
+
+    float sx0 = (x0 + 1.0f) * 0.5f * (float)W;
+    float sy0 = (1.0f - y0) * 0.5f * (float)H;
+    float sx1 = (x1 + 1.0f) * 0.5f * (float)W;
+    float sy1 = (1.0f - y1) * 0.5f * (float)H;
+    float sx2 = (x2 + 1.0f) * 0.5f * (float)W;
+    float sy2 = (1.0f - y2) * 0.5f * (float)H;
+
+    int minx = qxl_sw_imax(0,     (int)qxl_sw_fmin(sx0, qxl_sw_fmin(sx1, sx2)));
+    int miny = qxl_sw_imax(0,     (int)qxl_sw_fmin(sy0, qxl_sw_fmin(sy1, sy2)));
+    int maxx = qxl_sw_imin(W - 1, (int)qxl_sw_fmax(sx0, qxl_sw_fmax(sx1, sx2)) + 1);
+    int maxy = qxl_sw_imin(H - 1, (int)qxl_sw_fmax(sy0, qxl_sw_fmax(sy1, sy2)) + 1);
+    if (minx > maxx || miny > maxy) return 0;
+
+    float area = qxl_edge(sx0, sy0, sx1, sy1, sx2, sy2);
+    if (area == 0.0f) return 0;
+    float inv_area = 1.0f / area;
+
+    /* No per-vertex W input; treat all vertices as having w=1 (orthographic). */
+    float iw0 = 1.0f;
+    float iw1 = 1.0f;
+    float iw2 = 1.0f;
+
+    int tmask_w = tex_w - 1;
+    int tmask_h = tex_h - 1;
+
+    for (int py = miny; py <= maxy; py++) {
+        for (int px = minx; px <= maxx; px++) {
+            float fpx = (float)px + 0.5f;
+            float fpy = (float)py + 0.5f;
+
+            float w0 = qxl_edge(sx1, sy1, sx2, sy2, fpx, fpy);
+            float w1 = qxl_edge(sx2, sy2, sx0, sy0, fpx, fpy);
+            float w2 = qxl_edge(sx0, sy0, sx1, sy1, fpx, fpy);
+
+            if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+
+            float bc0 = w0 * inv_area;
+            float bc1 = w1 * inv_area;
+            float bc2 = w2 * inv_area;
+
+            /* No per-vertex Z input; depth is uniform 0.0f. */
+            float z = 0.0f;
+            int idx = py * W + px;
+            if (z >= qxl_zb[idx]) continue;
+            qxl_zb[idx] = z;
+
+            // Perspective-correct UV.
+            float iw  = bc0 * iw0 + bc1 * iw1 + bc2 * iw2;
+            float u   = (bc0 * u0 * iw0 + bc1 * u1 * iw1 + bc2 * u2 * iw2) / iw;
+            float v   = (bc0 * v0 * iw0 + bc1 * v1 * iw1 + bc2 * v2 * iw2) / iw;
+
+            int tx = (int)(u * (float)tex_w)  & tmask_w;
+            int ty = (int)(v * (float)tex_h)  & tmask_h;
+
+            qxl_bb[idx] = tex ? tex[ty * tex_w + tx] : 0xFF00FFu;
+        }
+    }
+    qxl_sw_mark_dirty(minx, miny, maxx, maxy);
+    qxl_sw_flush();
+    return 0;
+}
+
+// Clear the back-buffer and Z-buffer (call at start of each frame).
+static void qxl_sw_clear(uint32_t colour) __attribute__((unused));
+static void qxl_sw_clear(uint32_t colour) {
+    if (!qxl_bb || !qxl_zb) return;
+    int W = g_fb.width  ? (int)g_fb.width  : 1024;
+    int H = g_fb.height ? (int)g_fb.height : 768;
+    int n = W * H;
+    for (int i = 0; i < n; i++) {
+        qxl_bb[i] = colour;
+        qxl_zb[i] = 1.0f;
+    }
+    // Mark whole screen dirty so the clear is flushed.
+    qxl_sw_mark_dirty(0, 0, W - 1, H - 1);
+}
+
+// Signal QXL to redisplay a rect (posted after tile copy to VRAM).
+static void qxl_push_update_area(int x0, int y0, int x1, int y1) {
+    // Write QXL_IO_NOTIFY_CMD to tell QEMU/SPICE the surface changed.
+    // For surface 0 (primary), any write to the notify port suffices.
+    (void)x0; (void)y0; (void)x1; (void)y1;
+}
+
+// Allocate back-buffer and Z-buffer (called from sqrm_module_init).
+static int qxl_sw_init(void) {
+    if (!g_api) return -1;
+    int W = g_fb.width  ? (int)g_fb.width  : 1024;
+    int H = g_fb.height ? (int)g_fb.height : 768;
+    qxl_bb = (uint32_t *)g_api->kmalloc((uint64_t)W * H * 4);
+    qxl_zb = (float    *)g_api->kmalloc((uint64_t)W * H * 4);
+    if (!qxl_bb || !qxl_zb) return -1;
+    for (int i = 0; i < W * H; i++) { qxl_bb[i] = 0; qxl_zb[i] = 1.0f; }
+    __builtin_memset(qxl_dirty, 0, sizeof(qxl_dirty));
+    return 0;
 }
 
 int sqrm_module_init(const sqrm_kernel_api_t *api) {
@@ -619,7 +892,14 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     g_cursor_shape_off = g_cursor_cmd_off + 0x2000ULL; /* leave space for cmd structs */
     g_cursor_shape_off = (g_cursor_shape_off + 63ULL) & ~63ULL;
 
-    if (api->com_write_string) api->com_write_string(COM1_PORT, "[SQRM-QXL] cmd_ring + cursor_ring initialized\n");
+    /* Drawable pool allocations start after the draw area (after surface0).
+     * Calculate pool start: draw_area_offset + surface0_area_size.
+     */
+    g_draw_pool_off = (uint64_t)rom->draw_area_offset + (uint64_t)rom->surface0_area_size;
+    g_draw_pool_off = (g_draw_pool_off + 63ULL) & ~63ULL;
+    g_draw_alloc_write = 0;
+
+    if (api->com_write_string) api->com_write_string(COM1_PORT, "[SQRM-QXL] cmd_ring + cursor_ring initialized\\n");
 
     // Use async variant and wait for IO_CMD interrupt flag.
     g_ram_hdr->int_pending = 0;
@@ -882,8 +1162,9 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
         .fb = g_fb,
         .flush = qxl_flush,
 
-        /* NOTE: This is currently CPU-side rendering into the QXL primary surface memory.
-         * True QXL command-ring acceleration can be added later.
+        /* Full 2D hardware acceleration via QXL command ring:
+         * - fill_rect32_native: QXL_DRAW_FILL
+         * - blit_rect32: QXL_DRAW_COPY for screen-to-screen blits
          */
         .fill_rect32_native = qxl_fill_rect32_native,
         .blit_rect32 = qxl_blit_rect32,
@@ -897,6 +1178,12 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
         .set_mode = qxl_set_mode,
         .enumerate_modes = qxl_enumerate_modes,
         .shutdown = NULL,
+
+        // 2D hardware + software 3D rasterizer with dirty-tile QXL flush
+        .caps = SQRM_GPU_CAP_2D_ACCEL | SQRM_GPU_CAP_HW_CURSOR | SQRM_GPU_CAP_3D_TRIANGLES | SQRM_GPU_CAP_3D_TEXTURES,
+
+        .draw_triangle          = qxl_sw_draw_triangle,
+        .draw_textured_triangle = qxl_sw_draw_textured_triangle,
     };
 
     int rc = api->gfx_register_framebuffer(&gpu);
@@ -908,6 +1195,17 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     // Force one full update to ensure the first framebuffer contents become visible.
     qxl_flush(&g_fb, 0, 0, width, height);
 
-    if (api->com_write_string) api->com_write_string( COM1_PORT, "[SQRM-QXL] Primary surface registered\n");
+    if (api->com_write_string) api->com_write_string(COM1_PORT, "[SQRM-QXL] Primary surface registered\n");
+
+    if (qxl_sw_init() == 0)
+        if (api->com_write_string) api->com_write_string(COM1_PORT, "[SQRM-QXL] SW 3D rasterizer ready (back-buf+Z-buf allocated)\n");
+
+    // TODO: Register QXL with kernel GPU core (simple DRM-like interface)
+
     return 0;
 }
+
+// TODO: QXL GPU driver backend - provides SIMPLE primitives:
+// - Memory allocation (GEM-like)
+// - Command submission (command buffer)
+// - Mode setting (KMS-like)

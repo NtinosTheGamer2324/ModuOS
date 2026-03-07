@@ -45,10 +45,23 @@
 #define SVGA_ID_1 0x90000001
 #define SVGA_ID_2 0x90000002
 
-// FIFO commands
+// FIFO commands (2D acceleration)
 #define SVGA_CMD_UPDATE     1
 #define SVGA_CMD_RECT_FILL  2
 #define SVGA_CMD_RECT_COPY  3
+
+// 3D commands (SVGA3D command set)
+#define SVGA_CMD_DEFINE_GMRFB      4
+#define SVGA_CMD_BLIT_GMRFB_TO_SCREEN 5
+#define SVGA_CMD_BLIT_SCREEN_TO_GMRFB 6
+#define SVGA_CMD_ANNOTATION_FILL   7
+#define SVGA_CMD_ANNOTATION_COPY   8
+
+// Capabilities
+#define SVGA_CAP_RECT_FILL      (1 << 0)
+#define SVGA_CAP_RECT_COPY      (1 << 1)
+#define SVGA_CAP_3D             (1 << 2)  // Full 3D acceleration
+#define SVGA_CAP_EXTENDED_FIFO  (1 << 3)
 
 // FIFO registers (offsets in 32-bit words)
 #define SVGA_FIFO_MIN          0
@@ -85,3 +98,15 @@ typedef struct {
     uint32_t w;
     uint32_t h;
 } __attribute__((packed)) svga_fifo_rect_copy_t;
+
+// Simple polygon fill (uses RECT_FILL for triangle rasterization acceleration)
+// For true 3D, would need full SVGA3D context setup, but for basic triangle
+// drawing we can use accelerated rect fills to approximate
+typedef struct {
+    uint32_t cmd;   // SVGA_CMD_RECT_FILL
+    uint32_t color;
+    uint32_t x;
+    uint32_t y;
+    uint32_t w;
+    uint32_t h;
+} __attribute__((packed)) svga_fifo_polygon_fill_t;
