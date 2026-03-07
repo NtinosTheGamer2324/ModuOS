@@ -198,34 +198,118 @@ static inline void itoa(int value, char *str, int base) {
 
 static inline int snprintf(char *str, size_t size, const char *fmt, ...) {
     if (!str || size == 0) return 0;
-    va_list args; va_start(args, fmt);
+
+    va_list args;
+    va_start(args, fmt);
+
     char *out = str;
-    size_t rem = size - 1;
-    
-    for (const char *p = fmt; *p && rem > 0; p++) {
+    size_t rem = size ? size - 1 : 0;
+    int total = 0;
+
+    for (const char *p = fmt; *p; p++) {
         if (*p == '%' && *(p+1)) {
             p++;
             char buf[64]; memset(buf, 0, 64);
-            if (*p == 's') {
-                const char *s = va_arg(args, const char*);
-                while (s && *s && rem > 0) { *out++ = *s++; rem--; }
-            } else if (*p == 'd' || *p == 'i') {
-                itoa(va_arg(args, int), buf, 10);
-                for (int i=0; buf[i] && rem > 0; i++) { *out++ = buf[i]; rem--; }
-            } else if (*p == 'x' || *p == 'X') {
-                ulltoa(va_arg(args, unsigned int), buf, 16, (*p == 'X'));
-                for (int i=0; buf[i] && rem > 0; i++) { *out++ = buf[i]; rem--; }
-            } else if (*p == 'c') {
-                *out++ = (char)va_arg(args, int); rem--;
-            } else if (*p == '%') {
-                *out++ = '%'; rem--;
+            int long_flag = 0;
+            int longlong_flag = 0;
+
+            // Handle length modifiers
+            if (*p == 'l') {
+                long_flag = 1;
+                p++;
+                if (*p == 'l') {
+                    longlong_flag = 1;
+                    p++;
+                }
+            }
+
+            switch (*p) {
+                case 's': {
+                    const char *s = va_arg(args, const char*);
+                    if (!s) s = "(null)";
+                    for (int i=0; s[i]; i++, total++) {
+                        if (rem > 0) { *out++ = s[i]; rem--; }
+                    }
+                    break;
+                }
+                case 'd':
+                case 'i': {
+                    if (longlong_flag) {
+                        long long val = va_arg(args, long long);
+                        if (val < 0) { *buf = '-'; ulltoa((unsigned long long)(-val), buf+1, 10, 0); }
+                        else ulltoa((unsigned long long)val, buf, 10, 0);
+                    } else if (long_flag) {
+                        long val = va_arg(args, long);
+                        if (val < 0) { *buf = '-'; ulltoa((unsigned long)(-val), buf+1, 10, 0); }
+                        else ulltoa((unsigned long)val, buf, 10, 0);
+                    } else {
+                        int val = va_arg(args, int);
+                        if (val < 0) { *buf = '-'; ulltoa((unsigned int)(-val), buf+1, 10, 0); }
+                        else ulltoa((unsigned int)val, buf, 10, 0);
+                    }
+                    for (int i=0; buf[i]; i++, total++) {
+                        if (rem > 0) { *out++ = buf[i]; rem--; }
+                    }
+                    break;
+                }
+                case 'u': {
+                    if (longlong_flag) ulltoa(va_arg(args, unsigned long long), buf, 10, 0);
+                    else if (long_flag) ulltoa(va_arg(args, unsigned long), buf, 10, 0);
+                    else ulltoa(va_arg(args, unsigned int), buf, 10, 0);
+                    for (int i=0; buf[i]; i++, total++) {
+                        if (rem > 0) { *out++ = buf[i]; rem--; }
+                    }
+                    break;
+                }
+                case 'x':
+                case 'X': {
+                    int upper = (*p == 'X');
+                    if (longlong_flag) ulltoa(va_arg(args, unsigned long long), buf, 16, upper);
+                    else if (long_flag) ulltoa(va_arg(args, unsigned long), buf, 16, upper);
+                    else ulltoa(va_arg(args, unsigned int), buf, 16, upper);
+                    for (int i=0; buf[i]; i++, total++) {
+                        if (rem > 0) { *out++ = buf[i]; rem--; }
+                    }
+                    break;
+                }
+                case 'p': {
+                    unsigned long long ptr = (unsigned long long)va_arg(args, void*);
+                    strcpy(buf, "0x");
+                    char tmp[32]; memset(tmp, 0, 32);
+                    ulltoa(ptr, tmp, 16, 0);
+                    strncat(buf, tmp, sizeof(buf)-strlen(buf)-1);
+                    for (int i=0; buf[i]; i++, total++) {
+                        if (rem > 0) { *out++ = buf[i]; rem--; }
+                    }
+                    break;
+                }
+                case 'c': {
+                    char c = (char)va_arg(args, int);
+                    if (rem > 0) { *out++ = c; rem--; }
+                    total++;
+                    break;
+                }
+                case '%': {
+                    if (rem > 0) { *out++ = '%'; rem--; }
+                    total++;
+                    break;
+                }
+                default:
+                    // Unknown specifier: print literally
+                    if (rem > 0) { *out++ = '%'; rem--; }
+                    total++;
+                    if (rem > 0) { *out++ = *p; rem--; }
+                    total++;
+                    break;
             }
         } else {
-            *out++ = *p; rem--;
+            if (rem > 0) { *out++ = *p; rem--; }
+            total++;
         }
     }
+
     *out = '\0';
     va_end(args);
-    return (int)(out - str);
+    return total;
 }
 

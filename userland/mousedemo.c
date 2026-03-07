@@ -1,4 +1,5 @@
 #include "libc.h"
+#include "NodGL.h"
 #include "string.h"
 
 /*
@@ -401,41 +402,49 @@ int md_main(long argc, char **argv) {
     (void)argc;
     (void)argv;
 
-    md64api_grp_video_info_t info;
-    memset(&info, 0, sizeof(info));
-    if (md64api_grp_get_video0_info(&info) != 0) {
-        puts_raw("mousedemo: cannot read video info from $/dev/graphics/video0\n");
+    NodGL_Device device;
+    NodGL_Context ctx;
+    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &device, &ctx, NULL) != NodGL_OK) {
+        puts_raw("mousedemo: NodGL init failed\n");
         return 1;
     }
 
-    if (info.mode != MD64API_GRP_MODE_GRAPHICS || info.width == 0 || info.height == 0 || info.pitch == 0) {
-        puts_raw("mousedemo: not in graphics mode. Boot with graphics enabled.\n");
-        return 0;
-    }
+    uint32_t screen_w, screen_h;
+    NodGL_GetScreenResolution(device, &screen_w, &screen_h);
 
-    uint8_t fmt = info.fmt;
-    if (fmt == MD64API_GRP_FMT_UNKNOWN) {
-        if (info.bpp == 32) fmt = MD64API_GRP_FMT_XRGB8888;
-        else if (info.bpp == 16) fmt = MD64API_GRP_FMT_RGB565;
-    }
+    NodGL_TextureDesc tex_desc = {
+        .width = screen_w,
+        .height = screen_h,
+        .format = NodGL_FORMAT_R8G8B8A8_UNORM,
+        .mip_levels = 1,
+        .initial_data = NULL,
+        .initial_data_size = 0
+    };
 
-    uint32_t bpp_bytes = (fmt == MD64API_GRP_FMT_RGB565) ? 2u : 4u;
-    uint32_t pitch = info.width * bpp_bytes;
-    uint32_t buf_size = pitch * info.height;
-
-    uint8_t *bb = (uint8_t *)malloc(buf_size);
-    if (!bb) {
-        puts_raw("mousedemo: out of memory\n");
+    NodGL_Texture backbuffer_tex;
+    if (NodGL_CreateTexture(device, &tex_desc, &backbuffer_tex) != NodGL_OK) {
+        NodGL_ReleaseDevice(device);
         return 2;
     }
 
-    /*
-     * Prefer event0 for mouse deltas + buttons.
-     * This avoids getting "stuck" off-screen if any kernel absolute coords drift.
-     */
+    uint8_t *bb;
+    uint32_t pitch;
+    if (NodGL_MapResource(ctx, backbuffer_tex, (void**)&bb, &pitch) != NodGL_OK) {
+        NodGL_ReleaseResource(device, backbuffer_tex);
+        NodGL_ReleaseDevice(device);
+        return 2;
+    }
+
+    uint8_t fmt = MD64API_GRP_FMT_XRGB8888;
+    md64api_grp_video_info_t info;
+    info.width = screen_w;
+    info.height = screen_h;
+    info.bpp = 32;
+
     int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
     if (efd < 0) {
-        free(bb);
+        NodGL_ReleaseResource(device, backbuffer_tex);
+        NodGL_ReleaseDevice(device);
         puts_raw("mousedemo: cannot open $/dev/input/event0\n");
         return 3;
     }
@@ -472,14 +481,16 @@ int md_main(long argc, char **argv) {
             break;
         }
 
-        (void)gfx_blit(bb, (uint16_t)info.width, (uint16_t)info.height, 0, 0, (uint16_t)pitch, (uint16_t)fmt);
+        NodGL_DrawTexture(ctx, backbuffer_tex, 0, 0, 0, 0, info.width, info.height);
+        NodGL_PresentContext(ctx, 0);
 
         /* Keep CPU usage reasonable */
         yield();
     }
 
     close(efd);
-    free(bb);
+    NodGL_ReleaseResource(device, backbuffer_tex);
+    NodGL_ReleaseDevice(device);
     puts_raw("mousedemo: exit\n");
     return 0;
 }

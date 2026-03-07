@@ -29,7 +29,9 @@ int ls(long argc, char** argv) {
 
     char cwd_buf[256];
     if (!path) {
-        char *cwd = getcwd(cwd_buf, sizeof(cwd_buf));
+        /* getcwd not yet implemented; use root. */
+        cwd_buf[0] = '/'; cwd_buf[1] = '\0';
+        char *cwd = cwd_buf;
         path = (cwd && cwd[0]) ? cwd : ".";
     }
 

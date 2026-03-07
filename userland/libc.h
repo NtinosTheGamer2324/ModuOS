@@ -11,6 +11,7 @@ static int errno;
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <limits.h>
 
 /* Local string helpers (strlen, strcmp, etc.) */
 #include "string.h"
@@ -19,6 +20,7 @@ static int errno;
 #include "../include/moduos/kernel/syscall/syscall_numbers.h"
 // MD64API (userland-visible kernel interfaces)
 #include "../include/moduos/kernel/md64api_grp.h"
+#include "../include/moduos/kernel/md64api_user.h"
 #include "../include/moduos/fs/userfs_user_api.h"
 // SYS_WRITEFILE is provided by syscall_numbers.h
 
@@ -120,11 +122,11 @@ static inline long syscall(long num, long arg1, long arg2, long arg3) {
         "mov %2, %%rdi\n"
         "mov %3, %%rsi\n"
         "mov %4, %%rdx\n"
-        "int $0x80\n"
+        "syscall\n"
         "mov %%rax, %0"
         : "=r"(ret)
         : "r"(num), "r"(arg1), "r"(arg2), "r"(arg3)
-        : "rax", "rdi", "rsi", "rdx", "memory"
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
     );
     return ret;
 }
@@ -141,11 +143,11 @@ static inline long syscall4(long num, long arg1, long arg2, long arg3, long arg4
         "mov %3, %%rsi\n"
         "mov %4, %%rdx\n"
         "mov %5, %%r10\n"
-        "int $0x80\n"
+        "syscall\n"
         "mov %%rax, %0"
         : "=r"(ret)
         : "r"(num), "r"(arg1), "r"(arg2), "r"(arg3), "r"(arg4)
-        : "rax", "rdi", "rsi", "rdx", "r10", "memory"
+        : "rax", "rdi", "rsi", "rdx", "r10", "rcx", "r11", "memory"
     );
     return ret;
 }
@@ -166,9 +168,13 @@ static inline void puts(const char *s) {
     putc('\n');
 }
 
-static inline ssize_t input_read(char *buf, size_t max_len) {
-    if (!buf || max_len == 0) return -1;
-    return (ssize_t)syscall(SYS_INPUT, (long)buf, (long)max_len, 0);
+static inline ssize_t input_read(char *buf, size_t max_len) 
+{
+    if (!buf || max_len == 0 || max_len > INT_MAX) {
+        return -1;
+    }
+
+    return syscall(SYS_INPUT, (long)buf, (long)max_len, 0);
 }
 
 /* Forward declarations (input() uses file I/O wrappers declared later) */
@@ -211,45 +217,60 @@ static inline void input_flush(void) {
     input_flush_events();
 }
 
-// Convenience: returns pointer to a static buffer (blocking line read from kbd0)
-static inline char* input() {
-    static char input_buf[256];
+/* Safer version: read input into caller-provided buffer with bounds checking.
+ * Returns: bytes read (excluding null terminator), or negative on error.
+ */
+static inline ssize_t input_line_to_buffer(char *buf, size_t maxlen) {
+    if (!buf || maxlen == 0) return -1;
+    if (maxlen > 0x7FFFFFFF) return -1;
 
     int fd = open("$/dev/input/kbd0", O_RDONLY, 0);
     if (fd < 0) {
-        input_buf[0] = 0;
-        return input_buf;
+        if (maxlen > 0) buf[0] = 0;
+        return -1;
     }
 
-    int n = 0;
+    size_t n = 0;
+    size_t safe_max = (maxlen > 0) ? (maxlen - 1) : 0;
+    
     for (;;) {
         char c;
         if (read(fd, &c, 1) != 1) {
-            yield();  /* Yield CPU while waiting for input */
+            yield();
             continue;
         }
+        
         if (c == '\r') continue;
+        
         if (c == '\n') {
-            input_buf[n] = 0;
+            buf[n] = 0;
             close(fd);
-            /* Prevent typed keys from being replayed later by event0 consumers. */
             input_flush_events();
-            return input_buf;
+            return (ssize_t)n;
         }
+        
         if ((c == '\b' || c == 127) && n > 0) {
             n--;
-            input_buf[n] = 0;
-            /* echo erase */
+            buf[n] = 0;
             puts_raw("\b");
             continue;
         }
-        if (n < (int)sizeof(input_buf) - 1 && c >= 32 && c < 127) {
-            input_buf[n++] = c;
-            input_buf[n] = 0;
+        
+        if (n < safe_max && c >= 32 && c < 127) {
+            buf[n++] = c;
+            buf[n] = 0;
             char tmp[2] = {c, 0};
             puts_raw(tmp);
         }
     }
+}
+
+// Convenience: returns pointer to a static buffer (blocking line read from kbd0)
+// WARNING: NOT THREAD-SAFE. Use input_line_to_buffer() in new code.
+static inline char* input() {
+    static char input_buf[256];
+    ssize_t ret = input_line_to_buffer(input_buf, sizeof(input_buf));
+    return input_buf;  /* Return buffer even on error; will contain null string */
 }
 
 /* ============================================================
@@ -277,23 +298,19 @@ static inline uint64_t time_ms(void) {
     return (uint64_t)syscall(SYS_TIME, 0, 0, 0);
 }
 
-/* ============================================================
-   VGA / CONSOLE COLOR (Text Mode)
-   ============================================================ */
-
-/* Set VGA text colors: fg/bg are 0-15 (VGA attribute nibble) */
+/* VGA color functions (deprecated, kept as stubs for compatibility) */
 static inline void vga_set_color(uint8_t fg, uint8_t bg) {
-    syscall(SYS_VGA_SET_COLOR, (long)fg, (long)bg, 0);
+    /* Deprecated: VGA syscalls removed. Use ANSI codes or DevFS instead. */
+    (void)fg; (void)bg;
 }
 
-/* Get current color attribute: returns (bg<<4)|fg */
 static inline uint8_t vga_get_color(void) {
-    return (uint8_t)syscall(SYS_VGA_GET_COLOR, 0, 0, 0);
+    /* Deprecated: VGA syscalls removed. Return default color. */
+    return 0x07;
 }
 
-/* Reset to default 0x07 on 0x00 */
 static inline void vga_reset_color(void) {
-    syscall(SYS_VGA_RESET_COLOR, 0, 0, 0);
+    /* Deprecated: VGA syscalls removed. */
 }
 
 /* ANSI helpers (SGR). Works because kernel VGA driver parses ESC[...m. */
@@ -307,27 +324,6 @@ static inline int fs_trace_set(int enabled) {
     return (int)syscall(SYS_FS_TRACE, (long)enabled, 0, 0);
 }
 
-/* ---- Networking (SQRM 'net' service) ---- */
-
-static inline long net_link_up(void) {
-    return syscall(SYS_NET_LINK_UP, 0, 0, 0);
-}
-
-static inline long net_ipv4_addr(uint32_t *out_be) {
-    return syscall(SYS_NET_IPV4_ADDR, (long)out_be, 0, 0);
-}
-
-static inline long net_ipv4_gw(uint32_t *out_be) {
-    return syscall(SYS_NET_IPV4_GW, (long)out_be, 0, 0);
-}
-
-static inline long net_dns_a(const char *hostname, uint32_t *out_be) {
-    return syscall(SYS_NET_DNS_A, (long)hostname, (long)out_be, 0);
-}
-
-static inline long net_http_get(const char *url, void *buf, size_t bufsz, size_t *out_bytes) {
-    return syscall4(SYS_NET_HTTP_GET, (long)url, (long)buf, (long)bufsz, (long)out_bytes);
-}
 
 /* ============================================================
    FILE I/O OPERATIONS
@@ -382,11 +378,11 @@ static inline ssize_t sys_writefile_raw(int fd, const void *buf, size_t count) {
         "mov %2, %%rdi\n"
         "mov %3, %%rsi\n"
         "mov %4, %%rdx\n"
-        "int $0x80\n"
+        "syscall\n"
         "mov %%rax, %0"
         : "=r"(ret)
         : "r"((long)SYS_WRITEFILE), "r"((long)fd), "r"((long)buf), "r"((long)count)
-        : "rax", "rdi", "rsi", "rdx", "memory"
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
     );
     return (ssize_t)ret;
 }
@@ -484,6 +480,62 @@ static void print_long(long n) {
         n = -n;
     }
     print_ulong((unsigned long)n, 10, 0);
+}
+
+/* String conversion utilities */
+static inline long strtol(const char *str, char **endptr, int base) {
+    if (!str) {
+        if (endptr) *endptr = (char *)str;
+        return 0;
+    }
+    
+    /* Skip leading whitespace */
+    while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
+    
+    int negative = 0;
+    if (*str == '-') {
+        negative = 1;
+        str++;
+    } else if (*str == '+') {
+        str++;
+    }
+    
+    /* Auto-detect base if 0 */
+    if (base == 0) {
+        if (*str == '0' && (str[1] == 'x' || str[1] == 'X')) {
+            base = 16;
+            str += 2;
+        } else if (*str == '0') {
+            base = 8;
+        } else {
+            base = 10;
+        }
+    } else if (base == 16 && *str == '0' && (str[1] == 'x' || str[1] == 'X')) {
+        str += 2;
+    }
+    
+    long result = 0;
+    const char *start = str;
+    
+    while (*str) {
+        int digit;
+        if (*str >= '0' && *str <= '9') {
+            digit = *str - '0';
+        } else if (*str >= 'a' && *str <= 'z') {
+            digit = *str - 'a' + 10;
+        } else if (*str >= 'A' && *str <= 'Z') {
+            digit = *str - 'A' + 10;
+        } else {
+            break;
+        }
+        
+        if (digit >= base) break;
+        result = result * base + digit;
+        str++;
+    }
+    
+    if (endptr) *endptr = (char *)str;
+    return negative ? -result : result;
 }
 
 /* ============================================================
@@ -601,6 +653,137 @@ static int printf(const char *fmt, ...) {
     return 0;
 }
 
+/* sprintf - format to a string buffer */
+static int sprintf(char *str, const char *fmt, ...) {
+    if (!str) return -1;
+    
+    va_list ap;
+    va_start(ap, fmt);
+    
+    char *out = str;
+    
+    while (*fmt) {
+        if (*fmt != '%') {
+            const char *start = fmt;
+            while (*fmt && *fmt != '%') fmt++;
+            size_t len = fmt - start;
+            memcpy(out, start, len);
+            out += len;
+            continue;
+        }
+        
+        if (*fmt == '%') {
+            fmt++;
+            
+            int longmod = 0;
+            int longlongmod = 0;
+            
+            if (*fmt == 'l') {
+                longmod = 1;
+                fmt++;
+                if (*fmt == 'l') {
+                    longlongmod = 1;
+                    fmt++;
+                }
+            }
+            
+            switch (*fmt) {
+                case 'c': {
+                    *out++ = (char)va_arg(ap, int);
+                    break;
+                }
+                
+                case 's': {
+                    const char *s = va_arg(ap, const char*);
+                    if (!s) s = "(null)";
+                    size_t len = strlen(s);
+                    memcpy(out, s, len);
+                    out += len;
+                    break;
+                }
+                
+                case 'd':
+                case 'i': {
+                    char buf[32];
+                    int val;
+                    if (longlongmod) {
+                        long long n = va_arg(ap, long long);
+                        val = (int)n; /* truncate for simplicity */
+                    } else if (longmod) {
+                        val = (int)va_arg(ap, long);
+                    } else {
+                        val = va_arg(ap, int);
+                    }
+                    
+                    int neg = 0;
+                    if (val < 0) {
+                        neg = 1;
+                        val = -val;
+                    }
+                    
+                    int i = 0;
+                    if (val == 0) {
+                        buf[i++] = '0';
+                    } else {
+                        while (val > 0) {
+                            buf[i++] = '0' + (val % 10);
+                            val /= 10;
+                        }
+                    }
+                    
+                    if (neg) *out++ = '-';
+                    while (i > 0) *out++ = buf[--i];
+                    break;
+                }
+                
+                case 'u':
+                case 'x':
+                case 'X': {
+                    char buf[32];
+                    unsigned int val;
+                    int base = (*fmt == 'u') ? 10 : 16;
+                    const char *digits = (*fmt == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
+                    
+                    if (longlongmod) {
+                        val = (unsigned int)va_arg(ap, unsigned long long);
+                    } else if (longmod) {
+                        val = (unsigned int)va_arg(ap, unsigned long);
+                    } else {
+                        val = va_arg(ap, unsigned int);
+                    }
+                    
+                    int i = 0;
+                    if (val == 0) {
+                        buf[i++] = '0';
+                    } else {
+                        while (val > 0) {
+                            buf[i++] = digits[val % base];
+                            val /= base;
+                        }
+                    }
+                    
+                    while (i > 0) *out++ = buf[--i];
+                    break;
+                }
+                
+                case '%':
+                    *out++ = '%';
+                    break;
+                    
+                default:
+                    *out++ = '%';
+                    if (*fmt) *out++ = *fmt;
+                    break;
+            }
+            
+            if (*fmt) fmt++;
+        }
+    }
+    
+    *out = '\0';
+    va_end(ap);
+    return (int)(out - str);
+}
 
 /* ============================================================
    MEMORY FUNCTIONS
@@ -633,10 +816,17 @@ static inline size_t uheap_align(size_t n) {
     return (n + 15) & ~((size_t)15);
 }
 
+/* Insert block into free list in ADDRESS ORDER (required for coalescing) */
 static inline void uheap_insert_free(uheap_hdr_t *b) {
     b->free = 1;
-    b->next = g_uheap_free;
-    g_uheap_free = b;
+
+    /* Find insertion point: keep list sorted by address */
+    uheap_hdr_t **pp = &g_uheap_free;
+    while (*pp && *pp < b) {
+        pp = &(*pp)->next;
+    }
+    b->next = *pp;
+    *pp = b;
 }
 
 static inline void uheap_remove_free(uheap_hdr_t *b) {
@@ -651,9 +841,41 @@ static inline void uheap_remove_free(uheap_hdr_t *b) {
     }
 }
 
+/*
+ * Coalesce adjacent free blocks in the (address-ordered) free list.
+ * Two blocks A and B are adjacent if:
+ *   (uint8_t*)(A+1) + A->size == (uint8_t*)B
+ * i.e. A's payload ends exactly where B's header begins.
+ */
+static inline void uheap_coalesce(void) {
+    uheap_hdr_t *cur = g_uheap_free;
+    while (cur && cur->next) {
+        uheap_hdr_t *next = cur->next;
+
+        /* Check adjacency */
+        uint8_t *cur_end = (uint8_t*)(cur + 1) + cur->size;
+        if (cur_end == (uint8_t*)next) {
+            /* Merge: absorb next into cur */
+            cur->size += sizeof(uheap_hdr_t) + next->size;
+            cur->next = next->next;
+            /* Wipe next's magic so it can't be double-freed */
+            next->magic = 0;
+            /* Don't advance cur — try to merge again with new next */
+        } else {
+            cur = cur->next;
+        }
+    }
+}
+
 static inline uheap_hdr_t* uheap_request_from_kernel(size_t payload) {
+    /* Prevent integer overflow: payload + header size */
+    if (payload > (size_t)-1 - sizeof(uheap_hdr_t)) return NULL;
+    
     size_t total = sizeof(uheap_hdr_t) + payload;
     total = uheap_align(total);
+    
+    /* Verify alignment didn't cause overflow */
+    if (total < payload) return NULL;
 
     void *mem = sbrk((intptr_t)total);
     if ((intptr_t)mem == -1 || mem == NULL) return NULL;
@@ -667,11 +889,9 @@ static inline uheap_hdr_t* uheap_request_from_kernel(size_t payload) {
 }
 
 static inline void uheap_split_if_needed(uheap_hdr_t *h, size_t need) {
-    /* split only if we can create a useful remainder */
     size_t remain = (h->size > need) ? (h->size - need) : 0;
     if (remain < (sizeof(uheap_hdr_t) + 32)) return;
 
-    /* New block starts after allocated payload */
     uint8_t *base = (uint8_t*)(h + 1);
     uheap_hdr_t *nh = (uheap_hdr_t*)(base + need);
     nh->size = remain - sizeof(uheap_hdr_t);
@@ -694,7 +914,6 @@ static inline void* malloc(size_t size) {
     while (cur) {
         if (cur->magic != UHEAP_MAGIC) return NULL;
         if (cur->free && cur->size >= size) {
-            /* detach */
             if (prev) prev->next = cur->next;
             else g_uheap_free = cur->next;
             cur->next = NULL;
@@ -720,19 +939,20 @@ static inline void free(void *ptr) {
     if (h->magic != UHEAP_MAGIC) return;
     if (h->free) return;
 
-    /* mark free and add to free list */
     uheap_insert_free(h);
-
-    /* NOTE: simple allocator: no coalescing yet */
+    uheap_coalesce();          /* <-- merge adjacent free blocks */
 }
 
 static inline void* calloc(size_t nmemb, size_t size) {
+    /* Prevent integer overflow in multiplication */
+    if (nmemb > 0 && size > (size_t)-1 / nmemb) return NULL;
+    
     size_t total = nmemb * size;
     void *p = malloc(total);
     if (!p) return NULL;
     memset(p, 0, total);
     return p;
-}  
+}
 
 static inline void* realloc(void *ptr, size_t size) {
     if (!ptr) return malloc(size);
@@ -742,15 +962,54 @@ static inline void* realloc(void *ptr, size_t size) {
     if (h->magic != UHEAP_MAGIC) return NULL;
 
     size_t new_sz = uheap_align(size);
-    if (h->size >= new_sz) return ptr;
 
+    /* Already big enough — try to split off excess */
+    if (h->size >= new_sz) {
+        uheap_split_if_needed(h, new_sz);
+        return ptr;
+    }
+
+    /*
+     * Try in-place expansion: check if the next block in memory
+     * is free and adjacent, and combined they're big enough.
+     */
+    uint8_t *cur_end = (uint8_t*)(h + 1) + h->size;
+    uheap_hdr_t *next = (uheap_hdr_t*)cur_end;
+
+    /* Validate next block is in free list and adjacent */
+    int next_is_free = 0;
+    if (next->magic == UHEAP_MAGIC && next->free == 1) {
+        /* Double-check it's in free list */
+        for (uheap_hdr_t *f = g_uheap_free; f; f = f->next) {
+            if (f == next) {
+                next_is_free = 1;
+                break;
+            }
+        }
+    }
+
+    if (next_is_free) {
+        /* Prevent overflow when combining sizes */
+        if (next->size > (size_t)-1 - h->size - sizeof(uheap_hdr_t)) return NULL;
+        
+        size_t combined = h->size + sizeof(uheap_hdr_t) + next->size;
+        if (combined >= new_sz) {
+            /* Absorb next into h — expand in place, no copy needed */
+            uheap_remove_free(next);
+            next->magic = 0;
+            h->size = combined;
+            uheap_split_if_needed(h, new_sz);
+            return ptr;
+        }
+    }
+
+    /* Fall back: allocate new, copy, free old */
     void *n = malloc(new_sz);
     if (!n) return NULL;
     memcpy(n, ptr, h->size);
     free(ptr);
     return n;
 }
-
 /* ============================================================
    PROCESS FUNCTIONS
    ============================================================ */
@@ -826,6 +1085,34 @@ static inline int setenv(const char *key, const char *val) {
     return putenv(kv);
 }
 
+static inline int dup(int oldfd) {
+    return (int)syscall(SYS_DUP, (long)oldfd, 0, 0);
+}
+
+static inline int dup2(int oldfd, int newfd) {
+    return (int)syscall(SYS_DUP2, (long)oldfd, (long)newfd, 0);
+}
+
+static inline int pipe(int fds[2]) {
+    return (int)syscall(SYS_PIPE, (long)fds, 0, 0);
+}
+
+static inline int geteuid(void) {
+    return (int)syscall(SYS_GETEUID, 0, 0, 0);
+}
+
+static inline int getgid(void) {
+    return (int)syscall(SYS_GETGID, 0, 0, 0);
+}
+
+static inline int getegid(void) {
+    return (int)syscall(SYS_GETEGID, 0, 0, 0);
+}
+
+static inline int setgid(int gid) {
+    return (int)syscall(SYS_SETGID, (long)gid, 0, 0);
+}
+
 static inline int fork(void) {
     long r = syscall(SYS_FORK, 0, 0, 0);
     if (r < 0) { errno = (int)(-r); return -1; }
@@ -852,6 +1139,13 @@ static inline int waitpid(int pid, int *status, int options) {
     return (int)r;
 }
 
+/* POSIX wait - wait for any child process */
+static inline int wait(int *status) {
+    long r = syscall(SYS_WAIT, (long)status, 0, 0);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return (int)r;
+}
+
 static inline int getuid(void) {
     return (int)syscall(SYS_GETUID, 0, 0, 0);
 }
@@ -860,19 +1154,6 @@ static inline int setuid(int uid) {
     return (int)syscall(SYS_SETUID, (long)uid, 0, 0);
 }
 
-/*
- * Graphics blit: copy a user backbuffer into the framebuffer.
- * fmt must match the current framebuffer format (no conversion).
- */
-static inline int gfx_blit(const void *src, uint16_t w, uint16_t h,
-                           uint16_t dst_x, uint16_t dst_y,
-                           uint16_t src_pitch_bytes,
-                           uint16_t fmt) {
-    uint32_t wh = ((uint32_t)w << 16) | (uint32_t)h;
-    uint32_t xy = ((uint32_t)dst_x << 16) | (uint32_t)dst_y;
-    uint32_t pf = ((uint32_t)src_pitch_bytes << 16) | (uint32_t)fmt;
-    return (int)syscall4(SYS_GFX_BLIT, (long)src, (long)wh, (long)xy, (long)pf);
-}
 
 static inline void sleep(unsigned int sec) {
     syscall(SYS_SLEEP, sec, 0, 0);
@@ -880,6 +1161,24 @@ static inline void sleep(unsigned int sec) {
 
 static inline int kill(int pid, int sig) {
     return (int)syscall(SYS_KILL, pid, sig, 0);
+}
+
+// Signal handler type
+typedef void (*sighandler_t)(int);
+
+// Install signal handler (returns old handler or SIG_ERR on error)
+static inline sighandler_t signal(int signum, sighandler_t handler) {
+    return (sighandler_t)syscall(SYS_SIGNAL, (long)signum, (long)handler, 0);
+}
+
+// Raise a signal to current process
+static inline int raise(int sig) {
+    return (int)syscall(SYS_RAISE, (long)sig, 0, 0);
+}
+
+// File descriptor injection (for TTY manager)
+static inline int fd_inject(int pid, int fd, void *fd_obj) {
+    return (int)syscall(SYS_FD_INJECT, (long)pid, (long)fd, (long)fd_obj);
 }
 
 // Directory operations
@@ -906,7 +1205,7 @@ static inline int readdir(int fd, char *name_buf, size_t buf_size, int *is_dir, 
         "mov %4, %%rdx\n"
         "mov %5, %%r10\n"
         "mov %6, %%r8\n"
-        "int $0x80\n"
+        "syscall\n"
         "mov %%rax, %0\n"
         : "=r"(ret)
         : "r"((uint64_t)SYS_READDIR), "r"((uint64_t)fd), "r"((uint64_t)name_buf),
@@ -981,3 +1280,71 @@ void _start(long argc, char** argv) {
 }
 #endif /* LIBC_NO_START */
 
+
+// Simple sscanf for parsing integers (supports "%d" format only)
+static inline int sscanf(const char *str, const char *format, ...) {
+    int *args[16];
+    int arg_count = 0;
+    
+    // Count %d in format string
+    const char *f = format;
+    while (*f) {
+        if (*f == '%' && *(f+1) == 'd') {
+            arg_count++;
+            f += 2;
+        } else {
+            f++;
+        }
+    }
+    
+    // Get variadic arguments
+    __builtin_va_list ap;
+    __builtin_va_start(ap, format);
+    for (int i = 0; i < arg_count; i++) {
+        args[i] = __builtin_va_arg(ap, int*);
+    }
+    __builtin_va_end(ap);
+    
+    // Parse the string
+    int parsed = 0;
+    const char *s = str;
+    
+    for (int i = 0; i < arg_count && *s; i++) {
+        while (*s == ' ' || *s == '\t') s++;
+        
+        int sign = 1;
+        if (*s == '-') {
+            sign = -1;
+            s++;
+        }
+        
+        int value = 0;
+        int found = 0;
+        while (*s >= '0' && *s <= '9') {
+            value = value * 10 + (*s - '0');
+            s++;
+            found = 1;
+        }
+        
+        if (found) {
+            *args[i] = sign * value;
+            parsed++;
+        } else {
+            break;
+        }
+    }
+    
+    return parsed;
+}
+
+/* Random number generation (LCG) */
+static uint32_t __rand_seed = 1;
+
+static inline void srand(unsigned int seed) {
+    __rand_seed = seed;
+}
+
+static inline int rand(void) {
+    __rand_seed = __rand_seed * 1103515245 + 12345;
+    return (int)((__rand_seed / 65536) % 32768);
+}

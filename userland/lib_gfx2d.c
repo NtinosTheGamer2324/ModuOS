@@ -21,14 +21,32 @@ static int read_full(int fd, void *buf, size_t sz) {
 
 int gfx2d_open(gfx2d_t *g) {
     if (!g) return -EINVAL;
+    memset(g, 0, sizeof(*g));
+    
     int fd = open(VIDEO0_PATH, O_RDWR, 0);
     if (fd < 0) return -ENOENT;
     g->fd = fd;
+    
+    // Allocate userspace command buffer for batching (256KB)
+    // Since kernel doesn't support MAP_CMDBUF, we batch in userspace
+    g->cmdbuf_size = 256 * 1024;
+    g->cmdbuf = malloc(g->cmdbuf_size);
+    if (g->cmdbuf) {
+        g->cmdbuf_used = 0;
+        g->cmd_count = 0;
+    } else {
+        g->cmdbuf_size = 0;
+    }
+    
     return 0;
 }
 
 int gfx2d_close(gfx2d_t *g) {
     if (!g) return -EINVAL;
+    if (g->cmdbuf) {
+        free(g->cmdbuf);
+        g->cmdbuf = NULL;
+    }
     if (g->fd >= 0) {
         close(g->fd);
         g->fd = -1;
@@ -65,13 +83,13 @@ int gfx2d_get_info(gfx2d_t *g, gfx2d_info_t *out) {
 
 int gfx2d_fill_rect(gfx2d_t *g, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t argb) {
     if (!g) return -EINVAL;
+    
     videoctl2_enqueue_t req;
     memset(&req, 0, sizeof(req));
     req.hdr.magic = VIDEOCTL_MAGIC2;
     req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
     req.hdr.cmd = VIDEOCTL_CMD2_ENQUEUE;
     req.hdr.size_bytes = sizeof(req);
-
     req.u.fill.op = VIDEOCTL2_OP_FILL_RECT;
     req.u.fill.x = x;
     req.u.fill.y = y;
@@ -79,6 +97,15 @@ int gfx2d_fill_rect(gfx2d_t *g, uint32_t x, uint32_t y, uint32_t w, uint32_t h, 
     req.u.fill.h = h;
     req.u.fill.argb = argb;
 
+    // Use command buffer if available
+    if (g->cmdbuf && g->cmdbuf_used + sizeof(req) <= g->cmdbuf_size) {
+        memcpy((uint8_t*)g->cmdbuf + g->cmdbuf_used, &req, sizeof(req));
+        g->cmdbuf_used += sizeof(req);
+        g->cmd_count++;
+        return 0;
+    }
+    
+    // Fallback to direct write
     return write_full(g->fd, &req, sizeof(req));
 }
 
@@ -160,7 +187,6 @@ int gfx2d_blit_buf(gfx2d_t *g, uint32_t handle,
     req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
     req.hdr.cmd = VIDEOCTL_CMD2_ENQUEUE;
     req.hdr.size_bytes = sizeof(req);
-
     req.u.blit_buf.op = VIDEOCTL2_OP_BLIT_BUF;
     req.u.blit_buf.handle = handle;
     req.u.blit_buf.src_x = src_x;
@@ -172,19 +198,41 @@ int gfx2d_blit_buf(gfx2d_t *g, uint32_t handle,
     req.u.blit_buf.src_pitch = src_pitch;
     req.u.blit_buf.src_fmt = src_fmt;
 
+    // Use command buffer if available
+    if (g->cmdbuf && g->cmdbuf_used + sizeof(req) <= g->cmdbuf_size) {
+        memcpy((uint8_t*)g->cmdbuf + g->cmdbuf_used, &req, sizeof(req));
+        g->cmdbuf_used += sizeof(req);
+        g->cmd_count++;
+        return 0;
+    }
+    
+    // Fallback to direct write
     return write_full(g->fd, &req, sizeof(req));
 }
 
 int gfx2d_flush(gfx2d_t *g, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     if (!g) return -EINVAL;
+    
+    // Submit all batched commands in ONE write() call
+    if (g->cmdbuf && g->cmdbuf_used > 0) {
+        // Write all batched commands at once
+        ssize_t written = write(g->fd, g->cmdbuf, g->cmdbuf_used);
+        if (written != (ssize_t)g->cmdbuf_used) {
+            return -EIO;
+        }
+        
+        // Reset buffer for next batch
+        g->cmdbuf_used = 0;
+        g->cmd_count = 0;
+    }
 
+    // Now do the actual flush
     videoctl2_flush_t req;
     memset(&req, 0, sizeof(req));
     req.hdr.magic = VIDEOCTL_MAGIC2;
     req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
     req.hdr.cmd = VIDEOCTL_CMD2_FLUSH;
     req.hdr.size_bytes = sizeof(req);
-
     req.x = x;
     req.y = y;
     req.w = w;

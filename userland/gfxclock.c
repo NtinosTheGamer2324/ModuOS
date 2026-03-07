@@ -1,4 +1,5 @@
 #include "libc.h"
+#include "NodGL.h"
 #include "string.h"
 #include "../include/moduos/kernel/events/events.h"
 
@@ -190,34 +191,52 @@ static void hand_endpoint_smooth(int cx, int cy, int len, int tick0_59, uint16_t
     if (out_y) *out_y = cy + y;
 }
 
+static NodGL_Device g_device = NULL;
+static NodGL_Context g_ctx = NULL;
+static NodGL_Texture g_backbuffer_tex = 0;
+
 static int gfx_init(Gfx *g) {
     memset(g, 0, sizeof(*g));
 
-    if (md64api_grp_get_video0_info(&g->vi) != 0) return -1;
-    if (g->vi.mode != MD64API_GRP_MODE_GRAPHICS || g->vi.width == 0 || g->vi.height == 0) return -2;
-
-    uint8_t fmt = g->vi.fmt;
-    if (fmt == MD64API_GRP_FMT_UNKNOWN) {
-        if (g->vi.bpp == 32) fmt = MD64API_GRP_FMT_XRGB8888;
-        else if (g->vi.bpp == 16) fmt = MD64API_GRP_FMT_RGB565;
+    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &g_device, &g_ctx, NULL) != NodGL_OK) {
+        return -1;
     }
 
-    if (!(fmt == MD64API_GRP_FMT_XRGB8888 || fmt == MD64API_GRP_FMT_RGB565)) return -3;
+    uint32_t screen_w, screen_h;
+    NodGL_GetScreenResolution(g_device, &screen_w, &screen_h);
 
-    g->fmt = fmt;
-    g->bpp_bytes = (fmt == MD64API_GRP_FMT_RGB565) ? 2u : 4u;
-    g->bb_pitch = g->vi.width * g->bpp_bytes;
+    g->vi.width = screen_w;
+    g->vi.height = screen_h;
+    g->vi.bpp = 32;
+    g->fmt = MD64API_GRP_FMT_XRGB8888;
+    g->bpp_bytes = 4;
 
-    uint64_t size = (uint64_t)g->bb_pitch * g->vi.height;
-    g->bb = (uint8_t*)malloc((size_t)size);
-    if (!g->bb) return -4;
+    NodGL_TextureDesc tex_desc = {
+        .width = screen_w,
+        .height = screen_h,
+        .format = NodGL_FORMAT_R8G8B8A8_UNORM,
+        .mip_levels = 1,
+        .initial_data = NULL,
+        .initial_data_size = 0
+    };
+
+    if (NodGL_CreateTexture(g_device, &tex_desc, &g_backbuffer_tex) != NodGL_OK) {
+        NodGL_ReleaseDevice(g_device);
+        return -2;
+    }
+
+    if (NodGL_MapResource(g_ctx, g_backbuffer_tex, (void**)&g->bb, &g->bb_pitch) != NodGL_OK) {
+        NodGL_ReleaseResource(g_device, g_backbuffer_tex);
+        NodGL_ReleaseDevice(g_device);
+        return -4;
+    }
 
     return 0;
 }
 
 static void gfx_present(Gfx *g) {
-    (void)gfx_blit(g->bb, (uint16_t)g->vi.width, (uint16_t)g->vi.height,
-                   0, 0, (uint16_t)g->bb_pitch, (uint16_t)g->fmt);
+    NodGL_DrawTexture(g_ctx, g_backbuffer_tex, 0, 0, 0, 0, g->vi.width, g->vi.height);
+    NodGL_PresentContext(g_ctx, 0);
 }
 
 static void format_time(char out[16], uint8_t hh, uint8_t mm, uint8_t ss) {
@@ -362,15 +381,14 @@ int md_main(long argc, char **argv) {
     int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
     if (efd < 0) {
         puts_raw("gfxclock: cannot open $/dev/input/event0\n");
-        if (g.bb) free(g.bb);
+        NodGL_ReleaseResource(g_device, g_backbuffer_tex);
+        NodGL_ReleaseDevice(g_device);
         return 2;
     }
 
     md64api_sysinfo_data_u info;
     memset(&info, 0, sizeof(info));
-    if (get_system_info_u(&info) != 0) {
-        puts_raw("gfxclock: SYS_SSTATS2 failed\n");
-    }
+    int sysinfo_fd = open("$/dev/md64api/sysinfo", 0, 0);
 
     uint8_t last_s = 255;
     uint16_t last_ms_bucket = 0;
@@ -395,7 +413,7 @@ int md_main(long argc, char **argv) {
         if (bucket != last_ms_bucket) {
             last_ms_bucket = bucket;
 
-            if (get_system_info_u(&info) == 0) {
+            if (sysinfo_fd >= 0 && (lseek(sysinfo_fd, 0, 0), read(sysinfo_fd, &info, sizeof(info))) > 0) {
                 // Re-sync the sub-second phase when the RTC second changes.
                 // This avoids jitter caused by SYS_TIME not being aligned to RTC seconds.
                 if (info.rtc_second != last_s) {
@@ -416,4 +434,7 @@ int md_main(long argc, char **argv) {
 
         yield();
     }
+
+    NodGL_ReleaseResource(g_device, g_backbuffer_tex);
+    NodGL_ReleaseDevice(g_device);
 }

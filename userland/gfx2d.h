@@ -13,7 +13,11 @@
  */
 
 typedef struct {
-    int fd; /* open fd to $/dev/graphics/video0 */
+    int fd;                    /* open fd to $/dev/graphics/video0 */
+    void *cmdbuf;              /* mapped command buffer */
+    uint32_t cmdbuf_size;      /* size of command buffer */
+    uint32_t cmdbuf_used;      /* bytes used in current batch */
+    uint32_t cmd_count;        /* number of commands in current batch */
 } gfx2d_t;
 
 typedef struct {

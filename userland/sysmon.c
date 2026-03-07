@@ -1,4 +1,5 @@
 #include "libc.h"
+#include "NodGL.h"
 #include "string.h"
 #include "../include/moduos/kernel/events/events.h"
 
@@ -73,7 +74,7 @@ static const uint8_t font8x8_basic[96][8] = {
     /* 0x23 '#' */ {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
     /* 0x24 '$' */ {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00},
     /* 0x25 '%' */ {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},
-    /* 0x26 '&' */ {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00},
+    /* 0x '&' */ {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00},
     /* 0x27 '\''*/ {0x06,0x06,0x04,0x00,0x00,0x00,0x00,0x00},
     /* 0x28 '(' */ {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00},
     /* 0x29 ')' */ {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},
@@ -157,7 +158,7 @@ static const uint8_t font8x8_basic[96][8] = {
     /* 0x77 'w' */ {0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00},
     /* 0x78 'x' */ {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00},
     /* 0x79 'y' */ {0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F},
-    /* 0x7A 'z' */ {0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00},
+    /* 0x7A 'z' */ {0x00,0x00,0x3F,0x19,0x0C,0x00,0x3F,0x00},
     /* 0x7B '{' */ {0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00},
     /* 0x7C '|' */ {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00},
     /* 0x7D '}' */ {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00},
@@ -229,31 +230,50 @@ static const char *state_name(uint32_t st) {
     }
 }
 
+static NodGL_Device g_device = NULL;
+static NodGL_Context g_ctx = NULL;
+static NodGL_Texture g_backbuffer_tex = 0;
+
 static int gfx_init(Gfx *g) {
     memset(g, 0, sizeof(*g));
-    if (md64api_grp_get_video0_info(&g->vi) != 0) return -1;
-    if (g->vi.mode != MD64API_GRP_MODE_GRAPHICS) return -2;
+    
+    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &g_device, &g_ctx, NULL) != NodGL_OK) return -1;
 
-    uint8_t fmt = g->vi.fmt;
-    if (fmt == MD64API_GRP_FMT_UNKNOWN) {
-        if (g->vi.bpp == 32) fmt = MD64API_GRP_FMT_XRGB8888;
-        else if (g->vi.bpp == 16) fmt = MD64API_GRP_FMT_RGB565;
+    uint32_t screen_w, screen_h;
+    NodGL_GetScreenResolution(g_device, &screen_w, &screen_h);
+
+    g->vi.width = screen_w;
+    g->vi.height = screen_h;
+    g->vi.bpp = 32;
+    g->fmt = MD64API_GRP_FMT_XRGB8888;
+    g->bpp_bytes = 4;
+
+    NodGL_TextureDesc tex_desc = {
+        .width = screen_w,
+        .height = screen_h,
+        .format = NodGL_FORMAT_R8G8B8A8_UNORM,
+        .mip_levels = 1,
+        .initial_data = NULL,
+        .initial_data_size = 0
+    };
+
+    if (NodGL_CreateTexture(g_device, &tex_desc, &g_backbuffer_tex) != NodGL_OK) {
+        NodGL_ReleaseDevice(g_device);
+        return -2;
     }
 
-    if (!(fmt == MD64API_GRP_FMT_XRGB8888 || fmt == MD64API_GRP_FMT_RGB565)) return -3;
+    if (NodGL_MapResource(g_ctx, g_backbuffer_tex, (void**)&g->bb, &g->bb_pitch) != NodGL_OK) {
+        NodGL_ReleaseResource(g_device, g_backbuffer_tex);
+        NodGL_ReleaseDevice(g_device);
+        return -4;
+    }
 
-    g->fmt = fmt;
-    g->bpp_bytes = (fmt == MD64API_GRP_FMT_RGB565) ? 2u : 4u;
-    g->bb_pitch = g->vi.width * g->bpp_bytes;
-
-    uint64_t size = (uint64_t)g->bb_pitch * g->vi.height;
-    g->bb = (uint8_t*)malloc((size_t)size);
-    return g->bb ? 0 : -4;
+    return 0;
 }
 
 static void present(Gfx *g) {
-    (void)gfx_blit(g->bb, (uint16_t)g->vi.width, (uint16_t)g->vi.height,
-                   0, 0, (uint16_t)g->bb_pitch, (uint16_t)g->fmt);
+    NodGL_DrawTexture(g_ctx, g_backbuffer_tex, 0, 0, 0, 0, g->vi.width, g->vi.height);
+    NodGL_PresentContext(g_ctx, 0);
 }
 
 int md_main(long argc, char **argv) {
@@ -274,6 +294,7 @@ int md_main(long argc, char **argv) {
 
     md64api_sysinfo_data_u si;
     md64api_pid_info_u pi;
+    int sysinfo_fd = open("$/dev/md64api/sysinfo", 0, 0);
 
     uint64_t last_bucket = 0;
 
@@ -295,7 +316,7 @@ int md_main(long argc, char **argv) {
         last_bucket = bucket;
 
         memset(&si, 0, sizeof(si));
-        (void)get_system_info_u(&si);
+        if (sysinfo_fd >= 0) { lseek(sysinfo_fd, 0, 0); read(sysinfo_fd, &si, sizeof(si)); }
         // Enumerate processes by probing PIDs.
         // This avoids depending on a full proc table dump and tends to be more stable.
         uint32_t pids[128];
@@ -420,7 +441,12 @@ int md_main(long argc, char **argv) {
         while (read(efd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
             if (ev.type == EVENT_KEY_PRESSED) {
                 int kc = ev.data.keyboard.keycode;
-                if (kc == KEY_ESCAPE) { close(efd); if (g.bb) free(g.bb); return 0; }
+                if (kc == KEY_ESCAPE) { 
+                    close(efd); 
+                    NodGL_ReleaseResource(g_device, g_backbuffer_tex);
+                    NodGL_ReleaseDevice(g_device);
+                    return 0; 
+                }
                 if (kc == KEY_ARROW_DOWN) sel++;
                 if (kc == KEY_ARROW_UP) sel--;
                 if (kc == KEY_PAGE_DOWN) sel += 10;
@@ -568,6 +594,9 @@ int md_main(long argc, char **argv) {
         }
 
         present(&g);
-        yield();
+        yield(); //depricated
     }
 }
+
+
+

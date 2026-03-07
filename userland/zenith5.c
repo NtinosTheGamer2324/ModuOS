@@ -144,12 +144,8 @@ static int builtin_cd(int argc, char **argv) {
 }
 
 static int builtin_pwd(void) {
-    char buf[256];
-    if (!getcwd(buf, sizeof(buf))) {
-        printf("pwd: failed\n");
-        return 1;
-    }
-    printf("%s\n", buf);
+    /* CWD tracking not yet implemented. */
+    printf("/\n");
     return 0;
 }
 
@@ -242,8 +238,7 @@ int md_main(long argc0, char **argv0) {
     char user[64] = "user";
 
     for (;;) {
-        char cwd[256];
-        if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "?");
+        static char cwd[4] = "/";
 
         printf("%s@%s %s> ", user, host, cwd);
         char *line = input();

@@ -196,6 +196,7 @@ int md_main(long argc, char** argv) {
         argc = 0;
     }
 
+    puts_raw("ARGS\n");
     for (long i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!a) continue;
@@ -206,16 +207,15 @@ int md_main(long argc, char** argv) {
         else if (streq(a, "--help") || streq(a, "-h")) { usage(argv ? argv[0] : NULL); return 0; }
     }
 
-    md64api_sysinfo_data_u info_s;
-    memset(&info_s, 0, sizeof(info_s));
-    if (get_system_info_u(&info_s) != 0) {
-        printf("Failed to get system info\n");
-        return 1;
-    }
-    md64api_sysinfo_data_u *info = &info_s;
-    if (!info) {
-        puts("Error: Cannot get system info");
-        return 1;
+    puts_raw("SYSINFO\n");
+    md64api_sysinfo_data_u *info = (md64api_sysinfo_data_u *)malloc(sizeof(md64api_sysinfo_data_u));
+    if (!info) { printf("neofetch: out of memory\n"); return 1; }
+    memset(info, 0, sizeof(md64api_sysinfo_data_u));
+    {
+        int fd = open("$/dev/md64api/sysinfo", 0, 0);
+        if (fd < 0) { free(info); printf("neofetch: cannot read system info\n"); return 1; }
+        read(fd, info, sizeof(md64api_sysinfo_data_u));
+        close(fd);
     }
 
     /* ASCII logo */
@@ -232,9 +232,11 @@ int md_main(long argc, char** argv) {
     const int logo_lines = (int)(sizeof(logo) / sizeof(logo[0]));
     const int logo_width = logo_max_width(logo, logo_lines);
 
+    puts_raw("SNPRINTF\n");
     char header[128];
     snprintf(header, sizeof(header), "%s@%s", safe_str(info->username), safe_str(info->pcname));
 
+    puts_raw("FORMAT UPTIME\n");
     char uptime_buf[64];
     format_uptime(time_ms(), uptime_buf, sizeof(uptime_buf));
 
@@ -372,5 +374,6 @@ int md_main(long argc, char** argv) {
         puts_raw(ANSI_RESET);
     }
 
+    free(info);
     return 0;
 }

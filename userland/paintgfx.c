@@ -3,6 +3,10 @@
 #include "../include/moduos/kernel/events/events.h"
 #include "gfx2d.h"
 
+/* paintgfx uses gfx2d directly (hardware-accelerated path).
+ * The single gfx_blit call is replaced with gfx2d_blit_buf.
+ */
+
 /*
  * paintgfx.sqr
  *
@@ -526,7 +530,7 @@ static const uint8_t font8x8_basic[96][8] = {
     /* 0x23 '#' */ {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
     /* 0x24 '$' */ {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00},
     /* 0x25 '%' */ {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},
-    /* 0x26 '&' */ {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00},
+    /* 0x '&' */ {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00},
     /* 0x27 '\''*/ {0x06,0x06,0x04,0x00,0x00,0x00,0x00,0x00},
     /* 0x28 '(' */ {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00},
     /* 0x29 ')' */ {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},
@@ -610,7 +614,7 @@ static const uint8_t font8x8_basic[96][8] = {
     /* 0x77 'w' */ {0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00},
     /* 0x78 'x' */ {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00},
     /* 0x79 'y' */ {0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F},
-    /* 0x7A 'z' */ {0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00},
+    /* 0x7A 'z' */ {0x00,0x00,0x3F,0x19,0x0C,0x00,0x3F,0x00},
     /* 0x7B '{' */ {0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00},
     /* 0x7C '|' */ {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00},
     /* 0x7D '}' */ {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00},
@@ -758,7 +762,7 @@ static void draw_tool_icon(uint8_t *fb, uint32_t pitch, uint32_t sw, uint32_t sh
     uint32_t dark = pack_xrgb8888(60,60,60);
     uint32_t blue = pack_xrgb8888(0,0,180);
 
-    /* 16x16-ish pixel icons inside a 26x26 button */
+    /* 16x16-ish pixel icons inside a 26FlareX button */
     int32_t ix = x + 5;
     int32_t iy = y + 5;
 
@@ -1932,18 +1936,17 @@ int md_main(long argc, char **argv) {
         }
 
         /* Present:
-         * Using video0 ENQUEUE+FLUSH for every mouse move is syscall-heavy and can lag.
-         * Prefer the kernel fast-path blit syscall for dirty rectangles.
+         * Using gfx2d buffer blit for dirty rectangles (hardware-accelerated path).
          */
         if (!rect_is_empty(dirty)) {
             rect_i32_t dr = rect_clip(dirty, (int32_t)vi.width, (int32_t)vi.height);
             if (!rect_is_empty(dr)) {
-                const uint8_t *src = (const uint8_t *)bb + (uint64_t)dr.y * pitch + (uint64_t)dr.x * 4u;
-                (void)gfx_blit(src,
-                               (uint16_t)dr.w, (uint16_t)dr.h,
-                               (uint16_t)dr.x, (uint16_t)dr.y,
-                               (uint16_t)pitch,
-                               (uint16_t)MD64API_GRP_FMT_XRGB8888);
+                (void)gfx2d_blit_buf(&g, bb_handle,
+                                     (uint32_t)dr.x, (uint32_t)dr.y,
+                                     (uint32_t)dr.x, (uint32_t)dr.y,
+                                     (uint32_t)dr.w, (uint32_t)dr.h,
+                                     pitch, (uint32_t)MD64API_GRP_FMT_XRGB8888);
+                (void)gfx2d_flush(&g, (uint32_t)dr.x, (uint32_t)dr.y, (uint32_t)dr.w, (uint32_t)dr.h);
             }
         } else if (!had_input) {
             /* Idle: yield CPU if nothing changed and no pending input. */
@@ -1971,3 +1974,6 @@ int md_main(long argc, char **argv) {
         }
     }
 }
+
+
+

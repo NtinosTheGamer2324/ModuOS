@@ -192,7 +192,7 @@ int md_main(long argc, char **argv) {
         next_ms += 20;
         uint64_t now;
         while ((now = (uint64_t)time_ms()) < next_ms) {
-            yield();
+            
         }
         if (now > next_ms + 100) {
             next_ms = now;

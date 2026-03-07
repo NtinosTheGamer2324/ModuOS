@@ -1,4 +1,5 @@
 #include "libc.h"
+#include "NodGL.h"
 #include "string.h"
 #include "../include/moduos/kernel/events/events.h"
 
@@ -199,7 +200,7 @@ static const uint8_t font8x8_basic[96][8] = {
     /* 0x23 '#' */ {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
     /* 0x24 '$' */ {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00},
     /* 0x25 '%' */ {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},
-    /* 0x26 '&' */ {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00},
+    /* 0x '&' */ {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00},
     /* 0x27 '\''*/ {0x06,0x06,0x04,0x00,0x00,0x00,0x00,0x00},
     /* 0x28 '(' */ {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00},
     /* 0x29 ')' */ {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},
@@ -284,7 +285,7 @@ static const uint8_t font8x8_basic[96][8] = {
     /* 0x77 'w' */ {0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00},
     /* 0x78 'x' */ {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00},
     /* 0x79 'y' */ {0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F},
-    /* 0x7A 'z' */ {0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00},
+    /* 0x7A 'z' */ {0x00,0x00,0x3F,0x19,0x0C,0x00,0x3F,0x00},
     /* 0x7B '{' */ {0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00},
     /* 0x7C '|' */ {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00},
     /* 0x7D '}' */ {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00},
@@ -400,24 +401,52 @@ typedef struct { const char *label; char key; } btn_t;
 int md_main(long argc, char **argv) {
     (void)argc; (void)argv;
 
-    md64api_grp_video_info_t vi;
-    memset(&vi, 0, sizeof(vi));
-    if (md64api_grp_get_video0_info(&vi) != 0) {
-        puts_raw("calcgfx: cannot read video info\n");
+    NodGL_Device device;
+    NodGL_Context ctx;
+    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &device, &ctx, NULL) != NodGL_OK) {
+        puts_raw("calcgfx: NodGL init failed\n");
         return 1;
     }
-    if (vi.mode != MD64API_GRP_MODE_GRAPHICS || vi.bpp != 32) {
-        puts_raw("calcgfx: requires 32bpp graphics\n");
-        return 0;
+
+    uint32_t screen_w, screen_h;
+    NodGL_GetScreenResolution(device, &screen_w, &screen_h);
+
+    NodGL_TextureDesc tex_desc = {
+        .width = screen_w,
+        .height = screen_h,
+        .format = NodGL_FORMAT_R8G8B8A8_UNORM,
+        .mip_levels = 1,
+        .initial_data = NULL,
+        .initial_data_size = 0
+    };
+
+    NodGL_Texture backbuffer_tex;
+    if (NodGL_CreateTexture(device, &tex_desc, &backbuffer_tex) != NodGL_OK) {
+        puts_raw("calcgfx: failed to create backbuffer texture\n");
+        NodGL_ReleaseDevice(device);
+        return 2;
     }
 
-    uint32_t pitch = vi.width * 4u;
-    uint32_t buf_size = pitch * vi.height;
-    uint8_t *bb = (uint8_t*)malloc(buf_size);
-    if (!bb) return 2;
+    uint8_t *bb;
+    uint32_t pitch;
+    if (NodGL_MapResource(ctx, backbuffer_tex, (void**)&bb, &pitch) != NodGL_OK) {
+        puts_raw("calcgfx: failed to map backbuffer\n");
+        NodGL_ReleaseResource(device, backbuffer_tex);
+        NodGL_ReleaseDevice(device);
+        return 2;
+    }
+
+    md64api_grp_video_info_t vi;
+    vi.width = screen_w;
+    vi.height = screen_h;
+    vi.bpp = 32;
 
     int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
-    if (efd < 0) { free(bb); return 3; }
+    if (efd < 0) {
+        NodGL_ReleaseResource(device, backbuffer_tex);
+        NodGL_ReleaseDevice(device);
+        return 3;
+    }
 
     calc_t calc;
     calc_clear(&calc);
@@ -576,7 +605,13 @@ int md_main(long argc, char **argv) {
             alpha_blit_cursor_xrgb8888(bb, pitch, vi.width, vi.height, &cursor, mx, my);
         }
 
-        (void)gfx_blit(bb, (uint16_t)vi.width, (uint16_t)vi.height, 0, 0, (uint16_t)pitch, (uint16_t)MD64API_GRP_FMT_XRGB8888);
-        yield();
+        NodGL_DrawTexture(ctx, backbuffer_tex, 0, 0, 0, 0, vi.width, vi.height);
+        NodGL_PresentContext(ctx, 0);
     }
+
+    NodGL_ReleaseResource(device, backbuffer_tex);
+    NodGL_ReleaseDevice(device);
 }
+
+
+

@@ -11,6 +11,7 @@
  */
 
 #include "libc.h"
+#include "NodGL.h"
 #include "string.h"
 #include "lib_fnt.h"
 #include "../include/moduos/kernel/events/events.h"
@@ -420,28 +421,42 @@ static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t)((rr << 11) | (gg << 5) | bb);
 }
 
+static NodGL_Device g_device = NULL;
+static NodGL_Context g_ctx = NULL;
+static NodGL_Texture g_backbuffer_tex = 0;
+
 int gfx_init(Gfx *g) {
     memset(g, 0, sizeof(*g));
-    if (md64api_grp_get_video0_info(&g->vi) != 0) return -1;
     
-    if (g->vi.mode != MD64API_GRP_MODE_GRAPHICS || g->vi.fb_addr == 0) return -2;
-    
-    g->fmt = g->vi.fmt;
-    if (g->fmt == MD64API_GRP_FMT_UNKNOWN) {
-        if (g->vi.bpp == 32) g->fmt = MD64API_GRP_FMT_XRGB8888;
-        else if (g->vi.bpp == 16) g->fmt = MD64API_GRP_FMT_RGB565;
+    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &g_device, &g_ctx, NULL) != NodGL_OK) return -1;
+
+    uint32_t screen_w, screen_h;
+    NodGL_GetScreenResolution(g_device, &screen_w, &screen_h);
+
+    g->vi.width = screen_w;
+    g->vi.height = screen_h;
+    g->vi.bpp = 32;
+    g->fmt = MD64API_GRP_FMT_XRGB8888;
+
+    NodGL_TextureDesc tex_desc = {
+        .width = screen_w,
+        .height = screen_h,
+        .format = NodGL_FORMAT_R8G8B8A8_UNORM,
+        .mip_levels = 1,
+        .initial_data = NULL,
+        .initial_data_size = 0
+    };
+
+    if (NodGL_CreateTexture(g_device, &tex_desc, &g_backbuffer_tex) != NodGL_OK) {
+        NodGL_ReleaseDevice(g_device);
+        return -2;
     }
-    
-    if (!((g->fmt == MD64API_GRP_FMT_XRGB8888 && g->vi.bpp == 32) ||
-          (g->fmt == MD64API_GRP_FMT_RGB565 && g->vi.bpp == 16))) {
-        return -3;
+
+    if (NodGL_MapResource(g_ctx, g_backbuffer_tex, (void**)&g->bb, &g->bb_pitch) != NodGL_OK) {
+        NodGL_ReleaseResource(g_device, g_backbuffer_tex);
+        NodGL_ReleaseDevice(g_device);
+        return -4;
     }
-    
-    uint32_t bpp_bytes = (g->fmt == MD64API_GRP_FMT_RGB565) ? 2u : 4u;
-    g->bb_pitch = g->vi.width * bpp_bytes;
-    uint32_t buf_size = g->bb_pitch * g->vi.height;
-    g->bb = (uint8_t*)malloc(buf_size);
-    if (!g->bb) return -4;
     
     return 0;
 }
@@ -482,8 +497,8 @@ void gfx_fill_rect(Gfx *g, int x, int y, int w, int h, uint32_t argb) {
 
 void gfx_present_full(Gfx *g) {
     if (!g || !g->bb) return;
-    gfx_blit(g->bb, (uint16_t)g->vi.width, (uint16_t)g->vi.height,
-             0, 0, (uint16_t)g->bb_pitch, (uint16_t)g->fmt);
+    NodGL_DrawTexture(g_ctx, g_backbuffer_tex, 0, 0, 0, 0, g->vi.width, g->vi.height);
+    NodGL_PresentContext(g_ctx, 0);
 }
 
 // Game logic

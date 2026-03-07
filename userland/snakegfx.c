@@ -1,4 +1,5 @@
 #include "libc.h"
+#include "NodGL.h"
 #include "string.h"
 #include "../include/moduos/kernel/events/events.h"
 
@@ -6,7 +7,7 @@
  * snakegfx.sqr
  *
  * Userland port of the kernel Snake (eatfruit.c) game, but rendered in graphics mode
- * via MD64API GRP ($/dev/graphics/video0).
+ * via NodGL.
  *
  * Input: $/dev/input/event0 (structured events)
  *   - WASD / hjkl / arrow-key escape sequences if your shell sends them as ASCII
@@ -134,6 +135,10 @@ typedef struct {
     uint32_t off_y;
 } Gfx;
 
+static NodGL_Device g_device = NULL;
+static NodGL_Context g_ctx = NULL;
+static NodGL_Texture g_backbuffer_tex = 0;
+
 static uint32_t xrgb(uint8_t r,uint8_t g,uint8_t b){ return ((uint32_t)r<<16)|((uint32_t)g<<8)|b; }
 static uint16_t rgb565(uint8_t r,uint8_t g,uint8_t b){
     uint16_t rr=(uint16_t)((r*31u)/255u);
@@ -189,18 +194,15 @@ static uint32_t col_body(Gfx *g){ return (g->fmt == MD64API_GRP_FMT_RGB565) ? (u
 /* One-time full clear. This avoids visible redraw every frame. */
 static int gfx_present_full(Gfx *g) {
     if (!g || !g->bb) return -1;
-    return gfx_blit(g->bb,
-                    (uint16_t)g->vi.width, (uint16_t)g->vi.height,
-                    0, 0,
-                    (uint16_t)g->bb_pitch,
-                    (uint16_t)g->fmt);
+    NodGL_DrawTexture(g_ctx, g_backbuffer_tex, 0, 0, 0, 0, g->vi.width, g->vi.height);
+    NodGL_PresentContext(g_ctx, 0);
+    return 0;
 }
 
 static int gfx_present_cell(Gfx *g, int cx, int cy) {
     if (!g || !g->bb) return -1;
     if (cx < 0 || cy < 0 || cx >= GAME_W || cy >= GAME_H) return 0;
 
-    uint32_t bpp = (g->fmt == MD64API_GRP_FMT_RGB565) ? 2u : 4u;
     uint32_t px = g->off_x + (uint32_t)cx * g->cell_px;
     uint32_t py = g->off_y + (uint32_t)cy * g->cell_px;
     uint32_t w = (g->cell_px > 0) ? (g->cell_px - 1) : 0;
@@ -211,13 +213,9 @@ static int gfx_present_cell(Gfx *g, int cx, int cy) {
     if (px + w > g->vi.width) w = g->vi.width - px;
     if (py + h > g->vi.height) h = g->vi.height - py;
 
-    const uint8_t *src = g->bb + (uint64_t)py * g->bb_pitch + (uint64_t)px * bpp;
-    uint32_t src_pitch = g->bb_pitch;
-
-    return gfx_blit(src, (uint16_t)w, (uint16_t)h,
-                    (uint16_t)px, (uint16_t)py,
-                    (uint16_t)src_pitch,
-                    (uint16_t)g->fmt);
+    NodGL_DrawTexture(g_ctx, g_backbuffer_tex, (int32_t)px, (int32_t)py, (int32_t)px, (int32_t)py, w, h);
+    NodGL_PresentContext(g_ctx, 0);
+    return 0;
 }
 
 /* HUD font: 3x5 glyphs rendered at SCALE (2x2 pixels per bit) so it's readable.
@@ -350,27 +348,38 @@ static void draw_update(Gfx *g, const Game *game, Pt old_head, Pt old_tail, Pt o
 
 static int gfx_init(Gfx *g) {
     memset(g, 0, sizeof(*g));
-    if (md64api_grp_get_video0_info(&g->vi) != 0) return -1;
-
-    if (g->vi.mode != MD64API_GRP_MODE_GRAPHICS || g->vi.fb_addr == 0) return -2;
-
-    g->fmt = g->vi.fmt;
-    if (g->fmt == MD64API_GRP_FMT_UNKNOWN) {
-        if (g->vi.bpp == 32) g->fmt = MD64API_GRP_FMT_XRGB8888;
-        else if (g->vi.bpp == 16) g->fmt = MD64API_GRP_FMT_RGB565;
+    
+    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &g_device, &g_ctx, NULL) != NodGL_OK) {
+        return -1;
     }
 
-    if (!((g->fmt == MD64API_GRP_FMT_XRGB8888 && g->vi.bpp == 32) ||
-          (g->fmt == MD64API_GRP_FMT_RGB565 && g->vi.bpp == 16))) {
-        return -3;
+    uint32_t screen_w, screen_h;
+    NodGL_GetScreenResolution(g_device, &screen_w, &screen_h);
+
+    g->vi.width = screen_w;
+    g->vi.height = screen_h;
+    g->vi.bpp = 32;
+    g->fmt = MD64API_GRP_FMT_XRGB8888;
+
+    NodGL_TextureDesc tex_desc = {
+        .width = screen_w,
+        .height = screen_h,
+        .format = NodGL_FORMAT_R8G8B8A8_UNORM,
+        .mip_levels = 1,
+        .initial_data = NULL,
+        .initial_data_size = 0
+    };
+
+    if (NodGL_CreateTexture(g_device, &tex_desc, &g_backbuffer_tex) != NodGL_OK) {
+        NodGL_ReleaseDevice(g_device);
+        return -2;
     }
 
-    /* allocate a tightly-packed backbuffer (presented via gfx_blit) */
-    uint32_t bpp_bytes = (g->fmt == MD64API_GRP_FMT_RGB565) ? 2u : 4u;
-    g->bb_pitch = g->vi.width * bpp_bytes;
-    uint32_t buf_size = g->bb_pitch * g->vi.height;
-    g->bb = (uint8_t*)malloc(buf_size);
-    if (!g->bb) return -4;
+    if (NodGL_MapResource(g_ctx, g_backbuffer_tex, (void**)&g->bb, &g->bb_pitch) != NodGL_OK) {
+        NodGL_ReleaseResource(g_device, g_backbuffer_tex);
+        NodGL_ReleaseDevice(g_device);
+        return -4;
+    }
 
     /* choose cell size to fit */
     uint32_t max_cell_w = g->vi.width / GAME_W;
@@ -501,6 +510,10 @@ int md_main(long argc, char **argv) {
     }
 
     close(efd);
+    
+    NodGL_ReleaseResource(g_device, g_backbuffer_tex);
+    NodGL_ReleaseDevice(g_device);
+    
     puts_raw("\nBye.\n");
     return 0;
 }

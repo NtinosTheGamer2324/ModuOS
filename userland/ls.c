@@ -28,10 +28,9 @@ int md_main(long argc, char** argv) {
         }
     }
 
-    char cwd_buf[256];
     if (!path) {
-        char *cwd = getcwd(cwd_buf, sizeof(cwd_buf));
-        path = (cwd && cwd[0]) ? cwd : ".";
+        /* CWD syscall not yet implemented; default to /Apps. */
+        path = "/Apps";
     }
 
     int dir_fd = opendir(path);

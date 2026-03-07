@@ -1,4 +1,5 @@
 #include "libc.h"
+#include "NodGL.h"
 #include "string.h"
 #include "../include/moduos/kernel/events/events.h"
 
@@ -109,54 +110,55 @@ int md_main(long argc, char **argv) {
         return 1;
     }
 
-    md64api_grp_video_info_t info;
-    memset(&info, 0, sizeof(info));
-
-    ssize_t n = read(fd, &info, sizeof(info));
-    close(fd);
-
-    if (n < (ssize_t)sizeof(info)) {
-        printf("gfxtest: read video info failed (n=%ld)\n", (long)n);
+    NodGL_Device device;
+    NodGL_Context ctx;
+    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &device, &ctx, NULL) != NodGL_OK) {
+        puts_raw("Neon Tank Arena: NodGL init failed\n");
         return 1;
     }
 
-    printf("mode=%u fmt=%u bpp=%u\n", (unsigned)info.mode, (unsigned)info.fmt, (unsigned)info.bpp);
-    printf("w=%u h=%u pitch=%u\n", (unsigned)info.width, (unsigned)info.height, (unsigned)info.pitch);
-    printf("fb_addr=0x%llx\n", (unsigned long long)info.fb_addr);
+    uint32_t game_w, game_h;
+    NodGL_GetScreenResolution(device, &game_w, &game_h);
 
-    if (info.mode != MD64API_GRP_MODE_GRAPHICS || info.width == 0 || info.height == 0) {
-        puts_raw("Neon Tank Arena: not in graphics mode\n");
-        return 0;
+    NodGL_TextureDesc tex_desc = {
+        .width = game_w,
+        .height = game_h,
+        .format = NodGL_FORMAT_R8G8B8A8_UNORM,
+        .mip_levels = 1,
+        .initial_data = NULL,
+        .initial_data_size = 0
+    };
+
+    NodGL_Texture backbuffer_tex;
+    if (NodGL_CreateTexture(device, &tex_desc, &backbuffer_tex) != NodGL_OK) {
+        NodGL_ReleaseDevice(device);
+        return 2;
     }
+
+    uint8_t *bb;
+    uint32_t pitch;
+    if (NodGL_MapResource(ctx, backbuffer_tex, (void**)&bb, &pitch) != NodGL_OK) {
+        NodGL_ReleaseResource(device, backbuffer_tex);
+        NodGL_ReleaseDevice(device);
+        return 2;
+    }
+
+    uint8_t fmt = MD64API_GRP_FMT_XRGB8888;
+    md64api_grp_video_info_t info;
+    info.width = game_w;
+    info.height = game_h;
+    info.bpp = 32;
 
     int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
     if (efd < 0) {
         puts_raw("Neon Tank Arena: cannot open input\n");
-        return 2;
+        NodGL_ReleaseResource(device, backbuffer_tex);
+        NodGL_ReleaseDevice(device);
+        return 3;
     }
 
     rng = (uint32_t)time_ms();
     puts_raw("Initializing game...\n");
-
-    /*
-     * Be tolerant: some kernels may report fmt=UNKNOWN (0) even though bpp is known.
-     * In that case, infer from bpp.
-     */
-    uint8_t fmt = info.fmt;
-    if (fmt == MD64API_GRP_FMT_UNKNOWN) {
-        if (info.bpp == 32) fmt = MD64API_GRP_FMT_XRGB8888;
-        else if (info.bpp == 16) fmt = MD64API_GRP_FMT_RGB565;
-    }
-
-    uint32_t bpp_bytes = (fmt == MD64API_GRP_FMT_RGB565) ? 2u : 4u;
-
-    uint32_t game_w = info.width;
-    uint32_t game_h = info.height;
-    uint32_t pitch = game_w * bpp_bytes;
-    uint32_t buf_size = pitch * game_h;
-
-    uint8_t *bb = (uint8_t*)malloc(buf_size);
-    if (!bb) return 3;
     
     p1 = (Tank){50, 50, 0, 3, 0, 0xFF00FFFF};
     p2 = (Tank){(float)game_w-50, (float)game_h-50, 180, 3, 0, 0xFFFF00FF};
@@ -278,14 +280,16 @@ int md_main(long argc, char **argv) {
         }
         
         // Present to screen
-        gfx_blit(bb, (uint16_t)game_w, (uint16_t)game_h, 0, 0, (uint16_t)pitch, (uint16_t)fmt);
+        NodGL_DrawTexture(ctx, backbuffer_tex, 0, 0, 0, 0, game_w, game_h);
+        NodGL_PresentContext(ctx, 0);
         
         yield();
     }
     
     puts_raw("\nNeon Tank Arena - Exiting...\n");
     
-    free(bb);
+    NodGL_ReleaseResource(device, backbuffer_tex);
+    NodGL_ReleaseDevice(device);
     close(efd);
     return 0;
 }

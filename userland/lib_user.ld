@@ -5,8 +5,13 @@ OUTPUT_ARCH(i386:x86-64)
 SECTIONS
 {
     . = 0;
-    .text : { *(.text*) }
+    .text   : { *(.text*) }
     .rodata : { *(.rodata*) }
-    .data : { *(.data*) }
-    .bss : { *(.bss*) *(COMMON) }
+    
+    .got    : { *(.got*) }
+    .plt    : { *(.plt*) }
+    .dynamic : { *(.dynamic) }
+
+    .data   : { *(.data*) }
+    .bss    : { *(.bss*) *(COMMON) }
 }
