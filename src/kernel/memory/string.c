@@ -252,6 +252,20 @@ char *strcpy(char *dest, const char *src) {
 }
 
 // Optimized strncpy function - copies up to n characters from src to dest
+size_t strlcpy(char *dest, const char *src, size_t size) {
+    const char *s = src;
+    size_t len = 0;
+    while (*s++) len++;
+    if (size) {
+        size_t copy = (len < size - 1) ? len : size - 1;
+        char *d = dest;
+        const char *p = src;
+        for (size_t i = 0; i < copy; i++) *d++ = *p++;
+        *d = '\0';
+    }
+    return len;
+}
+
 char *strncpy(char *dest, const char *src, size_t n) {
     char *d = dest;
     size_t i;

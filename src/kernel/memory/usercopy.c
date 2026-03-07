@@ -28,7 +28,39 @@ static int user_range_is_mapped(uint64_t addr, size_t n) {
 
 int usercopy_to_user(void *user_dst, const void *kernel_src, size_t n) {
     if (!user_dst || (!kernel_src && n)) return -1;
-    if (!user_range_is_mapped((uint64_t)(uintptr_t)user_dst, n)) return -2;
+    if (!user_range_is_mapped((uint64_t)(uintptr_t)user_dst, n)) {
+        extern void com_write_string(uint16_t, const char*);
+        extern int com_write_hex64(uint16_t, uint64_t);
+        com_write_string(0x3F8, "[USERCOPY] ERROR: user range not mapped\n");
+        com_write_string(0x3F8, "[USERCOPY]   Address: 0x");
+        com_write_hex64(0x3F8, (uint64_t)(uintptr_t)user_dst);
+        com_write_string(0x3F8, "\n[USERCOPY]   Size: ");
+        char buf[32];
+        extern char *itoa(int, char*, int);
+        itoa((int)n, buf, 10);
+        com_write_string(0x3F8, buf);
+        com_write_string(0x3F8, "\n");
+        
+        // Check current CR3
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        com_write_string(0x3F8, "[USERCOPY]   Current CR3: 0x");
+        com_write_hex64(0x3F8, cr3);
+        com_write_string(0x3F8, "\n");
+        
+        // Check which page specifically is not mapped
+        uint64_t addr = (uint64_t)(uintptr_t)user_dst;
+        uint64_t page = addr & ~0xFFFULL;
+        extern uint64_t paging_get_pte(uint64_t);
+        uint64_t pte = paging_get_pte(page);
+        com_write_string(0x3F8, "[USERCOPY]   Page: 0x");
+        com_write_hex64(0x3F8, page);
+        com_write_string(0x3F8, " PTE: 0x");
+        com_write_hex64(0x3F8, pte);
+        com_write_string(0x3F8, "\n");
+        
+        return -2;
+    }
     memcpy(user_dst, kernel_src, n);
     return 0;
 }

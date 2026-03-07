@@ -8,7 +8,9 @@
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/COM/com.h"
 
+#ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
+#endif
 #define USER_SPACE_START 0x0000000000400000ULL
 #define USER_SPACE_END   0x00007FFFFFFFF000ULL
 

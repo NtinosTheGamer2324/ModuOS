@@ -288,9 +288,6 @@ void memory_init(void *mb2_ptr) {
     
     int tags_found = 0;
 
-    // Framebuffer info (optional)
-    struct multiboot_tag_framebuffer *fb_tag = NULL;
-
     // ACPI RSDP from Multiboot2 tags (type 14/15)
     uint64_t rsdp_phys = 0;
 
@@ -310,10 +307,6 @@ void memory_init(void *mb2_ptr) {
         }
 
         tags_found++;
-
-        if (tag->type == MULTIBOOT_TAG_TYPE_FRAMEBUFFER) {
-            fb_tag = (struct multiboot_tag_framebuffer *)tag;
-        }
 
         // ACPI tags: payload begins at +8, containing RSDP (old/new format). We just record the physical address.
         if (tag->type == MULTIBOOT_TAG_TYPE_ACPI_OLD || tag->type == MULTIBOOT_TAG_TYPE_ACPI_NEW) {

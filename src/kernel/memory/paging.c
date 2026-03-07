@@ -32,6 +32,9 @@ void paging_set_smp_started(void) {
 static uint64_t *pml4 = NULL;       /* virtual pointer (via phys_to_virt) to PML4 */
 static uint64_t pml4_phys = 0;      /* physical address of PML4 */
 
+/* Master kernel CR3 - set during boot and used as reference for copying kernel mappings */
+static uint64_t kernel_master_cr3 = 0;
+
 /* phys_to_virt offset. Starts at 0 (identity). */
 static uint64_t phys_offset = 0; /* 0 means identity mapping */
 
@@ -123,6 +126,11 @@ void paging_init(void) {
     if (pml4) {
         com_write_string(COM1_PORT, "[PAGING] Already initialized\n");
         return;
+    }
+    
+    // Save the kernel's boot CR3 as the master reference (only once)
+    if (!kernel_master_cr3) {
+        __asm__ volatile("mov %%cr3, %0" : "=r"(kernel_master_cr3));
     }
 
     /* Defensive: ensure ioremap allocator starts from a known state even if .bss wasn't cleared */
@@ -524,10 +532,52 @@ uint64_t paging_create_process_pml4(void) {
      * boot/identity region mapped for the kernel, while still preventing user-mode from
      * accessing it.
      */
+    /* CRITICAL: Copy kernel mappings to new process page table.
+     * The high half (entries 256-511) contains kernel code, data, heap, and MMIO.
+     * ALL of these must be present for the kernel to continue executing after CR3 switch.
+     * 
+     * BUG FIX: Copy from the kernel's MASTER CR3 (saved at boot), not the current CR3
+     * which may be a process page table with incomplete kernel heap mappings (demand-paged).
+     */
+    // Always use the current kernel CR3 if we haven't switched to a process yet,
+    // or use the saved kernel_master_cr3 if it's been updated to a proper value
+    uint64_t current_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
+    
+    // Update kernel_master_cr3 ONLY ONCE to the first proper kernel CR3 we see
+    if (!kernel_master_cr3 || kernel_master_cr3 == 0x101000) {
+        if (current_cr3 != 0x101000) {
+            kernel_master_cr3 = current_cr3;
+            com_write_string(COM1_PORT, "[PAGING] Set kernel_master_cr3=0x");
+            com_write_hex64(COM1_PORT, kernel_master_cr3);
+            com_write_string(COM1_PORT, " (current=0x");
+            com_write_hex64(COM1_PORT, current_cr3);
+            com_write_string(COM1_PORT, ")\n");
+        }
+    } else if (current_cr3 != kernel_master_cr3) {
+        com_write_string(COM1_PORT, "[PAGING] Creating PML4: current_cr3=0x");
+        com_write_hex64(COM1_PORT, current_cr3);
+        com_write_string(COM1_PORT, " master=0x");
+        com_write_hex64(COM1_PORT, kernel_master_cr3);
+        com_write_string(COM1_PORT, "\n");
+    }
+    
+    uint64_t master_pml4_phys = kernel_master_cr3 & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *master_pml4 = (uint64_t*)phys_to_virt(master_pml4_phys);
+    if (!master_pml4) {
+        phys_free_frame(new_phys);
+        return 0;
+    }
+    
+    int high_half_copied = 0;
     for (int i = 0; i < PT_ENTRIES; ++i) {
-        uint64_t e = pml4[i];
+        uint64_t e = master_pml4[i];
         if (i >= 256) {
-            new_pml4[i] = (e & PFLAG_PRESENT) ? e : 0;
+            /* Copy ALL high-half entries (kernel space) exactly as-is.
+             * This includes present mappings AND empty slots.
+             */
+            new_pml4[i] = e;
+            if (e & PFLAG_PRESENT) high_half_copied++;
         } else {
             /* Preserve low identity mappings only if they are present and not user-accessible. */
             if ((e & PFLAG_PRESENT) && !(e & PFLAG_USER)) {
@@ -536,6 +586,14 @@ uint64_t paging_create_process_pml4(void) {
                 new_pml4[i] = 0;
             }
         }
+    }
+
+    if (kernel_debug_is_on()) {
+        char tmpbuf[32];
+        com_write_string(COM1_PORT, "[PAGING] Copied ");
+        format_hex64(tmpbuf, high_half_copied);
+        com_write_string(COM1_PORT, tmpbuf);
+        com_write_string(COM1_PORT, " present high-half entries\n");
     }
 
     if (kernel_debug_is_on()) {
@@ -552,6 +610,22 @@ uint64_t paging_create_process_pml4(void) {
 static uint64_t *get_or_create_in_pml4(uint64_t *pml4_virt, unsigned idx4) {
     uint64_t ent = pml4_virt[idx4];
     if (ent & PFLAG_PRESENT) {
+        /* If the existing entry is a kernel-only mapping (no PFLAG_USER), we must
+         * not share that PDPT with user space — the CPU page-table walker requires
+         * the user bit at every level, and sharing the kernel's PDPT would let user
+         * mappings alias kernel structures.  Allocate a fresh PDPT instead and
+         * replace the entry so user-space gets its own subtree. */
+        if (!(ent & PFLAG_USER)) {
+            uint64_t *next = alloc_pt_page();
+            if (!next) return NULL;
+            uint64_t v = (uint64_t)(uintptr_t)next;
+            uint64_t next_phys = (phys_offset == 0) ? v : (v - phys_offset);
+            /* Replace the kernel-only entry with a fresh user-accessible PDPT.
+             * Must use assignment, not |=: ORing a new physical address into an
+             * existing PML4 entry corrupts the stored PDPT pointer and causes #GP. */
+            pml4_virt[idx4] = (next_phys & PAGE_MASK) | (PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER);
+            return next;
+        }
         uint64_t phys = ent & PAGE_MASK;
         return (uint64_t *)phys_to_virt(phys);
     } else {
@@ -559,7 +633,7 @@ static uint64_t *get_or_create_in_pml4(uint64_t *pml4_virt, unsigned idx4) {
         if (!next) return NULL;
         uint64_t v = (uint64_t)(uintptr_t)next;
         uint64_t next_phys = (phys_offset == 0) ? v : (v - phys_offset);
-        pml4_virt[idx4] = (next_phys & PAGE_MASK) | (PFLAG_PRESENT | PFLAG_WRITABLE);
+        pml4_virt[idx4] = (next_phys & PAGE_MASK) | (PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER);
         return next;
     }
 }
@@ -605,14 +679,16 @@ int paging_map_range_to_pml4(uint64_t *pml4_virt, uint64_t virt_base, uint64_t p
 }
 
 uint64_t paging_get_pte(uint64_t virt) {
-    uint64_t *current_pml4 = paging_get_pml4();
-    if (!current_pml4) {
-        uint64_t cr3;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-        uint64_t pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
-        current_pml4 = (uint64_t*)phys_to_virt(pml4_phys);
-        if (!current_pml4) return 0;
-    }
+    /*
+     * Always walk the page table currently loaded in CR3.
+     * The global kernel pml4 does not contain user-process mappings,
+     * so using it would cause user address validation to always fail.
+     */
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *current_pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+    if (!current_pml4) return 0;
 
     uint64_t pml4_idx = (virt >> 39) & 0x1FF;
     uint64_t pdpt_idx = (virt >> 30) & 0x1FF;
@@ -724,14 +800,17 @@ uint64_t paging_get_flags(uint64_t virt) {
 }
 
 uint64_t paging_virt_to_phys(uint64_t virt) {
-    uint64_t *current_pml4 = paging_get_pml4();
+    /* CRITICAL: Always walk the CURRENT page table (from CR3), not the global kernel pml4.
+     * When fork() copies user stack pages, it needs to read from the parent's page table,
+     * not the kernel's global PML4 which doesn't have user mappings. */
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    
+    uint64_t pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
+    uint64_t *current_pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+    
     if (!current_pml4) {
-        /* PML4 not initialized yet - try to use CR3 directly */
-        uint64_t cr3;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-        
-        uint64_t pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
-        current_pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+        return 0;
     }
     
     uint64_t pml4_idx = (virt >> 39) & 0x1FF;
