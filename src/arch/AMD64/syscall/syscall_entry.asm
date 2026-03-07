@@ -1,9 +1,10 @@
-; syscall_asm.s  (fixed)
+; syscall_entry.asm
 bits 64
 
 extern syscall_handler
 extern g_syscall_entry_rbp
 extern g_syscall_entry_rsp
+extern current
 
 global syscall_entry
 global syscall_entry_return
@@ -57,8 +58,10 @@ syscall_entry:
     ; Restore stack
     mov rsp, rbp
 
-    ; Store return value (rax is at top of stack now!)
+    ; Store return value at [rbp+0] (the saved rax slot).
     mov [rsp], rax
+
+    ; Signal delivery happens at the start of the next syscall (see syscall_handler).
 
     ; Restore all
 syscall_entry_return:
@@ -78,7 +81,7 @@ syscall_entry_return:
     pop r14
     pop r15
 
-    ; DEBUG: Force enable interrupts before iretq
-    sti
+    ; Interrupts will be restored from RFLAGS in iret frame
+    ; Do NOT sti here - it only affects ring 0, and can cause issues
     
     iretq

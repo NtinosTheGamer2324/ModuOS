@@ -57,32 +57,16 @@ context_switch:
     ; Get new RSP
     mov rcx, [rsi + 56]
     
-    ; Restore RFLAGS
+    ; Disable interrupts for the critical window between restoring RFLAGS and
+    ; completing the stack switch. A timer IRQ firing after popfq but before
+    ; 'mov rsp, rcx' would run on the outgoing process's kernel stack, which
+    ; may be freed by scheduler_tick's zombie reaper before we finish.
+    cli
+
+    ; Restore RFLAGS into a scratch register (do not popfq yet).
+    ; We will re-enable interrupts explicitly after the stack switch.
     mov rdx, [rsi + 64]
-    ; Always ensure IF=1 while running scheduled processes.
-    ; This prevents "keyboard dead" scenarios if a saved context had IF=0.
-    or  rdx, 0x200
-    push rdx
-    popfq
-    
-    ; DEBUG: Verify interrupts are enabled after popfq
-    pushfq
-    pop rdx
-    test rdx, 0x200
-    jnz .if_enabled
-    ; IF is NOT set - this should never happen!
-    push rax
-    push rdi
-    push rsi
-    mov rdi, 0x3F8
-    lea rsi, [rel .if_disabled_msg]
-    extern com_write_string
-    call com_write_string
-    pop rsi
-    pop rdi
-    pop rax
-.if_enabled:
-    
+
     ; NOTE:
     ; User-mode entry goes through amd64_enter_user_trampoline.
     ; That trampoline expects argc/argv in r12/r13 (callee-saved), not rdi/rsi.
@@ -92,10 +76,11 @@ context_switch:
     ; and rdi/rsi are not part of the saved cpu_state.
 
 .switch_stack:
-    ; Switch to new stack
+    ; Switch to new stack — safe to take IRQs again after this point.
     mov rsp, rcx
-    
-    ; Jump to new RIP
-    jmp rax
 
-.if_disabled_msg: db "[CONTEXT_SWITCH] IF NOT ENABLED AFTER POPFQ!", 10, 0
+    ; Re-enable interrupts now that we are on the correct stack.
+    sti
+
+    ; Jump to new RIP.
+    jmp rax

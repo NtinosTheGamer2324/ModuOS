@@ -4,28 +4,21 @@ bits 64
 global amd64_enter_user_trampoline
 global amd64_enter_user_now
 
+extern process_get_current_cr3
+extern com_write_string
+
 ; Expected register state when entered (from context_switch):
 ;   r14 = user RIP (entry point)
 ;   r15 = user RSP (top of user stack)
-;   r12 = argc (saved in cpu_state)
-;   r13 = argv (saved in cpu_state)
-;   rbx = envp (saved in cpu_state)
-;
-; This routine loads SysV registers for user entry:
-;   rdi=argc, rsi=argv, rdx=envp
+;   r12 = argc
+;   r13 = argv
+;   rbx = envp
 
 %define USER_CS_SEL 0x2B
 %define USER_DS_SEL 0x23
 
 section .text
 
-; Noreturn helper for execve: immediately enter userland at a fresh RIP/RSP.
-; SysV C ABI:
-;   rdi = user_rip
-;   rsi = user_rsp
-;   rdx = argc
-;   rcx = argv
-;   r8  = envp
 amd64_enter_user_now:
     mov r14, rdi
     mov r15, rsi
@@ -35,40 +28,54 @@ amd64_enter_user_now:
     jmp amd64_enter_user_trampoline
 
 amd64_enter_user_trampoline:
-    ; DEBUG: Log entry to trampoline
-    push rax
-    push rdi
-    push rsi
-    push rdx
-    extern com_write_string
-    mov rdi, 0x3F8          ; COM1_PORT = 0x3F8
+    ; Interrupts must be off for the entire trampoline — iretq restores IF
+    ; atomically from RFLAGS=0x202.  Enforce this regardless of caller state.
+    cli
+
+    ; Announce entry for diagnostics.
+    mov rdi, 0x3F8
     lea rsi, [rel .msg]
     call com_write_string
-    pop rdx
-    pop rsi
-    pop rdi
-    pop rax
-    
-    ; Pass argc/argv into userland following SysV: rdi=argc, rsi=argv
-    ; We stored them in callee-saved regs r12/r13 in the process cpu_state.
+
+    ; Retrieve the process PML4 physical address via C — NASM extern data
+    ; symbol PC32 relocations are unreliable across kernel object files.
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbx
+    call process_get_current_cr3    ; rax = CR3 (0 = no switch needed)
+    pop rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+
+    test rax, rax
+    jz .no_cr3_switch
+    mov cr3, rax
+
+.no_cr3_switch:
+    ; SysV userland entry: rdi=argc, rsi=argv, rdx=envp
     mov rdi, r12
     mov rsi, r13
     mov rdx, rbx
 
-    ; Set user rbp to the user stack top to avoid stale kernel frame pointers.
-    mov rbp, r15
+    xor rbp, rbp        ; ABI: rbp=0 marks outermost frame at process entry
 
-    ; Build iret frame: SS, RSP, RFLAGS, CS, RIP
+    mov ax, USER_DS_SEL
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+
+    ; iretq frame: SS, RSP, RFLAGS, CS, RIP
     push qword USER_DS_SEL
     push r15
     push qword 0x202
     push qword USER_CS_SEL
     push r14
-    
-    ; Ensure interrupts are enabled before iretq
-    ; (iretq will restore RFLAGS from stack, but we need IF=1 *now* in CPL0)
-    sti
-    
-    iretq
 
+    iretq           ; atomically restores RFLAGS (IF=1 from 0x202) on ring-3 entry
+
+section .rodata
 .msg: db "[TRAMPOLINE] Entering user mode", 10, 0

@@ -1,6 +1,6 @@
 ; context_switch_new.asm - Context switching for new process system
 ; void context_switch_asm(cpu_context_t *old_ctx, cpu_context_t *new_ctx,
-;                         void *old_fpu, void *new_fpu)
+;                         void *old_fpu, void *new_fpu, uint64_t new_cr3)
 
 section .text
 global context_switch_asm
@@ -21,6 +21,10 @@ context_switch_asm:
     ; RSI = new_ctx
     ; RDX = old_fpu (or NULL)
     ; RCX = new_fpu
+    ; R8  = new_cr3 (or 0 if no switch needed)
+    
+    ; Save new_cr3 in R9 (not used by context_switch)
+    mov r9, r8
     
     ; Save current context if old_ctx is not NULL
     test rdi, rdi
@@ -65,14 +69,30 @@ context_switch_asm:
     ; Get new RSP
     mov rcx, [rsi + 56]
     
-    ; Restore RFLAGS (ensure IF=1 for interrupts)
+    ; Disable interrupts for the stack switch.  They must stay disabled
+    ; through the jump to amd64_enter_user_trampoline: the trampoline builds
+    ; an iretq frame and iretq atomically restores IF from RFLAGS (0x202).
+    ; A premature sti here would let a timer IRQ fire on the kernel stack
+    ; mid-trampoline and corrupt the iretq frame.
+    cli
+
+    ; Restore RFLAGS into a scratch register (not applied yet).
     mov rdx, [rsi + 64]
-    or  rdx, 0x200      ; Force IF=1
+
+    ; Switch to new stack.
+    mov rsp, rcx
+
+    ; Restore RFLAGS from the saved context.  For kernel threads this
+    ; re-enables interrupts (IF=1 was saved).  For user processes the
+    ; trampoline opens with an explicit cli, so the window is safe.
     push rdx
     popfq
+
+    ; Switch CR3 if needed (new_cr3 is in R9)
+    test r9, r9
+    jz .no_cr3_switch
+    mov cr3, r9
     
-    ; Switch to new stack
-    mov rsp, rcx
-    
-    ; Jump to new RIP
+.no_cr3_switch:
+    ; Jump to new RIP.
     jmp rax

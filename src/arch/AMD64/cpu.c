@@ -18,3 +18,7 @@ cpu_local_t *cpu_local_get(void) {
     __asm__ volatile("movq %%gs:0, %0" : "=r"(p));
     return p;
 }
+uint64_t get_cpu_id(void) {
+    cpu_local_t *local = cpu_local_get();
+    return local->cpu_num;
+}

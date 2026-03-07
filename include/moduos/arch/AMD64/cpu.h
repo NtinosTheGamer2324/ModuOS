@@ -16,3 +16,5 @@ uint64_t amd64_cpu_get_gs_base(void);
 /* Current CPU local pointer (via GS:[0]) */
 cpu_local_t *cpu_local_get(void);
 
+/* Get current CPU ID (0..n-1) */
+uint64_t get_cpu_id(void);

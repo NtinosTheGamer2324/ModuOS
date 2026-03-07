@@ -1,67 +1,107 @@
-; syscall64_entry.asm - AMD64 SYSCALL/SYSRET entry
+; syscall64_entry.asm - SYSCALL/SYSRET entry point
+;
+; Frame layout mirrors syscall_entry.asm exactly so that sys_fork_impl,
+; syscall_entry_return, and signal delivery work without modification.
+;
+; On SYSCALL entry:
+;   RCX = user RIP (hardware-saved)
+;   R11 = user RFLAGS (hardware-saved)
+;   RSP = user RSP
+;   RAX = syscall number
+;   RDI, RSI, RDX = args 1-3
+;   R10 = arg 4
+;   R8  = arg 5
+
 bits 64
 
 extern syscall_handler
+extern g_syscall_entry_rbp
+extern g_kernel_cr3
+
 global syscall64_entry
+global syscall64_entry_return
 
 section .text
 
 syscall64_entry:
-    ; 1. Switch to Kernel GS to access per-cpu data
-    swapgs 
+    ; FMASK cleared IF on entry; we are non-interruptible.
+    swapgs
 
-    ; 2. Save the USER RSP into a temporary slot in your per-cpu struct
-    ; Assuming your cpu_local_t has user_rsp at offset 16
-    mov [gs:16], rsp 
-
-    ; 3. Load the KERNEL STACK
-    ; Assuming syscall_rsp0 is at offset 24
+    ; Preserve user RSP and switch to the per-CPU kernel stack.
+    mov [gs:48], rsp
     mov rsp, [gs:24]
 
-    ; 4. Manually construct what your C handler expects
-    ; SYSCALL put User RIP in RCX and User RFLAGS in R11.
-    push qword [gs:16]  ; Push User RSP
-    push r11            ; Push User RFLAGS
-    push rcx            ; Push User RIP
+    ; Build a synthetic iretq-compatible frame so syscall64_entry_return
+    ; can use iretq unconditionally, matching the syscall_entry.asm contract.
+    push qword 0x23     ; user SS  (USER_DS)
+    push qword [gs:48]  ; user RSP
+    push r11            ; user RFLAGS
+    push qword 0x2B     ; user CS  (USER_CS)
+    push rcx            ; user RIP
 
-    ; 5. Push GPRs to match your syscall_handler call
-    push rbp
-    push rbx
-    push r12
-    push r13
-    push r14
+    ; GPR save — identical order to syscall_entry.asm.
+    ; RAX still holds the syscall number at this point.
     push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
 
-    ; 6. Map registers to C Calling Convention
-    ; User: rax=num, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5
-    ; C:    rdi=num, rsi=a1, rdx=a2, rcx=a3, r8=a4, r9=a5
-    mov r9, r8      ; a5
-    mov r8, r10     ; a4
-    mov rcx, rdx    ; a3
-    mov rdx, rsi    ; a2
-    mov rsi, rdi    ; a1
-    mov rdi, rax    ; syscall_num
+    ; Record frame base for sys_fork_impl.
+    mov rbp, rsp
+    mov [rel g_syscall_entry_rbp], rbp
+
+    ; SysV ABI alignment.
+    test rsp, 0xF
+    jz .aligned
+    sub rsp, 8
+.aligned:
+    ; Reconstruct C arguments from the saved frame.
+    ; Saved layout (rbp offsets): [0]=rax [8]=rbx [16]=rcx [24]=rdx
+    ;                             [32]=rsi [40]=rdi [48]=rbp [56]=r8
+    ;                             [64]=r9  [72]=r10 [80]=r11 [88]=r12
+    ;                             [96]=r13 [104]=r14 [112]=r15
+    ; iretq frame above that: RIP CS RFLAGS RSP SS
+    mov rdi, [rbp]      ; syscall_num  ← saved rax
+    mov rsi, [rbp + 40] ; arg1         ← saved rdi
+    mov rdx, [rbp + 32] ; arg2         ← saved rsi
+    mov rcx, [rbp + 24] ; arg3         ← saved rdx
+    mov r8,  [rbp + 72] ; arg4         ← saved r10
+    mov r9,  [rbp + 56] ; arg5         ← saved r8
 
     cld
     call syscall_handler
 
-    ; 7. Restore GPRs
-    pop r15
-    pop r14
-    pop r13
-    pop r12
+    mov rsp, rbp
+    mov [rsp], rax      ; write return value into saved rax slot
+
+syscall64_entry_return:
+    pop rax
     pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
     pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
 
-    ; 8. Prepare for SYSRET
-    pop rcx         ; Restore User RIP into RCX
-    pop r11         ; Restore User RFLAGS into R11
-    
-    ; 9. Restore User RSP
-    mov rsp, [gs:16]
-
-    ; 10. Flip GS back to User mode
+    ; iretq frame: RIP CS RFLAGS RSP SS
     swapgs
-
-    ; 11. RETURN (Must use sysretq, NOT iretq)
-    sysretq
+    iretq

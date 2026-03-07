@@ -1,12 +1,23 @@
 #include "moduos/arch/AMD64/syscall/syscall64.h"
 #include "moduos/arch/AMD64/msr.h"
 #include "moduos/arch/AMD64/gdt.h"
+#include "moduos/arch/AMD64/cpu.h"
+#include "moduos/kernel/percpu.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/macros.h"
 
 extern void syscall64_entry(void);
 
+/* saved kernel CR3 for SYSCALL entry; makes sure we can switch to a page table
+   where the per-CPU GS base is mapped, even if the user CR3 doesn't include
+   that mapping.  Written once during initialization. */
+uint64_t g_kernel_cr3;
 void amd64_syscall_init(void) {
+    /* record current CR3 (kernel page table) before we possibly switch to
+       user page tables; we'll use it on every syscall entry to return to a
+       known-good page table where kernel memory (including GS base) is mapped. */
+    __asm__ volatile("mov %%cr3, %0" : "=r"(g_kernel_cr3));
+
     /* Enable SYSCALL/SYSRET */
     uint64_t efer = rdmsr(MSR_IA32_EFER);
     efer |= EFER_SCE;
