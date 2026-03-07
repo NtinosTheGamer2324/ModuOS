@@ -45,8 +45,11 @@ Thumbs.db
 .DS_Store
 
 #####################################################
-# Squirrel Executable and Linkable Programms (.SQR)
+# Squirrel Executable and Linkable Programms (.SQR) (Added Linux stuff)
 #####################################################
 *.sqr
 *.sqrm
 *.sqrl
+*.o
+*.ko
+*.a
