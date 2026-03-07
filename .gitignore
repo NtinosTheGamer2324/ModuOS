@@ -33,9 +33,10 @@ file_dump.bat
 *.log
 
 #############################################
-# Local Windows-only binaries
+# Local Windows-only binaries (And Linux)
 #############################################
 *.exe
+*.elf
 
 #############################################
 # OS-specific metadata files
@@ -49,8 +50,3 @@ Thumbs.db
 *.sqr
 *.sqrm
 *.sqrl
-
-#############################################
-# External sources (keep untracked)
-#############################################
-/EXTERNAL/

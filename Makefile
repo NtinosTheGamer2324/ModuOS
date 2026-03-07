@@ -102,7 +102,7 @@ dist/$(ARCH)/md/e1000.sqrm:
 $(filter dist/$(ARCH)/md/qxl_gpu.sqrm,$(sqrm_modules_out_special)):
 	$(MAKE) -C modules/QXL ARCH=$(ARCH)
 
-$(sqrm_modules_out_generic): dist/$(ARCH)/md/%.sqrm : modules/%_sqrm.c
+$(sqrm_modules_out_generic): dist/$(ARCH)/md/%.sqrm : modules/%_sqrm.c $(SQRM_LIBC)
 	mkdir -p $(dir $@)
 	# Build as ELF64 ET_DYN (shared-object style module)
 	# Link against sqrmlibc so modules get freestanding memset/memcpy/etc without relying on loader symbol resolution.
@@ -138,17 +138,58 @@ build-$(ARCH): $(kernel_object_files) $(drivers_object_files) $(fs_object_files)
 	mkdir -p targets/$(ARCH)/iso/ModuOS/shared/usr/lib
 	cp -f userland/dist/*.sqrl targets/$(ARCH)/iso/ModuOS/shared/usr/lib/ 2>/dev/null || true
 	cp -f userland/dist/ld-moduos.sqr targets/$(ARCH)/iso/ModuOS/shared/usr/lib/ 2>/dev/null || true
-	@echo Building Xenith26 display server and applications
-	$(MAKE) -C EXTERNAL/Xenith26 ARCH=$(ARCH)
+	@echo Building FlareX display server and applications
+	$(MAKE) -C EXTERNAL/FlareX ARCH=$(ARCH)
 	mkdir -p targets/$(ARCH)/iso/Apps
-	cp -f EXTERNAL/Xenith26/build/*.sqr targets/$(ARCH)/iso/Apps/ 2>/dev/null || true
+	cp -f EXTERNAL/FlareX/build/*.sqr targets/$(ARCH)/iso/Apps/ 2>/dev/null || true
 	@echo Building BIOS ISO
-	grub-mkrescue -o dist/$(ARCH)/kernel.iso targets/$(ARCH)/iso
+	# Build GRUB core image with custom prefix baked in, then assemble ISO.
+	mkdir -p dist/$(ARCH)/iso_grub/boot/grub/i386-pc
+	grub-mkimage \
+		--format=i386-pc-eltorito \
+		--output=dist/$(ARCH)/iso_grub/boot/grub/i386-pc/eltorito.img \
+		--prefix=/ModuOS/System64/boot/grub \
+		biosdisk iso9660 normal search search_fs_file configfile \
+		part_msdos part_gpt ext2 fat multiboot2 gfxterm gfxmenu \
+		all_video font png jpeg video_bochs video_cirrus
+	cp /usr/lib/grub/i386-pc/boot.img   dist/$(ARCH)/iso_grub/boot/grub/i386-pc/
+	cp -r /usr/lib/grub/i386-pc/*.mod   dist/$(ARCH)/iso_grub/boot/grub/i386-pc/ 2>/dev/null || true
+	cp -r /usr/lib/grub/i386-pc/*.lst   dist/$(ARCH)/iso_grub/boot/grub/i386-pc/ 2>/dev/null || true
+	xorriso -as mkisofs \
+		-b boot/grub/i386-pc/eltorito.img \
+		-no-emul-boot -boot-load-size 4 -boot-info-table \
+		--grub2-boot-info \
+		--grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img \
+		-r -J \
+		-o dist/$(ARCH)/kernel.iso \
+		-graft-points \
+		dist/$(ARCH)/iso_grub \
+		targets/$(ARCH)/iso
 
 .PHONY: iso-$(ARCH)-uefi
 iso-$(ARCH)-uefi: build-$(ARCH)
 	@echo Building UEFI ISO
-	grub-mkrescue -o dist/$(ARCH)/kernel_uefi.iso targets/$(ARCH)/iso
+	mkdir -p dist/$(ARCH)/iso_grub_uefi/boot/grub/i386-pc
+	grub-mkimage \
+		--format=i386-pc-eltorito \
+		--output=dist/$(ARCH)/iso_grub_uefi/boot/grub/i386-pc/eltorito.img \
+		--prefix=/ModuOS/System64/boot/grub \
+		biosdisk iso9660 normal search search_fs_file configfile \
+		part_msdos part_gpt ext2 fat multiboot2 gfxterm gfxmenu \
+		all_video font png jpeg video_bochs video_cirrus
+	cp /usr/lib/grub/i386-pc/boot.img   dist/$(ARCH)/iso_grub_uefi/boot/grub/i386-pc/
+	cp -r /usr/lib/grub/i386-pc/*.mod   dist/$(ARCH)/iso_grub_uefi/boot/grub/i386-pc/ 2>/dev/null || true
+	cp -r /usr/lib/grub/i386-pc/*.lst   dist/$(ARCH)/iso_grub_uefi/boot/grub/i386-pc/ 2>/dev/null || true
+	xorriso -as mkisofs \
+		-b boot/grub/i386-pc/eltorito.img \
+		-no-emul-boot -boot-load-size 4 -boot-info-table \
+		--grub2-boot-info \
+		--grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img \
+		-r -J \
+		-o dist/$(ARCH)/kernel_uefi.iso \
+		-graft-points \
+		dist/$(ARCH)/iso_grub_uefi \
+		targets/$(ARCH)/iso
 
 .PHONY: build-$(ARCH)-uefi
 build-$(ARCH)-uefi: iso-$(ARCH)-uefi
@@ -159,7 +200,7 @@ build-$(ARCH)-uefi: iso-$(ARCH)-uefi
 .PHONY: clean
 clean:
 	rm -rf build dist
-	$(MAKE) -C EXTERNAL/Xenith26 clean
+	$(MAKE) -C EXTERNAL/FlareX clean
 
 .PHONY: check
 check:
@@ -168,5 +209,6 @@ check:
 		x86_64-elf-gcc $(file) -I include -ffreestanding -mcmodel=kernel $(ANALYZER_FLAGS) || true; \
 	)
 	@echo "Analysis complete."
+
 
 
