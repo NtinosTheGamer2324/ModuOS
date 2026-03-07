@@ -10,7 +10,7 @@ LIB     := $(OUT_DIR)/libsqrmlibc.a
 
 CFLAGS  := -I include -ffreestanding -fPIC -mno-red-zone -nostdlib -fno-builtin -fno-stack-protector -Wall -Wextra
 
-SRC := mem.c
+SRC := mem.c string.c
 OBJ := $(patsubst %.c,build/%.o,$(SRC))
 
 .PHONY: all clean

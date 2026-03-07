@@ -14,7 +14,7 @@
  *
  * IMPORTANT LAYERING RULE:
  *   This module should NOT implement IP/TCP/UDP/DNS/HTTP.
- *   Those belong in userland (/ModuOS/System64/services/*.csv) on top of the netdev service.
+ *   Those belong in userland (/ModuOS/System64/services/*.ctl) on top of the netdev service.
  *
  * NOTE:
  *   This template returns -1 so that the kernel autoload process can

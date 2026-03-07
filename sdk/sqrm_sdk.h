@@ -259,6 +259,16 @@ typedef struct {
 
 /* ---- Kernel API table passed to modules ---- */
 
+/*
+ * dma_buffer_t — mirrors the kernel's dma_buffer_t exactly.
+ * Must not be forward-declared differently elsewhere in this header.
+ */
+typedef struct {
+    void    *virt;
+    uint64_t phys;
+    size_t   size;
+} sqrm_dma_buffer_t;
+
 typedef enum {
     AUDIO_FMT_S16_LE = 1,
     AUDIO_FMT_S32_LE = 2,
@@ -286,6 +296,11 @@ typedef struct {
     int (*get_info)(void *ctx, audio_device_info_t *out);
 } audio_pcm_ops_t;
 
+/*
+ * sqrm_kernel_api_t — field order MUST match include/moduos/kernel/sqrm.h exactly.
+ * Opaque pointers are used for kernel-internal types (pci_device_t, framebuffer_t,
+ * sqrm_gpu_device_t, Event) that third-party modules do not need to dereference.
+ */
 typedef struct sqrm_kernel_api {
     uint32_t abi_version;
     sqrm_module_type_t module_type;
@@ -298,23 +313,9 @@ typedef struct sqrm_kernel_api {
     void *(*kmalloc)(size_t sz);
     void (*kfree)(void *p);
 
-    /* MMIO mapping (GPU/NET modules) */
-    void* (*ioremap)(uint64_t phys_addr, uint64_t size);
-    void* (*ioremap_guarded)(uint64_t phys_addr, uint64_t size);
-
-    /* Address translation helper */
-    uint64_t (*virt_to_phys)(uint64_t virt);
-
-    /* PCI config space access */
-    uint32_t (*pci_cfg_read32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
-    void (*pci_cfg_write32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
-
-    /* Optional PCI helpers */
-    void* (*pci_find_device)(uint16_t vendor_id, uint16_t device_id);
-
     /* DMA (capability-gated; may be NULL) */
-    int (*dma_alloc)(void *out_dma_buffer, size_t size, size_t align);
-    void (*dma_free)(void *dma_buffer);
+    int (*dma_alloc)(sqrm_dma_buffer_t *out, size_t size, size_t align);
+    void (*dma_free)(sqrm_dma_buffer_t *buf);
 
     /* Low-level port I/O (capability-gated; may be NULL) */
     uint8_t  (*inb)(uint16_t port);
@@ -341,6 +342,36 @@ typedef struct sqrm_kernel_api {
     /* DEVFS (capability-gated; may be NULL) */
     int (*devfs_register_path)(const char *path, const void *ops, void *ctx);
 
+    /* Multiboot2 header — raw pointer to the MB2 info struct from the bootloader.
+     * Parse MB2 tags directly from this pointer. Always valid after boot. */
+    const void *multiboot2_header;
+
+    /* Input injection (capability-gated; may be NULL) */
+    void (*input_push_event)(const void *event);
+
+    /* Graphics — GPU modules only (capability-gated; may be NULL) */
+    int (*gfx_register_framebuffer)(const void *gpu_dev);
+    int (*gfx_update_framebuffer)(const void *fb);
+
+    /* PCI (GPU/NET modules) */
+    int (*pci_get_device_count)(void);
+    void* (*pci_get_device)(int index);
+    void* (*pci_find_device)(uint16_t vendor_id, uint16_t device_id);
+    void (*pci_enable_memory_space)(void *dev);
+    void (*pci_enable_io_space)(void *dev);
+    void (*pci_enable_bus_mastering)(void *dev);
+
+    /* PCI config space access (restricted; may be NULL) */
+    uint32_t (*pci_cfg_read32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
+    void (*pci_cfg_write32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
+
+    /* MMIO mapping (GPU/NET modules) */
+    void* (*ioremap)(uint64_t phys_addr, uint64_t size);
+    void* (*ioremap_guarded)(uint64_t phys_addr, uint64_t size);
+
+    /* Address translation helper */
+    uint64_t (*virt_to_phys)(uint64_t virt);
+
     /* Blockdev (capability-gated; may be NULL) */
     int (*block_get_info)(blockdev_handle_t h, blockdev_info_t *out);
     int (*block_read)(blockdev_handle_t h, uint64_t lba, uint32_t count, void *buf, size_t buf_sz);
@@ -355,6 +386,12 @@ typedef struct sqrm_kernel_api {
     /* SQRM services (exports) */
     int (*sqrm_service_register)(const char *service_name, const void *api_ptr, size_t api_size);
     const void* (*sqrm_service_get)(const char *service_name, size_t *out_size);
+
+    /* Primitives exposed to modules for system information collection. */
+    const char *(*get_gpu_driver_name)(void);
+    const char *(*get_smbios_field)(int field); /* 0=mfr 1=product 2=bios_vendor 3=bios_version */
+    uint64_t (*phys_total_frames)(void);
+    uint64_t (*phys_count_free_frames)(void);
 } sqrm_kernel_api_t;
 
 typedef int (*sqrm_module_init_fn)(const sqrm_kernel_api_t *api);

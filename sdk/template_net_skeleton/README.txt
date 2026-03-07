@@ -5,7 +5,7 @@ This folder contains a starter template for a ModuOS SQRM network *device* modul
 IMPORTANT LAYERING RULE:
   - This module should only implement link-layer (L2) networking: raw Ethernet frames + link status.
   - Do NOT implement IP/TCP/UDP/DNS/HTTP here.
-  - Higher-level protocols belong in userland /ModuOS/System64/services/*.csv built on top of the netdev service.
+  - Higher-level protocols belong in userland /ModuOS/System64/services/*.ctl built on top of the netdev service.
 
 Files:
   - net_skeleton_sqrm.c : skeleton module source
