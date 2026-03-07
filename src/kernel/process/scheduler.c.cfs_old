@@ -1,0 +1,343 @@
+#if 0
+// scheduler.c - CFS (Completely Fair Scheduler)
+//
+// Single source of truth for all scheduling logic. Maintains a vruntime-sorted
+// linked list as the ready queue; idle (PID 0) is never enqueued and is used
+// as the implicit fallback when the queue is empty.
+
+#include "moduos/kernel/process/process_new.h"
+#include "moduos/kernel/spinlock.h"
+#include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/debug.h"
+#include <stdint.h>
+
+// ---------------------------------------------------------------------------
+// CFS weight table (Linux prio_to_weight[], nice -20..19)
+// ---------------------------------------------------------------------------
+
+#define NICE_0_WEIGHT        1024
+#define SCHED_LATENCY_TICKS  20
+#define SCHED_MIN_GRAN_TICKS 4
+#define MIN_GRANULARITY_NS   750000ULL   // 0.75 ms
+
+static const uint32_t nice_to_weight_table[40] = {
+    /* -20 */ 88761, 71755, 56483, 46273, 36291,
+    /* -15 */ 29154, 23254, 18705, 14949, 11916,
+    /* -10 */  9548,  7620,  6100,  4904,  3906,
+    /*  -5 */  3121,  2501,  1991,  1586,  1277,
+    /*   0 */  1024,   820,   655,   526,   423,
+    /*   5 */   335,   272,   215,   172,   137,
+    /*  10 */   110,    87,    70,    56,    45,
+    /*  15 */    36,    29,    23,    18,    15,
+};
+
+static uint32_t nice_to_weight(int nice) {
+    if (nice < -20) nice = -20;
+    if (nice >  19) nice =  19;
+    return nice_to_weight_table[nice + 20];
+}
+
+// Public wrapper used by process creation paths.
+uint32_t scheduler_nice_to_weight(int nice) { return nice_to_weight(nice); }
+
+// ---------------------------------------------------------------------------
+// Ready queue (vruntime-sorted singly-linked list via sched_next)
+// ---------------------------------------------------------------------------
+
+static spinlock_t sched_lock __attribute__((aligned(64)));
+static process_t *ready_head  = NULL;
+static uint64_t  min_vruntime = 0;
+static uint32_t  total_weight = 0;
+static uint32_t  nr_running   = 0;
+static uint64_t  clock_ticks  = 0;
+static int       sched_enabled = 0;
+
+static void cfs_update_min_vruntime(void) {
+    if (ready_head) min_vruntime = ready_head->vruntime;
+}
+
+static void cfs_enqueue(process_t *p) {
+    p->sched_next = NULL;
+    if (!ready_head || p->vruntime < ready_head->vruntime) {
+        p->sched_next = ready_head;
+        ready_head    = p;
+    } else {
+        process_t *cur = ready_head;
+        while (cur->sched_next && cur->sched_next->vruntime <= p->vruntime)
+            cur = cur->sched_next;
+        p->sched_next   = cur->sched_next;
+        cur->sched_next = p;
+    }
+    nr_running++;
+    total_weight += p->weight;
+    cfs_update_min_vruntime();
+}
+
+static void cfs_dequeue(process_t *p) {
+    if (!ready_head || !p) return;
+    if (ready_head == p) {
+        ready_head = p->sched_next;
+    } else {
+        process_t *cur = ready_head;
+        while (cur->sched_next) {
+            if (cur->sched_next == p) { cur->sched_next = p->sched_next; break; }
+            cur = cur->sched_next;
+        }
+    }
+    p->sched_next = NULL;
+    if (nr_running   > 0)          nr_running--;
+    if (total_weight >= p->weight) total_weight -= p->weight;
+    cfs_update_min_vruntime();
+}
+
+// ---------------------------------------------------------------------------
+// Deferred zombie reap queue — populated by schedule(), drained by
+// scheduler_tick() on the IRQ stack after the zombie's kernel stack is gone.
+// ---------------------------------------------------------------------------
+
+#define REAP_QUEUE_SIZE 16
+static process_t *reap_queue[REAP_QUEUE_SIZE];
+static int reap_head = 0, reap_tail = 0;
+
+static void reap_push(process_t *p) {
+    int next = (reap_tail + 1) % REAP_QUEUE_SIZE;
+    if (next != reap_head) {
+        reap_queue[reap_tail] = p;
+        reap_tail = next;
+    }
+}
+
+static process_t *reap_pop(void) {
+    if (reap_head == reap_tail) return NULL;
+    process_t *p = reap_queue[reap_head];
+    reap_head = (reap_head + 1) % REAP_QUEUE_SIZE;
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+void scheduler_init(void) {
+    spinlock_init(&sched_lock);
+    ready_head   = NULL;
+    total_weight = 0;
+    nr_running   = 0;
+    min_vruntime = 0;
+    clock_ticks  = 0;
+    sched_enabled = 1;
+    com_write_string(COM1_PORT, "[SCHED] CFS scheduler initialized\n");
+}
+
+// scheduler_compat_init is kept as an alias so process_init_new.c compiles
+// without modification. It does nothing — scheduler_init() does the real work.
+void scheduler_compat_init(void) { /* no-op: superseded by scheduler_init() */ }
+
+void scheduler_add_process(process_t *p) {
+    if (!p) return;
+    spinlock_lock(&sched_lock);
+    if (p->state == PROCESS_STATE_ZOMBIE ||
+        p->state == PROCESS_STATE_TERMINATED) {
+        spinlock_unlock(&sched_lock);
+        return;
+    }
+    if (p->weight == 0) p->weight = nice_to_weight(p->nice);
+    if (p->vruntime < min_vruntime) p->vruntime = min_vruntime;
+    cfs_enqueue(p);
+    p->state = PROCESS_STATE_READY;
+    spinlock_unlock(&sched_lock);
+}
+
+// Thin aliases so old call sites (scheduler_add / scheduler_remove) still link.
+void scheduler_add(process_t *p)    { scheduler_add_process(p); }
+
+void scheduler_remove_process(process_t *p) {
+    if (!p) return;
+    spinlock_lock(&sched_lock);
+    cfs_dequeue(p);
+    spinlock_unlock(&sched_lock);
+}
+
+void scheduler_remove(process_t *p) { scheduler_remove_process(p); }
+
+// Re-enqueue a process that has just yielded or been preempted.
+static void requeue(process_t *p) {
+    if (!p) return;
+    spinlock_lock(&sched_lock);
+    if (p->state != PROCESS_STATE_ZOMBIE &&
+        p->state != PROCESS_STATE_TERMINATED) {
+        if (p->weight == 0) p->weight = nice_to_weight(p->nice);
+        if (p->vruntime < min_vruntime) p->vruntime = min_vruntime;
+        cfs_enqueue(p);
+        p->state = PROCESS_STATE_READY;
+    }
+    spinlock_unlock(&sched_lock);
+}
+
+static process_t *pick_next(void) {
+    spinlock_lock(&sched_lock);
+    process_t *p = ready_head;
+    if (p) cfs_dequeue(p);
+    spinlock_unlock(&sched_lock);
+    return p;
+}
+
+// Getters used by process creation / fork paths.
+uint64_t scheduler_get_min_vruntime(void)  { return min_vruntime; }
+uint64_t scheduler_get_clock_ticks(void)   { return clock_ticks;  }
+
+// ---------------------------------------------------------------------------
+// Vruntime accounting
+// ---------------------------------------------------------------------------
+
+static void update_curr(process_t *p, uint64_t delta_ns) {
+    if (!p) return;
+    if (p->weight == 0) p->weight = nice_to_weight(p->nice);
+    if (p->weight == 0) p->weight = NICE_0_WEIGHT;
+
+    p->vruntime += (delta_ns * NICE_0_WEIGHT) / p->weight;
+
+    // min_vruntime advances monotonically. Read ready_head without the lock —
+    // we may race with enqueue/dequeue but min_vruntime only ever increases, so
+    // a stale read at worst delays advancement by one tick. This avoids a
+    // deadlock when update_curr() is called from scheduler_tick() (IRQ context)
+    // while another path holds sched_lock.
+    process_t *head = ready_head;
+    if (head && head->vruntime > min_vruntime)
+        min_vruntime = head->vruntime;
+}
+
+// ---------------------------------------------------------------------------
+// schedule() — must not be called from IRQ context
+// ---------------------------------------------------------------------------
+
+void schedule(void) {
+    if (!sched_enabled) return;
+
+    process_t *prev = current;
+    process_t *next = NULL;
+
+    if (prev) prev->need_resched = 0;
+
+    // Re-enqueue prev only if still runnable. Idle (PID 0) is never enqueued;
+    // it is the implicit fallback selected via process_find(0) below.
+    if (prev && prev->pid != 0 &&
+        (prev->state == PROCESS_STATE_RUNNING  ||
+         prev->state == PROCESS_STATE_RUNNABLE ||
+         prev->state == PROCESS_STATE_READY)) {
+        requeue(prev);
+    }
+
+    // Zombies stay in the process table until the parent reaps them via
+    // do_waitpid() → process_destroy(). Do NOT push to reap_queue here —
+    // scheduler_tick() freeing memory on the IRQ stack races with do_waitpid
+    // and causes double-free corruption.
+
+    next = pick_next();
+    if (!next) next = process_find(0);  // fall back to idle
+
+    if (next) {
+        next->state       = PROCESS_STATE_RUNNING;
+        next->need_resched = 0;
+    }
+
+    if (prev != next && next) {
+        extern void set_curproc(process_t *p);
+        com_write_string(COM1_PORT, "[SCHED] Calling set_curproc for PID ");
+        com_write_hex64(COM1_PORT, next->pid);
+        com_write_string(COM1_PORT, "\n");
+        set_curproc(next);
+        
+        // Verify that current was set correctly
+        extern volatile process_t *current;
+        com_write_string(COM1_PORT, "[SCHED] After set_curproc, current=0x");
+        com_write_hex64(COM1_PORT, (uint64_t)(uintptr_t)current);
+        com_write_string(COM1_PORT, "\n");
+        if (current != next) {
+            extern int com_write_string(uint16_t, const char*);
+            extern int com_write_hex64(uint16_t, uint64_t);
+            com_write_string(0x3F8, "[SCHED] ERROR: set_curproc failed! current=0x");
+            com_write_hex64(0x3F8, (uint64_t)current);
+            com_write_string(0x3F8, " next=0x");
+            com_write_hex64(0x3F8, (uint64_t)next);
+            com_write_string(0x3F8, "\n");
+        }
+
+        extern void switch_to(process_t *prev, process_t *next);
+        switch_to(prev, next);
+        // Returns here when prev is rescheduled.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scheduler_tick() — called from the timer IRQ handler (~1 kHz)
+// ---------------------------------------------------------------------------
+
+void scheduler_tick(void) {
+    if (!sched_enabled || !current) return;
+
+    clock_ticks++;
+
+    update_curr(current, 1000000ULL /* 1 ms per tick */);
+
+    // Signal preemption if current has run past its fair share.
+    if (min_vruntime > 0 && current->vruntime > min_vruntime + MIN_GRANULARITY_NS)
+        current->need_resched = 1;
+}
+
+// ---------------------------------------------------------------------------
+// sleep / wakeup
+// ---------------------------------------------------------------------------
+
+void sleep_on(void *channel) {
+    if (!current) return;
+    current->wait_channel = channel;
+    current->state        = PROCESS_STATE_SLEEPING;
+    // Remove from the ready queue so it isn't picked while asleep.
+    scheduler_remove_process(current);
+    schedule();
+}
+
+void wakeup(void *channel) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *p = process_table[i];
+        if (p && p->state == PROCESS_STATE_SLEEPING &&
+            p->wait_channel == channel) {
+            p->wait_channel = NULL;
+            scheduler_add_process(p);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preemption helpers
+// ---------------------------------------------------------------------------
+
+int should_reschedule(void) {
+    if (!sched_enabled || !current) return 0;
+    if (current->need_resched) return 1;
+    if (current->state != PROCESS_STATE_RUNNING) return 1;
+    return 0;
+}
+
+void clear_need_resched(void) {
+    if (current) current->need_resched = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Debug
+// ---------------------------------------------------------------------------
+
+void debug_print_ready_queue(void) {
+    if (!kernel_debug_is_on()) return;
+    com_write_string(COM1_PORT, "[SCHED-DEBUG] Ready queue: ");
+    if (!ready_head) { com_write_string(COM1_PORT, "EMPTY\n"); return; }
+    for (process_t *p = ready_head; p; p = p->sched_next) {
+        com_write_string(COM1_PORT, p->name);
+        if (p->sched_next) com_write_string(COM1_PORT, " -> ");
+    }
+    com_write_string(COM1_PORT, "\n");
+}
+
+#endif /* legacy scheduler.c disabled */
