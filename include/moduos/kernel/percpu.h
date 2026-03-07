@@ -15,6 +15,9 @@ typedef struct cpu_local {
     uint64_t syscall_rsp0;    /* +24 : ring0 stack for SYSCALL entry */
     uint64_t current_process; /* +32 : process_t* (opaque here) */
     uint64_t resched;         /* +40 : reschedule requested flag */
+    uint64_t user_rsp;        /* +48 : user RSP saved by SYSCALL */
+    uint64_t user_rip;        /* +56 : user RIP saved by SYSCALL */
+    uint64_t user_rflags;     /* +64 : user RFLAGS saved by SYSCALL */
 } cpu_local_t;
 
 /* Offsets for assembly (must match struct layout) */
@@ -24,4 +27,7 @@ typedef struct cpu_local {
 #define CPU_LOCAL_OFF_SYSCALL_RSP0    24
 #define CPU_LOCAL_OFF_CURRENT_PROCESS 32
 #define CPU_LOCAL_OFF_RESCHED         40
+#define CPU_LOCAL_OFF_USER_RSP        48
+#define CPU_LOCAL_OFF_USER_RIP        56
+#define CPU_LOCAL_OFF_USER_RFLAGS     64
 

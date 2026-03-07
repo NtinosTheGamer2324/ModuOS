@@ -123,6 +123,24 @@ typedef struct sqrm_gpu_device {
                           uint32_t dst_x, uint32_t dst_y,
                           uint32_t w, uint32_t h);
 
+    /* ------------------------------------------------------------
+     * Optional 3D acceleration hooks (future).
+     * For basic triangle rasterization and vertex processing.
+     * Return 0 on success, negative on failure.
+     * ------------------------------------------------------------ */
+    int (*draw_triangle)(const framebuffer_t *fb, 
+                        int32_t x0, int32_t y0, uint32_t color0,
+                        int32_t x1, int32_t y1, uint32_t color1,
+                        int32_t x2, int32_t y2, uint32_t color2);
+    
+    int (*draw_textured_triangle)(const framebuffer_t *fb,
+                                 int32_t x0, int32_t y0, float u0, float v0,
+                                 int32_t x1, int32_t y1, float u1, float v1,
+                                 int32_t x2, int32_t y2, float u2, float v2,
+                                 uint32_t texture_id);
+
+    /* Future: vertex buffer submission, transform matrices, etc */
+
     // Optional: request a mode change. Returns 0 on success.
     int (*set_mode)(uint32_t width, uint32_t height, uint32_t bpp);
 
@@ -130,6 +148,14 @@ typedef struct sqrm_gpu_device {
     // Writes up to max_modes entries into out_modes and returns number of modes written.
     // Returns negative on error.
     int (*enumerate_modes)(gfx_mode_t *out_modes, uint32_t max_modes);
+
+    // Optional: capability flags (indicate which acceleration is supported)
+    uint32_t caps;
+    #define SQRM_GPU_CAP_2D_ACCEL      (1u << 0)  // Has fill_rect32/blit_rect32
+    #define SQRM_GPU_CAP_3D_TRIANGLES  (1u << 1)  // Has draw_triangle
+    #define SQRM_GPU_CAP_3D_TEXTURES   (1u << 2)  // Has draw_textured_triangle
+    #define SQRM_GPU_CAP_HW_CURSOR     (1u << 3)  // Has cursor hooks
+    #define SQRM_GPU_CAP_VSYNC         (1u << 4)  // Supports vsync
 
     // Optional: called on shutdown/unload (not implemented yet)
     void (*shutdown)(void);
@@ -187,6 +213,11 @@ typedef struct sqrm_kernel_api {
     // DEVFS (capability-gated; may be NULL)
     int (*devfs_register_path)(const char *path, const void *ops, void *ctx);
 
+    /* Multiboot2 header — pointer to the raw MB2 info struct passed by the
+     * bootloader. The module may parse any MB2 tag from this pointer.
+     * Valid for the lifetime of the kernel. */
+    const void *multiboot2_header;
+
     // Input injection (capability-gated; may be NULL)
     // Injects an input event into /dev/input/event0 and /dev/input/kbd0 (VT100 translation)
     // and also pushes it to the kernel event queue.
@@ -239,6 +270,12 @@ typedef struct sqrm_kernel_api {
     // Lookup a named service API blob. Returns pointer or NULL if not found.
     // If out_size is non-NULL, it will be filled with the api_size.
     const void* (*sqrm_service_get)(const char *service_name, size_t *out_size);
+
+    /* Primitives exposed to modules for system information collection. */
+    const char *(*get_gpu_driver_name)(void);
+    const char *(*get_smbios_field)(int field); /* 0=mfr 1=product 2=bios_vendor 3=bios_version */
+    uint64_t (*phys_total_frames)(void);
+    uint64_t (*phys_count_free_frames)(void);
 } sqrm_kernel_api_t;
 
 typedef int (*sqrm_module_init_fn)(const sqrm_kernel_api_t *api);

@@ -56,6 +56,9 @@ typedef struct md64api_sysinfo_data_u {
     int secure_boot_enabled;
     int tpm_version;
 
+    /* System uptime in seconds since boot. */
+    uint64_t uptime_seconds;
+
     /* RTC date/time snapshot (from kernel RTC). */
     uint8_t rtc_second;
     uint8_t rtc_minute;

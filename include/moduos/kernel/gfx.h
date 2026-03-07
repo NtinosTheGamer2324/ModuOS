@@ -30,6 +30,9 @@ const char *gfx_get_sqrm_gpu_driver_name(void);
 // Returns the active SQRM GPU device descriptor (includes optional accel hooks), or NULL.
 const sqrm_gpu_device_t *gfx_get_sqrm_gpu_device(void);
 
+// Query GPU capabilities (2D/3D acceleration support)
+uint32_t gfx_get_gpu_caps(void);
+
 /* ------------------------------------------------------------
  * GPU acceleration types (32bpp destination)
  * ------------------------------------------------------------
