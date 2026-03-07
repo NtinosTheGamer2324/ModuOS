@@ -1,172 +1,38 @@
+// process.h — compatibility shim
+//
+// The canonical process descriptor is now defined in process_new.h.
+// This file re-exports everything old callers expect so they do not
+// need to be updated individually.
+
 #ifndef PROCESS_H
 #define PROCESS_H
 
-#include <stdint.h>
-#include <stddef.h>
+#include "moduos/kernel/process/process_new.h"
 
-#define MAX_PROCESSES 256
-#define PROCESS_NAME_MAX 64
-#define MAX_OPEN_FILES 16
-#define KERNEL_STACK_SIZE 8192
+// Constants that process_new.h does not carry but old callers use.
+#ifndef KERNEL_STACK_SIZE
+#define KERNEL_STACK_SIZE 16384
+#endif
+#ifndef USER_STACK_SIZE
 #define USER_STACK_SIZE 65536
+#endif
+#ifndef MAX_OPEN_FILES
+#define MAX_OPEN_FILES 256   /* matches PROCESS_MAX_FDS in process_new.h */
+#endif
 
-typedef enum {
-    PROCESS_STATE_READY = 0,
-    PROCESS_STATE_RUNNING,
-    PROCESS_STATE_BLOCKED,
-    PROCESS_STATE_SLEEPING,
-    PROCESS_STATE_ZOMBIE,
-    PROCESS_STATE_TERMINATED
-} process_state_t;
+// cpu_state_t is the same layout as cpu_context_t.
+// Provide the alias so files that reference cpu_state_t still compile.
+typedef cpu_context_t cpu_state_t;
 
-/*
- CPU state used by context_switch.
- Order and offsets MUST match context_switch.asm.
- We save callee-saved regs per SysV: r15, r14, r13, r12, rbx, rbp.
- Also save rip, rsp, and RFLAGS (critical for interrupt enable flag).
- Layout (bytes): r15(0), r14(8), r13(16), r12(24), rbx(32),
-                rbp(40), rip(48), rsp(56), rflags(64)
- */
-typedef struct {
-    uint64_t r15;      // +0
-    uint64_t r14;      // +8
-    uint64_t r13;      // +16
-    uint64_t r12;      // +24
-    uint64_t rbx;      // +32
-    uint64_t rbp;      // +40
-    uint64_t rip;      // +48
-    uint64_t rsp;      // +56
-    uint64_t rflags;   // +64 - ADDED: Must preserve interrupt flag!
-} cpu_state_t;
+// Legacy field alias — old callers use ->parent_pid; new struct has ->ppid.
+// NOTE: do NOT use this macro in new code.
+#ifndef parent_pid
+#define parent_pid ppid
+#endif
 
-typedef struct process {
-    uint32_t pid;
-    uint32_t parent_pid;
-    int32_t pgid; /* process group id (POSIX waitpid semantics) */
-    char name[PROCESS_NAME_MAX];
-
-    /* User identity */
-    uint32_t uid; /* 0 = mdman/root */
-    uint32_t gid;
-    uint16_t groups[32];  /* Supplementary group IDs */
-    uint8_t  group_count; /* Number of supplementary groups */
-    uint8_t  _identity_pad;
-
-    process_state_t state;
-    int exit_code;
-
-    /* waitpid bookkeeping (kernel-internal) */
-    int waiting;
-    int32_t wait_pid;      /* -1 any, 0 current pgid, >0 pid, <-1 pgid */
-    int wait_options;
-    int32_t wait_result_pid;
-    int wait_result_status;
-
-    cpu_state_t cpu_state;
-
-    /* FPU/SSE state (FXSAVE/FXRSTOR).
-     * Must be 16-byte aligned for fxsave64/fxrstor64.
-     */
-    __attribute__((aligned(16))) uint8_t fpu_state[512];
-
-    // Memory management - single global kernel page table for now
-    uint64_t page_table;
-    void *kernel_stack;
-    void *user_stack;
-
-    /* User stack growth tracking (canonical user stack grows downward). */
-    uint64_t user_stack_top;    /* fixed top (exclusive) */
-    uint64_t user_stack_low;    /* lowest mapped address */
-    uint64_t user_stack_limit;  /* lowest allowed address (max growth) */
-
-    /* User-mode launch context (used by amd64_enter_user_trampoline) */
-    uint64_t user_rip;
-    uint64_t user_rsp;
-    int is_user;
-
-    /* User heap (sbrk/brk) */
-    uint64_t user_heap_base;
-    uint64_t user_heap_end;
-    uint64_t user_heap_limit;
-
-    /* User mmap region (used by userland dynamic linker) */
-    uint64_t user_mmap_base;
-    uint64_t user_mmap_end;
-    uint64_t user_mmap_limit;
-
-    /* User image range (ELF PT_LOAD segments) so we can cleanly free on exit
-     * without touching kernel identity-mapped RAM.
-     */
-    uint64_t user_image_base;
-    uint64_t user_image_end;
-    // File descriptors
-    void *fd_table[MAX_OPEN_FILES];
-
-    // Timing
-    uint64_t time_slice;
-    uint64_t total_time;
-    uint64_t vruntime;
-    uint64_t sum_exec_runtime;
-    uint64_t exec_start;
-    int nice;
-    uint32_t weight;
-
-
-    // Priority (0 = highest)
-    int priority;
-    
-    // Arguments (Windows-style)
-    int argc;
-    char **argv;
-
-    // Environment (POSIX-style KEY=VALUE strings)
-    int envc;
-    char **envp;
-
-    // Filesystem context
-    char cwd[256];           // Current working directory
-    int current_slot;        // Currently active filesystem slot (-1 = none)
-
-    /* Xenith26 shared buffer mappings (not inherited across fork).
-     * Tracked so we can unmap them in the child.
-     */
-    struct {
-        uint32_t buf_id;
-        uint64_t vaddr;
-        uint64_t size_bytes;
-        uint8_t  used;
-        uint8_t  _pad[7];
-    } x26_maps[32];
-
-    // Linked list for scheduler
-    struct process *next;
-} process_t;
-
-/* Process management functions */
-void process_init(void);
-process_t* process_create(const char *name, void (*entry_point)(void), int priority);
-process_t* process_create_with_args(const char *name, void (*entry_point)(void), int priority, int argc, char **argv);
-void process_set_build_pml4(uint64_t *pml4_virt, uint64_t pml4_phys);
-void process_exit(int exit_code);
-void process_kill(uint32_t pid);
-process_t* process_get_current(void);
-process_t* process_get_by_pid(uint32_t pid);
-void process_yield(void);
-void process_sleep(uint64_t milliseconds);
-void process_wake(uint32_t pid);
-
-/* Internal helpers for syscalls like fork/exec. */
-uint32_t process_alloc_pid(void);
-int process_register(process_t *proc);
-int process_unregister(uint32_t pid);
-void process_destroy(process_t *proc);
-
-/* Scheduler */
-void scheduler_init(void);
+// Old scheduler API names — compat wrappers declared in scheduler_compat.c.
 void scheduler_add_process(process_t *proc);
 void scheduler_remove_process(process_t *proc);
-void schedule(void);
-void scheduler_tick(void);
 void scheduler_request_reschedule(void);
 int  scheduler_take_reschedule(void);
 uint64_t scheduler_get_min_vruntime(void);
@@ -174,26 +40,19 @@ uint32_t scheduler_nice_to_weight(int nice);
 uint64_t scheduler_get_clock_ticks(void);
 void debug_print_ready_queue(void);
 
-/* Internal process management helpers */
+// Legacy process management entry points still implemented in process.c.
+void process_init(void);
+void process_wake(uint32_t pid);
 void set_curproc(process_t *p);
 void do_switch_and_reap(process_t *old, process_t *newp);
 
-/* Free user-space mappings tracked by process (image/heap/mmap/stack). */
-void process_free_user_memory(struct process *p);
-
-/* Context switching (assembly) */
-/* Context switching (assembly)
- * void context_switch(cpu_state_t *old_state, cpu_state_t *new_state,
- *                    void *old_fpu_state, void *new_fpu_state)
- */
-extern void context_switch(cpu_state_t *old_state, cpu_state_t *new_state,
+// Context switch asm stub — takes cpu_context_t* (== cpu_state_t*).
+extern void context_switch(cpu_context_t *old_state, cpu_context_t *new_state,
                            void *old_fpu_state, void *new_fpu_state);
 
-/* Lazy FPU switching hooks */
-void fpu_lazy_on_context_switch(struct process *next);
-void fpu_lazy_on_process_exit(struct process *p);
+// Lazy FPU hooks.
+void fpu_lazy_on_context_switch(process_t *next);
+void fpu_lazy_on_process_exit(process_t *p);
 void fpu_lazy_handle_nm(void);
 
 #endif /* PROCESS_H */
-
-
