@@ -204,7 +204,6 @@ void replace_input_line(const char* new_text) {
 #endif
 
 char scancode_to_char_extended(uint8_t scancode) {
-    if (scancode >= 256) return 0;
     return shifted ? shifted_extended_scancode_map[scancode] : extended_scancode_map[scancode];
 }
 

@@ -325,10 +325,8 @@ int ata_read_sector_lba28(int drive_index, uint32_t lba, void* buffer) {
     if (lba > 0x0FFFFFFF) return -5;
 
     uint16_t base = ata_base_for(drive_index);
-    uint16_t ctrl = ata_ctrl_for(drive_index);
     uint8_t drive = ata_drive_bit_for(drive_index);
     int channel = (drive_index < 2) ? 0 : 1;
-    int irq = ata_irq_for_channel(channel);
 
     /* Check that there's no in-flight request on this channel */
     if (pending[channel].active) return -6; /* busy */

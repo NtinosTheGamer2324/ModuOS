@@ -551,7 +551,7 @@ int hid_stop_interrupt_transfers(hid_device_t *hid) {
 // Process keyboard report
 static void hid_process_keyboard_report(hid_device_t *hid) {
     hid_keyboard_report_t *report = &hid->report.keyboard;
-    
+    (void)report;
     // Call input system to process the report
     extern void usb_process_keyboard_report(hid_device_t *hid);
     usb_process_keyboard_report(hid);

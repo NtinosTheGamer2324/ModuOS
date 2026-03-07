@@ -24,11 +24,36 @@ typedef enum {
     VIDEOCTL_CMD2_FLUSH       = 102,
     VIDEOCTL_CMD2_ALLOC_BUF   = 103,
     VIDEOCTL_CMD2_MAP_BUF     = 104,
+    
+    /* Stage 3: Mapped Command Buffers (zero-copy GPU submission) */
+    VIDEOCTL_CMD2_MAP_CMDBUF    = 105,  // Map shared command buffer
+    VIDEOCTL_CMD2_SUBMIT_CMDBUF = 106,  // Submit commands from mapped buffer
 
     /* v2 (cursor) */
     VIDEOCTL_CMD2_CURSOR_SET  = 110,
     VIDEOCTL_CMD2_CURSOR_MOVE = 111,
     VIDEOCTL_CMD2_CURSOR_SHOW = 112,
+    
+    /* v2 (shaders) - GPU programmable pipeline */
+    VIDEOCTL_CMD2_SHADER_CREATE  = 120,
+    VIDEOCTL_CMD2_SHADER_COMPILE = 121,
+    VIDEOCTL_CMD2_SHADER_DELETE  = 122,
+    VIDEOCTL_CMD2_PROGRAM_CREATE = 123,
+    VIDEOCTL_CMD2_PROGRAM_LINK   = 124,
+    VIDEOCTL_CMD2_PROGRAM_DELETE = 125,
+    VIDEOCTL_CMD2_PROGRAM_USE    = 126,
+    
+    /* v2 (vertex buffers) */
+    VIDEOCTL_CMD2_VBUF_CREATE    = 130,
+    VIDEOCTL_CMD2_VBUF_UPDATE    = 131,
+    VIDEOCTL_CMD2_VBUF_DELETE    = 132,
+    VIDEOCTL_CMD2_VBUF_BIND      = 133,
+    
+    /* v2 (draw calls) */
+    VIDEOCTL_CMD2_DRAW_ARRAYS    = 140,
+    VIDEOCTL_CMD2_DRAW_ELEMENTS  = 141,
+    VIDEOCTL_CMD2_SET_UNIFORM    = 142,
+    VIDEOCTL_CMD2_SET_ATTRIBUTE  = 143,
 } videoctl_cmd_t;
 
 /* Legacy request (kept for compatibility). */
@@ -62,6 +87,9 @@ typedef struct {
 #define VIDEOCTL2_CAP_BUF_HANDLES       (1u << 4)
 #define VIDEOCTL2_CAP_BUF_SG_PAGES      (1u << 5) /* buffer memory is non-contiguous scatter/gather pages */
 #define VIDEOCTL2_CAP_HW_CURSOR         (1u << 6) /* kernel-composited cursor (set/move/show) */
+#define VIDEOCTL2_CAP_SHADERS           (1u << 7) /* programmable GPU shaders */
+#define VIDEOCTL2_CAP_VERTEX_BUFFERS    (1u << 8) /* GPU vertex buffers */
+#define VIDEOCTL2_CAP_PROGRAMMABLE_GPU  (1u << 9) /* full programmable rendering pipeline */
 
 typedef struct {
     videoctl2_hdr_t hdr;
@@ -183,6 +211,35 @@ typedef struct {
  */
 #define VIDEOCTL2_CURSOR_MAX_W 64u
 #define VIDEOCTL2_CURSOR_MAX_H 64u
+
+/* ------------------------------------------------------------
+ * Stage 3: Mapped Command Buffers (zero-copy submission)
+ * ------------------------------------------------------------
+ * Instead of write() per command, map a shared buffer and fill it
+ * with commands, then submit the entire buffer in ONE syscall.
+ * This is how Vulkan/DirectX work: no per-command overhead!
+ */
+
+typedef struct {
+    videoctl2_hdr_t hdr; /* cmd = VIDEOCTL_CMD2_MAP_CMDBUF */
+    uint32_t size_bytes;   /* in: requested buffer size (e.g., 1MB) */
+    uint32_t reserved;
+    
+    /* out: mapped address and actual size */
+    uint64_t user_addr;    /* mapped user virtual address */
+    uint32_t actual_size;  /* actual allocated size (may be rounded up) */
+    uint32_t reserved2;
+} videoctl2_map_cmdbuf_t;
+
+typedef struct {
+    videoctl2_hdr_t hdr; /* cmd = VIDEOCTL_CMD2_SUBMIT_CMDBUF */
+    uint32_t count;        /* number of commands in buffer */
+    uint32_t reserved;
+    
+    /* Commands are read from the mapped command buffer.
+     * Each command starts with a videoctl2_hdr_t.
+     * The kernel parses count commands sequentially from the buffer. */
+} videoctl2_submit_cmdbuf_t;
 
 typedef struct {
     videoctl2_hdr_t hdr; /* cmd = VIDEOCTL_CMD2_CURSOR_SET */

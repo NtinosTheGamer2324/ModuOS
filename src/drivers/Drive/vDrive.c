@@ -521,6 +521,11 @@ vdrive_t* vdrive_get(uint8_t vdrive_id) {
     return &vdrive_system.drives[vdrive_id];
 }
 
+const char *vdrive_get_model(int idx) {
+    vdrive_t *d = vdrive_get((uint8_t)idx);
+    return (d && d->model[0]) ? d->model : "";
+}
+
 vdrive_t* vdrive_get_first(void) {
     for (int i = 0; i < VDRIVE_MAX_DRIVES; i++) {
         if (vdrive_system.drives[i].present) {

@@ -147,7 +147,7 @@ typedef struct hid_device {
 #define HID_KEY_6               0x23
 #define HID_KEY_7               0x24
 #define HID_KEY_8               0x25
-#define HID_KEY_9               0x26
+#define HID_KEY_9               0x
 #define HID_KEY_0               0x27
 #define HID_KEY_ENTER           0x28
 #define HID_KEY_ESCAPE          0x29
@@ -223,3 +223,5 @@ const char* hid_keycode_to_string(uint8_t keycode);
 void hid_poll_all(void);
 
 #endif // USB_HID_H
+
+

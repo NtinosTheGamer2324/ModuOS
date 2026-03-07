@@ -135,17 +135,6 @@ static void fb_scroll_up(fb_console_t *c) {
     uint32_t dy = c->cell_h;
     if (!c || !c->fb.addr || c->fb.pitch == 0) return;
 
-    /* Debug: log scroll parameters (COM only, no VGA recursion). */
-#if FBCON_DEBUG
-    com_printf(COM1_PORT,
-               "[FBCON] fb_scroll_up: fb.addr=0x%08x%08x pitch=%u height=%u dy=%u\n",
-               (uint32_t)(((uint64_t)(uintptr_t)c->fb.addr) >> 32),
-               (uint32_t)(((uint64_t)(uintptr_t)c->fb.addr) & 0xFFFFFFFFu),
-               (unsigned)c->fb.pitch,
-               (unsigned)c->fb.height,
-               (unsigned)dy);
-#endif
-
     /* Heuristic: warn if framebuffer lives in heap range (should usually be ioremap/MMIO). */
     if (((uint64_t)(uintptr_t)c->fb.addr) >= 0xFFFF800000000000ULL &&
         ((uint64_t)(uintptr_t)c->fb.addr) <  0xFFFF900000000000ULL) {
@@ -175,12 +164,6 @@ static void fb_scroll_up(fb_console_t *c) {
     }
     uint64_t move_bytes = fb_size - src_off;
 
-#if FBCON_DEBUG
-    com_printf(COM1_PORT,
-               "[FBCON] fb_scroll_up: fb_size=%u src_off=%u move_bytes=%u\n",
-               (uint32_t)fb_size, (uint32_t)src_off, (uint32_t)move_bytes);
-#endif
-
     /* Extra mapping sanity: ensure framebuffer pages are mapped */
     uint64_t p_phys0 = paging_virt_to_phys((uint64_t)(uintptr_t)p);
     uint64_t p_phys1 = paging_virt_to_phys((uint64_t)(uintptr_t)(p + fb_size - 1));
@@ -199,11 +182,6 @@ static void fb_scroll_up(fb_console_t *c) {
 
     uint8_t *dst = p;
     uint8_t *src = p + src_off;
-#if FBCON_DEBUG
-    com_printf(COM1_PORT, "[FBCON] memmove dst=0x%08x%08x src=0x%08x%08x\n",
-               (uint32_t)(((uint64_t)(uintptr_t)dst) >> 32), (uint32_t)(((uint64_t)(uintptr_t)dst) & 0xFFFFFFFFu),
-               (uint32_t)(((uint64_t)(uintptr_t)src) >> 32), (uint32_t)(((uint64_t)(uintptr_t)src) & 0xFFFFFFFFu));
-#endif
     uintptr_t src_end = (uintptr_t)src + (uintptr_t)move_bytes;
     uintptr_t dst_end = (uintptr_t)dst + (uintptr_t)move_bytes;
 
@@ -808,8 +786,8 @@ static const char *fbcon_unicode_to_ascii_fallback(uint32_t cp) {
         case 0x2713: /* ✓ */ return "[OK]";
         case 0x2714: /* ✔ */ return "[OK]";
         case 0x2705: /* ✅ */ return "[OK]";
-        case 0x2611: /* ☑ */ return "[x]";
-        case 0x2610: /* ☐ */ return "[ ]";
+        case 0x11: /* ☑ */ return "[x]";
+        case 0x10: /* ☐ */ return "[ ]";
 
         /* Common emojis (fallbacks) */
         case 0x1F600: /* 😀 */ return ":D";
@@ -983,3 +961,5 @@ void fbcon_backspace(fb_console_t *c) {
     fbcon_cursor_show(c);
     fbcon_flush_commit(c);
 }
+
+

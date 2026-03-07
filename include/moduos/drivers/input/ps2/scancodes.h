@@ -227,3 +227,5 @@ const char shifted_extended_scancode_map[256] = {
     [0x7D] = '9',      // Keypad Page Up
     [0x7C] = '*',      // Keypad *
 };
+
+

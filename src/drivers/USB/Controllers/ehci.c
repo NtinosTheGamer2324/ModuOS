@@ -200,6 +200,7 @@ static void ehci_process_completed_transfers(ehci_controller_t *ehci) {
     while (*curr) {
         ehci_transfer_info_t *info = *curr;
         ehci_qh_t *qh = info->qh;
+        (void)qh;
         ehci_qtd_t *qtd = info->first_qtd;
         
         // Check if transfer is complete (not active anymore)
