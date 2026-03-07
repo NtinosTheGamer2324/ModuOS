@@ -1748,6 +1748,7 @@ static int fat32_create_dir_entry_for_file(int handle, const char *path, uint32_
     if (fat32_find_free_dir_slots(handle, dir_cluster, needed_slots, &target_cluster, &target_index) != 0) return -6;
 
     uint32_t clus_size = (uint32_t)fs->bytes_per_sector * (uint32_t)fs->sectors_per_cluster;
+    (void)clus_size;
     void *dirbuf = fat32_alloc_cluster_buffer(fs);
     if (!dirbuf) return -7;
 
@@ -1858,6 +1859,7 @@ static int fat32_create_dir_entry_for_dir(int handle, const char *path, uint32_t
     if (fat32_find_free_dir_slots(handle, dir_cluster, needed_slots, &target_cluster, &target_index) != 0) return -6;
 
     uint32_t clus_size = (uint32_t)fs->bytes_per_sector * (uint32_t)fs->sectors_per_cluster;
+    (void)clus_size;
     void *dirbuf = fat32_alloc_cluster_buffer(fs);
     if (!dirbuf) return -7;
 

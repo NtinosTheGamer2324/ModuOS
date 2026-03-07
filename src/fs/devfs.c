@@ -16,7 +16,7 @@
 // Forward declarations
 static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count);
 
-#define DEVFS_MAX_DEVICES 256
+#define DEVFS_MAX_DEVICES 32
 
 typedef enum {
     DEVFS_NODE_DIR = 0,
@@ -85,7 +85,6 @@ static devfs_event_stream_t g_evt0;
 static devfs_device_t g_devices[DEVFS_MAX_DEVICES];
 static devfs_node_t *g_root = NULL;
 static int g_inited = 0;
-static spinlock_t devfs_lock;
 
 static devfs_node_t* devfs_new_node(devfs_node_type_t type, const char *name, devfs_node_t *parent) {
     devfs_node_t *n = (devfs_node_t*)kmalloc(sizeof(devfs_node_t));
@@ -458,12 +457,12 @@ int devfs_close(void *handle) {
     if (!h) return -1;
 
     if (h->is_tree) {
-        devfs_node_t *n = h->u.node;
+        (void)h->u.node;
         if (h->ops && h->ops->close) {
             h->ops->close(h->opened_ctx);
         }
     } else {
-        devfs_device_t *d = h->u.legacy;
+        (void)h->u.legacy;
         if (h->ops && h->ops->close) {
             h->ops->close(h->opened_ctx);
         }
@@ -668,6 +667,11 @@ typedef struct {
 } video0_open_ctx_t;
 
 static uint64_t g_video0_next_user_va = 0x0000005000000000ULL;
+
+/* Stage 3: Mapped command buffer (zero-copy submission) */
+static void *g_video0_cmdbuf = NULL;      // Kernel-side command buffer
+static uint64_t g_video0_cmdbuf_user = 0; // User-side mapped address
+static uint32_t g_video0_cmdbuf_size = 0; // Buffer size in bytes
 
 static uint64_t video0_alloc_user_va(uint64_t size_bytes) {
     uint64_t sz = (size_bytes + 0xFFFULL) & ~0xFFFULL;
@@ -892,17 +896,29 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
     video0_open_ctx_t *c = (video0_open_ctx_t*)ctx;
     if (!c || !buf || count < sizeof(videoctl2_hdr_t)) return -1;
 
-    const videoctl2_hdr_t *h = (const videoctl2_hdr_t*)buf;
-    if (h->magic != VIDEOCTL_MAGIC2) return -1;
-    if (h->abi_version != VIDEOCTL_ABI_VERSION) return -1;
-    if (h->size_bytes == 0 || h->size_bytes > count) return -1;
-
     framebuffer_t fb;
     memset(&fb, 0, sizeof(fb));
     VGA_GetFrameBuffer(&fb);
+    
+    // Process ALL commands in the buffer (batched writes)
+    size_t offset = 0;
+    size_t total_processed = 0;
+    
+    while (offset + sizeof(videoctl2_hdr_t) <= count) {
+        const videoctl2_hdr_t *h = (const videoctl2_hdr_t*)((const uint8_t*)buf + offset);
+        
+        if (h->magic != VIDEOCTL_MAGIC2) break;
+        if (h->abi_version != VIDEOCTL_ABI_VERSION) break;
+        if (h->size_bytes == 0 || offset + h->size_bytes > count) break;
 
     switch (h->cmd) {
         case VIDEOCTL_CMD2_GET_INFO: {
+            // Commands with responses can't be batched - must be sent alone
+            if (offset > 0) {
+                // Already processed some commands, stop here and return
+                return (ssize_t)total_processed;
+            }
+            
             videoctl2_info_t resp;
             memset(&resp, 0, sizeof(resp));
             resp.hdr = *h;
@@ -927,10 +943,12 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
             strncpy(resp.driver, "kernel_sw", sizeof(resp.driver)-1);
 
             video0_resp_set(c, &resp, sizeof(resp));
-            return (ssize_t)h->size_bytes;
+            return (ssize_t)h->size_bytes; // Return immediately for response commands
         }
 
         case VIDEOCTL_CMD2_ALLOC_BUF: {
+            // Commands with responses can't be batched
+            if (offset > 0) return (ssize_t)total_processed;
             if (h->size_bytes < sizeof(videoctl2_alloc_buf_t)) return -1;
             videoctl2_alloc_buf_t resp;
             memcpy(&resp, buf, sizeof(resp));
@@ -938,14 +956,14 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
             if (resp.size_bytes == 0 || resp.size_bytes > (64u * 1024u * 1024u)) {
                 resp.handle = 0; resp.pitch = 0;
                 video0_resp_set(c, &resp, sizeof(resp));
-                return (ssize_t)h->size_bytes;
+                break;
             }
 
             video0_buf_t *slot = video0_alloc_buf_slot(c);
             if (!slot) {
                 resp.handle = 0; resp.pitch = 0;
                 video0_resp_set(c, &resp, sizeof(resp));
-                return (ssize_t)h->size_bytes;
+                break;
             }
 
             uint64_t pages = (((uint64_t)resp.size_bytes + 0xFFFULL) >> 12);
@@ -953,7 +971,7 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
             if (!phys) {
                 resp.handle = 0; resp.pitch = 0;
                 video0_resp_set(c, &resp, sizeof(resp));
-                return (ssize_t)h->size_bytes;
+                break;
             }
             void *kptr = phys_to_virt_kernel(phys);
             if (kptr) memset(kptr, 0, pages * 0x1000ULL);
@@ -966,17 +984,28 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
             slot->phys_base = phys;
             slot->user_addr = 0;
 
-            uint32_t pitch = 0;
-            if (fb.addr && resp.size_bytes == fb.pitch * fb.height) pitch = fb.pitch;
+            /*
+             * Derive pitch from the requested format and the framebuffer width.
+             * If the buffer size is an exact multiple of fb.height we can infer
+             * the stride; otherwise derive it from bytes-per-pixel × width.
+             */
+            uint32_t bpp_bytes = (resp.fmt == MD64API_GRP_FMT_RGB565) ? 2u : 4u;
+            uint32_t pitch = fb.addr ? fb.width * bpp_bytes : 0u;
+            /* If the allocation matches the screen exactly, use the real fb pitch
+             * (which may be wider due to hardware alignment). */
+            if (fb.addr && fb.height > 0 && resp.size_bytes == fb.pitch * fb.height)
+                pitch = fb.pitch;
             slot->pitch = pitch;
 
             resp.handle = handle;
             resp.pitch = pitch;
             video0_resp_set(c, &resp, sizeof(resp));
-            return (ssize_t)h->size_bytes;
+            return (ssize_t)h->size_bytes; // Return immediately for response commands
         }
 
         case VIDEOCTL_CMD2_MAP_BUF: {
+            // Commands with responses can't be batched
+            if (offset > 0) return (ssize_t)total_processed;
             if (h->size_bytes < sizeof(videoctl2_map_buf_t)) return -1;
             videoctl2_map_buf_t resp;
             memcpy(&resp, buf, sizeof(resp));
@@ -985,7 +1014,7 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
             if (!b) {
                 resp.user_addr = 0; resp.size_bytes = 0; resp.pitch = 0; resp.fmt = 0;
                 video0_resp_set(c, &resp, sizeof(resp));
-                return (ssize_t)h->size_bytes;
+                break;
             }
 
             if (!b->user_addr) {
@@ -993,7 +1022,7 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
                 if (paging_map_range(ua, b->phys_base, b->size_bytes, PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
                     resp.user_addr = 0; resp.size_bytes = 0; resp.pitch = 0; resp.fmt = 0;
                     video0_resp_set(c, &resp, sizeof(resp));
-                    return (ssize_t)h->size_bytes;
+                    break;
                 }
                 b->user_addr = ua;
             }
@@ -1003,7 +1032,7 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
             resp.pitch = b->pitch;
             resp.fmt = b->fmt;
             video0_resp_set(c, &resp, sizeof(resp));
-            return (ssize_t)h->size_bytes;
+            return (ssize_t)h->size_bytes; // Return immediately for response commands
         }
 
         case VIDEOCTL_CMD2_ENQUEUE: {
@@ -1016,7 +1045,7 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
 
             if (req->u.fill.op == VIDEOCTL2_OP_FILL_RECT) {
                 uint32_t x=req->u.fill.x, y=req->u.fill.y, w=req->u.fill.w, hh=req->u.fill.h;
-                if (x>=fb.width || y>=fb.height) return (ssize_t)h->size_bytes;
+                if (x>=fb.width || y>=fb.height) break;
                 if (x+w>fb.width) w = fb.width - x;
                 if (y+hh>fb.height) hh = fb.height - y;
                 if (fb.bpp == 32) {
@@ -1034,14 +1063,14 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
                     }
                 }
                 video0_dirty_union(c, x, y, w, hh);
-                return (ssize_t)h->size_bytes;
+                break;
             }
 
             if (req->u.blit.op == VIDEOCTL2_OP_BLIT) {
                 uint32_t sx=req->u.blit.src_x, sy=req->u.blit.src_y;
                 uint32_t dx=req->u.blit.dst_x, dy=req->u.blit.dst_y;
                 uint32_t w=req->u.blit.w, hh=req->u.blit.h;
-                if (sx>=fb.width || sy>=fb.height || dx>=fb.width || dy>=fb.height) return (ssize_t)h->size_bytes;
+                if (sx>=fb.width || sy>=fb.height || dx>=fb.width || dy>=fb.height) break;
                 if (sx+w>fb.width) w = fb.width - sx;
                 if (dx+w>fb.width) w = fb.width - dx;
                 if (sy+hh>fb.height) hh = fb.height - sy;
@@ -1053,36 +1082,67 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
                     memmove(dstp, srcp, w*bpp);
                 }
                 video0_dirty_union(c, dx, dy, w, hh);
-                return (ssize_t)h->size_bytes;
+                break;
             }
 
             if (req->u.blit_buf.op == VIDEOCTL2_OP_BLIT_BUF) {
                 video0_buf_t *b = video0_find_buf(c, req->u.blit_buf.handle);
-                if (!b) return (ssize_t)h->size_bytes;
+                if (!b) break;
                 uint8_t *srcbuf = (uint8_t*)phys_to_virt_kernel(b->phys_base);
-                if (!srcbuf) return (ssize_t)h->size_bytes;
+                if (!srcbuf) break;
 
                 uint32_t sx=req->u.blit_buf.src_x, sy=req->u.blit_buf.src_y;
                 uint32_t dx=req->u.blit_buf.dst_x, dy=req->u.blit_buf.dst_y;
                 uint32_t w=req->u.blit_buf.w, hh=req->u.blit_buf.h;
                 uint32_t sp=req->u.blit_buf.src_pitch;
                 uint32_t sf=req->u.blit_buf.src_fmt;
-                if (dx>=fb.width || dy>=fb.height) return (ssize_t)h->size_bytes;
+                if (dx>=fb.width || dy>=fb.height) break;
                 if (dx+w>fb.width) w = fb.width - dx;
                 if (dy+hh>fb.height) hh = fb.height - dy;
 
-                if (fb.bpp==32 && sf==MD64API_GRP_FMT_XRGB8888) {
-                    for (uint32_t yy=0; yy<hh; yy++) {
+                if (fb.bpp == 32 && sf == MD64API_GRP_FMT_XRGB8888) {
+                    for (uint32_t yy = 0; yy < hh; yy++) {
                         uint32_t *srcrow = (uint32_t*)(srcbuf + (sy+yy)*sp + sx*4);
                         uint32_t *dstrow = (uint32_t*)(dst + (dy+yy)*fb.pitch + dx*4);
-                        memcpy(dstrow, srcrow, w*4);
+                        memcpy(dstrow, srcrow, w * 4);
+                    }
+                } else if (fb.bpp == 16 && sf == MD64API_GRP_FMT_XRGB8888) {
+                    /* Convert XRGB8888 source to RGB565 framebuffer. */
+                    for (uint32_t yy = 0; yy < hh; yy++) {
+                        uint32_t *srcrow = (uint32_t*)(srcbuf + (sy+yy)*sp + sx*4);
+                        uint16_t *dstrow = (uint16_t*)(dst + (dy+yy)*fb.pitch + dx*2);
+                        for (uint32_t xx = 0; xx < w; xx++) {
+                            uint32_t p = srcrow[xx];
+                            dstrow[xx] = (uint16_t)(((p>>19)&0x1F)<<11 |
+                                                    ((p>>10)&0x3F)<<5  |
+                                                    ((p>>3) &0x1F));
+                        }
+                    }
+                } else if (fb.bpp == 16 && sf == MD64API_GRP_FMT_RGB565) {
+                    for (uint32_t yy = 0; yy < hh; yy++) {
+                        uint16_t *srcrow = (uint16_t*)(srcbuf + (sy+yy)*sp + sx*2);
+                        uint16_t *dstrow = (uint16_t*)(dst + (dy+yy)*fb.pitch + dx*2);
+                        memcpy(dstrow, srcrow, w * 2);
+                    }
+                } else if (fb.bpp == 32 && sf == MD64API_GRP_FMT_RGB565) {
+                    /* Upconvert RGB565 source to XRGB8888 framebuffer. */
+                    for (uint32_t yy = 0; yy < hh; yy++) {
+                        uint16_t *srcrow = (uint16_t*)(srcbuf + (sy+yy)*sp + sx*2);
+                        uint32_t *dstrow = (uint32_t*)(dst + (dy+yy)*fb.pitch + dx*4);
+                        for (uint32_t xx = 0; xx < w; xx++) {
+                            uint16_t p = srcrow[xx];
+                            uint32_t r = (p >> 11) & 0x1F; r = (r << 3) | (r >> 2);
+                            uint32_t g = (p >>  5) & 0x3F; g = (g << 2) | (g >> 4);
+                            uint32_t b = (p >>  0) & 0x1F; b = (b << 3) | (b >> 2);
+                            dstrow[xx] = (r << 16) | (g << 8) | b;
+                        }
                     }
                 }
                 video0_dirty_union(c, dx, dy, w, hh);
-                return (ssize_t)h->size_bytes;
+                break;
             }
 
-            return (ssize_t)h->size_bytes;
+            break;
         }
 
         case VIDEOCTL_CMD2_FLUSH: {
@@ -1099,17 +1159,31 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
             }
             if (w && hh) VGA_FlushRect(x,y,w,hh);
             c->dirty_valid = 0;
-            return (ssize_t)h->size_bytes;
+            break;
         }
 
         case VIDEOCTL_CMD2_CURSOR_SET:
         case VIDEOCTL_CMD2_CURSOR_MOVE:
         case VIDEOCTL_CMD2_CURSOR_SHOW:
-            return (ssize_t)h->size_bytes;
+            break;
+
+        case VIDEOCTL_CMD2_MAP_CMDBUF:
+        case VIDEOCTL_CMD2_SUBMIT_CMDBUF:
+            break;
 
         default:
-            return -1;
+            // Unknown command, stop processing
+            if (total_processed == 0) return -1;
+            return (ssize_t)total_processed;
     }
+    
+    // Move to next command
+    offset += h->size_bytes;
+    total_processed += h->size_bytes;
+    }
+    
+    // Return total bytes processed (all commands in the batch)
+    return (ssize_t)(total_processed > 0 ? total_processed : count);
 }
 
 

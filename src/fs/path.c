@@ -264,3 +264,91 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
 
     return -1;
 }
+
+void join_path(const char *base, const char *component, char *result) {
+    if (!base || !component || !result) return;
+    
+    result[0] = '\0';
+    size_t base_len = strlen(base);
+    
+    if (base_len >= 255) {
+        strncpy(result, base, 255);
+        result[255] = '\0';
+        return;
+    }
+    
+    strcpy(result, base);
+    
+    if (base_len > 0 && result[base_len - 1] != '/') {
+        if (base_len + 1 < 256) {
+            result[base_len] = '/';
+            result[base_len + 1] = '\0';
+        }
+    }
+    
+    strncat(result, component, 255 - strlen(result));
+}
+
+void normalize_path(char *path) {
+    if (!path || !*path) return;
+    
+    char temp[256];
+    char *parts[64];
+    int part_count = 0;
+    
+    int is_absolute = (path[0] == '/');
+    
+    char *p = path;
+    while (*p == '/') p++;
+    
+    while (*p && part_count < 64) {
+        char *start = p;
+        while (*p && *p != '/') p++;
+        
+        size_t len = p - start;
+        if (len == 0) {
+            while (*p == '/') p++;
+            continue;
+        }
+        
+        if (len == 1 && start[0] == '.') {
+            while (*p == '/') p++;
+            continue;
+        }
+        
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (part_count > 0) {
+                part_count--;
+            }
+            while (*p == '/') p++;
+            continue;
+        }
+        
+        parts[part_count++] = start;
+        if (*p == '/') {
+            *p = '\0';
+            p++;
+            while (*p == '/') p++;
+        }
+    }
+    
+    temp[0] = '\0';
+    if (is_absolute) {
+        strcpy(temp, "/");
+    }
+    
+    for (int i = 0; i < part_count; i++) {
+        if (i > 0 || is_absolute) {
+            if (temp[0] && temp[strlen(temp) - 1] != '/') {
+                strcat(temp, "/");
+            }
+        }
+        strcat(temp, parts[i]);
+    }
+    
+    if (temp[0] == '\0') {
+        strcpy(path, is_absolute ? "/" : ".");
+    } else {
+        strcpy(path, temp);
+    }
+}

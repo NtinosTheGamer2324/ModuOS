@@ -35,4 +35,10 @@ typedef struct {
  */
 int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *out);
 
+/* Join a base path with a component, handling '/' separator */
+void join_path(const char *base, const char *component, char *result);
+
+/* Normalize a path by resolving . and .. components */
+void normalize_path(char *path);
+
 #endif

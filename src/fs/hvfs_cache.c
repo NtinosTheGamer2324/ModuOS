@@ -24,7 +24,6 @@ typedef struct {
 
 static hvfs_cache_entry_t g_cache[HVFS_CACHE_MAX_ENTRIES];
 static hvfs_cache_mode_t g_mode = HVFS_CACHE_128M;
-static spinlock_t hvfs_cache_lock;
 static uint64_t g_use_counter = 1;
 static uint64_t g_hits = 0;
 static uint64_t g_misses = 0;

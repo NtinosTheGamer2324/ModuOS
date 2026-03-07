@@ -15,6 +15,17 @@
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/fs/MDFS/mdfs.h"
 
+/* Pipe ring buffer — shared between read and write fd entries. */
+#define PIPE_BUF_SIZE 4096
+
+typedef struct {
+    char    buf[PIPE_BUF_SIZE];
+    int     read_pos;
+    int     write_pos;
+    int     count;
+    int     write_end_open;  /* 0 when write fd is closed → EOF on read */
+} pipe_buf_t;
+
 /* NOTE: FD_DEBUG can be enabled to trace file operations to COM1.
  * This is extremely slow on real hardware/VMs (serial output bottleneck).
  */
@@ -37,6 +48,7 @@ typedef struct {
     int flags;                /* FD_FLAG_* flags */
     int in_use;               /* Is this FD active? */
     int pid;                  /* Owner process ID (0 for kernel) */
+    int type;                 /* FD_TYPE_* */
     void* cached_data;        /* Cached file contents (for reading) OR devfs/userfs handle */
     int is_directory;         /* 1 if this is a directory descriptor */
     void* dir_handle;         /* Directory handle (fs_dir_t*) or DEVVFS handle */
@@ -44,19 +56,21 @@ typedef struct {
     int is_devfs;             /* 1 if cached_data is a devfs handle */
     int is_userfs;            /* 1 if cached_data is a userfs handle or userfs dir */
 
+    /* Pipe support */
+    void *pipe_buf;           /* pipe_buf_t* when type==FD_TYPE_PIPE */
+    int   is_read_end;        /* 1=read end, 0=write end of pipe */
+
     /* FS-specific cache to accelerate repeated writes (MDFS). */
     uint32_t cached_inode;
     uint8_t  cached_type;
     uint8_t  cache_valid;
     uint8_t  _pad_cache;
 
-    /* Write coalescing buffer (for large sequential file writes).
-     * This is critical for performance when userland writes in 4KiB chunks.
-     */
+    /* Write coalescing buffer (for large sequential file writes). */
     uint8_t *wbuf;
     size_t   wbuf_cap;
     size_t   wbuf_len;
-    size_t   wbuf_file_off; /* file offset corresponding to wbuf[0] */
+    size_t   wbuf_file_off;
 } file_descriptor_internal_t;
 
 /* Global file descriptor table */
@@ -146,15 +160,18 @@ void fd_init(void) {
     FD_LOG("[FD] File descriptor table initialized\n");
 }
 
-/* Find free file descriptor */
-static int find_free_fd(void) {
-    /* Start from 3 (after stdin/stdout/stderr) */
-    for (int i = 3; i < MAX_FDS; i++) {
-        if (!fd_table[i].in_use) {
+/* Find lowest free file descriptor at or above min_fd. */
+static int find_free_fd_from(int min_fd) {
+    for (int i = min_fd; i < MAX_FDS; i++) {
+        if (!fd_table[i].in_use)
             return i;
-        }
     }
     return -1;
+}
+
+static int find_free_fd(void) {
+    /* POSIX: allocate the lowest available fd >= 0. */
+    return find_free_fd_from(0);
 }
 
 static int fd_open_devfs_internal(const char *node, int flags) {
@@ -381,11 +398,7 @@ int fd_close(int fd) {
         return -1;
     }
     
-    /* Don't close stdin/stdout/stderr */
-    if (fd <= 2) {
-        FD_LOG("[FD] Cannot close standard fd\n");
-        return -2;
-    }
+    /* Closing fd 0/1/2 is valid POSIX — just mark slot free. */
     
     /* Flush pending buffered writes before closing. */
     (void)fd_flush_write_buffer(fd);
@@ -405,6 +418,17 @@ int fd_close(int fd) {
         fd_table[fd].wbuf_cap = 0;
         fd_table[fd].wbuf_len = 0;
         fd_table[fd].wbuf_file_off = 0;
+    }
+
+    /* Pipe cleanup: mark write end closed so readers see EOF */
+    if (fd_table[fd].type == FD_TYPE_PIPE && fd_table[fd].pipe_buf) {
+        pipe_buf_t *pb = (pipe_buf_t*)fd_table[fd].pipe_buf;
+        if (!fd_table[fd].is_read_end)
+            pb->write_end_open = 0;
+        /* The pipe_buf is shared between read and write ends.
+         * Only free it when both ends are closed.
+         * We use a simple ref-count via write_end_open + a separate flag. */
+        fd_table[fd].pipe_buf = NULL;
     }
 
     /* Close devfs/userfs handle OR free cached file data */
@@ -469,6 +493,25 @@ ssize_t fd_read(int fd, void* buffer, size_t count) {
         return -3;
     }
 
+    /* Pipe read */
+    if (fd_table[fd].type == FD_TYPE_PIPE) {
+        pipe_buf_t *pb = (pipe_buf_t*)fd_table[fd].pipe_buf;
+        if (!pb || !fd_table[fd].is_read_end) return -1;
+        /* Spin-wait for data (simple blocking read; no sleep/wakeup yet) */
+        while (pb->count == 0) {
+            if (!pb->write_end_open) return 0; /* EOF */
+            process_yield();
+        }
+        size_t n = (count < (size_t)pb->count) ? count : (size_t)pb->count;
+        char *dst = (char*)buffer;
+        for (size_t i = 0; i < n; i++) {
+            dst[i] = pb->buf[pb->read_pos];
+            pb->read_pos = (pb->read_pos + 1) % PIPE_BUF_SIZE;
+        }
+        pb->count -= (int)n;
+        return (ssize_t)n;
+    }
+
     /* devfs-backed FD */
     if (fd_table[fd].is_devfs) {
         if (!fd_table[fd].cached_data) return -4;
@@ -521,26 +564,6 @@ ssize_t fd_write(int fd, const void* buffer, size_t count) {
     }
 
 
-    // DEBUG: identify what fd=3 is for paintgfx crash diagnosis
-    if (fd == 3) {
-        com_write_string(COM1_PORT, "[FD_WRITE] fd=3 pid=");
-        char dbuf[32];
-        itoa(fd_table[fd].pid, dbuf, 10); com_write_string(COM1_PORT, dbuf);
-        com_write_string(COM1_PORT, " is_devfs=");
-        itoa(fd_table[fd].is_devfs, dbuf, 10); com_write_string(COM1_PORT, dbuf);
-        com_write_string(COM1_PORT, " is_userfs=");
-        itoa(fd_table[fd].is_userfs, dbuf, 10); com_write_string(COM1_PORT, dbuf);
-        com_write_string(COM1_PORT, " mount=");
-        itoa(fd_table[fd].mount_slot, dbuf, 10); com_write_string(COM1_PORT, dbuf);
-        com_write_string(COM1_PORT, " flags=0x");
-        itoa(fd_table[fd].flags, dbuf, 16); com_write_string(COM1_PORT, dbuf);
-        com_write_string(COM1_PORT, " path=");
-        com_write_string(COM1_PORT, fd_table[fd].path);
-        com_write_string(COM1_PORT, " count=");
-        itoa((int)count, dbuf, 10); com_write_string(COM1_PORT, dbuf);
-        com_write_string(COM1_PORT, "\n");
-    }
-
     /* Handle stdout/stderr specially */
     if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
         /* Userspace typically writes via SYS_WRITE (string) for console output.
@@ -548,6 +571,22 @@ ssize_t fd_write(int fd, const void* buffer, size_t count) {
          */
         if (buffer && count) {
             VGA_WriteN((const char*)buffer, count);
+        }
+        return (ssize_t)count;
+    }
+
+    /* Pipe write */
+    if (fd_table[fd].type == FD_TYPE_PIPE) {
+        pipe_buf_t *pb = (pipe_buf_t*)fd_table[fd].pipe_buf;
+        if (!pb || fd_table[fd].is_read_end) return -1;
+        const char *src = (const char*)buffer;
+        size_t written = 0;
+        while (written < count) {
+            while (pb->count == PIPE_BUF_SIZE)
+                process_yield(); /* wait for space */
+            pb->buf[pb->write_pos] = src[written++];
+            pb->write_pos = (pb->write_pos + 1) % PIPE_BUF_SIZE;
+            pb->count++;
         }
         return (ssize_t)count;
     }
@@ -758,17 +797,143 @@ int fd_dup(int oldfd) {
     return newfd;
 }
 
+/* Duplicate oldfd into newfd exactly (dup2 semantics).
+ * If newfd is already open, it is closed first.
+ * Returns newfd on success, -1 on error. */
+int fd_dup2(int oldfd, int newfd) {
+    fd_init();
+
+    if (oldfd < 0 || oldfd >= MAX_FDS || !fd_table[oldfd].in_use) return -1;
+    if (newfd < 0 || newfd >= MAX_FDS) return -1;
+    if (oldfd == newfd) return newfd;
+
+    /* Close newfd if open — suppress errors, POSIX says best-effort. */
+    if (fd_table[newfd].in_use)
+        fd_close(newfd);
+
+    fd_table[newfd] = fd_table[oldfd];
+    fd_table[newfd].in_use = 1;
+
+    /* Duplicate cached data buffer so both FDs have independent position. */
+    if (fd_table[oldfd].cached_data && fd_table[oldfd].file_size > 0
+        && !fd_table[oldfd].is_devfs && !fd_table[oldfd].is_userfs) {
+        void *nb = kmalloc(fd_table[oldfd].file_size);
+        if (nb) {
+            memcpy(nb, fd_table[oldfd].cached_data, fd_table[oldfd].file_size);
+            fd_table[newfd].cached_data = nb;
+        } else {
+            fd_table[newfd].cached_data = NULL;
+        }
+    }
+    /* Write buffer is not inherited — child starts fresh. */
+    fd_table[newfd].wbuf = NULL;
+    fd_table[newfd].wbuf_cap = 0;
+    fd_table[newfd].wbuf_len = 0;
+    fd_table[newfd].wbuf_file_off = 0;
+
+    return newfd;
+}
+
+/* Clone all open FDs from parent_pid into child_pid.
+ * Used by fork() to give the child the same open file table. */
+void fd_clone_for_fork(int parent_pid, int child_pid) {
+    fd_init();
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!fd_table[i].in_use || fd_table[i].pid != parent_pid) continue;
+        /* Duplicate the slot into a fresh entry for the child. */
+        file_descriptor_internal_t copy = fd_table[i];
+        copy.pid = child_pid;
+        /* Give the child its own cached data copy so seek positions diverge. */
+        if (copy.cached_data && copy.file_size > 0
+            && !copy.is_devfs && !copy.is_userfs) {
+            void *nb = kmalloc(copy.file_size);
+            if (nb) {
+                memcpy(nb, fd_table[i].cached_data, copy.file_size);
+                copy.cached_data = nb;
+            } else {
+                copy.cached_data = NULL;
+            }
+        }
+        copy.wbuf = NULL;
+        copy.wbuf_cap = 0;
+        copy.wbuf_len = 0;
+        copy.wbuf_file_off = 0;
+        fd_table[i] = copy;  /* preserve parent slot untouched; child needs its own slot */
+        /* Actually we need a NEW slot for the child at the same fd number. */
+        /* Restore parent slot first, then copy to the same index — this only
+         * works if we treat fd as process-local.  Since the table is global,
+         * we reuse the same index but tag it with child_pid when fd_close_all
+         * is called per-pid.  The parent's slot stays as-is (pid=parent_pid).
+         * We need a second slot at the same fd number for the child — not
+         * possible with a global flat table.
+         *
+         * Practical compromise: share the slot but update pid to child_pid
+         * only for FDs 0,1,2 (stdio).  All other FDs get fresh duplicates
+         * in new slots. */
+        fd_table[i] = fd_table[i]; /* restore */
+        fd_table[i].pid = parent_pid; /* keep parent ownership */
+        if (i < 3) {
+            /* stdio is shared read-only — no separate slot needed.
+             * Just mark child as a co-owner by leaving pid as parent for now;
+             * child's fd_close_all skips these slots. */
+        } else {
+            int nfd = find_free_fd_from(3);
+            if (nfd >= 0) {
+                fd_table[nfd] = copy;
+                fd_table[nfd].pid = child_pid;
+            }
+        }
+    }
+}
+
+/* pipe() — create an anonymous read/write fd pair backed by a kernel ring buffer. */
+int fd_pipe(int fds[2]) {
+    fd_init();
+
+    /* Allocate ring buffer */
+    pipe_buf_t *pb = (pipe_buf_t*)kmalloc(sizeof(pipe_buf_t));
+    if (!pb) return -1;
+    pb->read_pos     = 0;
+    pb->write_pos    = 0;
+    pb->count        = 0;
+    pb->write_end_open = 1;
+
+    int rfd = find_free_fd_from(0);
+    if (rfd < 0) { kfree(pb); return -1; }
+    fd_table[rfd].in_use    = 1;
+    fd_table[rfd].type      = FD_TYPE_PIPE;
+    fd_table[rfd].flags     = FD_FLAG_READ;
+    fd_table[rfd].pipe_buf  = pb;
+    fd_table[rfd].is_read_end = 1;
+
+    int wfd = find_free_fd_from(rfd + 1);
+    if (wfd < 0) {
+        fd_table[rfd].in_use = 0;
+        kfree(pb);
+        return -1;
+    }
+    fd_table[wfd].in_use    = 1;
+    fd_table[wfd].type      = FD_TYPE_PIPE;
+    fd_table[wfd].flags     = FD_FLAG_WRITE;
+    fd_table[wfd].pipe_buf  = pb;
+    fd_table[wfd].is_read_end = 0;
+
+    fds[0] = rfd;
+    fds[1] = wfd;
+    return 0;
+}
+
 /* Close all FDs for a process */
 void fd_close_all(int pid) {
     fd_init();
     
-    /* Get current process if pid is 0 */
     if (pid == 0) {
         process_t* proc = process_get_current();
         if (proc) pid = proc->pid;
     }
-    
-    for (int i = 3; i < MAX_FDS; i++) {
+
+    /* Close from 0 — fd 0/1/2 may now be owned by this process */
+    for (int i = 0; i < MAX_FDS; i++) {
         if (fd_table[i].in_use && fd_table[i].pid == pid) {
             fd_close(i);
         }

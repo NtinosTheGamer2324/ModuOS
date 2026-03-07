@@ -35,6 +35,13 @@ typedef int64_t ssize_t;
 #define SEEK_CUR 1
 #define SEEK_END 2
 
+/* FD type tags */
+#define FD_TYPE_FILE   0
+#define FD_TYPE_DIR    1
+#define FD_TYPE_DEVFS  2
+#define FD_TYPE_PIPE   3
+#define FD_TYPE_USERFS 4
+
 /* File descriptor structure */
 typedef struct {
     int mount_slot;           /* Which filesystem mount (0-25) */
@@ -44,6 +51,11 @@ typedef struct {
     int flags;                /* FD_FLAG_* flags */
     int in_use;               /* Is this FD active? */
     int pid;                  /* Owner process ID (0 for kernel) */
+    int type;                 /* FD_TYPE_* */
+
+    /* Pipe support */
+    void *pipe_buf;           /* pipe_buf_t* when type==FD_TYPE_PIPE */
+    int   is_read_end;        /* 1=read end, 0=write end of pipe */
 
     /* FS-specific cache to accelerate repeated writes.
      * For MDFS we cache inode number resolved/created at open() time.
@@ -53,6 +65,9 @@ typedef struct {
     uint8_t  cache_valid;
     uint8_t  _pad_cache;
 } file_descriptor_t;
+
+/* Pipe fd operations */
+int fd_pipe(int fds[2]);
 
 /**
  * Initialize file descriptor table
@@ -126,11 +141,21 @@ file_descriptor_t* fd_get(int fd);
 int fd_is_valid(int fd);
 
 /**
- * Duplicate a file descriptor
- * @param oldfd: Existing file descriptor
- * @return: New file descriptor, or -1 on error
+ * Duplicate a file descriptor (dup)
  */
 int fd_dup(int oldfd);
+
+/**
+ * Duplicate oldfd into newfd exactly (dup2).
+ * Closes newfd first if open.
+ * Returns newfd on success, -1 on error.
+ */
+int fd_dup2(int oldfd, int newfd);
+
+/**
+ * Clone all open FDs from parent into child (used by fork).
+ */
+void fd_clone_for_fork(int parent_pid, int child_pid);
 
 /**
  * Close all file descriptors for a process

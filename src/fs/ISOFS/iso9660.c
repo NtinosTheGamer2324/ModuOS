@@ -818,6 +818,7 @@ int iso9660_read_folder(int handle, const char* path, iso9660_folder_entry_t* en
                 if (sig == RR_SIGNATURE_NM) {
                     /* Found Rock Ridge alternate name */
                     uint8_t flags_nm = su_area[su_pos + 4];
+                    (void)flags_nm;
                     int nm_len = len - 5;
                     if (nm_len > 0 && nm_len < 255) {
                         memcpy(out->name, su_area + su_pos + 5, nm_len);
