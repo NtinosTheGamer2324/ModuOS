@@ -112,7 +112,7 @@ static void vga_try_init_fb_console(void) {
             /* Try FNT unicode font (custom format) first */
             #if 1
             if (!g_fbcon_fnt_loaded) {
-                const char *fntp = "/ModuOS/shared/usr/assets/fonts/Unicode.fnt";
+                const char *fntp = "/ModuOS/shared/assets/fonts/Unicode.fnt";
                 void *fnt_buf = NULL;
                 size_t fnt_size = 0;
                 int fr = hvfs_read(slot, fntp, &fnt_buf, &fnt_size);
@@ -122,7 +122,7 @@ static void vga_try_init_fb_console(void) {
                     if (g_fbcon_fnt) {
                         g_fbcon_fnt_loaded = 1;
                         fbcon_set_fnt_font(&g_fbcon, g_fbcon_fnt);
-                        com_write_string(COM1_PORT, "[FBCON] Using FNT font: /ModuOS/shared/usr/assets/fonts/Unicode.fnt\n");
+                        com_write_string(COM1_PORT, "[FBCON] Using FNT font: /ModuOS/shared/assets/fonts/Unicode.fnt\n");
                     }
                 }
             }

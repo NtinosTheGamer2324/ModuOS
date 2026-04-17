@@ -214,7 +214,7 @@ int devfs_register_path(const char *path, const devfs_device_ops_t *ops, void *c
     devfs_init_once();
     if (!g_root) return -1;
     if (!path || !path[0]) return -2;
-    if (!ops || !ops->name || !ops->name[0] || !ops->read) return -3;
+    if (!ops || !ops->name || !ops->name[0]) return -3;
 
     /* Normalize user paths: accept $/dev/... or /dev/... and strip prefix. */
     const char *path_in = devfs_normalize_path(path);
@@ -807,6 +807,14 @@ int devfs_graphics_init(void) {
     return r;
 }
 
+int devfs_net_init(void) {
+    devfs_owner_t owner = { .kind = DEVFS_OWNER_KERNEL, .id = "kernel" };
+    devfs_init_once();
+    devfs_mkdir_p("net", owner);
+    com_write_string(COM1_PORT, "[DEVFS] Created $/dev/net/\n");
+    return 0;
+}
+
 void devfs_input_push_event(const Event *e) {
     if (!e) return;
 
@@ -899,293 +907,291 @@ static ssize_t dev_video0_write(void *ctx, const void *buf, size_t count) {
     framebuffer_t fb;
     memset(&fb, 0, sizeof(fb));
     VGA_GetFrameBuffer(&fb);
-    
-    // Process ALL commands in the buffer (batched writes)
-    size_t offset = 0;
+
+    size_t offset          = 0;
     size_t total_processed = 0;
-    
+
     while (offset + sizeof(videoctl2_hdr_t) <= count) {
+        /* h already points at buf+offset — use it for ALL reads below */
         const videoctl2_hdr_t *h = (const videoctl2_hdr_t*)((const uint8_t*)buf + offset);
-        
-        if (h->magic != VIDEOCTL_MAGIC2) break;
-        if (h->abi_version != VIDEOCTL_ABI_VERSION) break;
-        if (h->size_bytes == 0 || offset + h->size_bytes > count) break;
 
-    switch (h->cmd) {
-        case VIDEOCTL_CMD2_GET_INFO: {
-            // Commands with responses can't be batched - must be sent alone
-            if (offset > 0) {
-                // Already processed some commands, stop here and return
-                return (ssize_t)total_processed;
-            }
-            
-            videoctl2_info_t resp;
-            memset(&resp, 0, sizeof(resp));
-            resp.hdr = *h;
-            resp.hdr.size_bytes = sizeof(resp);
+        if (h->magic       != VIDEOCTL_MAGIC2)       break;
+        if (h->abi_version != VIDEOCTL_ABI_VERSION)  break;
+        if (h->size_bytes  == 0 || offset + h->size_bytes > count) break;
 
-            if (fb.addr) {
-                resp.width = fb.width;
-                resp.height = fb.height;
-                resp.pitch = fb.pitch;
-                resp.bpp = fb.bpp;
-                if (fb.bpp == 32) resp.fmt = MD64API_GRP_FMT_XRGB8888;
-                else if (fb.bpp == 16) resp.fmt = MD64API_GRP_FMT_RGB565;
-                else resp.fmt = MD64API_GRP_FMT_UNKNOWN;
-            }
+        switch (h->cmd) {
 
-            resp.caps = VIDEOCTL2_CAP_ENQUEUE_FILL_RECT |
-                        VIDEOCTL2_CAP_ENQUEUE_BLIT |
-                        VIDEOCTL2_CAP_ENQUEUE_BLIT_BUF |
-                        VIDEOCTL2_CAP_FLUSH |
-                        VIDEOCTL2_CAP_BUF_HANDLES |
-                        VIDEOCTL2_CAP_BUF_SG_PAGES;
-            strncpy(resp.driver, "kernel_sw", sizeof(resp.driver)-1);
+            /* ---- Commands that produce a read-back response ---- */
+            /* These cannot be pipelined; they must arrive alone.   */
 
-            video0_resp_set(c, &resp, sizeof(resp));
-            return (ssize_t)h->size_bytes; // Return immediately for response commands
-        }
+            case VIDEOCTL_CMD2_GET_INFO: {
+                if (offset > 0) return (ssize_t)total_processed;
 
-        case VIDEOCTL_CMD2_ALLOC_BUF: {
-            // Commands with responses can't be batched
-            if (offset > 0) return (ssize_t)total_processed;
-            if (h->size_bytes < sizeof(videoctl2_alloc_buf_t)) return -1;
-            videoctl2_alloc_buf_t resp;
-            memcpy(&resp, buf, sizeof(resp));
+                videoctl2_info_t resp;
+                memset(&resp, 0, sizeof(resp));
+                resp.hdr = *h;
+                resp.hdr.size_bytes = sizeof(resp);
 
-            if (resp.size_bytes == 0 || resp.size_bytes > (64u * 1024u * 1024u)) {
-                resp.handle = 0; resp.pitch = 0;
+                if (fb.addr) {
+                    resp.width  = fb.width;
+                    resp.height = fb.height;
+                    resp.pitch  = fb.pitch;
+                    resp.bpp    = fb.bpp;
+                    if      (fb.bpp == 32) resp.fmt = MD64API_GRP_FMT_XRGB8888;
+                    else if (fb.bpp == 16) resp.fmt = MD64API_GRP_FMT_RGB565;
+                    else                   resp.fmt = MD64API_GRP_FMT_UNKNOWN;
+                }
+
+                resp.caps = VIDEOCTL2_CAP_ENQUEUE_FILL_RECT |
+                            VIDEOCTL2_CAP_ENQUEUE_BLIT      |
+                            VIDEOCTL2_CAP_ENQUEUE_BLIT_BUF  |
+                            VIDEOCTL2_CAP_FLUSH             |
+                            VIDEOCTL2_CAP_BUF_HANDLES       |
+                            VIDEOCTL2_CAP_BUF_SG_PAGES;
+                strncpy(resp.driver, "kernel_sw", sizeof(resp.driver) - 1);
+
                 video0_resp_set(c, &resp, sizeof(resp));
-                break;
+                return (ssize_t)h->size_bytes;
             }
 
-            video0_buf_t *slot = video0_alloc_buf_slot(c);
-            if (!slot) {
-                resp.handle = 0; resp.pitch = 0;
-                video0_resp_set(c, &resp, sizeof(resp));
-                break;
-            }
+            case VIDEOCTL_CMD2_ALLOC_BUF: {
+                if (offset > 0) return (ssize_t)total_processed;
+                if (h->size_bytes < sizeof(videoctl2_alloc_buf_t)) return -1;
 
-            uint64_t pages = (((uint64_t)resp.size_bytes + 0xFFFULL) >> 12);
-            uint64_t phys = phys_alloc_contiguous((size_t)pages);
-            if (!phys) {
-                resp.handle = 0; resp.pitch = 0;
-                video0_resp_set(c, &resp, sizeof(resp));
-                break;
-            }
-            void *kptr = phys_to_virt_kernel(phys);
-            if (kptr) memset(kptr, 0, pages * 0x1000ULL);
+                videoctl2_alloc_buf_t resp;
+                memcpy(&resp, h, sizeof(resp));   /* ← was: memcpy(&resp, buf, ...) */
 
-            uint32_t handle = c->next_handle++;
-            slot->in_use = 1;
-            slot->handle = handle;
-            slot->fmt = resp.fmt;
-            slot->size_bytes = resp.size_bytes;
-            slot->phys_base = phys;
-            slot->user_addr = 0;
-
-            /*
-             * Derive pitch from the requested format and the framebuffer width.
-             * If the buffer size is an exact multiple of fb.height we can infer
-             * the stride; otherwise derive it from bytes-per-pixel × width.
-             */
-            uint32_t bpp_bytes = (resp.fmt == MD64API_GRP_FMT_RGB565) ? 2u : 4u;
-            uint32_t pitch = fb.addr ? fb.width * bpp_bytes : 0u;
-            /* If the allocation matches the screen exactly, use the real fb pitch
-             * (which may be wider due to hardware alignment). */
-            if (fb.addr && fb.height > 0 && resp.size_bytes == fb.pitch * fb.height)
-                pitch = fb.pitch;
-            slot->pitch = pitch;
-
-            resp.handle = handle;
-            resp.pitch = pitch;
-            video0_resp_set(c, &resp, sizeof(resp));
-            return (ssize_t)h->size_bytes; // Return immediately for response commands
-        }
-
-        case VIDEOCTL_CMD2_MAP_BUF: {
-            // Commands with responses can't be batched
-            if (offset > 0) return (ssize_t)total_processed;
-            if (h->size_bytes < sizeof(videoctl2_map_buf_t)) return -1;
-            videoctl2_map_buf_t resp;
-            memcpy(&resp, buf, sizeof(resp));
-
-            video0_buf_t *b = video0_find_buf(c, resp.handle);
-            if (!b) {
-                resp.user_addr = 0; resp.size_bytes = 0; resp.pitch = 0; resp.fmt = 0;
-                video0_resp_set(c, &resp, sizeof(resp));
-                break;
-            }
-
-            if (!b->user_addr) {
-                uint64_t ua = video0_alloc_user_va(b->size_bytes);
-                if (paging_map_range(ua, b->phys_base, b->size_bytes, PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
-                    resp.user_addr = 0; resp.size_bytes = 0; resp.pitch = 0; resp.fmt = 0;
+                if (resp.size_bytes == 0 || resp.size_bytes > (64u * 1024u * 1024u)) {
+                    resp.handle = 0; resp.pitch = 0;
                     video0_resp_set(c, &resp, sizeof(resp));
                     break;
                 }
-                b->user_addr = ua;
-            }
 
-            resp.user_addr = b->user_addr;
-            resp.size_bytes = b->size_bytes;
-            resp.pitch = b->pitch;
-            resp.fmt = b->fmt;
-            video0_resp_set(c, &resp, sizeof(resp));
-            return (ssize_t)h->size_bytes; // Return immediately for response commands
-        }
-
-        case VIDEOCTL_CMD2_ENQUEUE: {
-            if (h->size_bytes < sizeof(videoctl2_enqueue_t)) return -1;
-            const videoctl2_enqueue_t *req = (const videoctl2_enqueue_t*)buf;
-            if (!fb.addr) return -1;
-            if (!(fb.bpp == 32 || fb.bpp == 16)) return -1;
-
-            uint8_t *dst = (uint8_t*)fb.addr;
-
-            if (req->u.fill.op == VIDEOCTL2_OP_FILL_RECT) {
-                uint32_t x=req->u.fill.x, y=req->u.fill.y, w=req->u.fill.w, hh=req->u.fill.h;
-                if (x>=fb.width || y>=fb.height) break;
-                if (x+w>fb.width) w = fb.width - x;
-                if (y+hh>fb.height) hh = fb.height - y;
-                if (fb.bpp == 32) {
-                    uint32_t color = req->u.fill.argb;
-                    for (uint32_t yy=0; yy<hh; yy++) {
-                        uint32_t *row = (uint32_t*)(dst + (y+yy)*fb.pitch + x*4);
-                        for (uint32_t xx=0; xx<w; xx++) row[xx] = color;
-                    }
-                } else {
-                    uint32_t c32 = req->u.fill.argb;
-                    uint16_t c565 = (uint16_t)(((c32>>19)&0x1F)<<11 | ((c32>>10)&0x3F)<<5 | ((c32>>3)&0x1F));
-                    for (uint32_t yy=0; yy<hh; yy++) {
-                        uint16_t *row = (uint16_t*)(dst + (y+yy)*fb.pitch + x*2);
-                        for (uint32_t xx=0; xx<w; xx++) row[xx] = c565;
-                    }
+                video0_buf_t *slot = video0_alloc_buf_slot(c);
+                if (!slot) {
+                    resp.handle = 0; resp.pitch = 0;
+                    video0_resp_set(c, &resp, sizeof(resp));
+                    break;
                 }
-                video0_dirty_union(c, x, y, w, hh);
-                break;
-            }
 
-            if (req->u.blit.op == VIDEOCTL2_OP_BLIT) {
-                uint32_t sx=req->u.blit.src_x, sy=req->u.blit.src_y;
-                uint32_t dx=req->u.blit.dst_x, dy=req->u.blit.dst_y;
-                uint32_t w=req->u.blit.w, hh=req->u.blit.h;
-                if (sx>=fb.width || sy>=fb.height || dx>=fb.width || dy>=fb.height) break;
-                if (sx+w>fb.width) w = fb.width - sx;
-                if (dx+w>fb.width) w = fb.width - dx;
-                if (sy+hh>fb.height) hh = fb.height - sy;
-                if (dy+hh>fb.height) hh = fb.height - dy;
-                uint32_t bpp = (fb.bpp==32)?4:2;
-                for (uint32_t yy=0; yy<hh; yy++) {
-                    void *srcp = dst + (sy+yy)*fb.pitch + sx*bpp;
-                    void *dstp = dst + (dy+yy)*fb.pitch + dx*bpp;
-                    memmove(dstp, srcp, w*bpp);
+                uint64_t pages = (((uint64_t)resp.size_bytes + 0xFFFULL) >> 12);
+                uint64_t phys  = phys_alloc_contiguous((size_t)pages);
+                if (!phys) {
+                    resp.handle = 0; resp.pitch = 0;
+                    video0_resp_set(c, &resp, sizeof(resp));
+                    break;
                 }
-                video0_dirty_union(c, dx, dy, w, hh);
-                break;
+                void *kptr = phys_to_virt_kernel(phys);
+                if (kptr) memset(kptr, 0, pages * 0x1000ULL);
+
+                uint32_t handle = c->next_handle++;
+                slot->in_use     = 1;
+                slot->handle     = handle;
+                slot->fmt        = resp.fmt;
+                slot->size_bytes = resp.size_bytes;
+                slot->phys_base  = phys;
+                slot->user_addr  = 0;
+
+                uint32_t bpp_bytes = (resp.fmt == MD64API_GRP_FMT_RGB565) ? 2u : 4u;
+                uint32_t pitch     = fb.addr ? fb.width * bpp_bytes : 0u;
+                if (fb.addr && fb.height > 0 && resp.size_bytes == fb.pitch * fb.height)
+                    pitch = fb.pitch;
+                slot->pitch = pitch;
+
+                resp.handle = handle;
+                resp.pitch  = pitch;
+                video0_resp_set(c, &resp, sizeof(resp));
+                return (ssize_t)h->size_bytes;
             }
 
-            if (req->u.blit_buf.op == VIDEOCTL2_OP_BLIT_BUF) {
-                video0_buf_t *b = video0_find_buf(c, req->u.blit_buf.handle);
-                if (!b) break;
-                uint8_t *srcbuf = (uint8_t*)phys_to_virt_kernel(b->phys_base);
-                if (!srcbuf) break;
+            case VIDEOCTL_CMD2_MAP_BUF: {
+                if (offset > 0) return (ssize_t)total_processed;
+                if (h->size_bytes < sizeof(videoctl2_map_buf_t)) return -1;
 
-                uint32_t sx=req->u.blit_buf.src_x, sy=req->u.blit_buf.src_y;
-                uint32_t dx=req->u.blit_buf.dst_x, dy=req->u.blit_buf.dst_y;
-                uint32_t w=req->u.blit_buf.w, hh=req->u.blit_buf.h;
-                uint32_t sp=req->u.blit_buf.src_pitch;
-                uint32_t sf=req->u.blit_buf.src_fmt;
-                if (dx>=fb.width || dy>=fb.height) break;
-                if (dx+w>fb.width) w = fb.width - dx;
-                if (dy+hh>fb.height) hh = fb.height - dy;
+                videoctl2_map_buf_t resp;
+                memcpy(&resp, h, sizeof(resp));   /* ← was: memcpy(&resp, buf, ...) */
 
-                if (fb.bpp == 32 && sf == MD64API_GRP_FMT_XRGB8888) {
-                    for (uint32_t yy = 0; yy < hh; yy++) {
-                        uint32_t *srcrow = (uint32_t*)(srcbuf + (sy+yy)*sp + sx*4);
-                        uint32_t *dstrow = (uint32_t*)(dst + (dy+yy)*fb.pitch + dx*4);
-                        memcpy(dstrow, srcrow, w * 4);
+                video0_buf_t *b = video0_find_buf(c, resp.handle);
+                if (!b) {
+                    resp.user_addr = 0; resp.size_bytes = 0;
+                    resp.pitch = 0;     resp.fmt = 0;
+                    video0_resp_set(c, &resp, sizeof(resp));
+                    break;
+                }
+
+                if (!b->user_addr) {
+                    uint64_t ua = video0_alloc_user_va(b->size_bytes);
+                    if (paging_map_range(ua, b->phys_base, b->size_bytes,
+                                        PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
+                        resp.user_addr = 0; resp.size_bytes = 0;
+                        resp.pitch = 0;     resp.fmt = 0;
+                        video0_resp_set(c, &resp, sizeof(resp));
+                        break;
                     }
-                } else if (fb.bpp == 16 && sf == MD64API_GRP_FMT_XRGB8888) {
-                    /* Convert XRGB8888 source to RGB565 framebuffer. */
-                    for (uint32_t yy = 0; yy < hh; yy++) {
-                        uint32_t *srcrow = (uint32_t*)(srcbuf + (sy+yy)*sp + sx*4);
-                        uint16_t *dstrow = (uint16_t*)(dst + (dy+yy)*fb.pitch + dx*2);
-                        for (uint32_t xx = 0; xx < w; xx++) {
-                            uint32_t p = srcrow[xx];
-                            dstrow[xx] = (uint16_t)(((p>>19)&0x1F)<<11 |
-                                                    ((p>>10)&0x3F)<<5  |
-                                                    ((p>>3) &0x1F));
+                    b->user_addr = ua;
+                }
+
+                resp.user_addr  = b->user_addr;
+                resp.size_bytes = b->size_bytes;
+                resp.pitch      = b->pitch;
+                resp.fmt        = b->fmt;
+                video0_resp_set(c, &resp, sizeof(resp));
+                return (ssize_t)h->size_bytes;
+            }
+
+            /* ---- Fire-and-forget drawing commands (batchable) ---- */
+
+            case VIDEOCTL_CMD2_ENQUEUE: {
+                if (h->size_bytes < sizeof(videoctl2_enqueue_t)) return -1;
+                if (!fb.addr) break;
+                if (!(fb.bpp == 32 || fb.bpp == 16)) break;
+
+                /* ← was: (const videoctl2_enqueue_t*)buf  — WRONG */
+                const videoctl2_enqueue_t *req = (const videoctl2_enqueue_t*)h;
+                uint8_t *dst = (uint8_t*)fb.addr;
+
+                if (req->u.fill.op == VIDEOCTL2_OP_FILL_RECT) {
+                    uint32_t x=req->u.fill.x, y=req->u.fill.y;
+                    uint32_t w=req->u.fill.w, hh=req->u.fill.h;
+                    if (x >= fb.width || y >= fb.height) break;
+                    if (x + w > fb.width)  w  = fb.width  - x;
+                    if (y + hh > fb.height) hh = fb.height - y;
+
+                    if (fb.bpp == 32) {
+                        uint32_t color = req->u.fill.argb;
+                        for (uint32_t yy = 0; yy < hh; yy++) {
+                            uint32_t *row = (uint32_t*)(dst + (y+yy)*fb.pitch + x*4);
+                            for (uint32_t xx = 0; xx < w; xx++) row[xx] = color;
+                        }
+                    } else {
+                        uint32_t c32  = req->u.fill.argb;
+                        uint16_t c565 = (uint16_t)(((c32>>19)&0x1F)<<11 |
+                                                   ((c32>>10)&0x3F)<<5  |
+                                                   ((c32>> 3)&0x1F));
+                        for (uint32_t yy = 0; yy < hh; yy++) {
+                            uint16_t *row = (uint16_t*)(dst + (y+yy)*fb.pitch + x*2);
+                            for (uint32_t xx = 0; xx < w; xx++) row[xx] = c565;
                         }
                     }
-                } else if (fb.bpp == 16 && sf == MD64API_GRP_FMT_RGB565) {
+                    video0_dirty_union(c, x, y, w, hh);
+                    break;
+                }
+
+                if (req->u.blit.op == VIDEOCTL2_OP_BLIT) {
+                    uint32_t sx=req->u.blit.src_x, sy=req->u.blit.src_y;
+                    uint32_t dx=req->u.blit.dst_x, dy=req->u.blit.dst_y;
+                    uint32_t w=req->u.blit.w,      hh=req->u.blit.h;
+                    if (sx>=fb.width||sy>=fb.height||dx>=fb.width||dy>=fb.height) break;
+                    if (sx+w>fb.width)  w  = fb.width  - sx;
+                    if (dx+w>fb.width)  w  = fb.width  - dx;
+                    if (sy+hh>fb.height) hh = fb.height - sy;
+                    if (dy+hh>fb.height) hh = fb.height - dy;
+                    uint32_t bpp = (fb.bpp == 32) ? 4u : 2u;
                     for (uint32_t yy = 0; yy < hh; yy++) {
-                        uint16_t *srcrow = (uint16_t*)(srcbuf + (sy+yy)*sp + sx*2);
-                        uint16_t *dstrow = (uint16_t*)(dst + (dy+yy)*fb.pitch + dx*2);
-                        memcpy(dstrow, srcrow, w * 2);
+                        void *srcp = dst + (sy+yy)*fb.pitch + sx*bpp;
+                        void *dstp = dst + (dy+yy)*fb.pitch + dx*bpp;
+                        memmove(dstp, srcp, w*bpp);
                     }
-                } else if (fb.bpp == 32 && sf == MD64API_GRP_FMT_RGB565) {
-                    /* Upconvert RGB565 source to XRGB8888 framebuffer. */
-                    for (uint32_t yy = 0; yy < hh; yy++) {
-                        uint16_t *srcrow = (uint16_t*)(srcbuf + (sy+yy)*sp + sx*2);
-                        uint32_t *dstrow = (uint32_t*)(dst + (dy+yy)*fb.pitch + dx*4);
-                        for (uint32_t xx = 0; xx < w; xx++) {
-                            uint16_t p = srcrow[xx];
-                            uint32_t r = (p >> 11) & 0x1F; r = (r << 3) | (r >> 2);
-                            uint32_t g = (p >>  5) & 0x3F; g = (g << 2) | (g >> 4);
-                            uint32_t b = (p >>  0) & 0x1F; b = (b << 3) | (b >> 2);
-                            dstrow[xx] = (r << 16) | (g << 8) | b;
+                    video0_dirty_union(c, dx, dy, w, hh);
+                    break;
+                }
+
+                if (req->u.blit_buf.op == VIDEOCTL2_OP_BLIT_BUF) {
+                    video0_buf_t *b = video0_find_buf(c, req->u.blit_buf.handle);
+                    if (!b) break;
+                    uint8_t *srcbuf = (uint8_t*)phys_to_virt_kernel(b->phys_base);
+                    if (!srcbuf) break;
+
+                    uint32_t sx=req->u.blit_buf.src_x, sy=req->u.blit_buf.src_y;
+                    uint32_t dx=req->u.blit_buf.dst_x, dy=req->u.blit_buf.dst_y;
+                    uint32_t w=req->u.blit_buf.w,      hh=req->u.blit_buf.h;
+                    uint32_t sp=req->u.blit_buf.src_pitch;
+                    uint32_t sf=req->u.blit_buf.src_fmt;
+                    if (dx>=fb.width||dy>=fb.height) break;
+                    if (dx+w>fb.width)  w  = fb.width  - dx;
+                    if (dy+hh>fb.height) hh = fb.height - dy;
+
+                    if (fb.bpp==32 && sf==MD64API_GRP_FMT_XRGB8888) {
+                        for (uint32_t yy=0;yy<hh;yy++) {
+                            uint32_t *srcrow=(uint32_t*)(srcbuf+(sy+yy)*sp+sx*4);
+                            uint32_t *dstrow=(uint32_t*)(dst+(dy+yy)*fb.pitch+dx*4);
+                            memcpy(dstrow,srcrow,w*4);
+                        }
+                    } else if (fb.bpp==16 && sf==MD64API_GRP_FMT_XRGB8888) {
+                        for (uint32_t yy=0;yy<hh;yy++) {
+                            uint32_t *srcrow=(uint32_t*)(srcbuf+(sy+yy)*sp+sx*4);
+                            uint16_t *dstrow=(uint16_t*)(dst+(dy+yy)*fb.pitch+dx*2);
+                            for (uint32_t xx=0;xx<w;xx++) {
+                                uint32_t p=srcrow[xx];
+                                dstrow[xx]=(uint16_t)(((p>>19)&0x1F)<<11|
+                                                      ((p>>10)&0x3F)<<5 |
+                                                      ((p>> 3)&0x1F));
+                            }
+                        }
+                    } else if (fb.bpp==16 && sf==MD64API_GRP_FMT_RGB565) {
+                        for (uint32_t yy=0;yy<hh;yy++) {
+                            uint16_t *srcrow=(uint16_t*)(srcbuf+(sy+yy)*sp+sx*2);
+                            uint16_t *dstrow=(uint16_t*)(dst+(dy+yy)*fb.pitch+dx*2);
+                            memcpy(dstrow,srcrow,w*2);
+                        }
+                    } else if (fb.bpp==32 && sf==MD64API_GRP_FMT_RGB565) {
+                        for (uint32_t yy=0;yy<hh;yy++) {
+                            uint16_t *srcrow=(uint16_t*)(srcbuf+(sy+yy)*sp+sx*2);
+                            uint32_t *dstrow=(uint32_t*)(dst+(dy+yy)*fb.pitch+dx*4);
+                            for (uint32_t xx=0;xx<w;xx++) {
+                                uint16_t p=srcrow[xx];
+                                uint32_t r=(p>>11)&0x1F; r=(r<<3)|(r>>2);
+                                uint32_t g=(p>> 5)&0x3F; g=(g<<2)|(g>>4);
+                                uint32_t bv=(p>>0)&0x1F; bv=(bv<<3)|(bv>>2);
+                                dstrow[xx]=(r<<16)|(g<<8)|bv;
+                            }
                         }
                     }
+                    video0_dirty_union(c, dx, dy, w, hh);
+                    break;
                 }
-                video0_dirty_union(c, dx, dy, w, hh);
+
                 break;
             }
 
-            break;
-        }
-
-        case VIDEOCTL_CMD2_FLUSH: {
-            if (!fb.addr) return -1;
-            uint32_t x=0,y=0,w=0,hh=0;
-            if (h->size_bytes >= sizeof(videoctl2_flush_t)) {
-                const videoctl2_flush_t *req = (const videoctl2_flush_t*)buf;
-                x=req->x; y=req->y; w=req->w; hh=req->h;
-            }
-            if (w==0 || hh==0) {
-                if (c->dirty_valid) {
-                    x=c->dirty_x0; y=c->dirty_y0; w=c->dirty_x1 - c->dirty_x0; hh=c->dirty_y1 - c->dirty_y0;
+            case VIDEOCTL_CMD2_FLUSH: {
+                if (!fb.addr) break;
+                uint32_t x=0, y=0, w=0, hh=0;
+                if (h->size_bytes >= sizeof(videoctl2_flush_t)) {
+                    /* ← was: (const videoctl2_flush_t*)buf  — WRONG */
+                    const videoctl2_flush_t *req = (const videoctl2_flush_t*)h;
+                    x=req->x; y=req->y; w=req->w; hh=req->h;
                 }
+                if (w == 0 || hh == 0) {
+                    if (c->dirty_valid) {
+                        x=c->dirty_x0; y=c->dirty_y0;
+                        w=c->dirty_x1 - c->dirty_x0;
+                        hh=c->dirty_y1 - c->dirty_y0;
+                    }
+                }
+                if (w && hh) VGA_FlushRect(x, y, w, hh);
+                c->dirty_valid = 0;
+                break;
             }
-            if (w && hh) VGA_FlushRect(x,y,w,hh);
-            c->dirty_valid = 0;
-            break;
+
+            case VIDEOCTL_CMD2_CURSOR_SET:
+            case VIDEOCTL_CMD2_CURSOR_MOVE:
+            case VIDEOCTL_CMD2_CURSOR_SHOW:
+            case VIDEOCTL_CMD2_MAP_CMDBUF:
+            case VIDEOCTL_CMD2_SUBMIT_CMDBUF:
+                break;
+
+            default:
+                if (total_processed == 0) return -1;
+                return (ssize_t)total_processed;
         }
 
-        case VIDEOCTL_CMD2_CURSOR_SET:
-        case VIDEOCTL_CMD2_CURSOR_MOVE:
-        case VIDEOCTL_CMD2_CURSOR_SHOW:
-            break;
-
-        case VIDEOCTL_CMD2_MAP_CMDBUF:
-        case VIDEOCTL_CMD2_SUBMIT_CMDBUF:
-            break;
-
-        default:
-            // Unknown command, stop processing
-            if (total_processed == 0) return -1;
-            return (ssize_t)total_processed;
+        offset          += h->size_bytes;
+        total_processed += h->size_bytes;
     }
-    
-    // Move to next command
-    offset += h->size_bytes;
-    total_processed += h->size_bytes;
-    }
-    
-    // Return total bytes processed (all commands in the batch)
+
     return (ssize_t)(total_processed > 0 ? total_processed : count);
 }
-
 
 // ------------------------------------------------------------
 // GUI IPC stubs
@@ -1202,11 +1208,3 @@ uint32_t devfs_gui_server_pid(void) {
     // 0 means: no GUI server claimed.
     return 0;
 }
-
-
-
-
-
-
-
-

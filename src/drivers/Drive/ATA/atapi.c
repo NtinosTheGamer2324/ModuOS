@@ -232,3 +232,23 @@ int atapi_read_blocks_pio(int drive_index, uint32_t lba, uint32_t count, void* o
 int atapi_read_sector(int drive_index, uint32_t lba, void* out) {
     return atapi_read_blocks_pio(drive_index, lba, 1, out);
 }
+
+int atapi_has_media(int drive_index) {
+    if (drive_index < 0 || drive_index > 3) return 0;
+
+    uint16_t base, ctrl;
+    uint8_t drive_sel;
+    atapi_get_ports(drive_index, &base, &ctrl, &drive_sel);
+
+    uint8_t packet[12];
+    memset(packet, 0, sizeof(packet));
+    packet[0] = 0x00; /* TEST UNIT READY */
+
+    if (atapi_send_packet(base, ctrl, drive_sel, packet, 0) != 0) return 0;
+
+    /* Single quick poll — no retries, no waiting */
+    if (atapi_poll_status(base, ctrl, 0, 5000) != 0) return 0;
+
+    uint8_t st = inb(base + REG_STATUS);
+    return (st & ATA_SR_ERR) ? 0 : 1;
+}

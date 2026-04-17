@@ -432,10 +432,14 @@ int vdrive_init(void) {
     }
     
     com_write_string(COM1_PORT, "[vDrive] Scanning ATA drives...\n");
-    
+
     for (int i = 0; i < 4; i++) {
         const ata_drive_t *ata_drive = ata_get_drive(i);
         if (ata_drive && ata_drive->exists) {
+            if (ata_drive->is_atapi && !atapi_has_media(i)) {
+                com_printf(COM1_PORT, "[vDrive] ATA drive %d: ATAPI no media, skipping\n", i);
+                continue;
+            }
             int vdrive_id = vdrive_register_ata_drive(i, ata_drive);
             if (vdrive_id >= 0) {
                 com_write_string(COM1_PORT, "[vDrive] Registered ATA drive as vDrive");

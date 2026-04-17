@@ -1,4 +1,5 @@
 #include "moduos/drivers/Drive/ATA/ata.h"
+#include "moduos/drivers/Drive/ATA/atapi.h"
 #include "moduos/kernel/io/io.h"
 #include "moduos/kernel/interrupts/irq.h"
 #include "moduos/kernel/interrupts/pic.h"
