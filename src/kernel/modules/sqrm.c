@@ -19,6 +19,7 @@
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/io/io.h"
 #include "moduos/kernel/spinlock.h"
+#include "moduos/drivers/input/input.h"
 
 static char g_sqrm_current_module_name[64];
 const char *sqrm_get_current_module_name(void) { return g_sqrm_current_module_name; }
@@ -1475,6 +1476,40 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
     // audio registration: audio modules only
     if (desc->type == SQRM_TYPE_AUDIO) {
         out_api->audio_register_pcm = audio_register_pcm;
+
+        /* DMA — HDA/AC97 need physically contiguous ring buffers (CORB/RIRB/BDL) */
+        out_api->dma_alloc = dma_alloc;
+        out_api->dma_free  = dma_free;
+
+        /* Port I/O — raw CF8/CFC PCI scan used by HDA/AC97 */
+        out_api->inb  = inb;
+        out_api->inw  = inw;
+        out_api->inl  = inl;
+        out_api->outb = outb;
+        out_api->outw = outw;
+        out_api->outl = outl;
+
+        /* IRQ — HDA interrupt-driven BDL completion */
+        out_api->irq_install_handler   = irq_install_handler;
+        out_api->irq_uninstall_handler = irq_uninstall_handler;
+        out_api->pic_send_eoi          = pic_send_eoi;
+
+        /* MMIO — HDA BAR0 mapping */
+        out_api->ioremap         = ioremap;
+        out_api->ioremap_guarded = ioremap_guarded;
+
+        /* virt_to_phys — fallback when dma_alloc returns NULL */
+        out_api->virt_to_phys = paging_virt_to_phys;
+
+        /* PCI — controller discovery */
+        out_api->pci_get_device_count    = pci_get_device_count;
+        out_api->pci_get_device          = pci_get_device;
+        out_api->pci_find_device         = pci_find_device;
+        out_api->pci_enable_memory_space  = pci_enable_memory_space;
+        out_api->pci_enable_io_space      = pci_enable_io_space;
+        out_api->pci_enable_bus_mastering = pci_enable_bus_mastering;
+        out_api->pci_cfg_read32           = pci_config_read_dword;
+        out_api->pci_cfg_write32          = pci_config_write_dword;
     }
 
     // SQRM services (exports): available to all modules
@@ -1492,6 +1527,209 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
     out_api->get_smbios_field       = md64api_sqrm_get_smbios_field;
     out_api->phys_total_frames      = phys_total_frames;
     out_api->phys_count_free_frames = phys_count_free_frames;
+}
+
+#define NET_CMD_GET_MODE     1u
+#define NET_CMD_GET_LINK_UP  2u
+#define NET_CMD_GET_MTU      3u
+#define NET_CMD_GET_MAC      4u
+#define NET_CMD_TX_FRAME     5u
+#define NET_CMD_RX_POLL      6u
+
+#define NET_MODE_ETH         1u
+#define NET_MODE_WIFI        2u
+
+typedef struct {
+    uint32_t cmd;
+    uint32_t len;
+    uint8_t  data[1500];
+} sqrm_net_cmd_t;
+
+typedef struct {
+    uint32_t cmd;
+    int32_t  status;
+    uint32_t len;
+    uint8_t  data[1500];
+} sqrm_net_reply_t;
+
+// Stored as node->ctx so open() can access the net api pointer
+typedef struct {
+    sqrm_net_api_v1_t *net;
+} sqrm_net_node_ctx_t;
+
+// Per-open context: one staged reply at a time
+typedef struct {
+    sqrm_net_api_v1_t *net;
+    sqrm_net_reply_t   reply;
+    uint32_t           reply_off;
+    int                reply_ready;
+} sqrm_net_open_ctx_t;
+
+static int g_net_index = 0;
+
+static void* sqrm_net_devfs_open(void *ctx, int flags) {
+    (void)flags;
+    sqrm_net_node_ctx_t *nc = (sqrm_net_node_ctx_t*)ctx;
+    sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t*)kmalloc(sizeof(sqrm_net_open_ctx_t));
+    if (!oc) return NULL;
+    memset(oc, 0, sizeof(*oc));
+    oc->net = nc ? nc->net : NULL;
+    return oc;
+}
+
+static int sqrm_net_devfs_close(void *ctx) {
+    if (ctx) kfree(ctx);
+    return 0;
+}
+
+static ssize_t sqrm_net_devfs_read(void *ctx, void *buf, size_t count) {
+    sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t*)ctx;
+    if (!oc || !buf) return -1;
+    if (!oc->reply_ready) return 0;
+
+    uint32_t total  = (uint32_t)sizeof(sqrm_net_reply_t);
+    uint32_t remain = total - oc->reply_off;
+    uint32_t n      = (remain < (uint32_t)count) ? remain : (uint32_t)count;
+    memcpy(buf, (uint8_t*)&oc->reply + oc->reply_off, n);
+    oc->reply_off += n;
+    if (oc->reply_off >= total) {
+        oc->reply_ready = 0;
+        oc->reply_off   = 0;
+    }
+    return (ssize_t)n;
+}
+
+static ssize_t sqrm_net_devfs_write(void *ctx, const void *buf, size_t count) {
+    sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t*)ctx;
+    if (!oc || !buf || count < sizeof(uint32_t)) return -1;
+
+    sqrm_net_api_v1_t *net = oc->net;
+    if (!net) return -1;
+
+    const sqrm_net_cmd_t *cmd = (const sqrm_net_cmd_t*)buf;
+    sqrm_net_reply_t     *rep = &oc->reply;
+    memset(rep, 0, sizeof(*rep));
+    rep->cmd    = cmd->cmd;
+    rep->status = 0;
+    rep->len    = 0;
+
+    switch (cmd->cmd) {
+
+        case NET_CMD_GET_MODE: {
+            uint32_t mode = NET_MODE_ETH;
+            memcpy(rep->data, &mode, sizeof(mode));
+            rep->len = sizeof(mode);
+            break;
+        }
+
+        case NET_CMD_GET_LINK_UP: {
+            if (!net->get_link_up) { rep->status = -1; break; }
+            uint32_t val = (uint32_t)(net->get_link_up() ? 1 : 0);
+            memcpy(rep->data, &val, sizeof(val));
+            rep->len = sizeof(val);
+            break;
+        }
+
+        case NET_CMD_GET_MTU: {
+            if (!net->get_mtu) { rep->status = -1; break; }
+            uint32_t mtu = 0;
+            net->get_mtu(&mtu);
+            memcpy(rep->data, &mtu, sizeof(mtu));
+            rep->len = sizeof(mtu);
+            break;
+        }
+
+        case NET_CMD_GET_MAC: {
+            if (!net->get_mac) { rep->status = -1; break; }
+            uint8_t mac[6];
+            memset(mac, 0, sizeof(mac));
+            net->get_mac(mac);
+            memcpy(rep->data, mac, 6);
+            rep->len = 6;
+            break;
+        }
+
+        case NET_CMD_TX_FRAME: {
+            if (!net->tx_frame) { rep->status = -1; break; }
+            if (cmd->len == 0 || cmd->len > 1500) { rep->status = -2; break; }
+            rep->status = net->tx_frame(cmd->data, cmd->len);
+            break;
+        }
+
+        case NET_CMD_RX_POLL: {
+            if (!net->rx_poll) { rep->status = -1; break; }
+            size_t got = 0;
+            int rc = net->rx_poll(rep->data, sizeof(rep->data), &got);
+            if (rc != 0) { rep->status = rc; break; }
+            rep->len = (uint32_t)got;
+            if (got > 0 && net->rx_consume) net->rx_consume();
+            break;
+        }
+
+        default:
+            rep->status = -99;
+            break;
+    }
+
+    oc->reply_ready = 1;
+    oc->reply_off   = 0;
+    return (ssize_t)count;
+}
+
+static const devfs_device_ops_t g_sqrm_net_ops = {
+    .name  = "net",
+    .open  = sqrm_net_devfs_open,
+    .read  = sqrm_net_devfs_read,
+    .write = sqrm_net_devfs_write,
+    .close = sqrm_net_devfs_close,
+};
+
+static void sqrm_net_autoregister_devfs(const sqrm_module_desc_t *desc) {
+    size_t api_sz = 0;
+    const sqrm_net_api_v1_t *net = (const sqrm_net_api_v1_t*)sqrm_service_get_impl("net", &api_sz);
+    if (!net || api_sz < sizeof(sqrm_net_api_v1_t)) {
+        com_write_string(COM1_PORT, "[SQRM] NET module did not register 'net' service\n");
+        return;
+    }
+
+    // Allocate permanent node ctx (lives as long as the devfs node)
+    sqrm_net_node_ctx_t *nc = (sqrm_net_node_ctx_t*)kmalloc(sizeof(sqrm_net_node_ctx_t));
+    if (!nc) {
+        com_write_string(COM1_PORT, "[SQRM] NET node ctx alloc failed\n");
+        return;
+    }
+    nc->net = (sqrm_net_api_v1_t*)net;
+
+    // Build canonical name: net0, net1, net2...
+    char name[16];
+    name[0] = 'n'; name[1] = 'e'; name[2] = 't';
+    itoa(g_net_index, name + 3, 10);
+
+    char path[64];
+    path[0] = 0;
+    strcat(path, "net/");
+    strcat(path, name);
+
+    devfs_owner_t owner = { .kind = DEVFS_OWNER_SQRM, .id = "sqrm-net" };
+    int rc = devfs_register_path(path, &g_sqrm_net_ops, nc, owner);
+    if (rc != 0) {
+        kfree(nc);
+        com_write_string(COM1_PORT, "[SQRM] NET devfs register failed (rc=");
+        char rcbuf[12];
+        itoa(rc, rcbuf, 10);
+        com_write_string(COM1_PORT, rcbuf);
+        com_write_string(COM1_PORT, "): ");
+        com_write_string(COM1_PORT, path);
+        com_write_string(COM1_PORT, "\n");
+        return;
+    }
+
+    g_net_index++;
+    com_write_string(COM1_PORT, "[SQRM] NET devfs node: ");
+    com_write_string(COM1_PORT, path);
+    com_write_string(COM1_PORT, " (driver: ");
+    com_write_string(COM1_PORT, desc->name);
+    com_write_string(COM1_PORT, ")\n");
 }
 
 static int sqrm_load_one(const char *path, const char *basename, const sqrm_kernel_api_t *unused_api,
@@ -1990,7 +2228,7 @@ static int sqrm_load_one(const char *path, const char *basename, const sqrm_kern
     com_write_string(COM1_PORT, desc.name);
     com_write_string(COM1_PORT, "\n");
 
-    int rc = init(mod_api);
+int rc = init(mod_api);
 
     com_write_string(COM1_PORT, "[SQRM] init returned: ");
     char tmp[32];
@@ -1998,13 +2236,15 @@ static int sqrm_load_one(const char *path, const char *basename, const sqrm_kern
     com_write_string(COM1_PORT, tmp);
     com_write_string(COM1_PORT, "\n");
 
-    // If init failed, roll back and free image.
     if (rc != 0) {
-        // don't increment g_loaded_count; free resources
         kfree(image);
         kfree(buf);
         memset(&g_loaded[slot_idx], 0, sizeof(g_loaded[slot_idx]));
         return rc;
+    }
+
+    if (desc.type == SQRM_TYPE_NET) {
+        sqrm_net_autoregister_devfs(&desc);
     }
 
     // Commit loaded entry.

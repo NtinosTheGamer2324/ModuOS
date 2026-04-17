@@ -239,9 +239,6 @@ static void panic_draw_gui(const char* title, const char* message, const char* t
     code_line[pos] = '\0';
 
     fb_draw_text(&fb, card_x + 28, card_y + card_h - 140, code_line, fg2, 1, card_w - 56);
-    fb_draw_text(&fb, card_x + 28, card_y + card_h - 110,
-                 "If this issue repeats, please contact customer support at support.new-tech.com", fg2, 1, card_w - 56);
-
     /* Safely build reboot message */
     char reboot_line[128];
     pos = 0;
@@ -302,15 +299,17 @@ void panic(const char* title, const char* message, const char* tips, const char*
     for (;;) { __asm__("hlt"); }
 }
 
+// Zenith4 deprecated, this is now just for init.
 void trigger_no_shell_panic() {
     panic(
-        "Zenith4 has stopped responding",
-        "The system cannot continue without the shell running.\n"
+        "init process has stopped responding",
+        "The system cannot continue without the init process running.\n"
         "This may be due to memory corruption.",
         " - Check if your RAM is properly connected and not loose.\n"
-        " - Try a different RAM stick.",
+        " - Try a different RAM stick.\n"
+        " - If using automan, check what automan version you are using.",
         "SYS_PROCESS",
-        "ZENITH4_NOT_RUNNING",
+        "INIT_PROCESS_NOT_RUNNING",
         6
     );
 }

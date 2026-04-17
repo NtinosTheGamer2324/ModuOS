@@ -1,3 +1,6 @@
+// kheap.c - Kernel heap allocator
+// SPDX-License-Identifier: GPL-2.0-only
+
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/string.h"
@@ -8,16 +11,10 @@
 #include <stddef.h>
 
 /* --- CONFIGURATION --- */
-#define KHEAP_START 0xFFFF800000000000ULL
-#define KHEAP_MAX   (KHEAP_START + (32 * 1024 * 1024ULL)) /* 32 MiB heap */
+#define KHEAP_START      0xFFFF800000000000ULL
+#define KHEAP_MAX        (KHEAP_START + (32ULL * 1024 * 1024))
 #define KHEAP_PAGE_FLAGS (PFLAG_PRESENT | PFLAG_WRITABLE)
-/* Heap debug verbosity:
- * 0: off
- * 1: lightweight (keep existing useful checks)
- * 2: very verbose (can destroy performance; enable only when needed)
- *
- * Tied to FBCON_DEBUG so normal debug builds (FBCON_DEBUG=1) don't spam.
- */
+
 #if defined(FBCON_DEBUG) && (FBCON_DEBUG >= 2)
 #  define KHEAP_DEBUG 2
 #else
@@ -28,17 +25,17 @@
 #error "PAGE_SIZE must be defined"
 #endif
 
-#define ALLOC_MAGIC   0x4E54534654574152ULL  // NTSFTWAR aka NTSoftware aka New Technologies Software
-#define FREED_MAGIC   0x46524545444D4147ULL  // FREEDMAG (diagnostic only)
-#define ALIGNED_MAGIC 0x414C49474E45444DULL  // ALIGNEDM (prefix for kmalloc_aligned)
+#define ALLOC_MAGIC   0x4E54534654574152ULL
+#define FREED_MAGIC   0x46524545444D4147ULL
+#define ALIGNED_MAGIC 0x414C49474E45444DULL
 #define MAX_FREE_NODES 256
 
 /* --- STRUCTURES --- */
 struct alloc_header {
-    uint64_t magic;      
-    uint64_t size;       
-    uint64_t pages;      
-    uint64_t phys_base;  
+    uint64_t magic;
+    uint64_t size;
+    uint64_t pages;
+    uint64_t phys_base;
 };
 
 struct free_node {
@@ -48,67 +45,29 @@ struct free_node {
     int used;
 };
 
-/* Prefix stored immediately before an aligned pointer returned by kmalloc_aligned().
- * This allows kfree() to recover the original kmalloc() pointer.
- */
 struct aligned_prefix {
     uint64_t magic;
-    void *raw;
+    void    *raw;
 };
 
-static struct free_node free_nodes_pool[MAX_FREE_NODES];
+static struct free_node  free_nodes_pool[MAX_FREE_NODES];
 static struct free_node *free_list = NULL;
 
-/* forward decls (used by early helpers like kheap_check_cycle) */
-static void uint64_to_hex(uint64_t v, char *buf, size_t buf_len);
-
-/* SMP-safe heap lock using spinlock */
-/* Cache-line aligned to prevent false sharing */
-static spinlock_t kheap_spinlock __attribute__((aligned(64)));
-
-/* NOTE: kheap_init() MUST be called during boot before any kmalloc() */
-
-static inline void kheap_lock(void) {
-    spinlock_lock(&kheap_spinlock);
-}
-
-static inline void kheap_unlock(void) {
-    spinlock_unlock(&kheap_spinlock);
-}
-
-#define KHEAP_UNLOCK_AND_RETURN() do { kheap_unlock(); return; } while (0)
-#define KHEAP_UNLOCK_AND_RETURN_VAL(v) do { kheap_unlock(); return (v); } while (0)
-
-static void kheap_check_cycle(void) {
-    /* Floyd cycle detection on free_list */
-    struct free_node *slow = free_list;
-    struct free_node *fast = free_list;
-    while (fast && fast->next) {
-        slow = slow->next;
-        fast = fast->next->next;
-        if (slow == fast) {
-            com_write_string(COM1_PORT, "[KHEAP] FATAL: free_list cycle detected at node=\n");
-            char hb[32]; uint64_to_hex((uint64_t)(uintptr_t)slow, hb, sizeof(hb));
-            com_write_string(COM1_PORT, hb);
-            com_write_string(COM1_PORT, "\n");
-            for (;;) { __asm__ volatile("cli; hlt"); }
-        }
-    }
-}
-
-static uint64_t heap_alloc_next = KHEAP_START;
+static uint64_t heap_alloc_next   = KHEAP_START;
 static uint64_t total_allocations = 0;
 static uint64_t failed_allocations = 0;
+
+static spinlock_t kheap_spinlock __attribute__((aligned(64)));
 
 /* --- INTERNAL HELPERS --- */
 
 static void uint64_to_dec(uint64_t v, char *buf, size_t buf_len) {
     if (buf_len == 0) return;
-    if (v == 0) { buf[0] = '0'; buf[1] = 0; return; }
+    if (v == 0) { if (buf_len >= 2) { buf[0] = '0'; buf[1] = 0; } return; }
     char tmp[32]; int pos = 0;
     while (v > 0 && pos < (int)sizeof(tmp)) { tmp[pos++] = '0' + (v % 10); v /= 10; }
     int out = 0;
-    while (pos > 0 && out + 1 < (int)buf_len) { buf[out++] = tmp[--pos]; }
+    while (pos > 0 && out + 1 < (int)buf_len) buf[out++] = tmp[--pos];
     buf[out] = 0;
 }
 
@@ -133,23 +92,7 @@ static void log_oom(size_t requested_size, const char *reason) {
     failed_allocations++;
 }
 
-/* Verbose debug helper */
-static void debug_log(const char *msg, uint64_t val, int is_hex) {
-#if (KHEAP_DEBUG >= 2)
-    char buf[32];
-    // KHEAP debug spam can stall the system under QEMU; only print at very verbose level.
-    if (kernel_debug_get_level() >= KDBG_ON) {
-        com_write_string(COM1_PORT, "[KHEAP DEBUG] ");
-        com_write_string(COM1_PORT, msg);
-        if (is_hex) uint64_to_hex(val, buf, sizeof(buf));
-        else uint64_to_dec(val, buf, sizeof(buf));
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, "\n");
-    }
-#endif
-}
-
-/* --- NODE MANAGEMENT --- */
+/* --- FREE LIST MANAGEMENT --- */
 
 static struct free_node *alloc_free_node(void) {
     for (size_t i = 0; i < MAX_FREE_NODES; ++i) {
@@ -158,42 +101,71 @@ static struct free_node *alloc_free_node(void) {
             return &free_nodes_pool[i];
         }
     }
-    return NULL; 
+    return NULL;
+}
+
+/*
+ * Cycle detection on free_list using Floyd's algorithm.
+ * Halts with a diagnostic if a cycle is found — this should never happen
+ * in correct operation; it indicates a double-free or memory corruption.
+ */
+static void kheap_check_cycle(void) {
+    struct free_node *slow = free_list;
+    struct free_node *fast = free_list;
+    while (fast && fast->next) {
+        slow = slow->next;
+        fast = fast->next->next;
+        if (slow == fast) {
+            com_write_string(COM1_PORT, "[KHEAP] FATAL: free_list cycle at node=");
+            char hb[32]; uint64_to_hex((uint64_t)(uintptr_t)slow, hb, sizeof(hb));
+            com_write_string(COM1_PORT, hb);
+            com_write_string(COM1_PORT, "\n");
+            for (;;) __asm__ volatile("cli; hlt");
+        }
+    }
 }
 
 static void insert_and_coalesce(uint64_t virt, uint64_t pages) {
     kheap_check_cycle();
-
     if (pages == 0) return;
-    if (!free_list) {
-        struct free_node *n = alloc_free_node();
-        if (!n) { com_write_string(COM1_PORT, "[KHEAP] ERR: Free pool empty\n"); return; }
-        n->virt = virt; n->pages = pages; n->next = NULL;
-        free_list = n; return;
-    }
-    struct free_node *prev = NULL; struct free_node *cur = free_list;
+
+    /* Find insertion point (sorted by address). */
+    struct free_node *prev = NULL;
+    struct free_node *cur  = free_list;
     while (cur && cur->virt < virt) { prev = cur; cur = cur->next; }
+
+    /* Try to merge with predecessor. */
     if (prev && (prev->virt + prev->pages * PAGE_SIZE == virt)) {
         prev->pages += pages;
+        /* Try to also merge with successor. */
         if (cur && (prev->virt + prev->pages * PAGE_SIZE == cur->virt)) {
-            prev->pages += cur->pages; prev->next = cur->next;
-            cur->used = 0;
+            prev->pages += cur->pages;
+            prev->next   = cur->next;
+            cur->used    = 0;
         }
         return;
     }
+
+    /* Try to merge with successor only. */
     if (cur && (virt + pages * PAGE_SIZE == cur->virt)) {
-        cur->virt = virt; cur->pages += pages; return;
+        cur->virt   = virt;
+        cur->pages += pages;
+        return;
     }
+
+    /* No merge possible — allocate a new node. */
     struct free_node *n = alloc_free_node();
-    if (!n) { com_write_string(COM1_PORT, "[KHEAP] ERR: Free pool empty\n"); return; }
-    n->virt = virt; n->pages = pages; n->next = cur;
+    if (!n) { com_write_string(COM1_PORT, "[KHEAP] ERR: free node pool exhausted\n"); return; }
+    n->virt  = virt;
+    n->pages = pages;
+    n->next  = cur;
     if (prev) prev->next = n; else free_list = n;
 }
 
 static uint64_t find_and_remove_free_block(uint64_t pages) {
     kheap_check_cycle();
-
-    struct free_node *prev = NULL; struct free_node *cur = free_list;
+    struct free_node *prev = NULL;
+    struct free_node *cur  = free_list;
     while (cur) {
         if (cur->pages >= pages) {
             uint64_t v = cur->virt;
@@ -201,7 +173,8 @@ static uint64_t find_and_remove_free_block(uint64_t pages) {
                 if (prev) prev->next = cur->next; else free_list = cur->next;
                 cur->used = 0;
             } else {
-                cur->virt += pages * PAGE_SIZE; cur->pages -= pages;
+                cur->virt  += pages * PAGE_SIZE;
+                cur->pages -= pages;
             }
             return v;
         }
@@ -212,251 +185,249 @@ static uint64_t find_and_remove_free_block(uint64_t pages) {
 
 /* --- PUBLIC API --- */
 
+void kheap_init(void) {
+    spinlock_init(&kheap_spinlock);
+}
+
 void *kmalloc(size_t size) {
-    kheap_lock();
-    if (size == 0) KHEAP_UNLOCK_AND_RETURN_VAL(NULL);
-    size_t total_size = size + sizeof(struct alloc_header);
-    uint64_t pages = (total_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (size == 0) return NULL;
 
-    debug_log("Allocating pages: ", pages, 0);
+    spinlock_lock(&kheap_spinlock);
 
-    uint64_t virt = find_and_remove_free_block(pages);
-    int used_from_bump = 0;
+    size_t   total_size = size + sizeof(struct alloc_header);
+    uint64_t pages      = (total_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    /* Debug: log allocation source */
-    if (virt) {
-        debug_log("[KHEAP] alloc source=freelist virt=", virt, 1);
-    }
+    /* Try freelist first, then bump allocator. */
+    uint64_t virt         = find_and_remove_free_block(pages);
+    int      used_bump    = 0;
 
     if (!virt) {
         if (heap_alloc_next + pages * PAGE_SIZE > KHEAP_MAX) {
-            log_oom(size, "Virtual limit reached"); kheap_unlock(); return NULL;
+            log_oom(size, "virtual address space exhausted");
+            spinlock_unlock(&kheap_spinlock);
+            return NULL;
         }
-        debug_log("[KHEAP] bump before heap_alloc_next=", heap_alloc_next, 1);
-        virt = heap_alloc_next;
+        virt            = heap_alloc_next;
         heap_alloc_next += pages * PAGE_SIZE;
-        debug_log("[KHEAP] bump after  heap_alloc_next=", heap_alloc_next, 1);
-        used_from_bump = 1;
+        used_bump        = 1;
     }
 
+    /* Check physical memory availability before allocating. */
     if (phys_count_free_frames() < pages) {
-        if (used_from_bump) heap_alloc_next -= pages * PAGE_SIZE;
-        else insert_and_coalesce(virt, pages);
-        log_oom(size, "Phys memory low"); kheap_unlock(); return NULL;
+        if (used_bump) heap_alloc_next -= pages * PAGE_SIZE;
+        else           insert_and_coalesce(virt, pages);
+        log_oom(size, "insufficient physical frames");
+        spinlock_unlock(&kheap_spinlock);
+        return NULL;
     }
 
-#if (KHEAP_DEBUG >= 2)
-    com_write_string(COM1_PORT, "[KHEAP] Alloc phys contiguous pages=");
-    {
-        char tmp[32]; uint64_to_dec(pages, tmp, sizeof(tmp)); com_write_string(COM1_PORT, tmp);
-        com_write_string(COM1_PORT, "\n");
-    }
-#endif
     uint64_t phys = phys_alloc_contiguous(pages);
-#if (KHEAP_DEBUG >= 2)
-    com_write_string(COM1_PORT, "[KHEAP] phys_base=");
-    com_printf(COM1_PORT, "0x%08x%08x\n", (uint32_t)(phys >> 32), (uint32_t)(phys & 0xFFFFFFFFu));
-#endif
-    if (!phys) { 
-        if (used_from_bump) heap_alloc_next -= pages * PAGE_SIZE;
-        else insert_and_coalesce(virt, pages);
-        log_oom(size, "Phys fragmentation"); kheap_unlock(); return NULL;
+    if (!phys) {
+        if (used_bump) heap_alloc_next -= pages * PAGE_SIZE;
+        else           insert_and_coalesce(virt, pages);
+        log_oom(size, "physical allocator fragmentation");
+        spinlock_unlock(&kheap_spinlock);
+        return NULL;
     }
 
-#if (KHEAP_DEBUG >= 2)
-    com_write_string(COM1_PORT, "[KHEAP] paging_map_range virt=");
-    com_printf(COM1_PORT, "0x%08x%08x size=0x%x\n", (uint32_t)(virt >> 32), (uint32_t)(virt & 0xFFFFFFFFu), (uint32_t)(pages * PAGE_SIZE));
-#endif
-    if (paging_map_range(virt, phys, pages * PAGE_SIZE, KHEAP_PAGE_FLAGS) != 0) {
-        for (uint64_t i = 0; i < pages; ++i) phys_ref_dec(phys + i * PAGE_SIZE);
-        if (used_from_bump) heap_alloc_next -= pages * PAGE_SIZE;
-        else insert_and_coalesce(virt, pages);
-        log_oom(size, "Paging failure"); kheap_unlock(); return NULL;
-    }
-
-    /* Debug: verify every mapped heap page is present AND maps to the expected physical page.
-     * If this fails, paging structures are being corrupted or reused.
+    /*
+     * Map into the master kernel CR3, not whichever CR3 happens to be
+     * loaded (may be a process CR3 during fork/exec).  After mapping,
+     * mirror the updated high-half PML4 slots back into the current CR3
+     * so the new pages are immediately accessible.
      */
-    for (uint64_t i = 0; i < pages; ++i) {
-        uint64_t vaddr = virt + i * PAGE_SIZE;
-        uint64_t expected = phys + i * PAGE_SIZE;
-        uint64_t pa = paging_virt_to_phys(vaddr);
-        if (pa == 0) {
-            com_write_string(COM1_PORT, "[KHEAP] FATAL: paging_map_range reported success but page is not present. vaddr=");
-            char hb[32]; uint64_to_hex(vaddr, hb, sizeof(hb));
-            com_write_string(COM1_PORT, hb);
-            com_write_string(COM1_PORT, "\n");
-            for (;;) { __asm__ volatile("cli; hlt"); }
+    {
+        uint64_t cur_cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cur_cr3));
+        cur_cr3 &= 0xFFFFFFFFFFFFF000ULL;
+
+        uint64_t master_cr3 = paging_get_master_cr3() & 0xFFFFFFFFFFFFF000ULL;
+        int switched = (master_cr3 && cur_cr3 != master_cr3);
+
+        if (switched)
+            __asm__ volatile("mov %0, %%cr3" :: "r"(master_cr3) : "memory");
+
+        int map_rc = paging_map_range(virt, phys, pages * PAGE_SIZE, KHEAP_PAGE_FLAGS);
+
+        if (switched) {
+            __asm__ volatile("mov %0, %%cr3" :: "r"(cur_cr3) : "memory");
+            uint64_t *master_pml4 = (uint64_t *)phys_to_virt_kernel(master_cr3);
+            uint64_t *cur_pml4    = (uint64_t *)phys_to_virt_kernel(cur_cr3);
+            if (master_pml4 && cur_pml4) {
+                for (int i = 256; i < 512; i++) cur_pml4[i] = master_pml4[i];
+                __asm__ volatile("mov %0, %%cr3" :: "r"(cur_cr3) : "memory");
+            }
         }
-        if ((pa & ~0xFFFULL) != (expected & ~0xFFFULL)) {
-            com_write_string(COM1_PORT, "[KHEAP] FATAL: heap mapping mismatch vaddr=");
-            char hb[32]; uint64_to_hex(vaddr, hb, sizeof(hb));
-            com_write_string(COM1_PORT, hb);
-            com_write_string(COM1_PORT, " expected_phys=");
-            uint64_to_hex(expected, hb, sizeof(hb));
-            com_write_string(COM1_PORT, hb);
-            com_write_string(COM1_PORT, " got_phys=");
-            uint64_to_hex(pa, hb, sizeof(hb));
+
+        if (map_rc != 0) {
+            for (uint64_t i = 0; i < pages; i++) phys_ref_dec(phys + i * PAGE_SIZE);
+            if (used_bump) heap_alloc_next -= pages * PAGE_SIZE;
+            else           insert_and_coalesce(virt, pages);
+            log_oom(size, "paging_map_range failed");
+            spinlock_unlock(&kheap_spinlock);
+            return NULL;
+        }
+    }
+
+    /* Verify every page is present and maps to the expected physical address. */
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t vaddr    = virt + i * PAGE_SIZE;
+        uint64_t expected = phys + i * PAGE_SIZE;
+        uint64_t pa       = paging_virt_to_phys(vaddr);
+        if (pa == 0 || (pa & ~0xFFFULL) != (expected & ~0xFFFULL)) {
+            char hb[32];
+            com_write_string(COM1_PORT,
+                pa == 0 ? "[KHEAP] FATAL: mapped page not present vaddr="
+                        : "[KHEAP] FATAL: mapped page phys mismatch vaddr=");
+            uint64_to_hex(vaddr, hb, sizeof(hb));
             com_write_string(COM1_PORT, hb);
             com_write_string(COM1_PORT, "\n");
-            for (;;) { __asm__ volatile("cli; hlt"); }
+            for (;;) __asm__ volatile("cli; hlt");
         }
     }
 
     __asm__ volatile("mov %%cr3, %%rax\n\tmov %%rax, %%cr3" ::: "rax", "memory");
 
-#if (KHEAP_DEBUG >= 2)
-    com_write_string(COM1_PORT, "[KHEAP] writing header at virt=");
-    com_printf(COM1_PORT, "0x%08x%08x\n", (uint32_t)(virt >> 32), (uint32_t)(virt & 0xFFFFFFFFu));
-#endif
     struct alloc_header *hdr = (struct alloc_header *)(uintptr_t)virt;
-    hdr->magic = ALLOC_MAGIC; hdr->size = size; hdr->pages = pages; hdr->phys_base = phys;
+    hdr->magic     = ALLOC_MAGIC;
+    hdr->size      = size;
+    hdr->pages     = pages;
+    hdr->phys_base = phys;
 
     total_allocations++;
-    debug_log("KMALLOC SUCCESS: ", (uint64_t)virt, 1);
-    void *ret = (void *)((uintptr_t)virt + sizeof(struct alloc_header));
-    kheap_unlock();
-    return ret;
+    spinlock_unlock(&kheap_spinlock);
+    return (void *)((uintptr_t)virt + sizeof(struct alloc_header));
 }
 
 void kfree(void *ptr) {
-    kheap_lock();
-    if (!ptr) KHEAP_UNLOCK_AND_RETURN();
+    if (!ptr) return;
 
     uint64_t p = (uint64_t)(uintptr_t)ptr;
 
-    /* Basic range check: we only support freeing kernel heap pointers. */
     if (p < KHEAP_START || p >= KHEAP_MAX) {
-        com_write_string(COM1_PORT, "[KHEAP] WARNING: kfree on non-heap ptr=");
+        com_write_string(COM1_PORT, "[KHEAP] WARNING: kfree on non-heap pointer=");
         char pb[32]; uint64_to_hex(p, pb, sizeof(pb));
         com_write_string(COM1_PORT, pb);
         com_write_string(COM1_PORT, "\n");
-        KHEAP_UNLOCK_AND_RETURN();
+        return;
     }
 
-    /* Handle kmalloc_aligned() pointers first.
-     * The aligned prefix lives immediately before the pointer.
-     * 
-     * Must unlock before recursive kfree to avoid deadlock!
+    /*
+     * Check for aligned_prefix BEFORE checking the alloc_header.
+     * The prefix sits immediately before the aligned pointer; the header
+     * sits before the raw pointer stored inside the prefix.
+     *
+     * Guard: only inspect the prefix if the address is within the heap
+     * and the page is mapped.
      */
     {
         uint64_t prefix_addr = p - sizeof(struct aligned_prefix);
-        if (prefix_addr >= KHEAP_START) {
-            if (paging_virt_to_phys(prefix_addr) != 0) {
-                struct aligned_prefix *ap = (struct aligned_prefix *)(uintptr_t)prefix_addr;
-                if (ap->magic == ALIGNED_MAGIC && ap->raw) {
-                    void *raw = ap->raw;
-                    ap->magic = 0;
-                    ap->raw = NULL;
-                    kheap_unlock();  /* UNLOCK before recursive call! */
-                    kfree(raw);      /* This will reacquire the lock */
-                    return;
-                }
+        if (prefix_addr >= KHEAP_START && paging_virt_to_phys(prefix_addr) != 0) {
+            struct aligned_prefix *ap =
+                (struct aligned_prefix *)(uintptr_t)prefix_addr;
+            if (ap->magic == ALIGNED_MAGIC && ap->raw != NULL) {
+                void *raw = ap->raw;
+                /* Poison the prefix so a double-free is detectable. */
+                ap->magic = 0;
+                ap->raw   = NULL;
+                kfree(raw);   /* recurses once to free the underlying allocation */
+                return;
             }
         }
     }
 
-    /* Normal kmalloc() pointer: header is located immediately before returned pointer. */
     uint64_t hdr_addr = p - sizeof(struct alloc_header);
     if (hdr_addr < KHEAP_START) {
-        com_write_string(COM1_PORT, "[KHEAP] WARNING: kfree ptr underflow ptr=");
-        char pb[32]; uint64_to_hex(p, pb, sizeof(pb));
-        com_write_string(COM1_PORT, pb);
-        com_write_string(COM1_PORT, "\n");
-        KHEAP_UNLOCK_AND_RETURN();
+        com_write_string(COM1_PORT, "[KHEAP] WARNING: kfree pointer underflow\n");
+        return;
     }
 
-    /* If the header page is not mapped, this is almost certainly a double-free
-     * (we unmap on free) or an invalid pointer.
-     */
     if (paging_virt_to_phys(hdr_addr) == 0) {
-        com_write_string(COM1_PORT, "[KHEAP] WARNING: kfree on unmapped header (double free?) ptr=");
-        char pb[32]; uint64_to_hex(p, pb, sizeof(pb));
-        com_write_string(COM1_PORT, pb);
-        com_write_string(COM1_PORT, " hdr=");
-        char hb[32]; uint64_to_hex(hdr_addr, hb, sizeof(hb));
-        com_write_string(COM1_PORT, hb);
-        com_write_string(COM1_PORT, "\n");
-        KHEAP_UNLOCK_AND_RETURN();
+        com_write_string(COM1_PORT, "[KHEAP] WARNING: kfree on unmapped header (double free?)\n");
+        return;
     }
 
     struct alloc_header *hdr = (struct alloc_header *)(uintptr_t)hdr_addr;
 
-#if (KHEAP_DEBUG >= 2)
-    /* Debug: log frees (helps detect unexpected frees/double frees) */
-    {
-        char hb[32]; uint64_to_hex((uint64_t)(uintptr_t)hdr, hb, sizeof(hb));
-        com_write_string(COM1_PORT, "[KHEAP] kfree ptr=");
-        char pb[32]; uint64_to_hex((uint64_t)(uintptr_t)ptr, pb, sizeof(pb));
+    if (hdr->magic == FREED_MAGIC) {
+        com_write_string(COM1_PORT, "[KHEAP] WARNING: double free detected ptr=");
+        char pb[32]; uint64_to_hex(p, pb, sizeof(pb));
         com_write_string(COM1_PORT, pb);
-        com_write_string(COM1_PORT, " hdr=");
-        com_write_string(COM1_PORT, hb);
         com_write_string(COM1_PORT, "\n");
+        return;
     }
-#endif
 
     if (hdr->magic != ALLOC_MAGIC) {
-        /* If it was already freed, avoid touching more state. */
-        if (hdr->magic == FREED_MAGIC) {
-            com_write_string(COM1_PORT, "[KHEAP] WARNING: double free ptr=");
-            char pb[32]; uint64_to_hex(p, pb, sizeof(pb));
-            com_write_string(COM1_PORT, pb);
-            com_write_string(COM1_PORT, "\n");
-            KHEAP_UNLOCK_AND_RETURN();
-        }
-
-        com_write_string(COM1_PORT, "[KHEAP] WARNING: Corrupt/Invalid Free! magic=");
+        com_write_string(COM1_PORT, "[KHEAP] WARNING: corrupt/invalid free magic=");
         char mb[32]; uint64_to_hex(hdr->magic, mb, sizeof(mb));
         com_write_string(COM1_PORT, mb);
         com_write_string(COM1_PORT, "\n");
-        KHEAP_UNLOCK_AND_RETURN();
+        return;
     }
 
-#if (KHEAP_DEBUG >= 2)
-    com_printf(COM1_PORT, "[KHEAP]   size=%u pages=%u phys_base=0x%08x%08x\n",
-               (uint32_t)hdr->size, (uint32_t)hdr->pages,
-               (uint32_t)(hdr->phys_base >> 32), (uint32_t)(hdr->phys_base & 0xFFFFFFFFu));
-#endif
+    spinlock_lock(&kheap_spinlock);
 
     uint64_t phys_base = hdr->phys_base;
-    uint64_t pages = hdr->pages;
-    uint64_t virt = (uint64_t)(uintptr_t)hdr;
+    uint64_t pages     = hdr->pages;
+    uint64_t virt      = (uint64_t)(uintptr_t)hdr;
 
+    /* Poison the header so use-after-free is detectable. */
     hdr->magic = FREED_MAGIC;
 
     for (uint64_t i = 0; i < pages; i++) phys_ref_dec(phys_base + i * PAGE_SIZE);
-    for (uint64_t i = 0; i < pages; i++) paging_unmap_page(virt + i * PAGE_SIZE);
+
+    /* Unmap from master CR3, then mirror back into the current CR3. */
+    {
+        uint64_t cur_cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cur_cr3));
+        cur_cr3 &= 0xFFFFFFFFFFFFF000ULL;
+
+        uint64_t master_cr3 = paging_get_master_cr3() & 0xFFFFFFFFFFFFF000ULL;
+        int switched = (master_cr3 && cur_cr3 != master_cr3);
+
+        if (switched)
+            __asm__ volatile("mov %0, %%cr3" :: "r"(master_cr3) : "memory");
+
+        for (uint64_t i = 0; i < pages; i++)
+            paging_unmap_page(virt + i * PAGE_SIZE);
+
+        if (switched) {
+            __asm__ volatile("mov %0, %%cr3" :: "r"(cur_cr3) : "memory");
+            uint64_t *master_pml4 = (uint64_t *)phys_to_virt_kernel(master_cr3);
+            uint64_t *cur_pml4    = (uint64_t *)phys_to_virt_kernel(cur_cr3);
+            if (master_pml4 && cur_pml4) {
+                for (int i = 256; i < 512; i++) cur_pml4[i] = master_pml4[i];
+                __asm__ volatile("mov %0, %%cr3" :: "r"(cur_cr3) : "memory");
+            }
+        }
+    }
+
     insert_and_coalesce(virt, pages);
-    kheap_unlock();
-}
-
-
-/* Initialize kernel heap - MUST be called during boot */
-void kheap_init(void) {
-    spinlock_init(&kheap_spinlock);
+    spinlock_unlock(&kheap_spinlock);
 }
 
 void *kmalloc_aligned(size_t size, size_t alignment) {
-    if (size == 0) return NULL;
-    if (alignment < sizeof(void *)) alignment = sizeof(void *);
-    /* Require power-of-two alignment for the bitmask rounding. */
-    if ((alignment & (alignment - 1)) != 0) {
-        /* Round up to next power-of-two (conservative). */
+    if (size == 0)                        return NULL;
+    if (alignment < sizeof(void *))       alignment = sizeof(void *);
+    if (alignment & (alignment - 1)) {
+        /* Round up to next power of two. */
         size_t a = sizeof(void *);
         while (a < alignment) a <<= 1;
         alignment = a;
     }
 
     size_t extra = (alignment - 1) + sizeof(struct aligned_prefix);
-    void *raw = kmalloc(size + extra);
+    void  *raw   = kmalloc(size + extra);
     if (!raw) return NULL;
 
-    uintptr_t base = (uintptr_t)raw;
-    uintptr_t aligned = (base + sizeof(struct aligned_prefix) + (alignment - 1)) & ~(uintptr_t)(alignment - 1);
+    uintptr_t base    = (uintptr_t)raw;
+    uintptr_t aligned = (base + sizeof(struct aligned_prefix) + (alignment - 1))
+                        & ~(uintptr_t)(alignment - 1);
 
-    struct aligned_prefix *ap = (struct aligned_prefix *)(aligned - sizeof(struct aligned_prefix));
+    struct aligned_prefix *ap =
+        (struct aligned_prefix *)(aligned - sizeof(struct aligned_prefix));
     ap->magic = ALIGNED_MAGIC;
-    ap->raw = raw;
+    ap->raw   = raw;
 
     return (void *)aligned;
 }
@@ -470,7 +441,11 @@ void *kzalloc(size_t size) {
 void kheap_stats(void) {
     char buf[32];
     com_write_string(COM1_PORT, "\n--- KHEAP STATS ---\n");
-    com_write_string(COM1_PORT, "Allocs: "); uint64_to_dec(total_allocations, buf, sizeof(buf)); com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, " | OOM: "); uint64_to_dec(failed_allocations, buf, sizeof(buf)); com_write_string(COM1_PORT, buf);
+    com_write_string(COM1_PORT, "Allocs: ");
+    uint64_to_dec(total_allocations, buf, sizeof(buf));
+    com_write_string(COM1_PORT, buf);
+    com_write_string(COM1_PORT, " | OOM: ");
+    uint64_to_dec(failed_allocations, buf, sizeof(buf));
+    com_write_string(COM1_PORT, buf);
     com_write_string(COM1_PORT, "\n--------------------\n");
 }

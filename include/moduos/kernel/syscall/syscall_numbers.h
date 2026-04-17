@@ -34,9 +34,9 @@
 #define SYS_UNLINK      22
 #define SYS_LSEEK       23
 #define SYS_WRITEFILE   24
-#define SYS_INPUT       28
-#define SYS_SSTATS      29
-#define SYS_SSTATS2     38 /* fill user buffer with md64api_sysinfo_data_u */
+#define SYS_INPUT       28 // DO NOT USE - Deprecated
+#define SYS_SSTATS      29 /* SYS_SSTATS (29) removed — use $/dev/md64api/sysinfo via DevFS instead. */
+#define SYS_SSTATS2     38 /* fill user buffer with md64api_sysinfo_data_u  This literrly does not live anywhere, useless shit. - Deprecated*/
 // VFS formatting / mkfs
 #define SYS_VFS_MKFS    36
 #define SYS_VFS_GETPART 37
@@ -44,7 +44,7 @@
 /* User identity */
 #define SYS_GETUID      33
 #define SYS_SETUID      34
-/* Graphics/VGA - REMOVED: Use $/dev/graphics/video0 or $/dev/console instead */
+/* Graphics/VGA - REMOVED: Use $/dev/graphics/video0 instead */
 /* Virtual memory mapping (userland dynamic linker support) */
 #define SYS_MMAP        39
 #define SYS_MUNMAP      40
@@ -67,7 +67,6 @@
 #define SYS_DUP         68  /* dup(oldfd) -> newfd or -errno */
 #define SYS_DUP2        69  /* dup2(oldfd, newfd) -> newfd or -errno */
 #define SYS_PIPE        70  /* pipe(fds[2]) -> 0 or -errno */
-#define SYS_FCNTL       71  /* fcntl(fd, cmd, arg) -> result or -errno */
 
 /* POSIX process identity */
 #define SYS_GETGID      72  /* getgid() -> gid */
@@ -120,6 +119,7 @@
 #define SIG_DFL    ((void (*)(int))0)  /* Default action */
 #define SIG_IGN    ((void (*)(int))1)  /* Ignore signal */
 #define SIG_ERR    ((void (*)(int))-1) /* Error return */
+#define SYS_RT_SIGRETURN   25
 
 #endif
 

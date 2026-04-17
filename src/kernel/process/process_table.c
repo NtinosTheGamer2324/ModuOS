@@ -84,8 +84,6 @@ process_t *process_alloc(void) {
     
     memset(p, 0, sizeof(process_t));
 
-    p->fpu_state = kmalloc(512);   // FXSAVE area
-    if (!p->fpu_state) { kfree(p); spinlock_unlock(&ptable_lock); return NULL; }
     memset(p->fpu_state, 0, 512);
 
     p->pid      = pid;

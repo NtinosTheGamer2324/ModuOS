@@ -26,3 +26,5 @@
 #define EINVAL  22
 #define EROFS   30
 #define ENOSYS  38
+
+#define ERR_PTR(x) ((void*)(intptr_t)(-(x)))

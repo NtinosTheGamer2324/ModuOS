@@ -101,8 +101,6 @@ int exec_run(const char *args, int wait_for_exit) {
     while (*args == ' ') args++;
 
     if (*args == '\0') {
-        VGA_Write("Usage: exec <path> [args...]\n");
-        VGA_Write("Example: exec /Apps/cat.sqr /file.txt\n");
         return -1;
     }
 
@@ -110,14 +108,12 @@ int exec_run(const char *args, int wait_for_exit) {
     int slot = boot_drive_slot;
 
     if (slot < 0) {
-        VGA_Write("\\crError: No filesystem selected\\rr\n");
         return -1;
     }
 
     // Get mount from kernel mount table
     fs_mount_t* mount = fs_get_mount(slot);
     if (!mount || !mount->valid) {
-        VGA_Write("\\crError: Invalid filesystem mount\\rr\n");
         return -1;
     }
 
@@ -126,12 +122,11 @@ int exec_run(const char *args, int wait_for_exit) {
     int argc = parse_args_dynamic(args, &argv, MAX_ARGS);
     
     if (argc < 0) {
-        VGA_Write("\\crError: Failed to parse arguments\\rr\n");
         return -1;
     }
     
     if (argc == 0) {
-        VGA_Write("\\crError: No program specified\\rr\n");
+         // No command provided
         free_argv(argv, argc);
         return -1;
     }
@@ -163,7 +158,7 @@ int exec_run(const char *args, int wait_for_exit) {
     // Check existence
     com_write_string(COM1_PORT, "[EXEC] Checking if file exists...\n");
     if (!fs_file_exists(mount, exec_path)) {
-        VGA_Write("\\crFile not found\\rr\n");
+        com_write_string(COM1_PORT, "[EXEC] File not found\n");
         free_argv(argv, argc);
         return -1;
     }
@@ -173,7 +168,6 @@ int exec_run(const char *args, int wait_for_exit) {
     com_write_string(COM1_PORT, "[EXEC] Getting file info...\n");
     fs_file_info_t info;
     if (fs_stat(mount, exec_path, &info) != 0) {
-        VGA_Write("\\crFailed to get file info\\rr\n");
         com_write_string(COM1_PORT, "[EXEC] fs_stat failed\n");
         free_argv(argv, argc);
         return -1;
@@ -181,7 +175,7 @@ int exec_run(const char *args, int wait_for_exit) {
     com_write_string(COM1_PORT, "[EXEC] Got file info\n");
 
     if (info.is_directory) {
-        VGA_Write("\\crError: Cannot exec a directory\\rr\n");
+        com_write_string(COM1_PORT, "[EXEC] Error: Cannot exec a directory\n");
         free_argv(argv, argc);
         return -1;
     }
@@ -198,7 +192,6 @@ int exec_run(const char *args, int wait_for_exit) {
     size_t bytes_read = 0;
     int hvrc = hvfs_read(boot_drive_slot, exec_path, &buffer, &bytes_read);
     if (hvrc != 0 || !buffer) {
-        VGA_Write("\\crFailed to read file\\rr\n");
         com_write_string(COM1_PORT, "[EXEC] hvfs_read FAILED\n");
         free_argv(argv, argc);
         return -1;
@@ -215,7 +208,7 @@ int exec_run(const char *args, int wait_for_exit) {
     char interp_path[256];
     int has_interp = elf_get_interp_path(buffer, bytes_read, interp_path, sizeof(interp_path));
     if (has_interp < 0) {
-        VGA_Write("\\crFailed to parse ELF interpreter\\rr\n");
+        com_write_string(COM1_PORT, "[EXEC] Failed to parse ELF interpreter\n");
         hvfs_free(boot_drive_slot, exec_path, buffer);
         free_argv(argv, argc);
         return -1;
@@ -232,7 +225,7 @@ int exec_run(const char *args, int wait_for_exit) {
 
         char **new_argv = (char **)kmalloc((new_argc + 1) * sizeof(char *));
         if (!new_argv) {
-            VGA_Write("\\crFailed to allocate interpreter argv\\rr\n");
+            com_write_string(COM1_PORT, "[EXEC] Failed to allocate interpreter argv\n");
             hvfs_free(boot_drive_slot, exec_path, buffer);
             free_argv(argv, argc);
             return -1;
@@ -259,14 +252,14 @@ int exec_run(const char *args, int wait_for_exit) {
         free_argv(argv, argc);
 
         if (!fs_file_exists(mount, interp_path)) {
-            VGA_Write("\\crInterpreter not found\\rr\n");
+            com_write_string(COM1_PORT, "[EXEC] Interpreter not found\n");
             free_argv(new_argv, new_argc);
             return -1;
         }
 
         fs_file_info_t iinfo;
         if (fs_stat(mount, interp_path, &iinfo) != 0 || iinfo.is_directory) {
-            VGA_Write("\\crInterpreter stat failed\\rr\n");
+            com_write_string(COM1_PORT, "[EXEC] Interpreter stat failed\n");
             free_argv(new_argv, new_argc);
             return -1;
         }
@@ -275,7 +268,7 @@ int exec_run(const char *args, int wait_for_exit) {
         size_t ibread = 0;
         int ihrc = hvfs_read(boot_drive_slot, interp_path, &ibuf, &ibread);
         if (ihrc != 0 || !ibuf || ibread < (size_t)iinfo.size) {
-            VGA_Write("\\crInterpreter read failed\\rr\n");
+            com_write_string(COM1_PORT, "[EXEC] Interpreter read failed\n");
             hvfs_free(boot_drive_slot, interp_path, ibuf);
             free_argv(new_argv, new_argc);
             return -1;
@@ -292,7 +285,7 @@ int exec_run(const char *args, int wait_for_exit) {
             if (saved_rflags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
             hvfs_free(boot_drive_slot, interp_path, ibuf);
             free_argv(new_argv, new_argc);
-            VGA_Write("\\crFailed to create interpreter address space\\rr\n");
+            com_write_string(COM1_PORT, "[EXEC] Failed to create interpreter address space\n");
             return -1;
         }
         paging_switch_cr3(proc_cr3);
@@ -306,7 +299,7 @@ int exec_run(const char *args, int wait_for_exit) {
         hvfs_free(boot_drive_slot, interp_path, ibuf);
 
         if (elf_result != 0) {
-            VGA_Write("\\crFailed to load interpreter ELF\\rr\n");
+            com_write_string(COM1_PORT, "[EXEC] Failed to load interpreter ELF\n");
             free_argv(new_argv, new_argc);
             return -1;
         }
@@ -331,7 +324,7 @@ int exec_run(const char *args, int wait_for_exit) {
         free_argv(new_argv, new_argc);
 
         if (!proc) {
-            VGA_Write("\\crFailed to create interpreter process\\rr\n");
+            com_write_string(COM1_PORT, "[EXEC] Failed to create interpreter process\n");
             return -1;
         }
 
@@ -373,7 +366,7 @@ int exec_run(const char *args, int wait_for_exit) {
     if (!proc_cr3) {
         /* restore IF */
         if (saved_rflags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
-        VGA_Write("\\crFailed to create process address space\\rr\n");
+        com_write_string(COM1_PORT, "[EXEC] Failed to create process address space\n");
         hvfs_free(boot_drive_slot, exec_path, buffer);
         free_argv(argv, argc);
         return -1;
@@ -399,7 +392,6 @@ int exec_run(const char *args, int wait_for_exit) {
     com_write_string(COM1_PORT, "\n");
     
     if (elf_result != 0) {
-        VGA_Write("\\crFailed to load ELF\\rr\n");
         com_write_string(COM1_PORT, "[EXEC] ELF load failed!\n");
         hvfs_free(boot_drive_slot, exec_path, buffer);
         free_argv(argv, argc);
@@ -451,7 +443,6 @@ int exec_run(const char *args, int wait_for_exit) {
 
     if (!proc) {
         com_write_string(COM1_PORT, "[EXEC] Process creation FAILED\n");
-        VGA_Write("\\crFailed to create process\\rr\n");
         free_argv(argv, argc); // Free on error
         com_write_string(COM1_PORT, "[EXEC] ===== END EXEC COMMAND =====\n\n");
         return -1;

@@ -177,18 +177,21 @@ typedef struct sqrm_kernel_api {
     sqrm_module_type_t module_type;
     const char *module_name;
 
-    // logging
+    // logging — always available
     int (*com_write_string)(uint16_t port, const char *s);
 
-    // memory
+    // memory — always available
     void *(*kmalloc)(size_t sz);
     void (*kfree)(void *p);
 
-    // DMA (capability-gated; may be NULL)
+    // DMA — AUDIO modules only; NULL for all other types.
+    // HDA/AC97 use this for CORB/RIRB/BDL/PCM ring buffers.
+    // Always NULL-check; fall back to kmalloc+virt_to_phys if NULL.
     int (*dma_alloc)(dma_buffer_t *out, size_t size, size_t align);
     void (*dma_free)(dma_buffer_t *buf);
 
-    // Low-level port I/O (capability-gated; may be NULL)
+    // Port I/O — AUDIO modules only; NULL for all other types.
+    // AUDIO modules use raw CF8/CFC PCI scanning (same pattern as AC97).
     uint8_t  (*inb)(uint16_t port);
     uint16_t (*inw)(uint16_t port);
     uint32_t (*inl)(uint16_t port);
@@ -196,21 +199,22 @@ typedef struct sqrm_kernel_api {
     void (*outw)(uint16_t port, uint16_t val);
     void (*outl)(uint16_t port, uint32_t val);
 
-    // IRQ (capability-gated; may be NULL)
+    // IRQ — AUDIO modules only; NULL for all other types.
+    // Install a handler for the HDA/AC97 PCI IRQ line.
     void (*irq_install_handler)(int irq, void (*handler)(void));
     void (*irq_uninstall_handler)(int irq);
     void (*pic_send_eoi)(uint8_t irq);
 
-    // Timing (capability-gated; may be NULL)
+    // Timing — always available
     uint64_t (*get_system_ticks)(void);
     uint64_t (*ticks_to_ms)(uint64_t ticks);
     uint64_t (*ms_to_ticks)(uint64_t ms);
     void (*sleep_ms)(uint64_t ms);
 
-    // VFS (capability-gated; may be NULL)
+    // VFS — FS modules only
     int (*fs_register_driver)(const char *name, const fs_ext_driver_ops_t *ops);
 
-    // DEVFS (capability-gated; may be NULL)
+    // DEVFS — always available
     int (*devfs_register_path)(const char *path, const void *ops, void *ctx);
 
     /* Multiboot2 header — pointer to the raw MB2 info struct passed by the
@@ -218,18 +222,18 @@ typedef struct sqrm_kernel_api {
      * Valid for the lifetime of the kernel. */
     const void *multiboot2_header;
 
-    // Input injection (capability-gated; may be NULL)
+    // Input injection — HID modules only.
     // Injects an input event into /dev/input/event0 and /dev/input/kbd0 (VT100 translation)
     // and also pushes it to the kernel event queue.
     void (*input_push_event)(const Event *e);
 
-    // Graphics (GPU modules only): register/replace the active framebuffer.
+    // Graphics — GPU modules only.
     // Returns 0 on success.
     int (*gfx_register_framebuffer)(const sqrm_gpu_device_t *dev);
     // Update framebuffer descriptor after a mode change.
     int (*gfx_update_framebuffer)(const framebuffer_t *fb);
 
-    // PCI (GPU/NET modules)
+    // PCI — AUDIO, GPU, NET, USB, HID modules; NULL for FS, DRIVE, GENERIC.
     int (*pci_get_device_count)(void);
     pci_device_t* (*pci_get_device)(int index);
     pci_device_t* (*pci_find_device)(uint16_t vendor_id, uint16_t device_id);
@@ -237,19 +241,20 @@ typedef struct sqrm_kernel_api {
     void (*pci_enable_io_space)(pci_device_t *dev);
     void (*pci_enable_bus_mastering)(pci_device_t *dev);
 
-    // PCI config space access (restricted; may be NULL)
+    // PCI config space — AUDIO, NET, USB, HID only; NULL for GPU.
     uint32_t (*pci_cfg_read32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
     void (*pci_cfg_write32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
 
-    // MMIO mapping (GPU/NET modules)
+    // MMIO mapping — AUDIO, GPU, NET, USB, HID modules.
     void* (*ioremap)(uint64_t phys_addr, uint64_t size);
     void* (*ioremap_guarded)(uint64_t phys_addr, uint64_t size);
 
-    // Address translation helpers (NET/USB modules that build DMA descriptor rings)
+    // Address translation — AUDIO, NET, USB, HID modules.
+    // AUDIO fallback: if dma_alloc is NULL use kmalloc + virt_to_phys.
     // Returns physical address for a kernel virtual address, or 0 if unmapped.
     uint64_t (*virt_to_phys)(uint64_t virt);
 
-    // Blockdev (capability-gated; may be NULL)
+    // Blockdev — FS and GENERIC modules only.
     int (*block_get_info)(blockdev_handle_t h, blockdev_info_t *out);
     int (*block_read)(blockdev_handle_t h, uint64_t lba, uint32_t count, void *buf, size_t buf_sz);
     int (*block_write)(blockdev_handle_t h, uint64_t lba, uint32_t count, const void *buf, size_t buf_sz);
@@ -261,17 +266,17 @@ typedef struct sqrm_kernel_api {
     // Drive modules will get a register function later (capability-gated)
     int (*block_register)(const void *ops, void *ctx, blockdev_handle_t *out_handle);
 
-    // Audio (capability-gated; may be NULL)
+    // Audio — AUDIO modules only.
     int (*audio_register_pcm)(const char *dev_name, const audio_pcm_ops_t *ops, void *ctx);
 
-    // SQRM services (module-to-kernel/module-to-module exports)
+    // SQRM services — always available.
     // Register a named service API blob. Returns 0 on success.
     int (*sqrm_service_register)(const char *service_name, const void *api_ptr, size_t api_size);
     // Lookup a named service API blob. Returns pointer or NULL if not found.
     // If out_size is non-NULL, it will be filled with the api_size.
     const void* (*sqrm_service_get)(const char *service_name, size_t *out_size);
 
-    /* Primitives exposed to modules for system information collection. */
+    /* System info — always available. */
     const char *(*get_gpu_driver_name)(void);
     const char *(*get_smbios_field)(int field); /* 0=mfr 1=product 2=bios_vendor 3=bios_version */
     uint64_t (*phys_total_frames)(void);

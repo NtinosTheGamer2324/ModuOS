@@ -41,7 +41,6 @@ void hid_debug_poll_early(void);
 #include "moduos/drivers/Drive/SATA/SATA.h"
 #include "moduos/drivers/Drive/ATA/ata.h"
 #include "moduos/drivers/Drive/vDrive.h"
-#include "moduos/drivers/USB/usb.h"
 #include "moduos/drivers/power/ACPI.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/drivers/graphics/fb_console.h"

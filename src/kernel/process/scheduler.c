@@ -1,10 +1,30 @@
-// scheduler.c - HTDS (Hybrid-Tree Decay Scheduler) with Red-Black Tree
+// scheduler.c - HTDS (Hybrid-Tree Decay Scheduler)
 //
-// Adapted from anyway™_internal_NTOSIUX scheduler to use global scheduler state
-// while maintaining compatibility with the legacy CFS API.
+// vruntime-keyed red-black tree scheduler. Pick/insert/remove are all
+// O(log N). The leftmost node (minimum vruntime) is found by walking left
+// from the root on each pick rather than maintaining a stale cache pointer;
+// this costs nothing extra because pick already pays O(log N) for removal.
 //
-// Red-Black Tree implementation provides O(log N) operations vs O(N) for
-// the previous linked-list CFS scheduler.
+// REFACTOR — embedded scheduler node
+// -----------------------------------
+// rbtree_node_t is now defined in process_new.h and embedded inside
+// process_t as the field 'sched_node'.  This removes two classes of bug
+// that were corrupting PID 2's page_table field:
+//
+//   1. kzalloc() inside rbtree_insert() could return a recycled heap block
+//      that overlapped a live process_t, letting tree-pointer writes corrupt
+//      arbitrary kernel data structures.
+//
+//   2. The sched_nodes[MAX_PROCESSES] index array could hold a stale pointer
+//      after a rotation called sched_node_set() for only one of the affected
+//      PIDs, making subsequent remove/insert see the wrong node address.
+//
+// With embedded nodes:
+//   - No allocation or free ever touches the scheduling hot path.
+//   - container_of() recovers the process_t* from a node pointer in O(1)
+//     without any external array.
+//   - Rotations never change a node's address, so the container_of result
+//     is always correct regardless of how many times the tree rebalances.
 
 #include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/spinlock.h"
@@ -16,21 +36,23 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// External declarations
 extern process_t *process_table[MAX_PROCESSES];
 extern process_t *process_find(uint32_t pid);
 extern volatile process_t *current;
+extern void set_curproc(process_t *p);
+extern void switch_to(process_t *prev, process_t *next);
 
 // ---------------------------------------------------------------------------
-// Config & globals
+// Constants
 // ---------------------------------------------------------------------------
 
-#define NICE_0_WEIGHT        1024
-#define MIN_GRANULARITY_NS   750000ULL         // 0.75 ms
-#define SCHED_WAKEUP_BONUS_NS 1000000ULL       // 1 ms I/O boost
+#define NICE_0_WEIGHT         1024
+#define MIN_GRANULARITY_NS    750000ULL
+#define SCHED_WAKEUP_BONUS_NS 1000000ULL
+#define TICK_NS               1000000ULL
 
-// Weight table (Linux prio_to_weight[], nice -20..19)
-static const uint32_t nice_to_weight_table[40] = {
+// Linux prio_to_weight[], indexed by (nice + 20).
+static const uint32_t sched_weight_table[40] = {
     /* -20 */ 88761, 71755, 56483, 46273, 36291,
     /* -15 */ 29154, 23254, 18705, 14949, 11916,
     /* -10 */  9548,  7620,  6100,  4904,  3906,
@@ -41,461 +63,532 @@ static const uint32_t nice_to_weight_table[40] = {
     /*  15 */    36,    29,    23,    18,    15,
 };
 
-// Red-Black Tree node for scheduling tree
-typedef struct rbtree_node {
-    struct rbtree_node *left;
-    struct rbtree_node *right;
-    struct rbtree_node *parent;
-    bool is_red;
-    process_t *process;
-    uint64_t vruntime;
-} rbtree_node_t;
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
-// Scheduler state
+// rbtree_node_t is declared in process_new.h (embedded in process_t).
+// We only need the run-queue state here.
+
 typedef struct {
     rbtree_node_t *root;
-    rbtree_node_t *leftmost;
-    uint64_t min_vruntime;
-    uint64_t clock_ticks;
+    uint64_t       min_vruntime;
+    uint64_t       clock_ticks;
+    uint32_t       nr_running;
 } sched_state_t;
 
-static spinlock_t sched_lock __attribute__((aligned(64)));
-static sched_state_t g_sched;
-static int sched_enabled = 0;
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
 
-// Node tracking: indexed by PID to map process -> rbtree_node
-static rbtree_node_t *g_sched_nodes[MAX_PROCESSES];
+static spinlock_t    sched_lock __attribute__((aligned(64)));
+static sched_state_t sched_state;
+static int           sched_enabled = 0;
 
-static inline void set_sched_node(process_t *p, rbtree_node_t *node) {
-    if (p && p->pid < MAX_PROCESSES) g_sched_nodes[p->pid] = node;
+// ---------------------------------------------------------------------------
+// Node <-> process helpers
+// ---------------------------------------------------------------------------
+
+// Get the embedded scheduler node from a process pointer.
+static inline rbtree_node_t *sched_node_of(process_t *p) {
+    return &p->sched_node;
 }
 
-static inline rbtree_node_t *get_sched_node(process_t *p) {
-    if (!p || p->pid >= MAX_PROCESSES) return NULL;
-    return g_sched_nodes[p->pid];
+// Get the owning process from a node pointer using container_of.
+// This replaces every old use of n->process.
+static inline process_t *sched_proc_of(rbtree_node_t *n) {
+    return container_of(n, process_t, sched_node);
+}
+
+// Is this process currently linked into the tree?
+// A freshly removed node has all link fields NULLed, so this is O(1).
+static inline bool sched_node_in_tree(process_t *p) {
+    rbtree_node_t *n = sched_node_of(p);
+    return (n->parent != NULL) || (sched_state.root == n);
 }
 
 // ---------------------------------------------------------------------------
-// Weight helper
+// Weight
 // ---------------------------------------------------------------------------
 
-static uint32_t nice_to_weight(int nice) {
+static inline uint32_t sched_process_weight(process_t *p) {
+    if (p->weight == 0) {
+        int nice = p->nice;
+        if (nice < -20) nice = -20;
+        if (nice >  19) nice =  19;
+        p->weight = sched_weight_table[nice + 20];
+    }
+    return p->weight;
+}
+
+uint32_t scheduler_nice_to_weight(int nice) {
     if (nice < -20) nice = -20;
     if (nice >  19) nice =  19;
-    return nice_to_weight_table[nice + 20];
+    return sched_weight_table[nice + 20];
 }
-
-uint32_t scheduler_nice_to_weight(int nice) { return nice_to_weight(nice); }
 
 // ---------------------------------------------------------------------------
-// Red-Black Tree operations
+// Red-black tree — rotations
+// (Identical to the original; rotations only touch node pointers so they
+//  are correct with both heap-allocated and embedded nodes.)
 // ---------------------------------------------------------------------------
 
-static inline rbtree_node_t *rbtree_successor(rbtree_node_t *node) {
-    if (node->right != NULL) {
-        node = node->right;
-        while (node->left != NULL) node = node->left;
-        return node;
-    }
-    return NULL;
+static void rbtree_rotate_left(rbtree_node_t *n) {
+    rbtree_node_t *r = n->right;
+
+    n->right = r->left;
+    if (r->left)
+        r->left->parent = n;
+
+    r->parent = n->parent;
+    if      (!n->parent)            sched_state.root  = r;
+    else if (n->parent->left == n)  n->parent->left   = r;
+    else                            n->parent->right  = r;
+
+    r->left   = n;
+    n->parent = r;
 }
 
-static inline void rbtree_rotate_left(rbtree_node_t *node) {
-    rbtree_node_t *right_child = node->right;
-    if (!right_child) return;
+static void rbtree_rotate_right(rbtree_node_t *n) {
+    rbtree_node_t *l = n->left;
 
-    node->right = right_child->left;
-    if (right_child->left) right_child->left->parent = node;
+    n->left = l->right;
+    if (l->right)
+        l->right->parent = n;
 
-    right_child->parent = node->parent;
-    if (!node->parent) {
-        g_sched.root = right_child;
-    } else if (node->parent->left == node) {
-        node->parent->left = right_child;
-    } else {
-        node->parent->right = right_child;
-    }
+    l->parent = n->parent;
+    if      (!n->parent)            sched_state.root  = l;
+    else if (n->parent->left == n)  n->parent->left   = l;
+    else                            n->parent->right  = l;
 
-    right_child->left = node;
-    node->parent = right_child;
+    l->right  = n;
+    n->parent = l;
 }
 
-static inline void rbtree_rotate_right(rbtree_node_t *node) {
-    rbtree_node_t *left_child = node->left;
-    if (!left_child) return;
+// ---------------------------------------------------------------------------
+// Red-black tree — insert fixup (CLRS)
+// ---------------------------------------------------------------------------
 
-    node->left = left_child->right;
-    if (left_child->right) left_child->right->parent = node;
+static void rbtree_insert_fixup(rbtree_node_t *n) {
+    while (n->parent && n->parent->is_red) {
+        rbtree_node_t *p  = n->parent;
+        rbtree_node_t *gp = p->parent;
 
-    left_child->parent = node->parent;
-    if (!node->parent) {
-        g_sched.root = left_child;
-    } else if (node->parent->left == node) {
-        node->parent->left = left_child;
-    } else {
-        node->parent->right = left_child;
-    }
-
-    left_child->right = node;
-    node->parent = left_child;
-}
-
-static inline void rbtree_insert_fixup(rbtree_node_t *node) {
-    while (node->parent && node->parent->is_red) {
-        if (node->parent == node->parent->parent->left) {
-            rbtree_node_t *uncle = node->parent->parent->right;
-
+        if (p == gp->left) {
+            rbtree_node_t *uncle = gp->right;
             if (uncle && uncle->is_red) {
-                node->parent->is_red = false;
+                p->is_red     = false;
                 uncle->is_red = false;
-                node->parent->parent->is_red = true;
-                node = node->parent->parent;
+                gp->is_red    = true;
+                n = gp;
             } else {
-                if (node == node->parent->right) {
-                    node = node->parent;
-                    rbtree_rotate_left(node);
+                if (n == p->right) {
+                    n = p;
+                    rbtree_rotate_left(n);
+                    p  = n->parent;
+                    gp = p->parent;
                 }
-                node->parent->is_red = false;
-                node->parent->parent->is_red = true;
-                rbtree_rotate_right(node->parent->parent);
+                p->is_red  = false;
+                gp->is_red = true;
+                rbtree_rotate_right(gp);
             }
         } else {
-            rbtree_node_t *uncle = node->parent->parent->left;
-
+            rbtree_node_t *uncle = gp->left;
             if (uncle && uncle->is_red) {
-                node->parent->is_red = false;
+                p->is_red     = false;
                 uncle->is_red = false;
-                node->parent->parent->is_red = true;
-                node = node->parent->parent;
+                gp->is_red    = true;
+                n = gp;
             } else {
-                if (node == node->parent->left) {
-                    node = node->parent;
-                    rbtree_rotate_right(node);
+                if (n == p->left) {
+                    n = p;
+                    rbtree_rotate_right(n);
+                    p  = n->parent;
+                    gp = p->parent;
                 }
-                node->parent->is_red = false;
-                node->parent->parent->is_red = true;
-                rbtree_rotate_left(node->parent->parent);
+                p->is_red  = false;
+                gp->is_red = true;
+                rbtree_rotate_left(gp);
             }
         }
     }
-    if (g_sched.root) g_sched.root->is_red = false;
+    sched_state.root->is_red = false;
 }
 
-static inline void rbtree_remove_fixup(rbtree_node_t *node, rbtree_node_t *parent) {
-    while (node != g_sched.root && !node->is_red) {
-        if (node == parent->left) {
-            rbtree_node_t *sibling = parent->right;
+// ---------------------------------------------------------------------------
+// Red-black tree — delete fixup (CLRS)
+//
+// x_parent is passed separately because x may be NULL (removed black leaf).
+// ---------------------------------------------------------------------------
 
-            if (sibling && sibling->is_red) {
-                sibling->is_red = false;
-                parent->is_red = true;
-                rbtree_rotate_left(parent);
-                sibling = parent->right;
+static void rbtree_remove_fixup(rbtree_node_t *x, rbtree_node_t *x_parent) {
+    while (x != sched_state.root && (!x || !x->is_red)) {
+        if (!x_parent)
+            break;
+
+        if (x == x_parent->left) {
+            rbtree_node_t *w = x_parent->right;
+
+            if (w && w->is_red) {
+                w->is_red        = false;
+                x_parent->is_red = true;
+                rbtree_rotate_left(x_parent);
+                w = x_parent->right;
             }
 
-            if (sibling && 
-                (!sibling->left || !sibling->left->is_red) &&
-                (!sibling->right || !sibling->right->is_red)) {
-                sibling->is_red = true;
-                node = parent;
-                parent = node->parent;
-            } else if (sibling) {
-                if (!sibling->right || !sibling->right->is_red) {
-                    if (sibling->left) sibling->left->is_red = false;
-                    sibling->is_red = true;
-                    rbtree_rotate_right(sibling);
-                    sibling = parent->right;
+            if (!w) {
+                x        = x_parent;
+                x_parent = x->parent;
+            } else if ((!w->left  || !w->left->is_red) &&
+                       (!w->right || !w->right->is_red)) {
+                w->is_red = true;
+                x         = x_parent;
+                x_parent  = x->parent;
+            } else {
+                if (!w->right || !w->right->is_red) {
+                    if (w->left) w->left->is_red = false;
+                    w->is_red = true;
+                    rbtree_rotate_right(w);
+                    w = x_parent->right;
                 }
-                sibling->is_red = parent->is_red;
-                parent->is_red = false;
-                if (sibling->right) sibling->right->is_red = false;
-                rbtree_rotate_left(parent);
-                node = g_sched.root;
+                w->is_red        = x_parent->is_red;
+                x_parent->is_red = false;
+                if (w->right) w->right->is_red = false;
+                rbtree_rotate_left(x_parent);
+                x = sched_state.root;
                 break;
             }
         } else {
-            rbtree_node_t *sibling = parent->left;
+            rbtree_node_t *w = x_parent->left;
 
-            if (sibling && sibling->is_red) {
-                sibling->is_red = false;
-                parent->is_red = true;
-                rbtree_rotate_right(parent);
-                sibling = parent->left;
+            if (w && w->is_red) {
+                w->is_red        = false;
+                x_parent->is_red = true;
+                rbtree_rotate_right(x_parent);
+                w = x_parent->left;
             }
 
-            if (sibling && 
-                (!sibling->right || !sibling->right->is_red) &&
-                (!sibling->left || !sibling->left->is_red)) {
-                sibling->is_red = true;
-                node = parent;
-                parent = node->parent;
-            } else if (sibling) {
-                if (!sibling->left || !sibling->left->is_red) {
-                    if (sibling->right) sibling->right->is_red = false;
-                    sibling->is_red = true;
-                    rbtree_rotate_left(sibling);
-                    sibling = parent->left;
+            if (!w) {
+                x        = x_parent;
+                x_parent = x->parent;
+            } else if ((!w->right || !w->right->is_red) &&
+                       (!w->left  || !w->left->is_red)) {
+                w->is_red = true;
+                x         = x_parent;
+                x_parent  = x->parent;
+            } else {
+                if (!w->left || !w->left->is_red) {
+                    if (w->right) w->right->is_red = false;
+                    w->is_red = true;
+                    rbtree_rotate_left(w);
+                    w = x_parent->left;
                 }
-                sibling->is_red = parent->is_red;
-                parent->is_red = false;
-                if (sibling->left) sibling->left->is_red = false;
-                rbtree_rotate_right(parent);
-                node = g_sched.root;
+                w->is_red        = x_parent->is_red;
+                x_parent->is_red = false;
+                if (w->left) w->left->is_red = false;
+                rbtree_rotate_right(x_parent);
+                x = sched_state.root;
                 break;
             }
         }
     }
-    if (node) node->is_red = false;
+    if (x) x->is_red = false;
 }
 
 // ---------------------------------------------------------------------------
-// Tree insertion
+// Red-black tree — transplant
+// ---------------------------------------------------------------------------
+
+static void rbtree_transplant(rbtree_node_t *u, rbtree_node_t *v) {
+    if      (!u->parent)            sched_state.root  = v;
+    else if (u == u->parent->left)  u->parent->left   = v;
+    else                            u->parent->right  = v;
+    if (v) v->parent = u->parent;
+}
+
+// ---------------------------------------------------------------------------
+// Red-black tree — insert
+//
+// Caller must hold sched_lock.
+//
+// No kzalloc: we use the node embedded in the process_t directly.
+// All link fields are reset so a re-enqueued process starts clean.
 // ---------------------------------------------------------------------------
 
 static void rbtree_insert(process_t *p) {
-    if (!p) return;
-
-    rbtree_node_t *node = (rbtree_node_t *)kzalloc(sizeof(rbtree_node_t));
-    if (!node) return;
-
-    node->process = p;
-    node->vruntime = p->vruntime;
-    node->is_red = true;
-    node->left = NULL;
-    node->right = NULL;
-    node->parent = NULL;
-
-    set_sched_node(p, node);
-
-    if (g_sched.root == NULL) {
-        g_sched.root = node;
-        node->is_red = false;
-        g_sched.leftmost = node;
+    if (sched_node_in_tree(p))
         return;
-    }
 
-    rbtree_node_t *current = g_sched.root;
+    rbtree_node_t *n = sched_node_of(p);
+
+    // Reset every link field — the process may have been in the tree before.
+    n->left     = NULL;
+    n->right    = NULL;
+    n->parent   = NULL;
+    n->is_red   = true;
+    n->vruntime = p->vruntime;
+
     rbtree_node_t *parent = NULL;
-
-    while (current != NULL) {
-        parent = current;
-        if (node->vruntime < current->vruntime) {
-            current = current->left;
-        } else {
-            current = current->right;
-        }
+    rbtree_node_t *cur    = sched_state.root;
+    while (cur) {
+        parent = cur;
+        cur = (n->vruntime < cur->vruntime) ? cur->left : cur->right;
     }
 
-    node->parent = parent;
-    if (node->vruntime < parent->vruntime) {
-        parent->left = node;
+    n->parent = parent;
+    if (!parent) {
+        sched_state.root = n;
+        n->is_red = false;
+    } else if (n->vruntime < parent->vruntime) {
+        parent->left = n;
+        rbtree_insert_fixup(n);
     } else {
-        parent->right = node;
+        parent->right = n;
+        rbtree_insert_fixup(n);
     }
 
-    if (node->vruntime < g_sched.leftmost->vruntime) {
-        g_sched.leftmost = node;
-    }
-
-    rbtree_insert_fixup(node);
+    sched_state.nr_running++;
 }
 
 // ---------------------------------------------------------------------------
-// Tree removal
+// Red-black tree — remove (CLRS)
+//
+// Caller must hold sched_lock.
+//
+// Key change from the old implementation:
+//   The old two-child case called sched_node_set(y->process, y) because the
+//   node was a separately allocated struct and "moving" the successor meant
+//   copying it to the deleted node's address, changing its heap address.
+//   The external sched_nodes[pid] array then had to be updated to point at
+//   the new address — and that update was the source of the corruption: if
+//   the index was wrong, the next insert/remove wrote tree pointers over an
+//   unrelated process_t field (PID 2's page_table in the observed crash).
+//
+//   With embedded nodes the node's address is always &process->sched_node.
+//   The CLRS two-child deletion copies only the *key* (vruntime) and the
+//   color bit into the successor slot; it does NOT move the struct itself.
+//   container_of() therefore always recovers the correct process_t* and
+//   sched_node_set() is simply gone.
+//
+// After the CLRS deletion we NULL all link fields on z so that
+// sched_node_in_tree() correctly returns false for this process until the
+// next enqueue.
 // ---------------------------------------------------------------------------
 
 static void rbtree_remove(process_t *p) {
-    if (!p) return;
+    if (!sched_node_in_tree(p))
+        return;
 
-    rbtree_node_t *node = get_sched_node(p);
-    if (!node) return;
-    rbtree_node_t *child, *parent;
-    bool node_was_red = node->is_red;
+    rbtree_node_t *z = sched_node_of(p);
+    sched_state.nr_running--;
 
-    if (node->left == NULL) {
-        child = node->right;
-        parent = node->parent;
+    rbtree_node_t *y              = z;
+    rbtree_node_t *x              = NULL;
+    rbtree_node_t *x_parent       = NULL;
+    bool           y_original_red = z->is_red;
 
-        if (child != NULL) child->parent = parent;
-        if (parent == NULL) {
-            g_sched.root = child;
-        } else if (parent->left == node) {
-            parent->left = child;
-        } else {
-            parent->right = child;
-        }
-
-        if (g_sched.leftmost == node) {
-            g_sched.leftmost = (child != NULL) ? child : parent;
-        }
-    } else if (node->right == NULL) {
-        child = node->left;
-        parent = node->parent;
-
-        if (parent == NULL) {
-            g_sched.root = child;
-        } else if (parent->left == node) {
-            parent->left = child;
-        } else {
-            parent->right = child;
-        }
-
-        child->parent = parent;
-
-        if (g_sched.leftmost == node) {
-            g_sched.leftmost = child;
-        }
+    if (!z->left) {
+        x        = z->right;
+        x_parent = z->parent;
+        rbtree_transplant(z, z->right);
+    } else if (!z->right) {
+        x        = z->left;
+        x_parent = z->parent;
+        rbtree_transplant(z, z->left);
     } else {
-        rbtree_node_t *successor = rbtree_successor(node);
-        node->vruntime = successor->vruntime;
-        node->process = successor->process;
-        set_sched_node(successor->process, node);
+        // Find in-order successor (leftmost node in right subtree).
+        y = z->right;
+        while (y->left) y = y->left;
 
-        rbtree_remove(successor->process);
+        y_original_red = y->is_red;
+        x              = y->right;
+
+        if (y->parent == z) {
+            x_parent = y;
+        } else {
+            x_parent         = y->parent;
+            rbtree_transplant(y, y->right);
+            y->right         = z->right;
+            y->right->parent = y;
+        }
+
+        rbtree_transplant(z, y);
+        y->left         = z->left;
+        y->left->parent = y;
+        y->is_red       = z->is_red;
+
+        // No sched_node_set() here — see block comment above.
+        // container_of() always resolves to the correct process_t*
+        // because the node is embedded at a fixed offset inside it.
+    }
+
+    if (!y_original_red)
+        rbtree_remove_fixup(x, x_parent);
+
+    // Mark node as "not in tree" by clearing all link fields.
+    // sched_node_in_tree() tests these and will return false until
+    // the process is re-inserted.
+    z->left = z->right = z->parent = NULL;
+    z->is_red = false;
+    // No kfree — the node is part of the process_t heap allocation.
+}
+
+// ---------------------------------------------------------------------------
+// min_vruntime — kept monotonically non-decreasing
+// ---------------------------------------------------------------------------
+
+static void sched_update_min_vruntime(void) {
+    rbtree_node_t *n = sched_state.root;
+    if (!n)
+        return;
+    while (n->left) n = n->left;
+    if (n->vruntime > sched_state.min_vruntime)
+        sched_state.min_vruntime = n->vruntime;
+}
+
+// ---------------------------------------------------------------------------
+// vruntime accounting
+// ---------------------------------------------------------------------------
+
+static void sched_update_curr(process_t *p, uint64_t delta_ns) {
+    p->vruntime += (delta_ns * NICE_0_WEIGHT) / sched_process_weight(p);
+    sched_update_min_vruntime();
+}
+
+// ---------------------------------------------------------------------------
+// Enqueue / dequeue
+// ---------------------------------------------------------------------------
+
+static void enqueue_process(process_t *p, bool is_wakeup) {
+    spinlock_lock(&sched_lock);
+
+    if (p->state == PROCESS_STATE_ZOMBIE ||
+        p->state == PROCESS_STATE_TERMINATED) {
+        spinlock_unlock(&sched_lock);
         return;
     }
 
-    if (!node_was_red && child != NULL) {
-        rbtree_remove_fixup(child, parent);
-    }
+    sched_process_weight(p);
 
-    kfree(node);
-    set_sched_node(p, NULL);
-}
+    uint64_t floor = sched_state.min_vruntime;
+    if (is_wakeup && floor >= SCHED_WAKEUP_BONUS_NS)
+        floor -= SCHED_WAKEUP_BONUS_NS;
 
-// ---------------------------------------------------------------------------
-// Public API for process.c
-// ---------------------------------------------------------------------------
+    if (p->vruntime < floor)
+        p->vruntime = floor;
 
-void scheduler_init(void) {
-    spinlock_init(&sched_lock);
-    g_sched.root = NULL;
-    g_sched.leftmost = NULL;
-    g_sched.min_vruntime = 0;
-    g_sched.clock_ticks = 0;
-    sched_enabled = 1;
-    com_write_string(COM1_PORT, "[SCHED] HTDS (Red-Black Tree Decay Scheduler) initialized\n");
-}
+    rbtree_insert(p);
+    p->state = PROCESS_STATE_READY;
 
-// Compatibility alias
-void scheduler_compat_init(void) { /* no-op */ }
-
-void scheduler_add_process(process_t *p) {
-    if (!p) return;
-    spinlock_lock(&sched_lock);
-    if (p->state != PROCESS_STATE_ZOMBIE && p->state != PROCESS_STATE_TERMINATED) {
-        if (p->weight == 0) p->weight = nice_to_weight(p->nice);
-        if (p->vruntime < g_sched.min_vruntime) p->vruntime = g_sched.min_vruntime;
-        rbtree_insert(p);
-        p->state = PROCESS_STATE_READY;
-    }
     spinlock_unlock(&sched_lock);
 }
 
-void scheduler_add(process_t *p) { scheduler_add_process(p); }
-
-void scheduler_remove_process(process_t *p) {
-    if (!p) return;
+static void dequeue_process(process_t *p) {
     spinlock_lock(&sched_lock);
     rbtree_remove(p);
     spinlock_unlock(&sched_lock);
 }
 
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+void scheduler_init(void) {
+    spinlock_init(&sched_lock);
+    sched_state.root         = NULL;
+    sched_state.min_vruntime = 0;
+    sched_state.clock_ticks  = 0;
+    sched_state.nr_running   = 0;
+    sched_enabled            = 1;
+    com_write_string(COM1_PORT,
+        "[SCHED] HTDS (Red-Black Tree Decay Scheduler) initialized\n");
+}
+
+void scheduler_add_process(process_t *p) {
+    if (p) enqueue_process(p, false);
+}
+
+void scheduler_remove_process(process_t *p) {
+    if (p) dequeue_process(p);
+}
+
+// Legacy names referenced by exit_new.c and signals_new.c.
+void scheduler_add(process_t *p)    { scheduler_add_process(p); }
 void scheduler_remove(process_t *p) { scheduler_remove_process(p); }
 
-// Getters
-uint64_t scheduler_get_min_vruntime(void)  { return g_sched.min_vruntime; }
-uint64_t scheduler_get_clock_ticks(void)   { return g_sched.clock_ticks;  }
-
-// Pick next process to run
-static process_t *pick_next(void) {
-    spinlock_lock(&sched_lock);
-    process_t *p = NULL;
-    if (g_sched.leftmost) {
-        p = g_sched.leftmost->process;
-        rbtree_remove(p);
-    }
-    spinlock_unlock(&sched_lock);
-    return p;
-}
-
-// Re-enqueue a process
-static void requeue(process_t *p) {
-    if (!p) return;
-    spinlock_lock(&sched_lock);
-    if (p->state != PROCESS_STATE_ZOMBIE && p->state != PROCESS_STATE_TERMINATED) {
-        if (p->weight == 0) p->weight = nice_to_weight(p->nice);
-        if (p->vruntime < g_sched.min_vruntime) p->vruntime = g_sched.min_vruntime;
-        rbtree_insert(p);
-        p->state = PROCESS_STATE_READY;
-    }
-    spinlock_unlock(&sched_lock);
-}
-
-// Update vruntime based on execution time
-static void update_curr(process_t *p, uint64_t delta_ns) {
-    if (!p) return;
-    if (p->weight == 0) p->weight = nice_to_weight(p->nice);
-    if (p->weight == 0) p->weight = NICE_0_WEIGHT;
-
-    p->vruntime += (delta_ns * NICE_0_WEIGHT) / p->weight;
-
-    // Advance min_vruntime
-    if (g_sched.leftmost && g_sched.leftmost->vruntime > g_sched.min_vruntime)
-        g_sched.min_vruntime = g_sched.leftmost->vruntime;
-}
+uint64_t scheduler_get_min_vruntime(void) { return sched_state.min_vruntime; }
+uint64_t scheduler_get_clock_ticks(void)  { return sched_state.clock_ticks;  }
+uint32_t scheduler_get_nr_running(void)   { return sched_state.nr_running;   }
 
 // ---------------------------------------------------------------------------
-// schedule() — called from process.c
+// schedule()
+//
+// The re-enqueue of prev and the pick of next happen under one lock
+// acquisition so there is never a window where prev is both in the tree
+// and selected as next.
 // ---------------------------------------------------------------------------
 
 void schedule(void) {
-    if (!sched_enabled) return;
+    if (!sched_enabled)
+        return;
 
     process_t *prev = (process_t *)current;
     process_t *next = NULL;
 
-    if (prev) prev->need_resched = 0;
+    if (prev)
+        prev->need_resched = 0;
 
-    if (prev && prev->pid != 0 &&
-        (prev->state == PROCESS_STATE_RUNNING  ||
-         prev->state == PROCESS_STATE_RUNNABLE ||
-         prev->state == PROCESS_STATE_READY)) {
-        requeue(prev);
+    spinlock_lock(&sched_lock);
+
+    if (prev && prev->pid != 0 && prev->state == PROCESS_STATE_RUNNING) {
+        if (prev->vruntime < sched_state.min_vruntime)
+            prev->vruntime = sched_state.min_vruntime;
+        rbtree_insert(prev);
+        prev->state = PROCESS_STATE_READY;
     }
 
-    next = pick_next();
-    if (!next) next = process_find(0);
+    rbtree_node_t *lm = sched_state.root;
+    if (lm) {
+        while (lm->left) lm = lm->left;
+        next = sched_proc_of(lm);   // container_of — replaces lm->process
+        rbtree_remove(next);
+    }
+
+    spinlock_unlock(&sched_lock);
+
+    if (!next)
+        next = process_find(0);
 
     if (next) {
-        next->state = PROCESS_STATE_RUNNING;
+        next->state        = PROCESS_STATE_RUNNING;
         next->need_resched = 0;
     }
 
     if (prev != next && next) {
-        extern void set_curproc(process_t *p);
         set_curproc(next);
-
-        extern void switch_to(process_t *prev, process_t *next);
         switch_to(prev, next);
     }
 }
 
 // ---------------------------------------------------------------------------
-// scheduler_tick() — called from timer IRQ (~1 kHz)
+// scheduler_tick() — timer IRQ, ~1 kHz
 // ---------------------------------------------------------------------------
 
 void scheduler_tick(void) {
-    if (!sched_enabled) return;
+    if (!sched_enabled)
+        return;
 
-    process_t *curr_cast = (process_t *)current;
+    process_t *p = (process_t *)current;
+    sched_state.clock_ticks++;
 
-    g_sched.clock_ticks++;
+    if (!p)
+        return;
 
-    update_curr(curr_cast, 1000000ULL /* 1 ms per tick */);
+    sched_update_curr(p, TICK_NS);
 
-    if (g_sched.min_vruntime > 0 && curr_cast->vruntime > g_sched.min_vruntime + MIN_GRANULARITY_NS)
-        curr_cast->need_resched = 1;
+    if (sched_state.nr_running > 0 &&
+        p->vruntime > sched_state.min_vruntime + MIN_GRANULARITY_NS)
+        p->need_resched = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -503,12 +596,13 @@ void scheduler_tick(void) {
 // ---------------------------------------------------------------------------
 
 void sleep_on(void *channel) {
-    if (!current) return;
-    
-    process_t *curr_cast = (process_t *)current;
-    curr_cast->wait_channel = channel;
-    curr_cast->state = PROCESS_STATE_SLEEPING;
-    scheduler_remove_process(curr_cast);
+    if (!current)
+        return;
+
+    process_t *p    = (process_t *)current;
+    p->wait_channel = channel;
+    p->state        = PROCESS_STATE_SLEEPING;
+    dequeue_process(p);
     schedule();
 }
 
@@ -518,33 +612,66 @@ void wakeup(void *channel) {
         if (p && p->state == PROCESS_STATE_SLEEPING &&
             p->wait_channel == channel) {
             p->wait_channel = NULL;
-            scheduler_add_process(p);
+            enqueue_process(p, true);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Preemption helpers
+// Preemption
 // ---------------------------------------------------------------------------
 
 int should_reschedule(void) {
-    if (!sched_enabled || !current) return 0;
-    if (current->need_resched) return 1;
-    if (current->state != PROCESS_STATE_RUNNING) return 1;
-    return 0;
+    if (!sched_enabled || !current)
+        return 0;
+    return current->need_resched != 0;
 }
 
 void clear_need_resched(void) {
-    if (current) current->need_resched = 0;
+    if (current)
+        current->need_resched = 0;
 }
 
 // ---------------------------------------------------------------------------
 // Debug
 // ---------------------------------------------------------------------------
 
+// Minimal decimal formatter — avoids a printf dependency in the kernel COM path.
+static void com_write_u64(uint64_t v) {
+    char buf[21];
+    int  i = 20;
+    buf[i] = '\0';
+    if (v == 0) {
+        buf[--i] = '0';
+    } else {
+        while (v) {
+            buf[--i] = '0' + (v % 10);
+            v /= 10;
+        }
+    }
+    com_write_string(COM1_PORT, buf + i);
+}
+
+static void rbtree_print_inorder(const rbtree_node_t *n) {
+    if (!n)
+        return;
+    rbtree_print_inorder(n->left);
+    // container_of replaces the old n->process back-pointer.
+    process_t *p = sched_proc_of((rbtree_node_t *)n);
+    com_write_string(COM1_PORT, "  pid=");
+    com_write_u64(p->pid);
+    com_write_string(COM1_PORT, " vruntime=");
+    com_write_u64(n->vruntime);
+    com_write_string(COM1_PORT, n->is_red ? " RED\n" : " BLK\n");
+    rbtree_print_inorder(n->right);
+}
+
 void debug_print_ready_queue(void) {
-    if (!kernel_debug_is_on()) return;
-    com_write_string(COM1_PORT, "[SCHED-DEBUG] Ready queue (in-order traversal):\n");
-    // Would need in-order tree walk here for full debugging
-    com_write_string(COM1_PORT, "[SCHED-DEBUG] Red-Black Tree structure (simplified output)\n");
+    if (!kernel_debug_is_on())
+        return;
+    com_write_string(COM1_PORT, "[SCHED-DEBUG] Run queue (vruntime order):\n");
+    spinlock_lock(&sched_lock);
+    rbtree_print_inorder(sched_state.root);
+    spinlock_unlock(&sched_lock);
+    com_write_string(COM1_PORT, "[SCHED-DEBUG] ---\n");
 }

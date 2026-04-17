@@ -169,8 +169,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_OPENDIR: return sys_opendir((const char*)arg1);
         case SYS_READDIR: return sys_readdir((int)arg1, (char*)arg2, (size_t)arg3, (int*)arg4, (uint32_t*)arg5);
         case SYS_CLOSEDIR: return sys_closedir((int)arg1);
-        case SYS_INPUT:   return (uint64_t)sys_input((char*)arg1, (size_t)arg2);
-        /* SYS_SSTATS (29) removed — use $/dev/md64api/sysinfo via DevFS instead. */
+        /* SYS_INPUT  (28) removed - use $/dev/input/kbd0 or $/dev/input/event0 idk.*/
+        /* SYS_SSTATS (29) removed - use $/dev/md64api/sysinfo via DevFS instead. */
 
         case SYS_MMAP:
             return (uint64_t)sys_mmap((void*)arg1, (size_t)arg2, (int)arg3, (int)arg4);
@@ -240,21 +240,18 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         }
 
         case SYS_WAITX: {
-            com_write_string(COM1_PORT, "[SYSCALL] SYS_WAITX entered, status ptr=0x");
-            com_write_hex64(COM1_PORT, arg2);
-            com_write_string(COM1_PORT, "\n");
+            extern int do_waitpid_full(int32_t, int *, int, void *);
             int wstatus = 0;
-            pid_t r = do_waitpid((int32_t)arg1, &wstatus, (int)arg3);
-            com_write_string(COM1_PORT, "[SYSCALL] do_waitpid returned, about to copy to userspace\n");
-            if (arg2 && r > 0)
-                usercopy_to_user((void*)arg2, &wstatus, sizeof(wstatus));
-            com_write_string(COM1_PORT, "[SYSCALL] SYS_WAITX about to return\n");
+            pid_t r = do_waitpid_full((int32_t)arg1, &wstatus, (int)arg3,
+                                       arg2 ? (void*)arg2 : NULL);
+            /* usercopy was already done inside do_waitpid_full — do NOT copy again */
             return (uint64_t)(int64_t)r;
         }
+        case 44: {// SYS_PUTENV
+            // For now, just return success so the init process doesn't abort
+            return 0;
+        }
 
-        // GPU Core syscalls (like Linux DRM) - Simple primitives, driver-agnostic
-        // TODO: Implement basic GPU memory/command syscalls
-        
         default:
             if (kernel_debug_is_med()) {
                 com_write_string(COM1_PORT, "[SYSCALL] Unknown syscall: ");
@@ -293,9 +290,6 @@ int sys_exit(int status) {
 
     // Use new POSIX-compliant exit
     do_exit(status);
-
-    /* Fallback: if do_exit ever returns, halt. */
-    for (;;) { __asm__ volatile("hlt"); }
 }
 
 int sys_fork(void) {
@@ -413,24 +407,6 @@ int sys_write(const char *str) {
     return (written >= 0) ? 0 : -1;
 }
 
-ssize_t sys_input(char *user_buf, size_t max_len) {
-    if (!user_buf || max_len == 0) return -1;
-
-    char *line = input();
-    if (!line) {
-        char z = 0;
-        usercopy_to_user(user_buf, &z, 1);
-        return 0;
-    }
-
-    size_t n = strlen(line);
-    if (n >= max_len) n = max_len - 1;
-    if (usercopy_to_user(user_buf, line, n) != 0) return -1;
-    char z = 0;
-    if (usercopy_to_user(user_buf + n, &z, 1) != 0) return -1;
-    return (ssize_t)n;
-}
-
 int sys_exec(const char *str) {
     if (!str) return -1;
     
@@ -450,9 +426,15 @@ int sys_open(const char *pathname, int flags, int mode) {
     process_t *proc = process_get_current();
     if (!proc) return -1;
 
-    // Resolve relative paths against process CWD (supports both / and $/ namespaces)
+    char kpathname[256];
+    if (copy_string_from_user(pathname, kpathname, sizeof(kpathname)) != 0) {
+        com_write_string(0x3F8, "[SYS_OPEN] bad user pointer, returning -1\n");  
+        return -1;
+    }
+
+    /* Resolve relative paths against process CWD (supports both / and $/ namespaces) */
     char full_path[256];
-    const char *p = pathname;
+    const char *p = kpathname;
     if (!(p[0] == '/' || (p[0] == '$' && p[1] == '/'))) {
         const char *cwd = (proc->cwd[0] ? proc->cwd : "/");
         strncpy(full_path, cwd, sizeof(full_path) - 1);
@@ -468,14 +450,13 @@ int sys_open(const char *pathname, int flags, int mode) {
     fs_path_resolved_t r;
     if (fs_resolve_path(proc, p, &r) != 0) return -1;
 
-    // DEVVFS: allow opening $/dev/<node> and $/dev/input/<node> as character devices
+    /* DEVFS: allow opening $/dev/<node> as character device */
     if (r.route == FS_ROUTE_DEVVFS) {
         if (r.devvfs_kind != 2) return -1;
         const char *node = r.rel_path;
         while (*node == '/') node++;
         if (!*node) return -1;
 
-        // DEVFS is hierarchical; node may contain slashes.
         return fd_open_devfs(node, flags);
     }
 
@@ -529,42 +510,67 @@ void sys_yield(void) {
     process_yield();
 }
 
+#define USER_MIN 0x0000000000001000ULL
+#define USER_MAX (0xFFFFFFFF80000000ULL - 0x1000ULL)
+
+static int is_user_range(uint64_t v, uint64_t sz) {
+    if (sz == 0) return 0;
+    if (v < USER_MIN) return 0;
+    if (v + sz < v) return 0;            // overflow
+    if (v + sz - 1 > USER_MAX) return 0; // inclusive end
+    return 1;
+}
+
 void* sys_sbrk(intptr_t increment) {
     process_t *p = process_get_current();
-    if (!p) return (void*)-1;
-    if (!p->is_user) return (void*)-1;
+    if (!p || !p->is_user) return ERR_PTR(EPERM);
 
-    /* Only support growing for now. */
-    if (increment < 0) return (void*)-1;
+    if (increment < 0) return ERR_PTR(EINVAL);
 
     uint64_t old = p->user_heap_end;
     uint64_t new_end = old + (uint64_t)increment;
-    if (p->user_heap_limit && new_end > p->user_heap_limit) return (void*)-1;
 
-    /* page-align mapping */
+    if (new_end < old) return ERR_PTR(EINVAL); // overflow
+
+    if (p->user_heap_limit && new_end > p->user_heap_limit)
+        return ERR_PTR(ENOMEM);
+
+    if (!is_user_range(old, (uint64_t)increment))
+        return ERR_PTR(EACCES);
+
     uint64_t map_start = (old + 0xFFFULL) & ~0xFFFULL;
-    uint64_t map_end = (new_end + 0xFFFULL) & ~0xFFFULL;
+    uint64_t map_end   = (new_end + 0xFFFULL) & ~0xFFFULL;
+
+    if (!is_user_range(map_start, map_end - map_start))
+        return ERR_PTR(EACCES);
 
     if (map_end > map_start) {
         size_t pages = (size_t)((map_end - map_start) / 0x1000ULL);
         uint64_t phys = phys_alloc_contiguous(pages);
-        if (!phys) return (void*)-1;
-        
-        /* Get current process's page table */
+        if (!phys) return ERR_PTR(ENOMEM);
+
         uint64_t proc_cr3 = p->page_table;
-        uint64_t *proc_pml4 = (uint64_t*)phys_to_virt_kernel(proc_cr3 & 0xFFFFFFFFFFFFF000ULL);
+        uint64_t *proc_pml4 =
+            (uint64_t*)phys_to_virt_kernel(proc_cr3 & 0xFFFFFFFFFFFFF000ULL);
+
         if (!proc_pml4) {
-            for (size_t i = 0; i < pages; i++) phys_free_frame(phys + (uint64_t)i * 0x1000ULL);
-            return (void*)-1;
+            for (size_t i = 0; i < pages; i++)
+                phys_free_frame(phys + i * 0x1000ULL);
+            return ERR_PTR(ENOMEM);
         }
-        
-        if (paging_map_range_to_pml4(proc_pml4, map_start, phys, (uint64_t)pages * 0x1000ULL, PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
-            for (size_t i = 0; i < pages; i++) phys_free_frame(phys + (uint64_t)i * 0x1000ULL);
-            return (void*)-1;
+
+        if (paging_map_range_to_pml4(
+                proc_pml4, map_start, phys,
+                (uint64_t)pages * 0x1000ULL,
+                PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
+
+            for (size_t i = 0; i < pages; i++)
+                phys_free_frame(phys + i * 0x1000ULL);
+            return ERR_PTR(ENOMEM);
         }
-        
-        /* Zero the allocated pages */
-        memset((void*)(uintptr_t)map_start, 0, (size_t)((map_end - map_start)));
+
+        memset((void*)(uintptr_t)map_start, 0,
+               (size_t)(map_end - map_start));
     }
 
     p->user_heap_end = new_end;
@@ -573,12 +579,12 @@ void* sys_sbrk(intptr_t increment) {
 
 /* VM mapping (MVP). prot: bit0=R bit1=W bit2=X (X currently ignored)
  * flags: bit0=FIXED, bit1=ANON (only anon supported)
+ * SECURITY UPDATE: Protect kernel memory
  */
 void* sys_mmap(void *addr, size_t size, int prot, int flags) {
-    (void)flags;
     process_t *p = process_get_current();
-    if (!p || !p->is_user) return (void*)-1;
-    if (size == 0) return (void*)-1;
+    if (!p || !p->is_user) return ERR_PTR(EPERM);
+    if (size == 0) return ERR_PTR(EINVAL);
 
     uint64_t sz = ((uint64_t)size + 0xFFFULL) & ~0xFFFULL;
 
@@ -586,43 +592,52 @@ void* sys_mmap(void *addr, size_t size, int prot, int flags) {
     int fixed = (flags & 1) != 0;
 
     if (fixed) {
-        if (v == 0 || (v & 0xFFFULL)) return (void*)-1;
+        if (v == 0 || (v & 0xFFFULL)) return ERR_PTR(EINVAL);
+        if (!is_user_range(v, sz)) return ERR_PTR(EACCES);
     } else {
         v = (p->user_mmap_end + 0xFFFULL) & ~0xFFFULL;
         if (v < p->user_mmap_base) v = p->user_mmap_base;
-        if (v + sz > p->user_mmap_limit) return (void*)-1;
+
+        if (!is_user_range(v, sz)) return ERR_PTR(ENOMEM);
+        if (v + sz > p->user_mmap_limit) return ERR_PTR(ENOMEM);
     }
 
     size_t pages = (size_t)(sz / 0x1000ULL);
     uint64_t phys = phys_alloc_contiguous(pages);
-    if (!phys) return (void*)-1;
+    if (!phys) return ERR_PTR(ENOMEM);
 
     uint64_t pflags = PFLAG_PRESENT | PFLAG_USER;
     if (prot & 2) pflags |= PFLAG_WRITABLE;
 
     if (paging_map_range(v, phys, sz, pflags) != 0) {
-        for (size_t i = 0; i < pages; i++) phys_free_frame(phys + (uint64_t)i * 0x1000ULL);
-        return (void*)-1;
+        for (size_t i = 0; i < pages; i++)
+            phys_free_frame(phys + i * 0x1000ULL);
+        return ERR_PTR(ENOMEM);
     }
 
     memset((void*)(uintptr_t)v, 0, (size_t)sz);
 
     if (!fixed) {
-        if (v + sz > p->user_mmap_end) p->user_mmap_end = v + sz;
+        if (v + sz > p->user_mmap_end)
+            p->user_mmap_end = v + sz;
     }
 
     return (void*)(uintptr_t)v;
 }
 
+// SECURITY UPDATE: Protect kernel memory
 int sys_munmap(void *addr, size_t size) {
     process_t *p = process_get_current();
-    if (!p || !p->is_user) return -1;
-    if (!addr || size == 0) return -1;
+    if (!p || !p->is_user) return -EPERM;
+    if (!addr || size == 0) return -EINVAL;
 
     uint64_t v = (uint64_t)(uintptr_t)addr;
-    if (v & 0xFFFULL) return -1;
+    if (v & 0xFFFULL) return -EINVAL;
 
     uint64_t sz = ((uint64_t)size + 0xFFFULL) & ~0xFFFULL;
+
+    if (!is_user_range(v, sz)) return -EACCES;
+
     uint64_t end = v + sz;
 
     for (uint64_t cur = v; cur < end; cur += 0x1000ULL) {

@@ -28,7 +28,6 @@
 #include "moduos/drivers/PCI/pci.h"
 #include "moduos/fs/fd.h" 
 #include "moduos/drivers/Drive/vDrive.h"
-#include "moduos/drivers/USB/usb.h"
 #include "moduos/kernel/multiboot2.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/memory/paging.h"
@@ -621,7 +620,7 @@ void kernel_main(uint64_t mb2_ptr)
 
     // Create init process (PID 1) - AutoMan (like systemd)
     com_write_string(COM1_PORT, "[KERNEL] Creating init process (AutoMan)...\n");
-    create_init_process("/Apps/zenith5.1.sqr");
+    create_init_process("/ModuOS/System64/automan.sqr");
 
     /* Enable interrupts and enter the idle loop.
      * create_init_process() has already enqueued PID 1; the first schedule()

@@ -4,6 +4,8 @@
 #include "moduos/kernel/macros.h"
 #include <stddef.h>
 
+uint64_t g_syscall_rsp0 = 0;
+
 /*
  * Proper AMD64 GDT + TSS for ring3 + syscall/sysret.
  *
@@ -97,6 +99,7 @@ static void gdt_set_tss_desc(int idx, uint64_t base, uint32_t limit) {
 
 void amd64_tss_set_rsp0(uint64_t rsp0) {
     tss.rsp0 = rsp0;
+    g_syscall_rsp0 = rsp0;
 }
 
 void amd64_gdt_init(void) {

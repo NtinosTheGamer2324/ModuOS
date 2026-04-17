@@ -11,14 +11,18 @@
  * initial kernel RSP, so the two files must agree on the stack size. */
 #define KERNEL_STACK_SIZE 16384
 
-// Compile-time guards: if these fail, update the hardcoded offsets in
-// enter_user_trampoline.asm and context_switch_new.c to match.
-_Static_assert(offsetof(process_t, cr3)     == 248,
-    "process_t::cr3 offset changed - update enter_user_trampoline.asm [rax+248]");
-_Static_assert(offsetof(process_t, context) == 168,
-    "process_t::context offset changed - update context_switch_new.c");
-_Static_assert(offsetof(process_t, fpu_state) == 240,
-    "process_t::fpu_state offset changed - update context_switch_new.c");
+// Add this right before your _Static_asserts
+char (*__compiler_is_telling_me_the_offset)[offsetof(process_t, fpu_state)] = 1;
+
+_Static_assert(offsetof(process_t, context) == 192,
+    "process_t::context offset changed");
+
+/* fpu_state is now the start of the 512-byte buffer */
+_Static_assert(offsetof(process_t, fpu_state) == 272, 
+    "process_t::fpu_state offset changed");
+
+_Static_assert(offsetof(process_t, cr3) == 784,
+    "process_t::cr3 offset changed - update enter_user_trampoline.asm [rax+784]");
 
 // External functions
 extern uint64_t read_cr3(void);

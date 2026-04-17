@@ -5,7 +5,6 @@
 // Included by syscall.c
 
 #include "moduos/kernel/errno.h"
-// #include "moduos/kernel/process/process.h"  // OLD
 #include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/spinlock.h"
 #include "moduos/kernel/memory/memory.h"
@@ -17,7 +16,6 @@
 extern volatile uint64_t g_syscall_entry_rbp;
 extern void syscall_entry_return(void);
 
-// From process.c (private); replicate constants
 #ifndef KERNEL_STACK_SIZE
 #define KERNEL_STACK_SIZE 16384
 #endif
@@ -51,38 +49,28 @@ static void fork_free_strv(char **v, int n) {
 extern uint64_t phys_alloc_frame(void);
 extern void     phys_free_frame(uint64_t phys);
 
-// Clone the parent's user address space into a fresh PML4 by physically
-// copying each mapped user page.  This allocates fresh physical frames for each
-// user page, ensuring the child has an independent copy that won't corrupt the
-// parent when process_free_user_memory() is called.
+/*
+ * clone_user_address_space
+ *
+ * Copies each mapped user page from the parent into a fresh physical frame for
+ * the child.  We use phys_to_virt_kernel() for both src and dst rather than a
+ * scratch mapping: phys_offset == 0 in this kernel (identity mapping), so the
+ * physical address is directly accessible as a virtual address.  This avoids
+ * the entire class of cross-CR3 PML4 slot synchronization bugs that the old
+ * scratch-VA approach suffered from.
+ */
 static int clone_user_address_space(process_t *parent, process_t *child) {
     if (!parent || !child) return -EINVAL;
 
     uint64_t child_cr3 = paging_create_process_pml4();
     if (!child_cr3) return -ENOMEM;
-    
+
     com_write_string(COM1_PORT, "[FORK] Created new PML4 for child: CR3=0x");
     com_write_hex64(COM1_PORT, child_cr3);
     com_write_string(COM1_PORT, "\n");
 
     uint64_t *child_pml4 = (uint64_t *)phys_to_virt_kernel(child_cr3 & ~0xFFFULL);
     if (!child_pml4) return -ENOMEM;
-
-    // Scratch VA used to temporarily map the new child physical page so we
-    // can copy into it while still running on the parent's CR3.
-    uint64_t scratch = paging_get_scratch_base();
-
-    /* Resolve the current process PML4 and the kernel PML4 once for the loop. */
-    uint64_t *kernel_pml4 = paging_get_pml4();
-    uint64_t *cur_pml4 = NULL;
-    unsigned  scratch_i4 = scratch ? ((scratch >> 39) & 0x1FF) : 0;
-    if (scratch && kernel_pml4) {
-        uint64_t cr3_phys;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3_phys));
-        cr3_phys &= 0xFFFFFFFFFFFFF000ULL;
-        uint64_t *p = (uint64_t *)phys_to_virt_kernel(cr3_phys);
-        if (p != kernel_pml4) cur_pml4 = p;
-    }
 
     struct range { uint64_t a, b; } ranges[4];
     int rn = 0;
@@ -116,23 +104,24 @@ static int clone_user_address_space(process_t *parent, process_t *child) {
             uint64_t pte = paging_get_pte(v);
             if (!(pte & PFLAG_USER)) continue;
 
-            // Allocate a fresh physical page for the child.
+            /* Allocate a fresh physical page for the child. */
             uint64_t child_phys = phys_alloc_frame();
             if (!child_phys) return -ENOMEM;
 
-            // Map scratch VA → child_phys in the kernel PML4, then propagate the
-            // PML4 slot into the current process CR3 before dereferencing scratch.
-            paging_map_page(scratch, child_phys, PFLAG_PRESENT | PFLAG_WRITABLE);
-            if (cur_pml4 && kernel_pml4)
-                cur_pml4[scratch_i4] = kernel_pml4[scratch_i4];
+            /*
+             * Copy the parent page directly via identity mapping.
+             * phys_to_virt_kernel(phys) == (void*)phys when phys_offset == 0,
+             * so no scratch VA or TLB shenanigans are needed.
+             */
+            void *src = phys_to_virt_kernel(parent_phys & ~0xFFFULL);
+            void *dst = phys_to_virt_kernel(child_phys);
+            if (!src || !dst) {
+                phys_free_frame(child_phys);
+                return -ENOMEM;
+            }
+            memcpy(dst, src, 4096);
 
-            // Copy parent page content (virtual address v is readable from here).
-            memcpy((void *)(uintptr_t)scratch, (void *)(uintptr_t)v, 4096);
-
-            // Unmap scratch to avoid stale TLB entries.
-            paging_unmap_page(scratch);
-
-            // Map child_phys into child's address space with the same flags.
+            /* Map child_phys into the child's address space with the same flags. */
             uint64_t flags = (pte & 0xFFFULL) | PFLAG_PRESENT | PFLAG_USER | PFLAG_WRITABLE;
             if (paging_map_range_to_pml4(child_pml4, v, child_phys, 4096, flags) != 0) {
                 phys_free_frame(child_phys);
@@ -144,9 +133,11 @@ static int clone_user_address_space(process_t *parent, process_t *child) {
     com_write_string(COM1_PORT, "[FORK] Setting child CR3=0x");
     com_write_hex64(COM1_PORT, child_cr3);
     com_write_string(COM1_PORT, "\n");
-    
-    child->cr3 = child_cr3;
-    child->page_table = child_cr3;  // CRITICAL: Initialize page_table too!
+
+    paging_sync_kernel_mappings(child_pml4);
+
+    child->cr3        = child_cr3;
+    child->page_table = child_cr3;
 
     child->user_image_base  = parent->user_image_base;
     child->user_image_end   = parent->user_image_end;
@@ -173,13 +164,9 @@ int sys_fork_impl(void) {
     if (!parent) return -ESRCH;
     if (!parent->is_user) return -EACCES;
 
-    // process_alloc() allocates the struct, assigns a PID, registers the slot
-    // in process_table[], and allocates fpu_state.  It does NOT allocate a
-    // kernel stack — we do that here because we need to copy the parent's.
     process_t *child = process_alloc();
     if (!child) return -ENOMEM;
 
-    // Copy identity from parent
     child->parent_pid = parent->pid;
     child->ppid       = parent->pid;
     child->pgid       = parent->pgid;
@@ -196,26 +183,20 @@ int sys_fork_impl(void) {
     child->weight     = parent->weight;
     strncpy(child->name, parent->name, PROCESS_NAME_MAX - 1);
 
-    // Inherit filesystem context
     child->current_slot = parent->current_slot;
     strncpy(child->cwd, parent->cwd, sizeof(child->cwd) - 1);
 
-    // Clone environment
     child->envc = parent->envc;
     child->envp = dup_strv(parent->envp, parent->envc);
     if (parent->envc && !child->envp) { process_free(child); return -ENOMEM; }
 
-    // Copy FPU state (process_alloc() already allocated fpu_state)
     if (parent->fpu_state && child->fpu_state)
         memcpy(child->fpu_state, parent->fpu_state, 512);
 
-    // Kernel stack: copy parent's stack byte-for-byte so the saved frames
-    // and on-stack variables are valid in the child's context.
     child->kernel_stack = kmalloc(KERNEL_STACK_SIZE);
     if (!child->kernel_stack) { process_free(child); return -ENOMEM; }
     memcpy(child->kernel_stack, parent->kernel_stack, KERNEL_STACK_SIZE);
 
-    // Translate parent's syscall frame base pointer into the child's stack.
     uint64_t parent_stack_base = (uint64_t)(uintptr_t)parent->kernel_stack;
     uint64_t child_stack_base  = (uint64_t)(uintptr_t)child->kernel_stack;
 
@@ -232,18 +213,14 @@ int sys_fork_impl(void) {
     uint64_t rbp_off   = parent_rbp - parent_stack_base;
     uint64_t child_rbp = child_stack_base + rbp_off;
 
-    // Patch saved rax on the child's copied stack → child returns 0 from fork().
     *(uint64_t *)(uintptr_t)child_rbp = 0;
 
-    // When context_switch_asm jumps to context.rip (syscall_entry_return) with
-    // RSP = child_rbp, the epilogue pops all saved registers and iretq's back
-    // to userland using the hardware frame already on the copied stack.
     memset(&child->context, 0, sizeof(child->context));
     child->context.rip    = (uint64_t)(uintptr_t)syscall_entry_return;
     child->context.rsp    = child_rbp;
     child->context.rbp    = child_rbp;
-    child->context.rflags = 0x202;  /* IF=1 */
-    
+    child->context.rflags = 0x202;
+
     com_write_string(COM1_PORT, "[FORK] Child context: RIP=0x");
     com_write_hex64(COM1_PORT, child->context.rip);
     com_write_string(COM1_PORT, " RSP=0x");
@@ -253,11 +230,15 @@ int sys_fork_impl(void) {
     com_write_hex64(COM1_PORT, (uint64_t)current);
     com_write_string(COM1_PORT, "\n");
 
-    // Give the child a fair starting vruntime
     extern uint64_t scheduler_get_min_vruntime(void);
     child->vruntime = scheduler_get_min_vruntime();
 
-    // Clone user address space (COW where writable)
+    /* Inherit FDs before creating PML4 — fd_clone_for_fork may kmalloc. */
+    extern void fd_clone_for_fork(int parent_pid, int child_pid);
+    fd_clone_for_fork((int)parent->pid, (int)child->pid);
+
+    /* ALL kmallocs are done above. Create the child PML4 now so it captures
+     * the fully up-to-date kernel_master_cr3 high-half entries. */
     int rc = clone_user_address_space(parent, child);
     if (rc != 0) {
         kfree(child->kernel_stack);
@@ -266,12 +247,6 @@ int sys_fork_impl(void) {
         return rc;
     }
 
-    // Inherit parent's open file descriptors (POSIX fork semantics).
-    extern void fd_clone_for_fork(int parent_pid, int child_pid);
-    fd_clone_for_fork((int)parent->pid, (int)child->pid);
-
-    // Link child into parent's children list under children_lock so that
-    // do_waitpid() sees the child immediately after fork() returns.
     extern spinlock_t children_lock;
     spinlock_lock(&children_lock);
     child->parent       = parent;
@@ -282,7 +257,6 @@ int sys_fork_impl(void) {
     parent->children = child;
     spinlock_unlock(&children_lock);
 
-    // Set child state and add to the scheduler run queue.
     child->state = PROCESS_STATE_RUNNABLE;
     scheduler_add_process(child);
 
@@ -299,6 +273,5 @@ int sys_fork_impl(void) {
     com_write_hex64(COM1_PORT, child->cr3);
     com_write_string(COM1_PORT, "\n");
 
-    // Parent returns child's PID.
     return (int)child->pid;
 }

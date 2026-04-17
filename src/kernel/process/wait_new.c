@@ -5,37 +5,33 @@
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/errno.h"
 #include "moduos/kernel/debug.h"
+#include "moduos/kernel/memory/usercopy.h"
+#include "moduos/kernel/memory/phys.h"
 
 extern char *itoa(int value, char *str, int base);
-
-// Defined in exit_new.c - protects sibling/children list traversal
 extern spinlock_t children_lock;
 
-// Wait for any child to exit
 int do_wait(int *status) {
     return do_waitpid(-1, status, 0);
 }
 
-// Wait for a specific child (pid > 0), any child (pid == -1),
-// or any child in the current process group (pid == 0).
+int do_waitpid_full(int32_t pid, int *kernel_status, int options,
+                    void *user_status_ptr);
+
 int do_waitpid(int32_t pid, int *status, int options) {
+    return do_waitpid_full(pid, status, options, NULL);
+}
+
+int do_waitpid_full(int32_t pid, int *kernel_status, int options,
+                    void *user_status_ptr) {
     process_t *parent = process_get_current();
-    
-    // Debug: show what current is
-    // TEMPORARILY DISABLED TO AVOID FAULT
-    // com_write_string(COM1_PORT, "[WAIT] do_waitpid called, current=0x");
-    // com_write_hex64(COM1_PORT, (uint64_t)parent);
-    // com_write_string(COM1_PORT, "\n");
+
     if (!parent) {
         com_write_string(COM1_PORT, "[WAIT] ERROR: current is NULL!\n");
         return -1;
     }
-    
-    // Safety check: verify parent pointer is valid (not a tiny value)
     if ((uint64_t)parent < 0xFFFF800000000000ULL) {
-        com_write_string(COM1_PORT, "[WAIT] ERROR: current pointer invalid: 0x");
-        com_write_hex64(COM1_PORT, (uint64_t)parent);
-        com_write_string(COM1_PORT, " (looks like PID instead of pointer!)\n");
+        com_write_string(COM1_PORT, "[WAIT] ERROR: current pointer invalid\n");
         return -ESRCH;
     }
 
@@ -46,13 +42,9 @@ int do_waitpid(int32_t pid, int *status, int options) {
 
         if (!parent->children) {
             spinlock_unlock(&children_lock);
-            if (kernel_debug_is_on())
-                com_write_string(COM1_PORT, "[WAIT] No children\n");
             return -ECHILD;
         }
 
-        /* For pid > 0: verify at least one child with that PID exists before
-         * sleeping, otherwise return ECHILD immediately. */
         if (pid > 0) {
             int found_match = 0;
             process_t *c = parent->children;
@@ -71,7 +63,7 @@ int do_waitpid(int32_t pid, int *status, int options) {
 
         while (child) {
             int match = (pid == -1) ||
-                        (pid > 0  && (uint32_t)pid == child->pid) ||
+                        (pid >  0 && (uint32_t)pid == child->pid) ||
                         (pid == 0 && child->pgid == parent->pgid) ||
                         (pid < -1 && child->pgid == (uint32_t)(-pid));
             if (match && child->state == PROCESS_STATE_ZOMBIE) {
@@ -86,16 +78,13 @@ int do_waitpid(int32_t pid, int *status, int options) {
                 com_write_string(COM1_PORT, "[WAIT] Reaping zombie PID ");
                 itoa((int)found->pid, buf, 10);
                 com_write_string(COM1_PORT, buf);
-                com_write_string(COM1_PORT, " exit=");
-                itoa(found->exit_code, buf, 10);
-                com_write_string(COM1_PORT, buf);
                 com_write_string(COM1_PORT, "\n");
             }
 
             uint32_t child_pid = found->pid;
-            int exit_code = found->exit_code;
+            int      exit_code = found->exit_code;
 
-            // Unlink from parent's children list.
+            /* Unlink from parent's children list. */
             if (found->sibling_prev)
                 found->sibling_prev->sibling_next = found->sibling_next;
             else
@@ -105,78 +94,94 @@ int do_waitpid(int32_t pid, int *status, int options) {
 
             spinlock_unlock(&children_lock);
 
-            extern void process_destroy(process_t *p);
-            extern void process_free_user_memory(process_t *p);
-            extern void paging_switch_cr3(uint64_t new_cr3_phys);
+            /*
+             * Step 1 — write exit status NOW, before any invlpg fires.
+             *
+             * process_free_user_memory() calls paging_unmap_page() which
+             * issues invlpg for every page it frees.  invlpg evicts TLB
+             * entries by virtual address regardless of CR3, so it can shoot
+             * the parent's own stack/heap entries even after we restore CR3.
+             * Writing the status here, while the parent's TLB is still warm
+             * and page_table is valid, avoids that race entirely.
+             */
+            if (kernel_status)
+                *kernel_status = exit_code;
 
-            // Switch to the child's CR3 so that paging_virt_to_phys() and
-            // paging_unmap_page() operate on the child's address space, not the
-            // parent's.  Without this, free_user_range() would unmap the parent's
-            // pages at the same virtual addresses, corrupting the parent.
-            
-            // Get the ACTUAL current CR3 - this is what we need to restore to
-            uint64_t actual_current_cr3;
-            __asm__ volatile("mov %%cr3, %0" : "=r"(actual_current_cr3));
-            
-            com_write_string(COM1_PORT, "[WAIT] Parent PID=");
-            char pbuf[16];
-            itoa((int)parent->pid, pbuf, 10);
-            com_write_string(COM1_PORT, pbuf);
-            com_write_string(COM1_PORT, " page_table=0x");
-            com_write_hex64(COM1_PORT, parent->page_table);
-            com_write_string(COM1_PORT, " cr3=0x");
-            com_write_hex64(COM1_PORT, parent->cr3);
-            com_write_string(COM1_PORT, "\n");
-            com_write_string(COM1_PORT, "[WAIT] Current CR3=0x");
-            com_write_hex64(COM1_PORT, actual_current_cr3);
-            com_write_string(COM1_PORT, "\n");
-            
-            uint64_t child_cr3 = found->page_table ? found->page_table : found->cr3;
-            com_write_string(COM1_PORT, "[WAIT] Child CR3=0x");
-            com_write_hex64(COM1_PORT, child_cr3);
-            com_write_string(COM1_PORT, "\n");
-            
-            if (child_cr3 && child_cr3 != actual_current_cr3) {
-                com_write_string(COM1_PORT, "[WAIT] Switching to child CR3\n");
-                paging_switch_cr3(child_cr3);
+            if (user_status_ptr) {
+                if (usercopy_to_user(user_status_ptr, &exit_code,
+                                     sizeof(exit_code)) != 0) {
+                    com_write_string(COM1_PORT,
+                        "[WAIT] WARNING: usercopy to user_status_ptr failed\n");
+                    /* Non-fatal — parent asked for status but mapping is gone.
+                     * Still reap the child so it doesn't stay zombie forever. */
+                }
             }
 
+            /*
+             * Step 2 — free the child's user-space page mappings.
+             *
+             * process_free_user_memory() saves CR3, switches to the child's
+             * page table, unmaps all user ranges, then restores CR3.
+             * It does NOT touch p->page_table or p->cr3 — that is our job.
+             */
+            extern void process_free_user_memory(process_t *p);
             process_free_user_memory(found);
 
-            // Restore the parent's address space before returning to it.
-            if (child_cr3 && child_cr3 != actual_current_cr3) {
-                com_write_string(COM1_PORT, "[WAIT] Restoring parent CR3\n");
-                paging_switch_cr3(actual_current_cr3);
+            /*
+             * Step 3 — free the child's PML4 frame.
+             *
+             * Do this after process_free_user_memory() has unmapped all leaf
+             * pages and restored CR3.  Never free if it matches PID 1's CR3
+             * (kernel processes share the boot PML4).
+             */
+            if (found->page_table) {
+                uint64_t pml4_phys  = found->page_table & ~0xFFFULL;
+                uint64_t kernel_cr3 = 0;
+                process_t *init = process_get_by_pid(1);
+                if (init) kernel_cr3 = init->page_table & ~0xFFFULL;
+                if (pml4_phys && pml4_phys != kernel_cr3)
+                    phys_free_frame(pml4_phys);
+                found->page_table = 0;
+                found->cr3        = 0;
             }
-            
-            uint64_t verify_cr3;
-            __asm__ volatile("mov %%cr3, %0" : "=r"(verify_cr3));
-            com_write_string(COM1_PORT, "[WAIT] After restore CR3=0x");
-            com_write_hex64(COM1_PORT, verify_cr3);
-            com_write_string(COM1_PORT, "\n");
 
+            /* Step 4 — verify CR3 is still the parent's (paranoia check). */
+            {
+                uint64_t verify_cr3;
+                __asm__ volatile("mov %%cr3, %0" : "=r"(verify_cr3));
+                uint64_t expected = parent->page_table & ~0xFFFULL;
+                if (expected && (verify_cr3 & ~0xFFFULL) != expected) {
+                    com_write_string(COM1_PORT,
+                        "[WAIT] BUG: CR3 wrong after free, restoring\n");
+                    __asm__ volatile("mov %0, %%cr3"
+                                     :: "r"(parent->page_table) : "memory");
+                }
+            }
+
+            /*
+             * Step 5 — destroy the process struct.
+             *
+             * page_table is already 0 so process_destroy()'s sanity check
+             * will not fire and will not attempt a second free.
+             */
+            extern void process_destroy(process_t *p);
             process_destroy(found);
 
             if (kernel_debug_is_on()) {
-                com_write_string(COM1_PORT, "[WAIT] Reap done, returning child PID ");
+                com_write_string(COM1_PORT, "[WAIT] Reap complete, child_pid=");
                 itoa((int)child_pid, buf, 10);
                 com_write_string(COM1_PORT, buf);
                 com_write_string(COM1_PORT, "\n");
-                com_write_string(COM1_PORT, "[WAIT] About to write exit_code to status pointer\n");
             }
-            if (status) *status = exit_code;
-            if (kernel_debug_is_on())
-                com_write_string(COM1_PORT, "[WAIT] Exit code written, about to return\n");
+
             return (int)child_pid;
         }
 
         spinlock_unlock(&children_lock);
 
-        if (options & 1) {  // WNOHANG
+        if (options & 1)  /* WNOHANG */
             return 0;
-        }
 
-        // Sleep until a child exits — process_exit() calls wakeup(parent).
         sleep_on(parent);
     }
 }

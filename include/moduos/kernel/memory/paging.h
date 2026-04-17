@@ -76,4 +76,23 @@ void* ioremap(uint64_t phys_addr, uint64_t size);
 // If callers write past the end of the mapped region they will fault immediately.
 void* ioremap_guarded(uint64_t phys_addr, uint64_t size);
 
+void paging_sync_kernel_mappings(uint64_t *target_pml4);
+int paging_map_kernel_page(uint64_t virt, uint64_t phys, uint64_t flags);
+uint64_t paging_get_master_cr3(void);
+
+/*
+ * paging_free_process_pml4 — tears down a process PML4 and frees all
+ * page-table pages it owns in the LOW HALF (indices 0–255) only.
+ *
+ * The high half (indices 256–511) is shared kernel space — those PDPT/PD/PT
+ * pages are owned by the kernel and must NOT be freed here.
+ *
+ * Physical frames backing the actual mapped pages are NOT freed here; that is
+ * the job of the VM / region-map teardown that runs before this call.  We only
+ * free the paging-structure pages themselves (PDPT, PD, PT).
+ *
+ * Precondition: the target PML4 must NOT be the currently-loaded CR3.
+ */
+void paging_free_process_pml4(uint64_t pml4_phys_addr);
+
 #endif /* PAGING_H */

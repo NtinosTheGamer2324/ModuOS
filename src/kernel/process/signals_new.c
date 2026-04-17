@@ -1,14 +1,9 @@
 // signals_new.c - Basic signal handling (POSIX-style)
 
 #include "moduos/kernel/process/process_new.h"
+#include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/process/signals.h"
 #include "moduos/kernel/COM/com.h"
-
-extern char *itoa(int value, char *str, int base);
-
-// Signal numbers (subset of POSIX signals)
-#define SIGKILL  9
-#define SIGTERM 15
-#define SIGCHLD 17
 
 // Send a signal to a process
 int send_signal(uint32_t pid, int sig) {

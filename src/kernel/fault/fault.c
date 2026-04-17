@@ -421,6 +421,30 @@ void fault_handler_stack_fault(uint64_t error_code, interrupt_frame_t *frame) {
 }
 
 void fault_handler_general_protection(uint64_t error_code, interrupt_frame_t *frame) {
+    // Print error code explicitly first
+    char hexbuf[19];
+    com_write_string(COM1_PORT, "[GPF] error_code=0x");
+    format_hex64(error_code, hexbuf);
+    com_write_string(COM1_PORT, hexbuf);
+    com_write_string(COM1_PORT, " frame->rip=0x");
+    format_hex64(frame->rip, hexbuf);
+    com_write_string(COM1_PORT, hexbuf);
+    com_write_string(COM1_PORT, " frame->cs=0x");
+    format_hex64(frame->cs, hexbuf);
+    com_write_string(COM1_PORT, hexbuf);
+    com_write_string(COM1_PORT, " frame->rflags=0x");
+    format_hex64(frame->rflags, hexbuf);
+    com_write_string(COM1_PORT, hexbuf);
+    com_write_string(COM1_PORT, "\n");
+    
+    // Also dump the raw RSP so we can see where the CPU was
+    uint64_t rsp_now;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp_now));
+    com_write_string(COM1_PORT, "[GPF] handler_rsp=0x");
+    format_hex64(rsp_now, hexbuf);
+    com_write_string(COM1_PORT, hexbuf);
+    com_write_string(COM1_PORT, "\n");
+    
     /* If CPL=3, treat as user process crash and terminate instead of panicking kernel. */
     if ((frame->cs & 3) == 3) {
         process_t *p = process_get_current();

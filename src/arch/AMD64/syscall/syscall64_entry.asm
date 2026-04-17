@@ -1,15 +1,17 @@
 ; syscall64_entry.asm - SYSCALL/SYSRET entry point
 ;
 ; Frame layout mirrors syscall_entry.asm exactly so that sys_fork_impl,
-; syscall_entry_return, and signal delivery work without modification.
+; syscall64_entry_return, and signal delivery work without modification.
 ;
-; On SYSCALL entry:
-;   RCX = user RIP (hardware-saved)
-;   R11 = user RFLAGS (hardware-saved)
-;   RSP = user RSP
+; On SYSCALL entry (hardware contract):
+;   RCX = user RIP
+;   R11 = user RFLAGS
+;   RSP = user RSP  (NOT switched; we must do it ourselves)
+;   CS  = STAR.kernel_cs, SS = STAR.kernel_cs + 8
+;   IF  = 0 (cleared by FMASK)
 ;   RAX = syscall number
-;   RDI, RSI, RDX = args 1-3
-;   R10 = arg 4
+;   RDI, RSI, RDX = args 1–3
+;   R10 = arg 4   (RCX is clobbered by hardware)
 ;   R8  = arg 5
 
 bits 64
@@ -17,6 +19,7 @@ bits 64
 extern syscall_handler
 extern g_syscall_entry_rbp
 extern g_kernel_cr3
+extern g_syscall_rsp0               ; written by amd64_syscall_set_kernel_stack()
 
 global syscall64_entry
 global syscall64_entry_return
@@ -24,23 +27,28 @@ global syscall64_entry_return
 section .text
 
 syscall64_entry:
-    ; FMASK cleared IF on entry; we are non-interruptible.
+    ; IF is already 0 (FMASK).  We are non-preemptible until we re-enable
+    ; interrupts at the bottom of syscall_handler (or never, for short paths).
+
     swapgs
 
-    ; Preserve user RSP and switch to the per-CPU kernel stack.
-    mov [gs:48], rsp
-    mov rsp, [gs:24]
+    ; Save user RSP, then load the kernel stack from g_syscall_rsp0.
+    ; This is the same value amd64_tss_set_rsp0() writes to TSS.rsp0, kept in
+    ; a plain exported global so we can reach it with a RIP-relative load
+    ; without needing g_tss exported from gdt.c.
+    mov [gs:48], rsp                        ; stash user RSP in scratch slot
+    mov rsp, [rel g_syscall_rsp0]           ; kernel RSP0
 
-    ; Build a synthetic iretq-compatible frame so syscall64_entry_return
-    ; can use iretq unconditionally, matching the syscall_entry.asm contract.
-    push qword 0x23     ; user SS  (USER_DS)
-    push qword [gs:48]  ; user RSP
-    push r11            ; user RFLAGS
-    push qword 0x2B     ; user CS  (USER_CS)
-    push rcx            ; user RIP
+    ; Build an iretq-compatible frame so syscall64_entry_return can use iretq
+    ; unconditionally, keeping the same contract as syscall_entry.asm.
+    push qword 0x23                         ; user SS  (USER_DS  | 3)
+    push qword [gs:48]                      ; user RSP
+    push r11                                ; user RFLAGS
+    push qword 0x2B                         ; user CS  (USER_CS  | 3)
+    push rcx                                ; user RIP
 
-    ; GPR save — identical order to syscall_entry.asm.
-    ; RAX still holds the syscall number at this point.
+    ; Save all GPRs in the same order as syscall_entry.asm so that
+    ; sys_fork_impl can walk the frame without caring which entry path was used.
     push r15
     push r14
     push r13
@@ -55,35 +63,35 @@ syscall64_entry:
     push rdx
     push rcx
     push rbx
-    push rax
+    push rax                                ; syscall number at [rsp+0]
 
-    ; Record frame base for sys_fork_impl.
     mov rbp, rsp
     mov [rel g_syscall_entry_rbp], rbp
 
-    ; SysV ABI alignment.
+    ; SysV ABI 16-byte stack alignment before the C call.
     test rsp, 0xF
     jz .aligned
     sub rsp, 8
 .aligned:
-    ; Reconstruct C arguments from the saved frame.
-    ; Saved layout (rbp offsets): [0]=rax [8]=rbx [16]=rcx [24]=rdx
-    ;                             [32]=rsi [40]=rdi [48]=rbp [56]=r8
-    ;                             [64]=r9  [72]=r10 [80]=r11 [88]=r12
-    ;                             [96]=r13 [104]=r14 [112]=r15
-    ; iretq frame above that: RIP CS RFLAGS RSP SS
-    mov rdi, [rbp]      ; syscall_num  ← saved rax
-    mov rsi, [rbp + 40] ; arg1         ← saved rdi
-    mov rdx, [rbp + 32] ; arg2         ← saved rsi
-    mov rcx, [rbp + 24] ; arg3         ← saved rdx
-    mov r8,  [rbp + 72] ; arg4         ← saved r10
-    mov r9,  [rbp + 56] ; arg5         ← saved r8
+
+    ; Map saved registers to C arguments.
+    ; Frame at rbp: [0]=rax(num) [8]=rbx [16]=rcx [24]=rdx
+    ;               [32]=rsi     [40]=rdi [48]=rbp [56]=r8
+    ;               [64]=r9      [72]=r10 [80]=r11 [88]=r12
+    ;               [96]=r13     [104]=r14 [112]=r15
+    ; iretq frame:  RIP CS RFLAGS RSP SS
+    mov rdi, [rbp]          ; syscall_num  ← saved rax
+    mov rsi, [rbp + 40]     ; arg1         ← saved rdi
+    mov rdx, [rbp + 32]     ; arg2         ← saved rsi
+    mov rcx, [rbp + 24]     ; arg3         ← saved rdx
+    mov r8,  [rbp + 72]     ; arg4         ← saved r10
+    mov r9,  [rbp + 56]     ; arg5         ← saved r8
 
     cld
     call syscall_handler
 
     mov rsp, rbp
-    mov [rsp], rax      ; write return value into saved rax slot
+    mov [rsp], rax          ; return value into saved-rax slot
 
 syscall64_entry_return:
     pop rax
@@ -102,6 +110,6 @@ syscall64_entry_return:
     pop r14
     pop r15
 
-    ; iretq frame: RIP CS RFLAGS RSP SS
+    ; iretq pops: RIP, CS, RFLAGS (restoring IF), RSP, SS
     swapgs
     iretq

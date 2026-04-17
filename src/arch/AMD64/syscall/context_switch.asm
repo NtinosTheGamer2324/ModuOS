@@ -1,86 +1,68 @@
-; context_switch.asm - Context switching with argument passing
-; context_switch.asm - Context switching with argument passing + FPU save/restore
+; context_switch.asm
+;
 ; void context_switch(cpu_state_t *old_state, cpu_state_t *new_state,
-;                    void *old_fpu_state, void *new_fpu_state)
+;                     void *old_fpu,           void *new_fpu)
+;
+; cpu_state_t layout mirrors cpu_context_t (same offsets).
+;
+; FPU is lazy: CR0.TS is set on switch; #NM restores on first use.
+; r12/r13 are preserved across the switch unmodified; the user-mode
+; trampoline (amd64_enter_user_trampoline) reads argc/argv from them.
+;
+; RFLAGS is restored from the saved context via popfq, not forced via sti,
+; so a kernel thread that context-switched out with IF=0 will resume with
+; IF=0.  The trampoline opens with an explicit cli and re-enables interrupts
+; through iretq, so that path is safe either way.
 
 section .text
 global context_switch
 
 context_switch:
-    ; RDI = old_state (or NULL for first switch)
+    ; RDI = old_state  (NULL on the very first switch)
     ; RSI = new_state
-    ; RDX = old_fpu_state (or NULL)
-    ; RCX = new_fpu_state
-    
-    ; Save current context if old_state is not NULL
+    ; RDX = old_fpu    (unused; lazy FPU)
+    ; RCX = new_fpu    (unused; lazy FPU)
+
     test rdi, rdi
     jz .restore
 
-    ; Lazy FPU switching: do NOT save here (too expensive).
-.save_gprs:
-    
-    ; Save callee-saved registers to old_state
-    mov [rdi + 0], r15
-    mov [rdi + 8], r14
+.save:
+    mov [rdi +  0], r15
+    mov [rdi +  8], r14
     mov [rdi + 16], r13
     mov [rdi + 24], r12
     mov [rdi + 32], rbx
     mov [rdi + 40], rbp
-    
-    ; Save return address as RIP
-    mov rax, [rsp]
+
+    mov rax, [rsp]          ; return address becomes saved RIP
     mov [rdi + 48], rax
-    
-    ; Save RSP (after return address)
-    lea rax, [rsp + 8]
+
+    lea rax, [rsp + 8]      ; caller's RSP (past the return address)
     mov [rdi + 56], rax
-    
-    ; Save RFLAGS
+
     pushfq
     pop rax
     mov [rdi + 64], rax
-    
-.restore:
-    ; Lazy FPU switching: FPU is restored on first use via #NM handler.
 
-    ; Restore context from new_state (RSI)
-    mov r15, [rsi + 0]
-    mov r14, [rsi + 8]
+.restore:
+    mov r15, [rsi +  0]
+    mov r14, [rsi +  8]
     mov r13, [rsi + 16]
     mov r12, [rsi + 24]
     mov rbx, [rsi + 32]
     mov rbp, [rsi + 40]
-    
-    ; Get new RIP
-    mov rax, [rsi + 48]
-    
-    ; Get new RSP
-    mov rcx, [rsi + 56]
-    
-    ; Disable interrupts for the critical window between restoring RFLAGS and
-    ; completing the stack switch. A timer IRQ firing after popfq but before
-    ; 'mov rsp, rcx' would run on the outgoing process's kernel stack, which
-    ; may be freed by scheduler_tick's zombie reaper before we finish.
+
+    mov rax, [rsi + 48]     ; new RIP
+    mov r9,  [rsi + 56]     ; new RSP
+    mov r10, [rsi + 64]     ; new RFLAGS
+
+    ; Keep interrupts closed across the stack swap and into popfq.
+    ; popfq is the only place IF changes; there is no sti in this path.
     cli
 
-    ; Restore RFLAGS into a scratch register (do not popfq yet).
-    ; We will re-enable interrupts explicitly after the stack switch.
-    mov rdx, [rsi + 64]
+    mov rsp, r9
 
-    ; NOTE:
-    ; User-mode entry goes through amd64_enter_user_trampoline.
-    ; That trampoline expects argc/argv in r12/r13 (callee-saved), not rdi/rsi.
-    ; So do NOT move/clear r12/r13 here.
-    ;
-    ; For kernel threads (non-user), r12/r13 may be used for other purposes,
-    ; and rdi/rsi are not part of the saved cpu_state.
+    push r10
+    popfq
 
-.switch_stack:
-    ; Switch to new stack — safe to take IRQs again after this point.
-    mov rsp, rcx
-
-    ; Re-enable interrupts now that we are on the correct stack.
-    sti
-
-    ; Jump to new RIP.
     jmp rax
