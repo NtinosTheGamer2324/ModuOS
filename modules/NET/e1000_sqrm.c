@@ -131,44 +131,78 @@ static inline uint32_t e1000_read_reg(uint32_t reg) {
  * @return 0 on success, negative on error
  */
 static int e1000_read_mac_addr(uint8_t mac_out[6]) {
-    if (!mac_out) {
-        return -22; // -EINVAL
-    }
-    
-    // Try reading from EEPROM
-    for (int i = 0; i < 3; i++) {
-        uint32_t eerd = e1000_read_reg(E1000_REG_EERD);
-        eerd = (i << 8) | 1;  // Address + Start bit
-        e1000_write_reg(E1000_REG_EERD, eerd);
-        
-        // Wait for read to complete (timeout after 1000 iterations)
-        int timeout = 1000;
-        while (timeout-- > 0) {
-            eerd = e1000_read_reg(E1000_REG_EERD);
-            if (eerd & (1 << 4)) {  // Done bit
-                uint16_t data = (eerd >> 16) & 0xFFFF;
-                mac_out[i * 2] = data & 0xFF;
-                mac_out[i * 2 + 1] = (data >> 8) & 0xFF;
+    if (!mac_out) return -22;
+
+    // Detect EEPROM presence by checking if EECD has the EEPROM present bit.
+    // If not present or unresponsive, fall back to RAL/RAH.
+    // EECD bit 8 = EE_PRES (EEPROM present) on 82540/82545/82541/82547
+    uint32_t eecd = e1000_read_reg(E1000_REG_EECD);
+    int eeprom_present = (eecd & (1u << 8)) != 0;
+
+    if (eeprom_present) {
+        // Determine EERD "done" bit position.
+        // 82540EM / 82545EM (small EEPROM): done = bit 4
+        // 82541xx / 82547xx (large EEPROM): done = bit 1
+        // We probe both: try bit 4 first (covers QEMU + most physical 8254x).
+        // If neither fires we fall through to RAL/RAH.
+        for (int i = 0; i < 3; i++) {
+            uint32_t eerd = ((uint32_t)i << 8) | 1u;  // addr=i, start=1
+            e1000_write_reg(E1000_REG_EERD, eerd);
+
+            uint16_t data = 0;
+            int done = 0;
+
+            // Poll up to 10000 iterations (~a few ms even at slow emulation speed).
+            for (int t = 0; t < 10000; t++) {
+                eerd = e1000_read_reg(E1000_REG_EERD);
+                // Check bit 4 (small EEPROM) or bit 1 (large EEPROM)
+                if ((eerd & (1u << 4)) || (eerd & (1u << 1))) {
+                    data = (uint16_t)((eerd >> 16) & 0xFFFF);
+                    done = 1;
+                    break;
+                }
+            }
+
+            if (!done) {
+                // EEPROM timed out — fall through to RAL/RAH below.
+                eeprom_present = 0;
                 break;
             }
+
+            mac_out[i * 2]     = (uint8_t)( data       & 0xFF);
+            mac_out[i * 2 + 1] = (uint8_t)((data >> 8) & 0xFF);
         }
-        
-        if (timeout <= 0) {
-            // Fallback: read from hardware registers
-            if (i == 0) {
-                uint32_t ral = e1000_read_reg(E1000_REG_RAL);
-                uint32_t rah = e1000_read_reg(E1000_REG_RAH);
-                mac_out[0] = ral & 0xFF;
-                mac_out[1] = (ral >> 8) & 0xFF;
-                mac_out[2] = (ral >> 16) & 0xFF;
-                mac_out[3] = (ral >> 24) & 0xFF;
-                mac_out[4] = rah & 0xFF;
-                mac_out[5] = (rah >> 8) & 0xFF;
-                return 0;
+
+        if (eeprom_present) {
+            // Sanity check: a all-zero or all-FF MAC is invalid.
+            int all_zero = 1, all_ff = 1;
+            for (int i = 0; i < 6; i++) {
+                if (mac_out[i] != 0x00) all_zero = 0;
+                if (mac_out[i] != 0xFF) all_ff = 0;
             }
+            if (!all_zero && !all_ff) return 0;
+            // Invalid MAC from EEPROM — fall through to RAL/RAH.
         }
     }
-    
+
+    // Fallback: read from Receive Address registers.
+    // RAL/RAH[0] always contains the primary station address.
+    // RAH bit 31 = Address Valid.
+    uint32_t ral = e1000_read_reg(E1000_REG_RAL);
+    uint32_t rah = e1000_read_reg(E1000_REG_RAH);
+
+    if (!(rah & (1u << 31))) {
+        // No valid address anywhere — zero it out and return error.
+        for (int i = 0; i < 6; i++) mac_out[i] = 0;
+        return -1;
+    }
+
+    mac_out[0] = (uint8_t)( ral        & 0xFF);
+    mac_out[1] = (uint8_t)((ral >>  8) & 0xFF);
+    mac_out[2] = (uint8_t)((ral >> 16) & 0xFF);
+    mac_out[3] = (uint8_t)((ral >> 24) & 0xFF);
+    mac_out[4] = (uint8_t)( rah        & 0xFF);
+    mac_out[5] = (uint8_t)((rah >>  8) & 0xFF);
     return 0;
 }
 

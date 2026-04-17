@@ -1204,8 +1204,3 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
 
     return 0;
 }
-
-// TODO: QXL GPU driver backend - provides SIMPLE primitives:
-// - Memory allocation (GEM-like)
-// - Command submission (command buffer)
-// - Mode setting (KMS-like)
