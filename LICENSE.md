@@ -11,7 +11,7 @@ The majority of the ModuOS project is licensed under the **GNU General Public Li
 * **License File:** `LICENSES/GNU_GPLv2.0.txt`
 * **Components Covered:**
     * ModuOS Kernel (`src/kernel/`)
-    * Userland Applications (`src/user/`)
+    * Userland Applications (`userland/`)
     * **MDFS (ModularFS)** implementation and headers (`src/fs/MDFS/` and `include/moduos/fs/MDFS/`)
     * Standard Library and SQRM modules.
 * **Terms:** Redistribution and modification are permitted under the terms of the GPLv2.

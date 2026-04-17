@@ -39,13 +39,20 @@ arch_asm_object_files := $(patsubst src/arch/$(ARCH)/%.asm, build/arch/$(ARCH)/%
 arch_object_files := $(arch_c_object_files) $(arch_asm_object_files)
 
 # ========================
+# Common kernel CFLAGS
+# ========================
+
+KERNEL_CFLAGS := -I include -ffreestanding -mno-red-zone -mcmodel=kernel -fno-pic -fno-pie \
+                 -fno-stack-protector -DFBCON_DEBUG=1
+
+# ========================
 # Compilation rules
 # ========================
 
 # Kernel C files
 $(kernel_c_object_files): build/kernel/%.o : src/kernel/%.c
 	mkdir -p $(dir $@)
-	x86_64-elf-gcc -c -I include -ffreestanding -mno-red-zone -mcmodel=kernel -fno-pic -fno-pie -DFBCON_DEBUG=1 $< -o $@
+	x86_64-elf-gcc -c $(KERNEL_CFLAGS) $< -o $@
 
 # Kernel ASM files
 $(kernel_asm_object_files): build/kernel/%.o : src/kernel/%.asm
@@ -55,17 +62,17 @@ $(kernel_asm_object_files): build/kernel/%.o : src/kernel/%.asm
 # Drivers C files
 $(drivers_object_files): build/drivers/%.o : src/drivers/%.c
 	mkdir -p $(dir $@)
-	x86_64-elf-gcc -c -I include -ffreestanding -mno-red-zone -mcmodel=kernel -fno-pic -fno-pie -DFBCON_DEBUG=1 $< -o $@
+	x86_64-elf-gcc -c $(KERNEL_CFLAGS) $< -o $@
 
 # FS C files
 $(fs_object_files): build/fs/%.o : src/fs/%.c
 	mkdir -p $(dir $@)
-	x86_64-elf-gcc -c -I include -ffreestanding -mno-red-zone -mcmodel=kernel -fno-pic -fno-pie -DFBCON_DEBUG=1 $< -o $@
+	x86_64-elf-gcc -c $(KERNEL_CFLAGS) $< -o $@
 
 # Arch C files
 $(arch_c_object_files): build/arch/$(ARCH)/%.o : src/arch/$(ARCH)/%.c
 	mkdir -p $(dir $@)
-	x86_64-elf-gcc -c -I include -ffreestanding -mno-red-zone -mcmodel=kernel -fno-pic -fno-pie -DFBCON_DEBUG=1 $< -o $@
+	x86_64-elf-gcc -c $(KERNEL_CFLAGS) $< -o $@
 
 # Arch ASM files
 $(arch_asm_object_files): build/arch/$(ARCH)/%.o : src/arch/$(ARCH)/%.asm
@@ -92,22 +99,17 @@ sqrm_modules_out_generic := $(patsubst modules/%_sqrm.c, dist/$(ARCH)/md/%.sqrm,
 # Special SQRM modules with their own build systems
 sqrm_modules_out_special := dist/$(ARCH)/md/qxl_gpu.sqrm $(shell [ -f modules/NET/Makefile ] && echo dist/$(ARCH)/md/e1000.sqrm)
 
-# QXL GPU module uses its own Makefile
-# It outputs to dist/$(ARCH)/md/qxl_gpu.sqrm
-
-# NET NIC driver modules (e1000 now; future *_sqrm.c in modules/NET will be built by that Makefile)
 dist/$(ARCH)/md/e1000.sqrm:
 	$(MAKE) -C modules/NET ARCH=$(ARCH)
 
 $(filter dist/$(ARCH)/md/qxl_gpu.sqrm,$(sqrm_modules_out_special)):
 	$(MAKE) -C modules/QXL ARCH=$(ARCH)
 
-$(sqrm_modules_out_generic): dist/$(ARCH)/md/%.sqrm : modules/%_sqrm.c $(SQRM_LIBC)
+$(sqrm_modules_out_generic): dist/$(ARCH)/md/%.sqrm : modules/%_sqrm.c
 	mkdir -p $(dir $@)
-	# Build as ELF64 ET_DYN (shared-object style module)
-	# Link against sqrmlibc so modules get freestanding memset/memcpy/etc without relying on loader symbol resolution.
-	x86_64-elf-gcc -I include -I sdk/sqrmlibc/include -ffreestanding -fPIC -mno-red-zone -nostdlib -fno-builtin -fno-stack-protector \
-	  -Wl,-shared -Wl,-e,sqrm_module_init $< $(SQRM_LIBC) -o $@
+	x86_64-elf-gcc -I include -ffreestanding -fPIC -mno-red-zone \
+	  -nostdlib -fno-builtin -fno-stack-protector \
+	  -Wl,-shared -Wl,-e,sqrm_module_init $< -o $@
 
 sqrm_modules_out := $(sqrm_modules_out_generic) $(sqrm_modules_out_special)
 
@@ -119,31 +121,25 @@ build-$(ARCH): $(kernel_object_files) $(drivers_object_files) $(fs_object_files)
 	@echo Building kernel
 	mkdir -p dist/$(ARCH)
 	x86_64-elf-ld -n -o dist/$(ARCH)/mdsys.sqr -T targets/$(ARCH)/linker.ld -Map dist/$(ARCH)/mdsys.map \
-		$(kernel_object_files) $(drivers_object_files) $(fs_object_files) $(arch_object_files) 
+		$(kernel_object_files) $(drivers_object_files) $(fs_object_files) $(arch_object_files)
 	cp dist/$(ARCH)/mdsys.sqr targets/$(ARCH)/iso/ModuOS/System64/mdsys.sqr
-	# Copy kernel modules into the ISO (flattened)
 	mkdir -p targets/$(ARCH)/iso/ModuOS/System64/md
-	# Purge old modules to avoid stale .sqrm binaries persisting across builds
 	rm -f targets/$(ARCH)/iso/ModuOS/System64/md/*.sqrm 2>/dev/null || true
 	find dist/$(ARCH)/md -name '*.sqrm' -exec cp -f {} targets/$(ARCH)/iso/ModuOS/System64/md/ \; 2>/dev/null || true
 	@echo Building userland apps
 	chmod +x userland/build.sh
-	# Normalize line endings in case repo is checked out with CRLF (Windows)
 	sed -i 's/\r$$//' userland/build.sh
 	cd userland && sh ./build.sh
 	cp -f userland/dist/*.sqr targets/$(ARCH)/iso/Apps/
-	# Copy automan to System64
 	cp -f userland/dist/automan.sqr targets/$(ARCH)/iso/ModuOS/System64/automan.sqr 2>/dev/null || true
-	# Copy userland dynamic linker + shared libraries
-	mkdir -p targets/$(ARCH)/iso/ModuOS/shared/usr/lib
-	cp -f userland/dist/*.sqrl targets/$(ARCH)/iso/ModuOS/shared/usr/lib/ 2>/dev/null || true
-	cp -f userland/dist/ld-moduos.sqr targets/$(ARCH)/iso/ModuOS/shared/usr/lib/ 2>/dev/null || true
+	mkdir -p targets/$(ARCH)/iso/ModuOS/shared/lib
+	cp -f userland/dist/*.sqrl targets/$(ARCH)/iso/ModuOS/shared/lib/ 2>/dev/null || true
+	cp -f userland/dist/ld-moduos.sqr targets/$(ARCH)/iso/ModuOS/shared/lib/ 2>/dev/null || true
 	@echo Building FlareX display server and applications
 	$(MAKE) -C EXTERNAL/FlareX ARCH=$(ARCH)
 	mkdir -p targets/$(ARCH)/iso/Apps
 	cp -f EXTERNAL/FlareX/build/*.sqr targets/$(ARCH)/iso/Apps/ 2>/dev/null || true
 	@echo Building BIOS ISO
-	# Build GRUB core image with custom prefix baked in, then assemble ISO.
 	mkdir -p dist/$(ARCH)/iso_grub/boot/grub/i386-pc
 	grub-mkimage \
 		--format=i386-pc-eltorito \
@@ -209,6 +205,3 @@ check:
 		x86_64-elf-gcc $(file) -I include -ffreestanding -mcmodel=kernel $(ANALYZER_FLAGS) || true; \
 	)
 	@echo "Analysis complete."
-
-
-

@@ -858,7 +858,7 @@ int md_main(long argc, char **argv) {
     }
 
     init_input(s);
-    s->have_cursor = (load_cursor_bmp_rgba8888("/ModuOS/shared/usr/assets/mouse/arrow.bmp", &s->cursor) == 0);
+    s->have_cursor = (load_cursor_bmp_rgba8888("/ModuOS/shared/assets/mouse/arrow.bmp", &s->cursor) == 0);
     load_dir(s);
     set_status(s, "Ready");
 

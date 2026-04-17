@@ -1,0 +1,16 @@
+MODUOS BOOT IMAGE RESOURCE IDENTIFICATION
+Copyright (c) 2026 NTSoftware (New Technologies Software)
+
+LEGAL DISCLAIMER:
+The bitmap images contained in this directory (.bmp) are intended for 
+hardware-specific identification and aesthetic personalization 
+within the ModuOS environment. 
+
+TRADEMARK NOTICE:
+All third-party logos, brand names, and trademarks (including but not limited 
+to: Acer, Apple, ASUS, Dell, HP, Intel, Microsoft, MSI, Razer, VMWare, etc.) 
+are the property of their respective owners. 
+
+ModuOS and NTSoftware are NOT affiliated with, endorsed by, or sponsored 
+by any of these entities. These assets are included under "Fair Use" 
+principles for the sole purpose of hardware-vendor identification.

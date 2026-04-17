@@ -1876,7 +1876,7 @@ int md_main(long argc, char** argv) {
      * Read in chunks until EOF since userland has no stat() to query file size. */
     fnt_font_t *sys_font = NULL;
     {
-        const char *font_path = "/ModuOS/shared/usr/assets/fonts/Unicode.fnt";
+        const char *font_path = "/ModuOS/shared/assets/fonts/Unicode.fnt";
         int ffd = open(font_path, O_RDONLY, 0);
         if (ffd >= 0) {
             /* Grow a buffer dynamically as we read. */

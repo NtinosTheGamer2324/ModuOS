@@ -46,7 +46,8 @@ start "cmdQEMU" qemu-system-x86_64 ^
     -serial file:com1.log ^
     -serial file:com2.log ^
     -audiodev dsound,id=snd0 ^
-    -device AC97,audiodev=snd0 ^
+    -device intel-hda -device hda-duplex,audiodev=snd0 ^
+    -netdev user,id=u1 -device e1000,netdev=u1,mac=52:54:00:12:34:56 ^
     -drive file=dist\AMD64\kernel.iso,format=raw,media=cdrom,if=none,id=cdrom0 ^
     -drive file=.\disk.img,format=raw,media=disk,if=none,id=disk0 ^
     -drive file=.\ext2.img,format=raw,media=disk,if=none,id=disk1 ^
