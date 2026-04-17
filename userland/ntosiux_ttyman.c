@@ -434,15 +434,15 @@ static int spawn_shell_on_tty(int tty_index) {
         if (stderr_fd > 2) close(stderr_fd);
         
         // Exec shell
-        char *argv[] = { "/ModuOS/System64/sh.sqr", NULL };
+        char *argv[] = { "/Apps/zenith5.1.sqr", NULL };
         char *env[] = {
-            "PATH=/ModuOS/System64:/ModuOS/System64/sutils",
+            "PATH=/ModuOS/System64:/Apps/",
             "HOME=/",
             "TERM=ntosiux",
             NULL
         };
         
-        execve("/ModuOS/System64/sh.sqr", argv, env);
+        execve("/Apps/zenith5.1.sqr", argv, env);
         
         // If we get here, exec failed
         printf("[NTOSIUX-TTY] execve failed\n");

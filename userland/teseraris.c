@@ -1890,7 +1890,7 @@ int md_main(long argc, char **argv) {
     printf("Teseraris - Falling Blocks Puzzle\n");
     printf("Loading font...\n");
     
-    int font_fd = open("/ModuOS/shared/usr/assets/fonts/Unicode.fnt", O_RDONLY, 0);
+    int font_fd = open("/ModuOS/shared/assets/fonts/Unicode.fnt", O_RDONLY, 0);
     if (font_fd < 0) {
         printf("Teseraris: cannot open font file\n");
         sleep(2);

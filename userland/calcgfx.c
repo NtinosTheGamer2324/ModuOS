@@ -452,7 +452,7 @@ int md_main(long argc, char **argv) {
     calc_clear(&calc);
 
     cursor_img_t cursor;
-    int have_cursor = (load_cursor_bmp_rgba8888("/ModuOS/shared/usr/assets/mouse/arrow.bmp", &cursor) == 0);
+    int have_cursor = (load_cursor_bmp_rgba8888("/ModuOS/shared/assets/mouse/arrow.bmp", &cursor) == 0);
 
     /* Layout */
     int w = 260;

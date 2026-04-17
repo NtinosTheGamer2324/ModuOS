@@ -486,7 +486,7 @@ int md_main(long argc, char **argv) {
         static int cur_loaded = 0;
         if (!cur_loaded) {
             cur_loaded = 1;
-            (void)load_cursor_bmp_rgba8888("/ModuOS/shared/usr/assets/mouse/arrow.bmp", &cur_arrow);
+            (void)load_cursor_bmp_rgba8888("/ModuOS/shared/assets/mouse/arrow.bmp", &cur_arrow);
         }
         alpha_blit_cursor_xrgb8888(bb, pitch, vi.width, vi.height, &cur_arrow, mx, my);
 

@@ -48,7 +48,7 @@ int md_main(long argc, char **argv) {
     signal(SIGHUP, SIG_IGN);    // Ignore hangup
     signal(SIGQUIT, SIG_IGN);   // Ignore quit
     
-    int fd = open("/ModuOS/shared/usr/assets/fonts/Unicode.fnt", O_RDONLY, 0);
+    int fd = open("/ModuOS/shared/assets/fonts/Unicode.fnt", O_RDONLY, 0);
     if (fd < 0) {
         printf("Error: Could not open font file!\n");
         return 1;

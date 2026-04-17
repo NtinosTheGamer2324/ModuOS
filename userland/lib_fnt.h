@@ -27,24 +27,24 @@ typedef struct {
 } fnt_glyph_t;
 
 typedef struct {
-    fnt_header_t header;
-    fnt_glyph_t *glyphs;
-    fnt_glyph_t *ascii_cache[128];
+    fnt_header_t  header;
+    fnt_glyph_t  *glyphs;
+    fnt_glyph_t  *ascii_cache[128];  /* direct O(1) lookup for U+0000..U+007F */
+    fnt_glyph_t **hash_buckets;      /* open-addressing hash table for U+0080+ */
+    uint32_t      hash_size;         /* number of buckets (always a power of 2) */
 } fnt_font_t;
 
-fnt_font_t *fnt_load_font(const void *data, size_t size);
-void fnt_free_font(fnt_font_t *font);
+fnt_font_t  *fnt_load_font(const void *data, size_t size);
+void         fnt_free_font(fnt_font_t *font);
 fnt_glyph_t *fnt_get_glyph(fnt_font_t *font, uint32_t codepoint);
 
 static inline int fnt_get_pixel(const fnt_glyph_t *glyph, int x, int y) {
     if (!glyph || !glyph->bitmap) return 0;
-    if (x < 0 || x >= glyph->bitmap_width) return 0;
+    if (x < 0 || x >= glyph->bitmap_width)  return 0;
     if (y < 0 || y >= glyph->bitmap_height) return 0;
-    
-    int bit_index = y * glyph->bitmap_width + x;
+    int bit_index  = y * glyph->bitmap_width + x;
     int byte_index = bit_index / 8;
     int bit_offset = 7 - (bit_index % 8);
-    
     return (glyph->bitmap[byte_index] >> bit_offset) & 1;
 }
 

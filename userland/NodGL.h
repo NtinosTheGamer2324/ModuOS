@@ -306,5 +306,3 @@ uint32_t NodGL_ColorARGB(uint8_t a, uint8_t r, uint8_t g, uint8_t b);
 #ifdef __cplusplus
 }
 #endif
-
-

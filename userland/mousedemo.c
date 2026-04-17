@@ -8,7 +8,7 @@
  * Tiny graphics+input demo:
  *  - animated gradient background
  *  - cursor driven by EVENT_MOUSE_MOVE deltas from $/dev/input/event0
- *  - cursor is a 16x16 transparent BMP from /ModuOS/shared/usr/assets/mouse/
+ *  - cursor is a 16x16 transparent BMP from /ModuOS/shared/assets/mouse/
  */
 
 #include "../include/moduos/kernel/events/events.h"
@@ -450,7 +450,7 @@ int md_main(long argc, char **argv) {
     }
 
     cursor_img_t cursor;
-    int have_cursor = (load_cursor_bmp_rgba8888("/ModuOS/shared/usr/assets/mouse/arrow.bmp", &cursor) == 0);
+    int have_cursor = (load_cursor_bmp_rgba8888("/ModuOS/shared/assets/mouse/arrow.bmp", &cursor) == 0);
 
     int32_t mx = (int32_t)(info.width / 2u);
     int32_t my = (int32_t)(info.height / 2u);

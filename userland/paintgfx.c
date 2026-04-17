@@ -1,6 +1,7 @@
 #include "libc.h"
 #include "string.h"
 #include "../include/moduos/kernel/events/events.h"
+#include "../include/moduos/drivers/graphics/videoctl.h"
 #include "gfx2d.h"
 
 /* paintgfx uses gfx2d directly (hardware-accelerated path).
@@ -935,10 +936,10 @@ int md_main(long argc, char **argv) {
     int text_scale = 1; /* 1..4 */
 
     cursor_img_t cur_arrow, cur_pencil, cur_eraser, cur_hand;
-    int have_arrow = (load_cursor_bmp_rgba8888("/ModuOS/shared/usr/assets/mouse/arrow.bmp", &cur_arrow) == 0);
-    int have_pencil = (load_cursor_bmp_rgba8888("/ModuOS/shared/usr/assets/mouse/pencil.bmp", &cur_pencil) == 0);
-    int have_eraser = (load_cursor_bmp_rgba8888("/ModuOS/shared/usr/assets/mouse/eraser.bmp", &cur_eraser) == 0);
-    int have_hand = (load_cursor_bmp_rgba8888("/ModuOS/shared/usr/assets/mouse/hand.bmp", &cur_hand) == 0);
+    int have_arrow = (load_cursor_bmp_rgba8888("/ModuOS/shared/assets/mouse/arrow.bmp", &cur_arrow) == 0);
+    int have_pencil = (load_cursor_bmp_rgba8888("/ModuOS/shared/assets/mouse/pencil.bmp", &cur_pencil) == 0);
+    int have_eraser = (load_cursor_bmp_rgba8888("/ModuOS/shared/assets/mouse/eraser.bmp", &cur_eraser) == 0);
+    int have_hand = (load_cursor_bmp_rgba8888("/ModuOS/shared/assets/mouse/hand.bmp", &cur_hand) == 0);
 
     /* Top-bar utilities (16x16 BMP icons) */
     icon_img_t ico_undo = {0}, ico_redo = {0};

@@ -98,7 +98,7 @@ for obj in "$BUILD_DIR"/*.o; do
             echo "[BUILD] LD(app dyn-demo) $obj -> $bin"
             "$LD" "$obj" -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv \
-                --dynamic-linker /ModuOS/shared/usr/lib/ld-moduos.sqr \
+                --dynamic-linker /ModuOS/shared/lib/ld-moduos.sqr \
                 --no-as-needed \
                 -L"$DIST_DIR" -l:demo_gfx.sqrl
             ;;

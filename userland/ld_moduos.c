@@ -11,7 +11,7 @@
  *
  * Features:
  * - Load ET_EXEC and ET_DYN (PIE) executables
- * - Load DT_NEEDED shared objects (.sqrl) from /ModuOS/shared/usr/lib
+ * - Load DT_NEEDED shared objects (.sqrl) from /ModuOS/shared/lib
  * - Apply x86_64 RELA relocations:
  *     R_X86_64_RELATIVE, R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT
  *
@@ -54,10 +54,19 @@
 #define ELF64_R_TYPE(i)    ((uint32_t)((i) & 0xffffffffu))
 
 /* x86_64 relocs */
-#define R_X86_64_64       1
-#define R_X86_64_GLOB_DAT 6
+#define R_X86_64_64        1
+#define R_X86_64_GLOB_DAT  6
 #define R_X86_64_JUMP_SLOT 7
-#define R_X86_64_RELATIVE 8
+#define R_X86_64_RELATIVE  8
+
+/* sys_mmap flags as defined in ModuOS kernel syscall.c */
+#define MMAP_FLAG_FIXED 1
+#define MMAP_FLAG_ANON  2
+
+/* sys_mmap prot bits */
+#define MMAP_PROT_R 1
+#define MMAP_PROT_W 2
+#define MMAP_PROT_X 4
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -138,15 +147,27 @@ struct so_obj {
     so_obj_t *next;
 };
 
+/* ── mmap/munmap wrappers ───────────────────────────────────────────────── */
+
 static inline void *mm_mmap(void *addr, size_t size, int prot, int flags) {
     return (void*)syscall4(SYS_MMAP, (long)addr, (long)size, (long)prot, (long)flags);
 }
+
 static inline int mm_munmap(void *addr, size_t size) {
     return (int)syscall(SYS_MUNMAP, (long)addr, (long)size, 0);
 }
 
+/* Returns 1 if mm_mmap returned an error (kernel returns (void*)-1 on fail) */
+static inline int mmap_failed(void *p) {
+    return (u64)(uintptr_t)p == (u64)-1ULL;
+}
+
+/* ── address alignment helpers ──────────────────────────────────────────── */
+
 static u64 align_down(u64 v) { return v & ~0xFFFULL; }
-static u64 align_up(u64 v) { return (v + 0xFFFULL) & ~0xFFFULL; }
+static u64 align_up(u64 v)   { return (v + 0xFFFULL) & ~0xFFFULL; }
+
+/* ── file helpers ───────────────────────────────────────────────────────── */
 
 static int read_all(int fd, void *buf, size_t n) {
     size_t got = 0;
@@ -177,11 +198,14 @@ static int load_file(const char *path, void **out_buf, size_t *out_sz) {
     close(fd);
 
     *out_buf = b;
-    *out_sz = (size_t)st.size;
+    *out_sz  = (size_t)st.size;
     return 0;
 }
 
-static int map_load_segments(const void *file, u64 base, u64 *out_entry, u64 *out_dyn_vaddr) {
+/* ── ELF segment loader ─────────────────────────────────────────────────── */
+
+static int map_load_segments(const void *file, u64 base,
+                             u64 *out_entry, u64 *out_dyn_vaddr) {
     const ehdr_t *eh = (const ehdr_t*)file;
     const phdr_t *ph = (const phdr_t*)((const u8*)file + eh->e_phoff);
 
@@ -193,22 +217,30 @@ static int map_load_segments(const void *file, u64 base, u64 *out_entry, u64 *ou
         }
         if (ph[i].p_type != PT_LOAD) continue;
 
-        u64 seg_vaddr = base + ph[i].p_vaddr;
-        u64 seg_start = align_down(seg_vaddr);
-        u64 seg_end = align_up(seg_vaddr + ph[i].p_memsz);
-        size_t map_sz = (size_t)(seg_end - seg_start);
+        u64    seg_vaddr = base + ph[i].p_vaddr;
+        u64    seg_start = align_down(seg_vaddr);
+        u64    seg_end   = align_up(seg_vaddr + ph[i].p_memsz);
+        size_t map_sz    = (size_t)(seg_end - seg_start);
 
-        int prot = 1; // R
-        if (ph[i].p_flags & PF_W) prot |= 2; // W
+        int prot = MMAP_PROT_R | MMAP_PROT_W;
 
-        void *m = mm_mmap((void*)(uintptr_t)seg_start, map_sz, prot, 1 /*FIXED*/ | 2 /*ANON*/);
-        if ((long)m == -1) {
-            printf("ld-moduos: mmap failed for segment\n");
+        void *m = mm_mmap((void*)(uintptr_t)seg_start, map_sz,
+                          prot, MMAP_FLAG_FIXED | MMAP_FLAG_ANON);
+        if (mmap_failed(m)) {
+            printf("ld-moduos: mmap failed for segment at 0x%lx size 0x%lx\n",
+                   (unsigned long)seg_start, (unsigned long)map_sz);
             return -1;
         }
 
+        /* Zero the whole region first — handles the .bss area between
+         * p_filesz and p_memsz automatically.                          */
+        memset((void*)(uintptr_t)seg_start, 0, map_sz);
+
+        /* Copy initialised data from the file image.                   */
         if (ph[i].p_filesz) {
-            memcpy((void*)(uintptr_t)seg_vaddr, (const u8*)file + ph[i].p_offset, (size_t)ph[i].p_filesz);
+            memcpy((void*)(uintptr_t)seg_vaddr,
+                   (const u8*)file + ph[i].p_offset,
+                   (size_t)ph[i].p_filesz);
         }
     }
 
@@ -216,13 +248,15 @@ static int map_load_segments(const void *file, u64 base, u64 *out_entry, u64 *ou
     return 0;
 }
 
+/* ── dynamic section parser ─────────────────────────────────────────────── */
+
 static void obj_free_needed(so_obj_t *o) {
     if (!o || !o->needed) return;
     for (u32 i = 0; i < o->needed_count; i++) {
         if (o->needed[i]) free(o->needed[i]);
     }
     free(o->needed);
-    o->needed = NULL;
+    o->needed       = NULL;
     o->needed_count = 0;
 }
 
@@ -230,30 +264,31 @@ static int obj_parse_dynamic(so_obj_t *o, u64 dyn_vaddr) {
     if (!dyn_vaddr) return 0;
 
     o->dyn = (const dyn_t*)(uintptr_t)dyn_vaddr;
-
     const dyn_t *dyn = o->dyn;
 
-    /* First pass: find key pointers */
+    /* First pass: collect pointers.
+     * NOTE: DT_STRTAB / DT_SYMTAB / DT_HASH / DT_RELA values are
+     * virtual addresses relative to the load base for ET_DYN objects. */
     for (size_t i = 0;; i++) {
         if (dyn[i].d_tag == DT_NULL) break;
         switch (dyn[i].d_tag) {
-            case DT_STRTAB: o->strtab = (const char*)(uintptr_t)(o->base + dyn[i].d_val); break;
-            case DT_STRSZ:  o->strsz  = dyn[i].d_val; break;
-            case DT_SYMTAB: o->symtab = (const sym_t*)(uintptr_t)(o->base + dyn[i].d_val); break;
-            case DT_HASH:   o->hash   = (const u32*)(uintptr_t)(o->base + dyn[i].d_val); break;
-            case DT_RELA:   o->rela   = (const rela_t*)(uintptr_t)(o->base + dyn[i].d_val); break;
-            case DT_RELASZ: o->relasz = dyn[i].d_val; break;
-            case DT_RELAENT:o->relaent = dyn[i].d_val; break;
+            case DT_STRTAB:  o->strtab  = (const char*)(uintptr_t)(o->base + dyn[i].d_val); break;
+            case DT_STRSZ:   o->strsz   = dyn[i].d_val; break;
+            case DT_SYMTAB:  o->symtab  = (const sym_t*)(uintptr_t)(o->base + dyn[i].d_val); break;
+            case DT_HASH:    o->hash    = (const u32*)(uintptr_t)(o->base + dyn[i].d_val); break;
+            case DT_RELA:    o->rela    = (const rela_t*)(uintptr_t)(o->base + dyn[i].d_val); break;
+            case DT_RELASZ:  o->relasz  = dyn[i].d_val; break;
+            case DT_RELAENT: o->relaent = dyn[i].d_val; break;
             default: break;
         }
     }
 
     if (o->hash) {
-        /* DT_HASH: [nbucket, nchain, buckets..., chains...] */
-        o->nsyms = o->hash[1];
+        /* DT_HASH layout: [nbucket, nchain, buckets[nbucket], chains[nchain]] */
+        o->nsyms = o->hash[1]; /* nchain == number of symbol table entries */
     }
 
-    /* Gather DT_NEEDED */
+    /* Second pass: gather DT_NEEDED entries. */
     obj_free_needed(o);
     u32 count = 0;
     for (size_t i = 0;; i++) {
@@ -285,6 +320,8 @@ static int obj_parse_dynamic(so_obj_t *o, u64 dyn_vaddr) {
     return 0;
 }
 
+/* ── loaded-object list ─────────────────────────────────────────────────── */
+
 static so_obj_t *g_objs = NULL;
 
 static so_obj_t *obj_find_loaded_by_path(const char *path) {
@@ -301,35 +338,68 @@ static so_obj_t *obj_add_loaded(const char *path) {
     strncpy(o->path, path, sizeof(o->path) - 1);
     o->path[sizeof(o->path) - 1] = 0;
     o->relaent = sizeof(rela_t);
-
     o->next = g_objs;
-    g_objs = o;
+    g_objs  = o;
     return o;
 }
+
+/* ── object loader ──────────────────────────────────────────────────────── */
 
 static int obj_load(const char *path, so_obj_t **out_obj) {
     if (!path || !out_obj) return -1;
 
+    /* Return cached object if already loaded. */
     so_obj_t *already = obj_find_loaded_by_path(path);
     if (already) { *out_obj = already; return 0; }
 
-    void *file = NULL;
+    void  *file    = NULL;
     size_t file_sz = 0;
-    if (load_file(path, &file, &file_sz) != 0) return -1;
+    if (load_file(path, &file, &file_sz) != 0) {
+        printf("ld-moduos: cannot read %s\n", path);
+        return -1;
+    }
 
     const ehdr_t *eh = (const ehdr_t*)file;
+    if (file_sz < sizeof(ehdr_t) ||
+        eh->e_ident[0] != 0x7f ||
+        eh->e_ident[1] != 'E'  ||
+        eh->e_ident[2] != 'L'  ||
+        eh->e_ident[3] != 'F') {
+        printf("ld-moduos: %s is not an ELF file\n", path);
+        free(file);
+        return -1;
+    }
 
     so_obj_t *o = obj_add_loaded(path);
     if (!o) { free(file); return -1; }
 
-    /* Choose base for ET_DYN */
     if (eh->e_type == ET_DYN) {
-        /* reserve some range and use it as a base */
-        void *tmp = mm_mmap(NULL, 0x400000, 3, 2 /*ANON*/);
-        if ((long)tmp == -1) { free(file); return -1; }
-        o->base = (u64)(uintptr_t)tmp;
-        mm_munmap(tmp, 0x400000);
+        u64 min_vaddr = (u64)-1ULL;
+        u64 max_vaddr = 0;
+        const phdr_t *ph = (const phdr_t*)((const u8*)file + eh->e_phoff);
+        for (u16 i = 0; i < eh->e_phnum; i++) {
+            if (ph[i].p_type != PT_LOAD) continue;
+            u64 lo = align_down(ph[i].p_vaddr);
+            u64 hi = align_up(ph[i].p_vaddr + ph[i].p_memsz);
+            if (lo < min_vaddr) min_vaddr = lo;
+            if (hi > max_vaddr) max_vaddr = hi;
+        }
+        if (min_vaddr == (u64)-1ULL) min_vaddr = 0;
+        size_t reserve_sz = (size_t)(max_vaddr - min_vaddr);
+
+        void *reservation = mm_mmap(NULL, reserve_sz,
+                                    MMAP_PROT_R | MMAP_PROT_W,
+                                    MMAP_FLAG_ANON);
+        if (mmap_failed(reservation)) {
+            printf("ld-moduos: cannot reserve VA for %s\n", path);
+            free(file);
+            return -1;
+        }
+        /* base = reservation start - min_vaddr so that
+         * base + ph[i].p_vaddr lands inside the reservation. */
+        o->base = (u64)(uintptr_t)reservation - min_vaddr;
     } else {
+        /* ET_EXEC: fixed virtual addresses, no base slide. */
         o->base = 0;
     }
 
@@ -349,6 +419,8 @@ static int obj_load(const char *path, so_obj_t **out_obj) {
     return 0;
 }
 
+/* ── recursive dependency loader ────────────────────────────────────────── */
+
 static int obj_load_deps_recursive(so_obj_t *o) {
     if (!o) return -1;
 
@@ -357,12 +429,12 @@ static int obj_load_deps_recursive(so_obj_t *o) {
         if (!soname || !soname[0]) continue;
 
         char full[256];
-        strcpy(full, "/ModuOS/shared/usr/lib/");
+        strcpy(full, "/ModuOS/shared/lib/");
         strncat(full, soname, sizeof(full) - strlen(full) - 1);
 
         so_obj_t *dep = NULL;
         if (obj_load(full, &dep) != 0) {
-            printf("ld-moduos: cannot load needed %s\n", full);
+            printf("ld-moduos: cannot load needed lib: %s\n", full);
             return -1;
         }
 
@@ -371,6 +443,8 @@ static int obj_load_deps_recursive(so_obj_t *o) {
 
     return 0;
 }
+
+/* ── symbol resolution ──────────────────────────────────────────────────── */
 
 static u64 obj_sym_addr(so_obj_t *o, const sym_t *s) {
     return o->base + s->st_value;
@@ -399,10 +473,7 @@ static u64 resolve_symbol_addr(const char *name, int *out_is_weak) {
 
             const char *sname = o->strtab + s->st_name;
             if (strcmp(sname, name) != 0) continue;
-
-            if (s->st_shndx == SHN_UNDEF) {
-                continue;
-            }
+            if (s->st_shndx == SHN_UNDEF) continue;
 
             u8 bind = ELF64_ST_BIND(s->st_info);
             if (bind == STB_GLOBAL) {
@@ -422,10 +493,12 @@ static u64 resolve_symbol_addr(const char *name, int *out_is_weak) {
     return 0;
 }
 
+/* ── relocation ─────────────────────────────────────────────────────────── */
+
 static int relocate_one_object(so_obj_t *o) {
     if (!o || !o->rela || !o->relasz) return 0;
 
-    u64 ent = o->relaent ? o->relaent : sizeof(rela_t);
+    u64 ent   = o->relaent ? o->relaent : sizeof(rela_t);
     u64 count = o->relasz / ent;
 
     for (u64 i = 0; i < count; i++) {
@@ -440,20 +513,23 @@ static int relocate_one_object(so_obj_t *o) {
             continue;
         }
 
-        if (type == R_X86_64_64 || type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT) {
+        if (type == R_X86_64_64       ||
+            type == R_X86_64_GLOB_DAT ||
+            type == R_X86_64_JUMP_SLOT) {
+
             if (!o->symtab || !o->strtab || o->nsyms == 0) {
-                printf("ld-moduos: missing symtab/strtab for reloc\n");
+                printf("ld-moduos: missing symtab/strtab for reloc in %s\n", o->path);
                 return -1;
             }
             if (symi >= o->nsyms) {
-                printf("ld-moduos: bad sym index\n");
+                printf("ld-moduos: bad sym index %u in %s\n", symi, o->path);
                 return -1;
             }
 
-            const sym_t *sym = &o->symtab[symi];
-            const char *name = (sym->st_name < o->strsz) ? (o->strtab + sym->st_name) : "";
+            const sym_t *sym  = &o->symtab[symi];
+            const char  *name = (sym->st_name < o->strsz)
+                                ? (o->strtab + sym->st_name) : "";
 
-            /* If the symbol is defined in this object, use it directly; otherwise resolve globally. */
             u64 S = 0;
             if (sym_is_usable_definition(sym)) {
                 S = obj_sym_addr(o, sym);
@@ -461,18 +537,18 @@ static int relocate_one_object(so_obj_t *o) {
                 int is_weak = 0;
                 S = resolve_symbol_addr(name, &is_weak);
                 if (S == 0 && ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
-                    printf("ld-moduos: unresolved symbol '%s'\n", name);
+                    printf("ld-moduos: unresolved symbol '%s' in %s\n",
+                           name, o->path);
                     return -1;
                 }
             }
 
-            u64 A = (u64)r->r_addend;
-            *where = S + A;
+            *where = S + (u64)r->r_addend;
             continue;
         }
 
-        /* Unknown relocation */
-        printf("ld-moduos: unsupported reloc type %u\n", (unsigned)type);
+        printf("ld-moduos: unsupported reloc type %u in %s\n",
+               (unsigned)type, o->path);
         return -1;
     }
 
@@ -480,10 +556,7 @@ static int relocate_one_object(so_obj_t *o) {
 }
 
 static int relocate_all_objects(void) {
-    /* We relocate in multiple passes in case of forward refs.
-     * With full symbol lookup across all loaded objects, one pass is usually enough,
-     * but doing two is cheap.
-     */
+    /* Two passes in case of forward references between objects. */
     for (int pass = 0; pass < 2; pass++) {
         for (so_obj_t *o = g_objs; o; o = o->next) {
             if (relocate_one_object(o) != 0) return -1;
@@ -491,6 +564,8 @@ static int relocate_all_objects(void) {
     }
     return 0;
 }
+
+/* ── entry point ────────────────────────────────────────────────────────── */
 
 int md_main(long argc, char **argv) {
     if (argc < 2) {
@@ -502,26 +577,23 @@ int md_main(long argc, char **argv) {
 
     so_obj_t *main_obj = NULL;
     if (obj_load(target, &main_obj) != 0) {
-        printf("ld-moduos: cannot load target %s\n", target);
+        printf("ld-moduos: cannot load target '%s'\n", target);
         return 1;
     }
 
     if (obj_load_deps_recursive(main_obj) != 0) {
+        printf("ld-moduos: dependency load failed\n");
         return 1;
     }
 
     if (relocate_all_objects() != 0) {
+        printf("ld-moduos: relocation failed\n");
         return 1;
     }
 
-    /* Jump to program entry using ModuOS ABI (_start(argc, argv)).
-     * Target argc/argv are argv[1..], so we pass argc-1 and &argv[1].
-     */
     void (*entry_fn)(long, char**) = (void(*)(long, char**))(uintptr_t)main_obj->entry;
-    long targc = argc - 1;
-    char **targv = &argv[1];
+    entry_fn(argc - 1, &argv[1]);
 
-    entry_fn(targc, targv);
-
+    /* entry_fn should not return, but if it does, exit cleanly. */
     return 0;
 }

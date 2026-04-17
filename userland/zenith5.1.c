@@ -32,9 +32,47 @@ void zsbanner(void) {
     printf(ANSI_PURPLE "   $$  / $$  __$$\\ $$  __$$\\ $$ |\\_$$  _|  $$  __$$\\ \n");
     printf(ANSI_PURPLE "  $$  /  $$$$$$$$ |$$ |  $$ |$$ |  $$ |    $$ |  $$ |\n");
     printf(ANSI_PURPLE " $$  /   $$   ____|$$ |  $$ |$$ |  $$ |$$\\ $$ |  $$ |\n");
-    printf(ANSI_PURPLE "$$$$$$$$\\  $$$$$$$\\ $$ |  $$ |$$ |  \\$$$$  |$$ |  $$ |\n");
+    printf(ANSI_PURPLE "$$$$$$$$\\ $$$$$$$\\ $$ |  $$ |$$ |  \\$$$$  |$$ |  $$ |\n");
     printf(ANSI_PURPLE "\\________|\\_______|\\__|  \\__|\\__|   \\____/ \\__|  \\__| ");
     printf(ANSI_CYAN "v0.5.1\n" ANSI_RESET);
+}
+
+const char* get_pc_name() {
+    const char* path = "/ModuOS/System64/pcname.txt";
+    fs_file_info_t file_info;
+
+    // 1. Get file stats to determine the size
+    if (stat(path, &file_info) < 0) {
+        return NULL; 
+    }
+
+    // 2. Open the file
+    int fd = open(path, O_RDONLY, 0);
+    if (fd < 0) {
+        return NULL;
+    }
+
+    // 3. Allocate memory (+1 for null terminator)
+    // We use the 'size' field from the fs_file_info_t struct
+    char* buffer = (char*)malloc(file_info.size + 1);
+    if (!buffer) {
+        close(fd);
+        return NULL;
+    }
+
+    // 4. Read the content
+    ssize_t bytes_read = read(fd, buffer, file_info.size);
+    if (bytes_read < 0) {
+        free(buffer);
+        close(fd);
+        return NULL;
+    }
+
+    // 5. Null-terminate and cleanup
+    buffer[bytes_read] = '\0';
+    close(fd);
+
+    return (const char*)buffer;
 }
 
 int md_main(long argc, char **argv) {
@@ -53,6 +91,8 @@ int md_main(long argc, char **argv) {
     static char app_path[256];
     static char args_copy[192];
 
+    const char* host = get_pc_name();
+
     while (g_running) {
         /* CWD syscall not yet implemented; show root. */
         cwd[0] = '/'; cwd[1] = '\0';
@@ -61,12 +101,18 @@ int md_main(long argc, char **argv) {
         int who = (int)syscall(SYS_GETUID, 0, 0, 0);
         if (who < 0) who = 1;
 
-        if (who == 0) {
-            printf("\n%s# %s%d@{pcname} %s> ",
-                   ANSI_RED, ANSI_RESET, who, cwd);
+        if (host) {
+            if (who == 0) {
+                printf("\n┌─%s# %s%d@%s\n└─[%s]>", ANSI_RED, ANSI_RESET, who, host, cwd);
+            } else {
+                printf("\n┌─%s# %s%d@%s\n└─[%s]>", ANSI_GREEN, ANSI_RESET, who, host, cwd);
+            }
         } else {
-            printf("\n%s$ %s%d@{pcname} %s> ",
-                   ANSI_GREEN, ANSI_RESET, who, cwd);
+            if (who == 0) {
+                printf("\n┌─%s# %s%d@{unknown}\n└─[%s]>", ANSI_RED, ANSI_RESET, who, cwd);
+            } else {
+                printf("\n┌─%s# %s%d@{unknown}\n└─[%s]>", ANSI_GREEN, ANSI_RESET, who, cwd);
+            }
         }
 
         char *user_input = input();

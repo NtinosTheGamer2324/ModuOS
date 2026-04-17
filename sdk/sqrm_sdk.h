@@ -11,6 +11,29 @@
  *     - `sqrm_module_desc` (sqrm_module_desc_t or sqrm_module_desc_v2_t)
  *     - `sqrm_module_init(const sqrm_kernel_api_t *api)`
  * - Build as ELF64 ET_DYN with entrypoint `sqrm_module_init`.
+ *
+ * Capability-gated API availability by module type:
+ *
+ *   Field                    FS  DRIVE  USB  AUDIO  GPU  NET  HID  GENERIC
+ *   -----------------------  --  -----  ---  -----  ---  ---  ---  -------
+ *   kmalloc/kfree             Y    Y     Y     Y     Y    Y    Y     Y
+ *   com_write_string          Y    Y     Y     Y     Y    Y    Y     Y
+ *   sleep_ms / ticks          Y    Y     Y     Y     Y    Y    Y     Y
+ *   sqrm_service_*            Y    Y     Y     Y     Y    Y    Y     Y
+ *   devfs_register_path       Y    Y     Y     Y     Y    Y    Y     Y
+ *   multiboot2_header         Y    Y     Y     Y     Y    Y    Y     Y
+ *   dma_alloc/free            -    -     -     Y     -    -    -     -
+ *   inb/inw/inl/out*          -    -     -     Y     -    -    -     -
+ *   irq_install_handler       -    -     -     Y     -    -    -     -
+ *   ioremap / _guarded        -    -     -     Y     Y    Y    Y     -
+ *   virt_to_phys              -    -     Y     Y     -    Y    Y     -
+ *   pci_*                     -    -     Y     Y     Y    Y    Y     -
+ *   pci_cfg_read32/write32    -    -     Y     Y     -    Y    Y     -
+ *   gfx_register_fb           -    -     -     -     Y    -    -     -
+ *   audio_register_pcm        -    -     -     Y     -    -    -     -
+ *   fs_register_driver        Y    -     -     -     -    -    -     -
+ *   block_get_info/read/write  Y   -     -     -     -    -    -     Y
+ *   input_push_event          -    -     -     -     -    -    Y     -
  */
 
 #include <stdint.h>
@@ -69,7 +92,7 @@ typedef struct {
 /* Helper macro to define the required descriptor symbol (ABI v1) */
 #define SQRM_DEFINE_MODULE(_type, _name_literal) \
     const sqrm_module_desc_t sqrm_module_desc = { \
-        .abi_version = SQRM_ABI_VERSION, \
+        .abi_version = SQRM_ABI_V1, \
         .type = (_type), \
         .name = (_name_literal), \
     }
@@ -167,6 +190,98 @@ typedef struct fs_ext_driver_ops {
     void (*closedir)(fs_dir_t *dir);
 } fs_ext_driver_ops_t;
 
+/* ---- Graphics structures (GPU modules) ---- */
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t bpp;
+} gfx_mode_t;
+
+typedef struct {
+    void    *addr;
+    uint64_t phys_addr;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t bpp;
+} framebuffer_t;
+
+/* Source scatter-gather descriptor for blit_from_sg32 */
+typedef struct {
+    const void *addr;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+} gfx_src_sg_t;
+
+typedef struct sqrm_gpu_device {
+    framebuffer_t fb;
+    // Optional: called after drawing into fb.addr to push updates to hardware.
+    // If NULL, fb.addr is assumed to be directly scanned out.
+    void (*flush)(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
+    /* ------------------------------------------------------------
+     * Optional hardware cursor hooks.
+     * If provided, the kernel can move/show the cursor without repainting the framebuffer.
+     * Pixels are ARGB8888 (0xAARRGGBB).
+     * Return 0 on success.
+     * ------------------------------------------------------------ */
+    int (*cursor_set_argb32)(uint32_t w, uint32_t h, int32_t hot_x, int32_t hot_y, const uint32_t *pixels_argb);
+    int (*cursor_move)(int32_t x, int32_t y);
+    int (*cursor_show)(int visible);
+
+    /* ------------------------------------------------------------
+     * Optional 2D acceleration hooks (thread-context only).
+     * These are enabled by default when provided and fb.bpp==32.
+     * All colors are native pixels for the current fb format (max speed).
+     * Return 0 on success, negative on failure.
+     * ------------------------------------------------------------ */
+    int (*fill_rect32_native)(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t native_pixel);
+    int (*blit_rect32)(const framebuffer_t *fb, uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y, uint32_t w, uint32_t h);
+    int (*blit_from_sg32)(const framebuffer_t *fb, const gfx_src_sg_t *src,
+                          uint32_t src_x, uint32_t src_y,
+                          uint32_t dst_x, uint32_t dst_y,
+                          uint32_t w, uint32_t h);
+
+    /* ------------------------------------------------------------
+     * Optional 3D acceleration hooks (future).
+     * For basic triangle rasterization and vertex processing.
+     * Return 0 on success, negative on failure.
+     * ------------------------------------------------------------ */
+    int (*draw_triangle)(const framebuffer_t *fb, 
+                        int32_t x0, int32_t y0, uint32_t color0,
+                        int32_t x1, int32_t y1, uint32_t color1,
+                        int32_t x2, int32_t y2, uint32_t color2);
+    
+    int (*draw_textured_triangle)(const framebuffer_t *fb,
+                                 int32_t x0, int32_t y0, float u0, float v0,
+                                 int32_t x1, int32_t y1, float u1, float v1,
+                                 int32_t x2, int32_t y2, float u2, float v2,
+                                 uint32_t texture_id);
+
+    /* Future: vertex buffer submission, transform matrices, etc */
+
+    // Optional: request a mode change. Returns 0 on success.
+    int (*set_mode)(uint32_t width, uint32_t height, uint32_t bpp);
+
+    // Optional: enumerate supported modes.
+    // Writes up to max_modes entries into out_modes and returns number of modes written.
+    // Returns negative on error.
+    int (*enumerate_modes)(gfx_mode_t *out_modes, uint32_t max_modes);
+
+    // Optional: capability flags (indicate which acceleration is supported)
+    uint32_t caps;
+    #define SQRM_GPU_CAP_2D_ACCEL      (1u << 0)  // Has fill_rect32/blit_rect32
+    #define SQRM_GPU_CAP_3D_TRIANGLES  (1u << 1)  // Has draw_triangle
+    #define SQRM_GPU_CAP_3D_TEXTURES   (1u << 2)  // Has draw_textured_triangle
+    #define SQRM_GPU_CAP_HW_CURSOR     (1u << 3)  // Has cursor hooks
+    #define SQRM_GPU_CAP_VSYNC         (1u << 4)  // Supports vsync
+
+    // Optional: called on shutdown/unload (not implemented yet)
+    void (*shutdown)(void);
+} sqrm_gpu_device_t;
+
 /* ---- Optional shared service ABIs (exported via sqrm_service_register/get) ---- */
 
 // Network service API (L2 NIC API). Return negative errno on failure.
@@ -260,7 +375,7 @@ typedef struct {
 /* ---- Kernel API table passed to modules ---- */
 
 /*
- * dma_buffer_t — mirrors the kernel's dma_buffer_t exactly.
+ * sqrm_dma_buffer_t — mirrors the kernel's dma_buffer_t exactly.
  * Must not be forward-declared differently elsewhere in this header.
  */
 typedef struct {
@@ -300,24 +415,31 @@ typedef struct {
  * sqrm_kernel_api_t — field order MUST match include/moduos/kernel/sqrm.h exactly.
  * Opaque pointers are used for kernel-internal types (pci_device_t, framebuffer_t,
  * sqrm_gpu_device_t, Event) that third-party modules do not need to dereference.
+ *
+ * "capability-gated" means the kernel sets the pointer to NULL if the module type
+ * does not have access. Always NULL-check before calling. See the capability table
+ * at the top of this header for the full matrix.
  */
 typedef struct sqrm_kernel_api {
     uint32_t abi_version;
     sqrm_module_type_t module_type;
     const char *module_name;
 
-    /* logging */
+    /* logging — always available */
     int (*com_write_string)(uint16_t port, const char *s);
 
-    /* memory */
+    /* memory — always available */
     void *(*kmalloc)(size_t sz);
     void (*kfree)(void *p);
 
-    /* DMA (capability-gated; may be NULL) */
+    /* DMA — AUDIO modules only; NULL for all other types.
+     * HDA/AC97 use this for CORB/RIRB/BDL/PCM ring buffers.
+     * Always NULL-check; fall back to kmalloc+virt_to_phys if NULL. */
     int (*dma_alloc)(sqrm_dma_buffer_t *out, size_t size, size_t align);
     void (*dma_free)(sqrm_dma_buffer_t *buf);
 
-    /* Low-level port I/O (capability-gated; may be NULL) */
+    /* Port I/O — AUDIO modules only; NULL for all other types.
+     * AUDIO modules use raw CF8/CFC PCI scanning (same pattern as AC97). */
     uint8_t  (*inb)(uint16_t port);
     uint16_t (*inw)(uint16_t port);
     uint32_t (*inl)(uint16_t port);
@@ -325,35 +447,36 @@ typedef struct sqrm_kernel_api {
     void (*outw)(uint16_t port, uint16_t val);
     void (*outl)(uint16_t port, uint32_t val);
 
-    /* IRQ (capability-gated; may be NULL) */
+    /* IRQ — AUDIO modules only; NULL for all other types.
+     * Install a handler for the HDA/AC97 PCI IRQ line. */
     void (*irq_install_handler)(int irq, void (*handler)(void));
     void (*irq_uninstall_handler)(int irq);
     void (*pic_send_eoi)(uint8_t irq);
 
-    /* Timing (capability-gated; may be NULL) */
+    /* Timing — always available */
     uint64_t (*get_system_ticks)(void);
     uint64_t (*ticks_to_ms)(uint64_t ticks);
     uint64_t (*ms_to_ticks)(uint64_t ms);
     void (*sleep_ms)(uint64_t ms);
 
-    /* VFS (capability-gated; may be NULL) */
+    /* VFS — FS modules only */
     int (*fs_register_driver)(const char *name, const fs_ext_driver_ops_t *ops);
 
-    /* DEVFS (capability-gated; may be NULL) */
+    /* DEVFS — always available */
     int (*devfs_register_path)(const char *path, const void *ops, void *ctx);
 
     /* Multiboot2 header — raw pointer to the MB2 info struct from the bootloader.
      * Parse MB2 tags directly from this pointer. Always valid after boot. */
     const void *multiboot2_header;
 
-    /* Input injection (capability-gated; may be NULL) */
+    /* Input injection — HID modules only */
     void (*input_push_event)(const void *event);
 
-    /* Graphics — GPU modules only (capability-gated; may be NULL) */
+    /* Graphics — GPU modules only */
     int (*gfx_register_framebuffer)(const void *gpu_dev);
     int (*gfx_update_framebuffer)(const void *fb);
 
-    /* PCI (GPU/NET modules) */
+    /* PCI — AUDIO, GPU, NET, USB, HID modules; NULL for FS, DRIVE, GENERIC. */
     int (*pci_get_device_count)(void);
     void* (*pci_get_device)(int index);
     void* (*pci_find_device)(uint16_t vendor_id, uint16_t device_id);
@@ -361,18 +484,20 @@ typedef struct sqrm_kernel_api {
     void (*pci_enable_io_space)(void *dev);
     void (*pci_enable_bus_mastering)(void *dev);
 
-    /* PCI config space access (restricted; may be NULL) */
+    /* PCI config space — AUDIO, NET, USB, HID only; NULL for GPU */
     uint32_t (*pci_cfg_read32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
     void (*pci_cfg_write32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
 
-    /* MMIO mapping (GPU/NET modules) */
+    /* MMIO mapping — AUDIO, GPU, NET, USB, HID modules */
     void* (*ioremap)(uint64_t phys_addr, uint64_t size);
     void* (*ioremap_guarded)(uint64_t phys_addr, uint64_t size);
 
-    /* Address translation helper */
+    /* Address translation — AUDIO, NET, USB, HID modules.
+     * AUDIO fallback: if dma_alloc is NULL use kmalloc + virt_to_phys.
+     * Returns physical address for a kernel virtual address, or 0 if unmapped. */
     uint64_t (*virt_to_phys)(uint64_t virt);
 
-    /* Blockdev (capability-gated; may be NULL) */
+    /* Blockdev — FS and GENERIC modules only */
     int (*block_get_info)(blockdev_handle_t h, blockdev_info_t *out);
     int (*block_read)(blockdev_handle_t h, uint64_t lba, uint32_t count, void *buf, size_t buf_sz);
     int (*block_write)(blockdev_handle_t h, uint64_t lba, uint32_t count, const void *buf, size_t buf_sz);
@@ -380,14 +505,14 @@ typedef struct sqrm_kernel_api {
     int (*block_get_handle_for_vdrive)(int vdrive_id, blockdev_handle_t *out_handle);
     int (*block_register)(const void *ops, void *ctx, blockdev_handle_t *out_handle);
 
-    /* Audio (capability-gated; may be NULL) */
+    /* Audio — AUDIO modules only */
     int (*audio_register_pcm)(const char *dev_name, const audio_pcm_ops_t *ops, void *ctx);
 
-    /* SQRM services (exports) */
+    /* SQRM services — always available */
     int (*sqrm_service_register)(const char *service_name, const void *api_ptr, size_t api_size);
     const void* (*sqrm_service_get)(const char *service_name, size_t *out_size);
 
-    /* Primitives exposed to modules for system information collection. */
+    /* System info — always available */
     const char *(*get_gpu_driver_name)(void);
     const char *(*get_smbios_field)(int field); /* 0=mfr 1=product 2=bios_vendor 3=bios_version */
     uint64_t (*phys_total_frames)(void);
