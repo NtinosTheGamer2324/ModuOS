@@ -73,7 +73,7 @@ static int sys_pidinfo(uint32_t pid, md64api_pid_info_u *out, size_t out_size);
 static int sys_proclist(md_proclist_entry_u *out, size_t out_bytes);
 static int sys_mount(int vdrive_id, uint32_t partition_lba, int fs_type);
 static int sys_unmount(int slot);
-static int sys_mounts(char *user_buf, size_t buflen);
+static int sys_mounts(fs_mount_info_t *user_buf, size_t max_entries);
 
 void syscall_init(void) {
     COM_LOG_INFO(COM1_PORT, "Initializing system calls");
@@ -194,7 +194,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_UNMOUNT:
             return (uint64_t)sys_unmount((int)arg1);
         case SYS_MOUNTS:
-            return (uint64_t)sys_mounts((char*)arg1, (size_t)arg2);
+            return (uint64_t)sys_mounts((fs_mount_info_t*)arg1, (size_t)arg2);
 
         case SYS_DUP: {
             extern int fd_dup(int);
@@ -1048,7 +1048,7 @@ int sys_opendir(const char *path) {
     }
 
     if (r.route == FS_ROUTE_USERLAND) {
-        return fd_devvfs_opendir(3);
+        return fd_devvfs_opendir_user(r.rel_path);
     }
 
     int slot = (r.route == FS_ROUTE_MOUNT) ? r.mount_slot : proc->current_slot;
@@ -1250,7 +1250,7 @@ int sys_raise(int sig) {
 extern int process_inject_fd(uint32_t pid, int fd, void *fd_obj);
 
 int sys_fd_inject(uint32_t pid, int fd, void *fd_obj) {
-    // TODO: Add permission check - only allow root or TTY manager
+    // TODO: Add permission check - only allow root
     return process_inject_fd(pid, fd, fd_obj);
 }
 
@@ -1268,32 +1268,48 @@ int sys_userfs_register(const userfs_user_node_t *user_node) {
 
     char kpath[128];
     char kowner[64];
+
     if (usercopy_string_from_user(kpath, req.path, sizeof(kpath)) != 0) return -1;
     if (usercopy_string_from_user(kowner, req.owner_id, sizeof(kowner)) != 0) return -1;
 
-    const char *path_in = kpath;
+    /* HARD STOP safety */
+    kpath[sizeof(kpath) - 1] = '\0';
+    kowner[sizeof(kowner) - 1] = '\0';
 
-    com_write_string(COM1_PORT, "[USERFS] register ");
+    /* ===== DEBUG ===== */
+    com_write_string(COM1_PORT, "\n[SYS] ===== REGISTER CALL =====\n");
+
+    com_write_string(COM1_PORT, "[SYS] PATH: '");
     com_write_string(COM1_PORT, kpath);
-    com_write_string(COM1_PORT, " owner=");
+    com_write_string(COM1_PORT, "'\n");
+
+    com_write_string(COM1_PORT, "[SYS] OWNER: '");
     com_write_string(COM1_PORT, kowner);
+    com_write_string(COM1_PORT, "'\n");
+
+    /* HEX DUMP (first 32 bytes) */
+    com_write_string(COM1_PORT, "[SYS] PATH HEX: ");
+    for (int i = 0; i < 32; i++) {
+        char buf[8];
+        itoa((unsigned char)kpath[i], buf, 16);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, " ");
+    }
     com_write_string(COM1_PORT, "\n");
 
-    size_t owner_len = strlen(kowner) + 1;
-    char *owner_copy = (char*)kmalloc(owner_len);
-    if (!owner_copy) return -12;
-    memcpy(owner_copy, kowner, owner_len);
-
-    uint32_t perms = req.perms;
-    int rc = userfs_register_user_path(path_in, owner_copy, perms);
-    if (rc != 0) {
-        kfree(owner_copy);
+    int rc = userfs_register_user_path(kpath, kowner, req.perms);
+    if (rc == 0) {
+        rc = userfs_set_ops(kpath, &req.ops, req.ctx);
     }
-    com_write_string(COM1_PORT, "[USERFS] register rc=");
+
+    com_write_string(COM1_PORT, "[SYS] RESULT rc=");
     char rbuf[16];
     itoa(rc, rbuf, 10);
     com_write_string(COM1_PORT, rbuf);
     com_write_string(COM1_PORT, "\n");
+
+    com_write_string(COM1_PORT, "[SYS] =========================\n\n");
+
     return rc;
 }
 
@@ -1387,39 +1403,30 @@ static int sys_unmount(int slot) {
 }
 
 /* List mounted filesystems */
-static int sys_mounts(char *user_buf, size_t buflen) {
-    if (!user_buf || buflen == 0) return -1;
-    
-    /* Build mount list string in kernel buffer */
-    char kbuf[2048];
-    int pos = 0;
-    int count = fs_get_mount_count();
-    
-    for (int slot = 0; slot < 16 && pos < (int)sizeof(kbuf) - 128; slot++) {
+static int sys_mounts(fs_mount_info_t *user_buf, size_t max_entries) {
+    if (!user_buf || max_entries == 0) return -1;
+
+    int count = 0;
+    for (int slot = 0; slot < MAX_MOUNTS; slot++) {
         int vdrive_id = -1;
         uint32_t partition_lba = 0;
         fs_type_t type = FS_TYPE_UNKNOWN;
-        
-        if (fs_get_mount_info(slot, &vdrive_id, &partition_lba, &type) == 0) {
-            char label[64] = "";
-            fs_get_mount_label(slot, label, sizeof(label));
-            
-            /* Format: "slot=X vdrive=Y lba=Z type=N label=L\n" */
-            pos += snprintf(kbuf + pos, sizeof(kbuf) - pos,
-                           "slot=%d vdrive=%d lba=%u type=%d label=%s\n",
-                           slot, vdrive_id, partition_lba, (int)type, label);
+        if (fs_get_mount_info(slot, &vdrive_id, &partition_lba, &type) != 0) continue;
+
+        fs_mount_info_t info;
+        info.slot = slot;
+        info.vdrive_id = vdrive_id;
+        info.partition_lba = partition_lba;
+        info.type = type;
+        if (fs_get_mount_label(slot, info.label, sizeof(info.label)) != 0) {
+            info.label[0] = '\0';
         }
+
+        if (count < (int)max_entries) {
+            if (usercopy_to_user(&user_buf[count], &info, sizeof(info)) != 0) return -1;
+        }
+        count++;
     }
-    
-    /* Copy to userspace */
-    size_t copy_len = (size_t)pos;
-    if (copy_len > buflen - 1) copy_len = buflen - 1;
-    
-    if (usercopy_to_user(user_buf, kbuf, copy_len) != 0) return -1;
-    
-    /* Null terminate */
-    char nul = 0;
-    if (usercopy_to_user(user_buf + copy_len, &nul, 1) != 0) return -1;
-    
+
     return count;
 }
