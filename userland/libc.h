@@ -18,6 +18,7 @@ static int errno;
 
 // Syscall numbers (shared with kernel)
 #include "../include/moduos/kernel/syscall/syscall_numbers.h"
+#include "../include/moduos/fs/fs.h"
 // MD64API (userland-visible kernel interfaces)
 #include "../include/moduos/kernel/md64api_grp.h"
 #include "../include/moduos/kernel/md64api_user.h"
@@ -361,14 +362,6 @@ static inline int open(const char *pathname, int flags, int mode) {
 static inline int close(int fd) {
     return (int)syscall(SYS_CLOSE, fd, 0, 0);
 }
-
-/* SYS_STAT: fills a kernel fs_file_info_t-like struct in userland */
-typedef struct {
-    char name[260];
-    uint32_t size;
-    int is_directory;
-    uint32_t cluster;
-} fs_file_info_t;
 
 static inline int stat(const char *path, fs_file_info_t *out_info) {
     return (int)syscall(SYS_STAT, (long)path, (long)out_info, (long)sizeof(*out_info));
@@ -1283,6 +1276,19 @@ static inline int userfs_register_path(const char *path, uint32_t perms) {
     node.perms = perms;
     return userfs_register(&node);
 }
+
+static inline int mount_drive(int vdrive_id, uint32_t partition_lba, int fs_type) {
+    return (int)syscall(SYS_MOUNT, (long)vdrive_id, (long)partition_lba, (long)fs_type);
+}
+
+static inline int unmount_slot(int slot) {
+    return (int)syscall(SYS_UNMOUNT, (long)slot, 0, 0);
+}
+
+static inline int list_mounts(fs_mount_info_t *buf, size_t max_entries) {
+    return (int)syscall(SYS_MOUNTS, (long)buf, (long)max_entries, 0);
+}
+
 int md_main(long argc, char** argv);
 
 #ifndef LIBC_NO_START
