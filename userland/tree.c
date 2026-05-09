@@ -16,47 +16,41 @@ typedef struct {
 void list_recursive(const char* path, int depth, TreeState state) {
     if (depth >= MAX_DEPTH) return;
 
+    // Count entries first
+    int entries = 0;
     int fd = opendir(path);
-    if (fd < 0) {
-        printf(" [Error opening %s]\n", path);
-        return;
-    }
-
+    if (fd < 0) return;
+    
     char name[256];
     int is_dir;
     unsigned int size;
-
-    // Count number of entries to detect last
-    int entries = 0;
-    int temp_fd = opendir(path);
-    while (readdir(temp_fd, name, sizeof(name), &is_dir, &size) > 0) {
+    
+    while (readdir(fd, name, sizeof(name), &is_dir, &size) > 0) {
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
         entries++;
     }
-    closedir(temp_fd);
+    closedir(fd);
+
+    // Now iterate for real
+    fd = opendir(path);
+    if (fd < 0) return;
 
     int index = 0;
     while (readdir(fd, name, sizeof(name), &is_dir, &size) > 0) {
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
         index++;
 
-        // Print tree indentation
         for (int i = 0; i < depth; i++) {
-            if (state.is_last[i])
-                printf("    ");
-            else
-                printf("%s", VLINE);
+            printf(state.is_last[i] ? "    " : "%s", VLINE);
         }
 
         int last = (index == entries);
         state.is_last[depth] = last;
-
         printf("%s", last ? LAST : BRANCH);
 
         if (is_dir) {
             printf("%s/\n", name);
 
-            // Build next path
             char next_path[MAX_PATH];
             strcpy(next_path, path);
             int len = strlen(next_path);
