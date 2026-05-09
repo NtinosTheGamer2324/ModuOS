@@ -1009,8 +1009,9 @@ int fd_opendir(int mount_slot, const char* path) {
 typedef struct {
     int kind;   /* 0=$/, 1=$/mnt, 2=$/dev, 3=$/user */
     int index;  /* current index */
-    int cookie; /* for devfs directory listing */
+    int cookie; /* for devfs/userfs directory listing */
     char dev_path[128]; /* for kind=2: subdir path under $/dev ("" for root) */
+    char user_path[128]; /* for kind=3: subpath under $/user ("" for root) */
 } devvfs_dir_t;
 
 static void devvfs_sanitize(const char *in, char *out, size_t out_sz) {
@@ -1047,6 +1048,41 @@ int fd_devvfs_opendir_dev(const char *dev_subdir) {
     if (dev_subdir) {
         strncpy(h->dev_path, dev_subdir, sizeof(h->dev_path) - 1);
         h->dev_path[sizeof(h->dev_path) - 1] = 0;
+    }
+
+    process_t* proc = process_get_current();
+    int pid = proc ? proc->pid : 0;
+
+    fd_table[fd].in_use = 1;
+    fd_table[fd].mount_slot = -1;
+    fd_table[fd].path[0] = '\0';
+    fd_table[fd].position = 0;
+    fd_table[fd].file_size = 0;
+    fd_table[fd].flags = FD_FLAG_READ;
+    fd_table[fd].pid = pid;
+    fd_table[fd].cached_data = NULL;
+    fd_table[fd].is_directory = 1;
+    fd_table[fd].is_devvfs = 1;
+    fd_table[fd].dir_handle = h;
+
+    return fd;
+}
+
+int fd_devvfs_opendir_user(const char *user_subpath) {
+    fd_init();
+
+    int fd = find_free_fd();
+    if (fd < 0) return -1;
+
+    devvfs_dir_t *h = (devvfs_dir_t*)kmalloc(sizeof(devvfs_dir_t));
+    if (!h) return -1;
+    memset(h, 0, sizeof(*h));
+    h->kind = 3;
+    h->index = 0;
+    h->cookie = 0;
+    if (user_subpath) {
+        strncpy(h->user_path, user_subpath, sizeof(h->user_path) - 1);
+        h->user_path[sizeof(h->user_path) - 1] = '\0';
     }
 
     process_t* proc = process_get_current();
@@ -1208,7 +1244,7 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
         if (h->kind == 3) {
             // $/user: list userfs tree
             int d_is_dir = 0;
-            int rc = userfs_list_dir_next("", &h->cookie, name_buf, buf_size, &d_is_dir);
+            int rc = userfs_list_dir_next(h->user_path, &h->cookie, name_buf, buf_size, &d_is_dir);
             if (rc == 1) {
                 if (is_dir) *is_dir = d_is_dir;
                 if (size) *size = 0;

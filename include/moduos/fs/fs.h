@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#define MAX_MOUNTS 26
+
 /* Filesystem types */
 typedef enum {
     FS_TYPE_UNKNOWN   = 0,
@@ -35,6 +37,15 @@ typedef struct {
     void *ext_ctx;
     char ext_name[16];
 } fs_mount_t;
+
+/* Public mount metadata returned to userland */
+typedef struct {
+    int slot;                /* Mount slot index */
+    int vdrive_id;           /* vDrive ID */
+    uint32_t partition_lba;  /* Partition LBA */
+    fs_type_t type;          /* Filesystem type */
+    char label[64];          /* Volume label or mount name */
+} fs_mount_info_t;
 
 /* --- KERNEL MOUNT TABLE MANAGEMENT --- */
 

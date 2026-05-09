@@ -10,7 +10,7 @@
 #include "moduos/arch/AMD64/interrupts/timer.h"
 
 // External FS driver registry (third-party)
-#define FS_EXT_MAX_DRIVERS 16
+#define FS_EXT_MAX_DRIVERS 256
 
 typedef struct {
     int in_use;
@@ -692,7 +692,7 @@ int fs_get_mount_label(int slot, char *out, size_t out_size) {
     return 0;
 }
 
-/* List all mounts */
+/* List all mounts  (Deprecated)*/
 void fs_list_mounts(void) {
     fs_init();
 
