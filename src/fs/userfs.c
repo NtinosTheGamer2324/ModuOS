@@ -280,19 +280,28 @@ static void ufs_prune(unode_t *dir) {
  * Permission check
  * ========================================================= */
 
-static int ufs_check_access(unode_t *node, int flags) {
+static int ufs_check_access(unode_t *node, int flags, int is_invoke)
+{
     if (!node) return 0;
 
+    /* Special case for invoke */
+    if (is_invoke) {
+        return (node->perms & USERFS_PERM_INVOKE) != 0;
+    }
+
+    /* Normal read/write checks */
     int want_r = ((flags & O_WRONLY) == 0);
     int want_w = ((flags & (O_WRONLY | O_RDWR)) != 0);
 
     int can_r = (node->perms & USERFS_PERM_READ_ONLY)  ||
                 (node->perms & USERFS_PERM_READ_WRITE);
+
     int can_w = (node->perms & USERFS_PERM_WRITE_ONLY) ||
                 (node->perms & USERFS_PERM_READ_WRITE);
 
     if (want_r && !can_r) return 0;
     if (want_w && !can_w) return 0;
+
     return 1;
 }
 
@@ -384,14 +393,16 @@ void *userfs_open_path(const char *path, int flags) {
     if (!path) return NULL;
 
     const char *rel = ufs_strip_prefix(path);
-    if (!rel) return NULL; /* can't open the root dir as a device */
+    if (!rel) return NULL;
 
     unode_t *node = ufs_walk(rel);
     if (!node || node->type != UNODE_DEV) {
         ufs_log("open", rel, 0);
         return NULL;
     }
-    if (!ufs_check_access(node, flags)) {
+
+    /* Use new signature with is_invoke=0 */
+    if (!ufs_check_access(node, flags, 0)) {
         ufs_log("open", rel, 0);
         return NULL;
     }
@@ -414,7 +425,9 @@ static uint64_t userfs_get_owner_cr3(unode_t *node) {
 }
 
 static ssize_t userfs_invoke_owner_callback(unode_t *node, int is_read,
-                                            void *buf, size_t count) {
+                                            const void *in_buf, size_t in_size,
+                                            void *out_buf, size_t out_size)
+{
     if (!node) return -1;
 
     uint64_t owner_cr3 = userfs_get_owner_cr3(node);
@@ -424,20 +437,30 @@ static ssize_t userfs_invoke_owner_callback(unode_t *node, int is_read,
 
     uint64_t old_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
+
     if (owner_cr3 && (old_cr3 & ~0xFFFULL) != owner_cr3) {
         __asm__ volatile("mov %0, %%cr3" :: "r"(owner_cr3) : "memory");
     }
 
-    ssize_t rc;
-    if (is_read) {
-        rc = node->ops.read(node->ops_ctx, buf, count);
-    } else {
-        rc = node->ops.write(node->ops_ctx, buf, count);
+    ssize_t rc = -1;
+
+    if (is_read == 1) {                    // read
+        if (node->ops.read)
+            rc = node->ops.read(node->ops_ctx, out_buf, out_size);
+    }
+    else if (is_read == 0) {               // write
+        if (node->ops.write)
+            rc = node->ops.write(node->ops_ctx, in_buf, in_size);
+    }
+    else {                                 // invoke
+        if (node->ops.invoke)
+            rc = node->ops.invoke(node->ops_ctx, in_buf, in_size, out_buf, out_size);
     }
 
     if (owner_cr3 && (old_cr3 & ~0xFFFULL) != owner_cr3) {
         __asm__ volatile("mov %0, %%cr3" :: "r"(old_cr3) : "memory");
     }
+
     return rc;
 }
 
@@ -445,19 +468,21 @@ static ssize_t userfs_invoke_owner_callback(unode_t *node, int is_read,
  * Read from handle.  Delegates straight to the node's read callback.
  * If no callback is set, returns -1.
  */
-ssize_t userfs_read(void *handle, void *buf, size_t count) {
+ssize_t userfs_read(void *handle, void *buf, size_t count)
+{
     uhandle_t *h = (uhandle_t *)handle;
     if (!h || !h->node || h->node->type != UNODE_DEV) return -1;
     if (!buf || count == 0) return -1;
 
-    if (!ufs_check_access(h->node, h->flags | O_RDONLY)) return -2;
+    if (!ufs_check_access(h->node, h->flags | O_RDONLY, 0)) return -2;
 
     if (!h->node->ops.read) return -1;
 
     void *kbuf = kmalloc(count);
     if (!kbuf) return -1;
 
-    ssize_t rc = userfs_invoke_owner_callback(h->node, 1, kbuf, count);
+    ssize_t rc = userfs_invoke_owner_callback(h->node, 1, NULL, 0, kbuf, count);
+
     if (rc > 0) {
         if (usercopy_to_user(buf, kbuf, (size_t)rc) != 0) {
             rc = -1;
@@ -471,24 +496,74 @@ ssize_t userfs_read(void *handle, void *buf, size_t count) {
 /*
  * Write to handle.  Delegates straight to the node's write callback.
  */
-ssize_t userfs_write(void *handle, const void *buf, size_t count) {
+ssize_t userfs_write(void *handle, const void *buf, size_t count)
+{
     uhandle_t *h = (uhandle_t *)handle;
     if (!h || !h->node || h->node->type != UNODE_DEV) return -1;
     if (!buf || count == 0) return -1;
 
-    if (!ufs_check_access(h->node, h->flags | O_WRONLY)) return -2;
+    if (!ufs_check_access(h->node, h->flags | O_WRONLY, 0)) return -2;
 
     if (!h->node->ops.write) return -1;
 
     void *kbuf = kmalloc(count);
     if (!kbuf) return -1;
+
     if (usercopy_from_user(kbuf, buf, count) != 0) {
         kfree(kbuf);
         return -1;
     }
 
-    ssize_t rc = userfs_invoke_owner_callback(h->node, 0, kbuf, count);
+    ssize_t rc = userfs_invoke_owner_callback(h->node, 0, kbuf, count, NULL, 0);
+
     kfree(kbuf);
+    return rc;
+}
+
+/*
+ * Invoke (ioctl-style) on a node.
+ * Sends input buffer and receives output buffer in one call.
+ */
+ssize_t userfs_invoke(void *handle,
+                      const void *in_buf,  size_t in_size,
+                      void *out_buf, size_t out_size)
+{
+    uhandle_t *h = (uhandle_t *)handle;
+    if (!h || !h->node || h->node->type != UNODE_DEV)
+        return -1;
+
+    if (!ufs_check_access(h->node, 0, 1))        // is_invoke = 1
+        return -2;
+
+    if (!h->node->ops.invoke)
+        return -1;
+
+    void *kin  = (in_size  > 0) ? kmalloc(in_size)  : NULL;
+    void *kout = (out_size > 0) ? kmalloc(out_size) : NULL;
+
+    if ((in_size > 0 && !kin) || (out_size > 0 && !kout)) {
+        kfree(kin);
+        kfree(kout);
+        return -1;
+    }
+
+    if (in_size > 0) {
+        if (usercopy_from_user(kin, in_buf, in_size) != 0) {
+            kfree(kin); kfree(kout);
+            return -1;
+        }
+    }
+
+    ssize_t rc = userfs_invoke_owner_callback(h->node, -1, kin, in_size, kout, out_size);
+
+    if (rc > 0 && out_size > 0) {
+        if (usercopy_to_user(out_buf, kout, (size_t)rc) != 0) {
+            rc = -1;
+        }
+    }
+
+    kfree(kin);
+    kfree(kout);
     return rc;
 }
 

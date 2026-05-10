@@ -58,6 +58,9 @@
 /* Userland USERFS nodes */
 #define SYS_USERFS_REGISTER 64
 
+/* Custom IPC / Device control operations (non-POSIX) */
+#define SYS_INVOKE      71  /* invoke(fd, in_buf, in_size, out_buf, out_size) */
+
 /* Filesystem mount/unmount */
 #define SYS_MOUNT       65  /* mount(vdrive_id, partition_lba, fs_type) -> slot or -errno */
 #define SYS_UNMOUNT     66  /* unmount(slot) -> 0 or -errno */

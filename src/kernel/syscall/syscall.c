@@ -176,7 +176,6 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             return (uint64_t)sys_mmap((void*)arg1, (size_t)arg2, (int)arg3, (int)arg4);
         case SYS_MUNMAP:
             return (uint64_t)sys_munmap((void*)arg1, (size_t)arg2);
-
         case SYS_VFS_MKFS:
             return (uint64_t)sys_vfs_mkfs((const vfs_mkfs_req_t*)arg1);
         case SYS_VFS_GETPART:
@@ -185,6 +184,27 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             return (uint64_t)sys_vfs_mbrinit((const vfs_mbrinit_req_t*)arg1);
         case SYS_USERFS_REGISTER:
             return (uint64_t)sys_userfs_register((const userfs_user_node_t*)arg1);
+        case SYS_INVOKE:
+        {
+            int fd               = (int)arg1;
+            const void *in_buf   = (const void*)arg2;
+            size_t in_size       = (size_t)arg3;
+            void *out_buf        = (void*)arg4;
+            size_t out_size      = (size_t)arg5;
+
+            /* Basic parameter validation */
+            if (in_size > 0 && in_buf == NULL) 
+                return (uint64_t)(int64_t)-EINVAL;
+            if (out_size > 0 && out_buf == NULL) 
+                return (uint64_t)(int64_t)-EINVAL;
+
+            /* Reasonable size limit to prevent DoS */
+            if (in_size > 0x400000 || out_size > 0x400000) {   // 4 MiB max
+                return (uint64_t)(int64_t)-EINVAL;
+            }
+
+            return (uint64_t) fd_invoke(fd, in_buf, in_size, out_buf, out_size);
+        }
         case SYS_PROCLIST:
             return (uint64_t)sys_proclist((md_proclist_entry_u*)arg1, (size_t)arg2);
         case SYS_PIDINFO:

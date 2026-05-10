@@ -201,4 +201,8 @@ int fd_devvfs_opendir(int kind);
 int fd_devvfs_opendir_dev(const char *dev_subdir);
 int fd_devvfs_opendir_user(const char *user_subpath);
 
+ssize_t fd_invoke(int fd,
+                  const void *in_buf,  size_t in_size,
+                  void *out_buf, size_t out_size);
+
 #endif /* FD_H */

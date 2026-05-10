@@ -692,6 +692,45 @@ ssize_t fd_write(int fd, const void* buffer, size_t count) {
     return (ssize_t)count;
 }
 
+/*
+ * Invoke (ioctl-style RPC) on a file descriptor.
+ * Mainly used for UserFS nodes (and potentially DevFS devices later).
+ */
+ssize_t fd_invoke(int fd,
+                  const void *in_buf,  size_t in_size,
+                  void *out_buf, size_t out_size)
+{
+    fd_init();
+
+    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
+        return -1;      /* EBADF */
+    }
+
+    /* Only devices (UserFS / DevFS) support invoke for now */
+    if (!fd_table[fd].is_userfs /* && !fd_table[fd].is_devfs */) {
+        return -2;      /* ENOTTY or ENOSYS */
+    }
+
+    /* Check that the FD was opened with sufficient permissions */
+    if (!(fd_table[fd].flags & (FD_FLAG_READ | FD_FLAG_WRITE))) {
+        return -3;      /* EACCES */
+    }
+
+    if (fd_table[fd].is_userfs) {
+        if (!fd_table[fd].cached_data) return -4;
+        return userfs_invoke(fd_table[fd].cached_data,
+                             in_buf, in_size,
+                             out_buf, out_size);
+    }
+
+    /* Future DevFS support would go here */
+    /* if (fd_table[fd].is_devfs) {
+        return devfs_invoke(fd_table[fd].cached_data, in_buf, in_size, out_buf, out_size);
+    } */
+
+    return -2;  /* Not supported */
+}
+
 /* Seek in file */
 off_t fd_lseek(int fd, off_t offset, int whence) {
     fd_init();
