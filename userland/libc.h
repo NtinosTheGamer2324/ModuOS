@@ -176,6 +176,24 @@ static inline long syscall4(long num, long arg1, long arg2, long arg3, long arg4
     return ret;
 }
 
+static inline long syscall5(long num, long arg1, long arg2, long arg3, long arg4, long arg5) {
+    long ret;
+    __asm__ volatile (
+        "mov %1, %%rax\n"
+        "mov %2, %%rdi\n"
+        "mov %3, %%rsi\n"
+        "mov %4, %%rdx\n"
+        "mov %5, %%r10\n"
+        "mov %6, %%r8\n"
+        "syscall\n"
+        "mov %%rax, %0"
+        : "=r"(ret)
+        : "r"(num), "r"(arg1), "r"(arg2), "r"(arg3), "r"(arg4), "r"(arg5)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
 /* ============================================================
    BASIC OUTPUT (now matches new SYS_WRITE)
    ============================================================ */
@@ -1275,6 +1293,22 @@ static inline int userfs_register_path(const char *path, uint32_t perms) {
     node.owner_id = "userland";
     node.perms = perms;
     return userfs_register(&node);
+}
+
+static inline ssize_t invoke(int fd, const void *in_buf,  size_t in_size, void *out_buf, size_t out_size) {
+    long ret = syscall5(SYS_INVOKE,
+                        (long)fd,
+                        (long)in_buf,
+                        (long)in_size,
+                        (long)out_buf,
+                        (long)out_size);
+
+    if (ret < 0) {
+        errno = (int)(-ret);
+        return -1;
+    }
+
+    return (ssize_t)ret;
 }
 
 static inline int mount_drive(int vdrive_id, uint32_t partition_lba, int fs_type) {
