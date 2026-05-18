@@ -146,11 +146,14 @@ static inline long syscall(long num, long arg1, long arg2, long arg3) {
         "mov %2, %%rdi\n"
         "mov %3, %%rsi\n"
         "mov %4, %%rdx\n"
+        "xor %%r10, %%r10\n"
+        "xor %%r8,  %%r8\n"
+        "xor %%r9,  %%r9\n"
         "syscall\n"
         "mov %%rax, %0"
         : "=r"(ret)
         : "r"(num), "r"(arg1), "r"(arg2), "r"(arg3)
-        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
     );
     return ret;
 }
@@ -902,17 +905,14 @@ static inline void uheap_coalesce(void) {
 }
 
 static inline uheap_hdr_t* uheap_request_from_kernel(size_t payload) {
-    /* Prevent integer overflow: payload + header size */
     if (payload > (size_t)-1 - sizeof(uheap_hdr_t)) return NULL;
-    
+
     size_t total = sizeof(uheap_hdr_t) + payload;
     total = uheap_align(total);
-    
-    /* Verify alignment didn't cause overflow */
     if (total < payload) return NULL;
 
     void *mem = sbrk((intptr_t)total);
-    if ((intptr_t)mem == -1 || mem == NULL) return NULL;
+    if (!mem || (intptr_t)mem < 0) return NULL;
 
     uheap_hdr_t *h = (uheap_hdr_t*)mem;
     h->size = total - sizeof(uheap_hdr_t);
@@ -1309,6 +1309,35 @@ static inline ssize_t invoke(int fd, const void *in_buf,  size_t in_size, void *
     }
 
     return (ssize_t)ret;
+}
+
+#define MAP_FAILED ((void*)-1)
+
+/* mmap a device fd (e.g. $/dev/mvc/mvi0 ring buffer or framebuffer).
+ * hint=NULL lets the kernel choose the VA.
+ * prot: 1=R 2=W 3=RW. flags: 0=normal.
+ * offset: device-specific region (MVC3_OFF_RING, MVC3_OFF_FB, etc.).
+ * Returns mapped user VA or MAP_FAILED.
+ */
+static inline void *dev_mmap(int fd, void *hint, size_t length,
+                              int prot, int flags, uint64_t offset) {
+    register long _num    __asm__("rax") = (long)SYS_DEV_MMAP;
+    register long _fd     __asm__("rdi") = (long)fd;
+    register long _hint   __asm__("rsi") = (long)hint;
+    register long _length __asm__("rdx") = (long)length;
+    register long _prot   __asm__("r10") = (long)prot;
+    register long _flags  __asm__("r8")  = (long)flags;
+    register long _offset __asm__("r9")  = (long)offset;
+    long ret;
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret)
+        : "r"(_num), "r"(_fd), "r"(_hint), "r"(_length),
+          "r"(_prot), "r"(_flags), "r"(_offset)
+        : "rcx", "r11", "memory"
+    );
+    if (ret == -1L) { errno = ENOMEM; return MAP_FAILED; }
+    return (void *)(uintptr_t)ret;
 }
 
 static inline int mount_drive(int vdrive_id, uint32_t partition_lba, int fs_type) {
