@@ -1,519 +1,415 @@
 #include "libc.h"
 #include "NodGL.h"
-#include "string.h"
 #include "../include/moduos/kernel/events/events.h"
 
-/*
- * snakegfx.sqr
- *
- * Userland port of the kernel Snake (eatfruit.c) game, but rendered in graphics mode
- * via NodGL.
- *
- * Input: $/dev/input/event0 (structured events)
- *   - WASD / hjkl / arrow-key escape sequences if your shell sends them as ASCII
- *   - p = pause
- *   - q or ESC = quit (ESC might arrive as 0x1B)
- */
+/* ── Grid ─────────────────────────────────────────────────────────── */
+#define GW 32
+#define GH 24
+#define MAX_LEN (GW * GH)
 
-#define GAME_W 40
-#define GAME_H 25
-#define MAX_SNAKE 1000
+/* ── Colors (XRGB8888) ────────────────────────────────────────────── */
+#define C_BG      0x000000u
+#define C_BORDER  0x222222u
+#define C_GRID    0x0A0A0Au
+#define C_HEAD    0x00FF44u
+#define C_BODY    0x00AA33u
+#define C_FOOD    0xFF3030u
+#define C_TEXT    0xFFFFFFu
+#define C_YELLOW  0xFFFF00u
+#define C_OVERLAY 0x111111u
 
-typedef enum { DIR_UP=0, DIR_DOWN=1, DIR_LEFT=2, DIR_RIGHT=3 } Dir;
-
+/* ── Types ────────────────────────────────────────────────────────── */
 typedef struct { int x, y; } Pt;
+typedef enum   { R=0, D=1, L=2, U=3 } Dir;
+static int g_needs_redraw = 0;
 
-typedef struct {
-    Pt body[MAX_SNAKE];
-    int len;
-    Dir dir;
-} Snake;
+/* ── Static state (keep off stack) ───────────────────────────────── */
+static Pt   g_body[MAX_LEN];
+static int  g_len;
+static Dir  g_dir, g_next_dir;
+static Pt   g_food;
+static int  g_score, g_hiscore;
+static int  g_over, g_paused;
+static uint32_t g_seed;
 
-typedef struct {
-    Snake s;
-    Pt food;
-    int score;
-    int over;
-    int paused;
-} Game;
+/* ── NodGL handles ────────────────────────────────────────────────── */
+static NodGL_Device  g_dev;
+static NodGL_Context g_ctx;
 
-/*
- * IMPORTANT: keep large state off the user stack.
- * The process stack is small; putting Game on the stack overflows instantly.
- */
-static Game g_game;
+/* ── Screen / cell geometry ───────────────────────────────────────── */
+static uint32_t g_sw, g_sh;
+static uint32_t g_cell;
+static uint32_t g_bx, g_by;   /* board origin in pixels */
+static uint32_t g_bw, g_bh;   /* board size in pixels   */
 
-static uint32_t rng_seed = 1;
-static uint32_t rnd_u32(void) {
-    rng_seed = (rng_seed * 1103515245u + 12345u) & 0x7fffffffu;
-    return rng_seed;
+/* ═══════════════════════════════════════════════════════════════════
+   Tiny 5x7 font (digits + A-Z + some punctuation)
+   Each glyph is 5 bytes, one per row, bits 4..0 = columns left→right
+   ═══════════════════════════════════════════════════════════════════ */
+static const uint8_t g_font5x7[][7] = {
+    /* 0 */ {0xE,0x11,0x13,0x15,0x19,0x11,0xE},
+    /* 1 */ {0x4,0xC,0x4,0x4,0x4,0x4,0xE},
+    /* 2 */ {0xE,0x11,0x1,0x2,0x4,0x8,0x1F},
+    /* 3 */ {0x1F,0x2,0x4,0x2,0x1,0x11,0xE},
+    /* 4 */ {0x2,0x6,0xA,0x12,0x1F,0x2,0x2},
+    /* 5 */ {0x1F,0x10,0x1E,0x1,0x1,0x11,0xE},
+    /* 6 */ {0x6,0x8,0x10,0x1E,0x11,0x11,0xE},
+    /* 7 */ {0x1F,0x1,0x2,0x4,0x8,0x8,0x8},
+    /* 8 */ {0xE,0x11,0x11,0xE,0x11,0x11,0xE},
+    /* 9 */ {0xE,0x11,0x11,0xF,0x1,0x2,0xC},
+    /* A */ {0xE,0x11,0x11,0x1F,0x11,0x11,0x11},
+    /* B */ {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},
+    /* C */ {0xE,0x11,0x10,0x10,0x10,0x11,0xE},
+    /* D */ {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E},
+    /* E */ {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},
+    /* F */ {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},
+    /* G */ {0xE,0x11,0x10,0x17,0x11,0x11,0xF},
+    /* H */ {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},
+    /* I */ {0xE,0x4,0x4,0x4,0x4,0x4,0xE},
+    /* J */ {0x7,0x2,0x2,0x2,0x2,0x12,0xC},
+    /* K */ {0x11,0x12,0x14,0x18,0x14,0x12,0x11},
+    /* L */ {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
+    /* M */ {0x11,0x1B,0x15,0x11,0x11,0x11,0x11},
+    /* N */ {0x11,0x19,0x15,0x13,0x11,0x11,0x11},
+    /* O */ {0xE,0x11,0x11,0x11,0x11,0x11,0xE},
+    /* P */ {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
+    /* Q */ {0xE,0x11,0x11,0x11,0x15,0x12,0xD},
+    /* R */ {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
+    /* S */ {0xF,0x10,0x10,0xE,0x1,0x1,0x1E},
+    /* T */ {0x1F,0x4,0x4,0x4,0x4,0x4,0x4},
+    /* U */ {0x11,0x11,0x11,0x11,0x11,0x11,0xE},
+    /* V */ {0x11,0x11,0x11,0x11,0x11,0xA,0x4},
+    /* W */ {0x11,0x11,0x11,0x15,0x15,0x1B,0x11},
+    /* X */ {0x11,0xA,0xA,0x4,0xA,0xA,0x11},
+    /* Y */ {0x11,0x11,0xA,0x4,0x4,0x4,0x4},
+    /* Z */ {0x1F,0x1,0x2,0x4,0x8,0x10,0x1F},
+    /* : */ {0x0,0x4,0x0,0x0,0x0,0x4,0x0},
+    /* ! */ {0x4,0x4,0x4,0x4,0x4,0x0,0x4},
+    /* - */ {0x0,0x0,0x0,0x1F,0x0,0x0,0x0},
+    /* . */ {0x0,0x0,0x0,0x0,0x0,0x0,0x4},
+    /* / */ {0x1,0x1,0x2,0x4,0x8,0x10,0x10},
+};
+
+static int font_idx(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'Z') return 10 + (c - 'A');
+    if (c >= 'a' && c <= 'z') return 10 + (c - 'a');
+    if (c == ':') return 36;
+    if (c == '!') return 37;
+    if (c == '-') return 38;
+    if (c == '.') return 39;
+    if (c == '/') return 40;
+    return -1;
 }
 
-static int snake_hits(const Snake *s, Pt p) {
-    for (int i = 0; i < s->len; i++) {
-        if (s->body[i].x == p.x && s->body[i].y == p.y) return 1;
-    }
-    return 0;
-}
-
-static void spawn_food(Game *g) {
-    do {
-        g->food.x = (int)(rnd_u32() % GAME_W);
-        g->food.y = (int)(rnd_u32() % GAME_H);
-    } while (snake_hits(&g->s, g->food));
-}
-
-static void game_init(Game *g) {
-    memset(g, 0, sizeof(*g));
-    g->s.len = 3;
-    g->s.dir = DIR_RIGHT;
-    int sx = GAME_W / 2;
-    int sy = GAME_H / 2;
-    g->s.body[0] = (Pt){sx, sy};
-    g->s.body[1] = (Pt){sx-1, sy};
-    g->s.body[2] = (Pt){sx-2, sy};
-    g->score = 0;
-    g->over = 0;
-    g->paused = 0;
-    spawn_food(g);
-}
-
-static int game_step(Game *g, Pt *old_head, Pt *old_tail, Pt *old_food, int *ate_food) {
-    if (old_head) *old_head = g->s.body[0];
-    if (old_tail) *old_tail = g->s.body[g->s.len - 1];
-    if (old_food) *old_food = g->food;
-    if (ate_food) *ate_food = 0;
-
-    if (g->over || g->paused) return 0;
-
-    Pt nh = g->s.body[0];
-    switch (g->s.dir) {
-        case DIR_UP:    nh.y--; break;
-        case DIR_DOWN:  nh.y++; break;
-        case DIR_LEFT:  nh.x--; break;
-        case DIR_RIGHT: nh.x++; break;
-    }
-
-    if (nh.x < 0 || nh.x >= GAME_W || nh.y < 0 || nh.y >= GAME_H) {
-        g->over = 1;
-        return 0;
-    }
-    if (snake_hits(&g->s, nh)) {
-        g->over = 1;
-        return 0;
-    }
-
-    int ate = (nh.x == g->food.x && nh.y == g->food.y);
-    if (ate) {
-        if (ate_food) *ate_food = 1;
-        g->score += 10;
-        if (g->s.len < MAX_SNAKE) g->s.len++;
-        spawn_food(g);
-    }
-
-    for (int i = g->s.len - 1; i > 0; i--) {
-        g->s.body[i] = g->s.body[i-1];
-    }
-    g->s.body[0] = nh;
-    return 1;
-}
-
-/* ===========================
- * Graphics backend
- * =========================== */
-
-typedef struct {
-    md64api_grp_video_info_t vi;
-
-    /* Render target: userland backbuffer (tightly packed). */
-    uint8_t *bb;
-    uint32_t bb_pitch;
-
-    uint32_t fmt; /* md64api_grp_format_t */
-    uint32_t cell_px;
-    uint32_t off_x;
-    uint32_t off_y;
-} Gfx;
-
-static NodGL_Device g_device = NULL;
-static NodGL_Context g_ctx = NULL;
-static NodGL_Texture g_backbuffer_tex = 0;
-
-static uint32_t xrgb(uint8_t r,uint8_t g,uint8_t b){ return ((uint32_t)r<<16)|((uint32_t)g<<8)|b; }
-static uint16_t rgb565(uint8_t r,uint8_t g,uint8_t b){
-    uint16_t rr=(uint16_t)((r*31u)/255u);
-    uint16_t gg=(uint16_t)((g*63u)/255u);
-    uint16_t bb=(uint16_t)((b*31u)/255u);
-    return (uint16_t)((rr<<11)|(gg<<5)|bb);
-}
-
-static void fb_put_px(Gfx *g, int x, int y, uint32_t c) {
-    if ((unsigned)x >= g->vi.width || (unsigned)y >= g->vi.height) return;
-
-    if (g->fmt == MD64API_GRP_FMT_RGB565) {
-        uint16_t *p = (uint16_t*)(g->bb + (uint32_t)y * g->bb_pitch + (uint32_t)x * 2u);
-        *p = (uint16_t)c;
-    } else {
-        uint32_t *p = (uint32_t*)(g->bb + (uint32_t)y * g->bb_pitch + (uint32_t)x * 4u);
-        *p = c;
-    }
-}
-
-static void fb_put_rect(Gfx *g, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t c) {
-    if (!g || !g->bb) return;
-    if (x >= g->vi.width || y >= g->vi.height) return;
-    if (x + w > g->vi.width) w = g->vi.width - x;
-    if (y + h > g->vi.height) h = g->vi.height - y;
-
-    if (g->fmt == MD64API_GRP_FMT_XRGB8888 && g->vi.bpp == 32) {
-        for (uint32_t yy=0; yy<h; yy++) {
-            uint32_t *row = (uint32_t*)(g->bb + (uint64_t)(y+yy)*g->bb_pitch);
-            for (uint32_t xx=0; xx<w; xx++) row[x+xx] = c;
-        }
-    } else if (g->fmt == MD64API_GRP_FMT_RGB565 && g->vi.bpp == 16) {
-        uint16_t cc = (uint16_t)c;
-        for (uint32_t yy=0; yy<h; yy++) {
-            uint16_t *row = (uint16_t*)(g->bb + (uint64_t)(y+yy)*g->bb_pitch);
-            for (uint32_t xx=0; xx<w; xx++) row[x+xx] = cc;
-        }
-    }
-}
-
-static void draw_cell(Gfx *g, int cx, int cy, uint32_t color) {
-    uint32_t px = g->off_x + (uint32_t)cx * g->cell_px;
-    uint32_t py = g->off_y + (uint32_t)cy * g->cell_px;
-    fb_put_rect(g, px, py, g->cell_px-1, g->cell_px-1, color);
-}
-
-static uint32_t col_bg(Gfx *g){ return (g->fmt == MD64API_GRP_FMT_RGB565) ? (uint32_t)rgb565(8,8,12) : xrgb(8,8,12); }
-static uint32_t col_grid(Gfx *g){ return (g->fmt == MD64API_GRP_FMT_RGB565) ? (uint32_t)rgb565(18,18,24) : xrgb(18,18,24); }
-static uint32_t col_food(Gfx *g){ return (g->fmt == MD64API_GRP_FMT_RGB565) ? (uint32_t)rgb565(220,40,40) : xrgb(220,40,40); }
-static uint32_t col_head(Gfx *g){ return (g->fmt == MD64API_GRP_FMT_RGB565) ? (uint32_t)rgb565(60,240,90) : xrgb(60,240,90); }
-static uint32_t col_body(Gfx *g){ return (g->fmt == MD64API_GRP_FMT_RGB565) ? (uint32_t)rgb565(30,160,60) : xrgb(30,160,60); }
-
-/* One-time full clear. This avoids visible redraw every frame. */
-static int gfx_present_full(Gfx *g) {
-    if (!g || !g->bb) return -1;
-    NodGL_DrawTexture(g_ctx, g_backbuffer_tex, 0, 0, 0, 0, g->vi.width, g->vi.height);
-    NodGL_PresentContext(g_ctx, 0);
-    return 0;
-}
-
-static int gfx_present_cell(Gfx *g, int cx, int cy) {
-    if (!g || !g->bb) return -1;
-    if (cx < 0 || cy < 0 || cx >= GAME_W || cy >= GAME_H) return 0;
-
-    uint32_t px = g->off_x + (uint32_t)cx * g->cell_px;
-    uint32_t py = g->off_y + (uint32_t)cy * g->cell_px;
-    uint32_t w = (g->cell_px > 0) ? (g->cell_px - 1) : 0;
-    uint32_t h = (g->cell_px > 0) ? (g->cell_px - 1) : 0;
-    if (w == 0 || h == 0) return 0;
-
-    if (px >= g->vi.width || py >= g->vi.height) return 0;
-    if (px + w > g->vi.width) w = g->vi.width - px;
-    if (py + h > g->vi.height) h = g->vi.height - py;
-
-    NodGL_DrawTexture(g_ctx, g_backbuffer_tex, (int32_t)px, (int32_t)py, (int32_t)px, (int32_t)py, w, h);
-    NodGL_PresentContext(g_ctx, 0);
-    return 0;
-}
-
-/* HUD font: 3x5 glyphs rendered at SCALE (2x2 pixels per bit) so it's readable.
- * Contains only the letters we need for snake HUD.
- */
-#define HUD_SCALE 2
-
-static void hud_put_glyph(Gfx *g, int x, int y, char ch, uint32_t fg) {
-    uint8_t rows[5] = {0,0,0,0,0};
-
-    /* digits */
-    if (ch >= '0' && ch <= '9') {
-        static const uint8_t dig[10][5] = {
-            {0x7,0x5,0x5,0x5,0x7}, {0x2,0x6,0x2,0x2,0x7}, {0x7,0x1,0x7,0x4,0x7},
-            {0x7,0x1,0x7,0x1,0x7}, {0x5,0x5,0x7,0x1,0x1}, {0x7,0x4,0x7,0x1,0x7},
-            {0x7,0x4,0x7,0x5,0x7}, {0x7,0x1,0x1,0x1,0x1}, {0x7,0x5,0x7,0x5,0x7},
-            {0x7,0x5,0x7,0x1,0x7},
-        };
-        for (int i=0;i<5;i++) rows[i]=dig[ch-'0'][i];
-    } else if (ch == ':') {
-        rows[0]=0x0; rows[1]=0x2; rows[2]=0x0; rows[3]=0x2; rows[4]=0x0;
-    } else if (ch == ' ') {
-        return;
-    } else {
-        /* letters needed: P A U S E D G M O V R */
-        switch (ch) {
-            case 'P': rows[0]=0x7; rows[1]=0x5; rows[2]=0x7; rows[3]=0x4; rows[4]=0x4; break;
-            case 'A': rows[0]=0x2; rows[1]=0x5; rows[2]=0x7; rows[3]=0x5; rows[4]=0x5; break;
-            case 'U': rows[0]=0x5; rows[1]=0x5; rows[2]=0x5; rows[3]=0x5; rows[4]=0x7; break;
-            case 'S': rows[0]=0x7; rows[1]=0x4; rows[2]=0x7; rows[3]=0x1; rows[4]=0x7; break;
-            case 'E': rows[0]=0x7; rows[1]=0x4; rows[2]=0x7; rows[3]=0x4; rows[4]=0x7; break;
-            case 'D': rows[0]=0x6; rows[1]=0x5; rows[2]=0x5; rows[3]=0x5; rows[4]=0x6; break;
-            case 'G': rows[0]=0x7; rows[1]=0x4; rows[2]=0x6; rows[3]=0x5; rows[4]=0x7; break;
-            case 'M': rows[0]=0x5; rows[1]=0x7; rows[2]=0x7; rows[3]=0x5; rows[4]=0x5; break;
-            case 'O': rows[0]=0x7; rows[1]=0x5; rows[2]=0x5; rows[3]=0x5; rows[4]=0x7; break;
-            case 'V': rows[0]=0x5; rows[1]=0x5; rows[2]=0x5; rows[3]=0x5; rows[4]=0x2; break;
-            case 'R': rows[0]=0x6; rows[1]=0x5; rows[2]=0x6; rows[3]=0x5; rows[4]=0x5; break;
-            default:
-                rows[0]=0x7; rows[1]=0x1; rows[2]=0x1; rows[3]=0x1; rows[4]=0x7; break;
-        }
-    }
-
-    for (int yy=0; yy<5; yy++) {
-        for (int xx=0; xx<3; xx++) {
-            if (rows[yy] & (1<<(2-xx))) {
-                for (int sy=0; sy<HUD_SCALE; sy++)
-                    for (int sx=0; sx<HUD_SCALE; sx++)
-                        fb_put_px(g, x + xx*HUD_SCALE + sx, y + yy*HUD_SCALE + sy, fg);
+/* Draw a single glyph at pixel (px,py), scale s, color col */
+static void draw_glyph(int px, int py, char c, int s, uint32_t col) {
+    int idx = font_idx(c);
+    if (idx < 0) return;
+    const uint8_t *rows = g_font5x7[idx];
+    for (int row = 0; row < 7; row++) {
+        for (int bit = 0; bit < 5; bit++) {
+            if (rows[row] & (1 << (4 - bit))) {
+                NodGL_FillRectContext(g_ctx,
+                    px + bit * s, py + row * s, (uint32_t)s, (uint32_t)s, col);
             }
         }
     }
 }
 
-static void hud_put_str(Gfx *g, int x, int y, const char *s, uint32_t fg) {
-    int cx = x;
-    for (int i=0; s[i]; i++) {
-        hud_put_glyph(g, cx, y, s[i], fg);
-        cx += (3*HUD_SCALE) + HUD_SCALE; /* glyph width + spacing */
+/* Draw a string; returns x after last glyph */
+static int draw_str(int px, int py, const char *s, int scale, uint32_t col) {
+    int x = px;
+    for (; *s; s++) {
+        if (*s == ' ') { x += (5 + 1) * scale; continue; }
+        draw_glyph(x, py, *s, scale, col);
+        x += (5 + 1) * scale;
     }
+    return x;
 }
 
-static void hud_put_int(Gfx *g, int x, int y, int v, uint32_t fg) {
+static int draw_int(int px, int py, int v, int scale, uint32_t col) {
     char buf[16];
     itoa(v, buf, 10);
-    hud_put_str(g, x, y, buf, fg);
+    return draw_str(px, py, buf, scale, col);
 }
 
-static void draw_hud(Gfx *g, const Game *game) {
-    uint32_t fg = (g->fmt == MD64API_GRP_FMT_RGB565) ? rgb565(255,255,255) : xrgb(255,255,255);
-    uint32_t fg2 = (g->fmt == MD64API_GRP_FMT_RGB565) ? rgb565(0,255,0) : xrgb(0,255,0);
-    uint32_t bg = (g->fmt == MD64API_GRP_FMT_RGB565) ? rgb565(0,0,0) : xrgb(0,0,0);
-
-    /* clear a HUD strip */
-    for (int y=0; y<28; y++) for (int x=0; x<220; x++) fb_put_px(g, x, y, bg);
-
-    hud_put_str(g, 2, 2, "SCORE:", fg);
-    hud_put_int(g, 2 + 7*((3*HUD_SCALE)+HUD_SCALE), 2, game->score, fg2);
-
-    hud_put_str(g, 2, 14, "LEN:", fg);
-    hud_put_int(g, 2 + 4*((3*HUD_SCALE)+HUD_SCALE), 14, game->s.len, fg2);
-
-    if (game->paused) {
-        hud_put_str(g, 110, 2, "PAUSED", fg);
-    }
-    if (game->over) {
-        hud_put_str(g, 110, 14, "GAME OVER", fg);
-    }
+/* ── RNG ──────────────────────────────────────────────────────────── */
+static uint32_t rnd(void) {
+    g_seed = g_seed * 1664525u + 1013904223u;
+    return g_seed;
 }
 
-static void draw_init(Gfx *g, const Game *game) {
-    fb_put_rect(g, 0, 0, g->vi.width, g->vi.height, col_bg(g));
-    fb_put_rect(g, g->off_x, g->off_y, GAME_W * g->cell_px, GAME_H * g->cell_px, col_grid(g));
-
-    /* initial snake + food */
-    draw_cell(g, game->food.x, game->food.y, col_food(g));
-    for (int i = 0; i < game->s.len; i++) {
-        draw_cell(g, game->s.body[i].x, game->s.body[i].y, (i==0)?col_head(g):col_body(g));
-    }
-}
-
-/* Incremental updates for smooth rendering */
-static void draw_update(Gfx *g, const Game *game, Pt old_head, Pt old_tail, Pt old_food, int ate) {
-    /* erase tail if we did not grow */
-    if (!ate) {
-        draw_cell(g, old_tail.x, old_tail.y, col_grid(g));
-        (void)gfx_present_cell(g, old_tail.x, old_tail.y);
-    }
-
-    /* old head becomes body (unless game over immediately) */
-    if (!game->over) {
-        draw_cell(g, old_head.x, old_head.y, col_body(g));
-        (void)gfx_present_cell(g, old_head.x, old_head.y);
-
-        draw_cell(g, game->s.body[0].x, game->s.body[0].y, col_head(g));
-        (void)gfx_present_cell(g, game->s.body[0].x, game->s.body[0].y);
-    }
-
-    /* food moved? */
-    if (ate) {
-        draw_cell(g, old_food.x, old_food.y, col_grid(g));
-        (void)gfx_present_cell(g, old_food.x, old_food.y);
-
-        draw_cell(g, game->food.x, game->food.y, col_food(g));
-        (void)gfx_present_cell(g, game->food.x, game->food.y);
-    }
-
-    /* HUD drawn in framebuffer (see draw_hud). */
-    (void)game;
-}
-
-static int gfx_init(Gfx *g) {
-    memset(g, 0, sizeof(*g));
-    
-    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &g_device, &g_ctx, NULL) != NodGL_OK) {
-        return -1;
-    }
-
-    uint32_t screen_w, screen_h;
-    NodGL_GetScreenResolution(g_device, &screen_w, &screen_h);
-
-    g->vi.width = screen_w;
-    g->vi.height = screen_h;
-    g->vi.bpp = 32;
-    g->fmt = MD64API_GRP_FMT_XRGB8888;
-
-    NodGL_TextureDesc tex_desc = {
-        .width = screen_w,
-        .height = screen_h,
-        .format = NodGL_FORMAT_R8G8B8A8_UNORM,
-        .mip_levels = 1,
-        .initial_data = NULL,
-        .initial_data_size = 0
-    };
-
-    if (NodGL_CreateTexture(g_device, &tex_desc, &g_backbuffer_tex) != NodGL_OK) {
-        NodGL_ReleaseDevice(g_device);
-        return -2;
-    }
-
-    if (NodGL_MapResource(g_ctx, g_backbuffer_tex, (void**)&g->bb, &g->bb_pitch) != NodGL_OK) {
-        NodGL_ReleaseResource(g_device, g_backbuffer_tex);
-        NodGL_ReleaseDevice(g_device);
-        return -4;
-    }
-
-    /* choose cell size to fit */
-    uint32_t max_cell_w = g->vi.width / GAME_W;
-    uint32_t max_cell_h = g->vi.height / GAME_H;
-    g->cell_px = max_cell_w < max_cell_h ? max_cell_w : max_cell_h;
-    if (g->cell_px < 8) g->cell_px = 8;
-    if (g->cell_px > 32) g->cell_px = 32;
-
-    uint32_t board_w = GAME_W * g->cell_px;
-    uint32_t board_h = GAME_H * g->cell_px;
-    g->off_x = (g->vi.width  > board_w) ? (g->vi.width  - board_w)/2 : 0;
-    g->off_y = (g->vi.height > board_h) ? (g->vi.height - board_h)/2 : 0;
-
+/* ── Helpers ──────────────────────────────────────────────────────── */
+static int hits_body(Pt p, int skip_tail) {
+    int end = skip_tail ? g_len - 1 : g_len;
+    for (int i = 0; i < end; i++)
+        if (g_body[i].x == p.x && g_body[i].y == p.y) return 1;
     return 0;
 }
 
-/* ===========================
- * Input
- * =========================== */
-
-static int evt_open(void) {
-    return open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
+static void place_food(void) {
+    Pt f;
+    do { f.x = (int)(rnd() % GW); f.y = (int)(rnd() % GH); }
+    while (hits_body(f, 0));
+    g_food = f;
 }
 
-static void handle_event(Game *g, const Event *e, int *quit) {
-    if (!g || !e || !quit) return;
+/* ── Game logic ───────────────────────────────────────────────────── */
+static void game_reset(void) {
+    g_len  = 4;
+    g_dir  = R;
+    g_next_dir = R;
+    g_over = 0;
+    g_paused = 0;
+    g_score = 0;
+    int sx = GW / 2, sy = GH / 2;
+    for (int i = 0; i < g_len; i++) {
+        g_body[i].x = sx - i;
+        g_body[i].y = sy;
+    }
+    place_food();
+}
+
+/* Returns 1 if snake moved, 0 if game over */
+static int game_tick(void) {
+    if (g_over || g_paused) return 0;
+    g_dir = g_next_dir;
+
+    Pt nh = g_body[0];
+    switch (g_dir) {
+        case R: nh.x++; break;
+        case L: nh.x--; break;
+        case D: nh.y++; break;
+        case U: nh.y--; break;
+    }
+
+    /* wall collision */
+    if (nh.x < 0 || nh.x >= GW || nh.y < 0 || nh.y >= GH) { g_over = 1; return 0; }
+    /* self collision (allow tail slot — it will move away) */
+    if (hits_body(nh, 1)) { g_over = 1; return 0; }
+
+    int ate = (nh.x == g_food.x && nh.y == g_food.y);
+
+    /* shift body */
+    if (!ate) g_len = g_len; /* no grow */
+    else {
+        g_score += 10;
+        if (g_score > g_hiscore) g_hiscore = g_score;
+        if (g_len < MAX_LEN) g_len++;
+        place_food();
+    }
+
+    for (int i = g_len - 1; i > 0; i--) g_body[i] = g_body[i-1];
+    g_body[0] = nh;
+    return 1;
+}
+
+/* ── Drawing ──────────────────────────────────────────────────────── */
+static void fill(int x, int y, uint32_t w, uint32_t h, uint32_t c) {
+    NodGL_FillRectContext(g_ctx, x, y, w, h, c);
+}
+
+static void draw_board_bg(void) {
+    /* outer border */
+    fill(0, 0, g_sw, g_sh, C_BG);
+    fill((int)g_bx - 2, (int)g_by - 2, g_bw + 4, g_bh + 4, C_BORDER);
+    /* grid */
+    for (int gy = 0; gy < GH; gy++) {
+        for (int gx = 0; gx < GW; gx++) {
+            uint32_t px = g_bx + (uint32_t)gx * g_cell;
+            uint32_t py = g_by + (uint32_t)gy * g_cell;
+            fill((int)px, (int)py, g_cell - 1, g_cell - 1, C_GRID);
+        }
+    }
+}
+
+static void draw_cell(int gx, int gy, uint32_t c) {
+    int px = (int)g_bx + gx * (int)g_cell;
+    int py = (int)g_by + gy * (int)g_cell;
+    uint32_t inner = g_cell > 2 ? g_cell - 2 : g_cell;
+    fill(px + 1, py + 1, inner, inner, c);
+}
+
+static void draw_snake_and_food(void) {
+    draw_cell(g_food.x, g_food.y, C_FOOD);
+    for (int i = g_len - 1; i >= 0; i--)
+        draw_cell(g_body[i].x, g_body[i].y, i == 0 ? C_HEAD : C_BODY);
+}
+
+static void draw_hud(void) {
+    /* HUD bar above board */
+    int hy = (int)g_by - 24;
+    if (hy < 0) hy = 0;
+    fill(0, hy, g_sw, 20, C_BG);
+
+    draw_str(4, hy + 2, "SCORE:", 2, C_TEXT);
+    int ax = draw_int(76, hy + 2, g_score, 2, C_YELLOW);
+
+    draw_str(ax + 16, hy + 2, "BEST:", 2, C_TEXT);
+    draw_int(ax + 16 + 60, hy + 2, g_hiscore, 2, C_YELLOW);
+
+    if (g_paused)
+        draw_str((int)g_sw / 2 - 40, hy + 2, "PAUSED", 2, 0x00CCFF);
+}
+
+static void draw_overlay(const char *line1, const char *line2) {
+    /* semi-transparent-ish dark box in centre */
+    uint32_t ow = 260, oh = 80;
+    int ox = (int)(g_sw - ow) / 2;
+    int oy = (int)(g_sh - oh) / 2;
+    fill(ox, oy, ow, oh, C_OVERLAY);
+    /* two lines of text */
+    int tw1 = (int)strlen(line1) * 6 * 2;
+    int tw2 = (int)strlen(line2) * 6 * 2;
+    draw_str(ox + ((int)ow - tw1) / 2, oy + 12, line1, 2, C_TEXT);
+    draw_str(ox + ((int)ow - tw2) / 2, oy + 44, line2, 2, C_YELLOW);
+}
+
+static void full_redraw(void) {
+    draw_board_bg();
+    draw_snake_and_food();
+    draw_hud();
+    NodGL_PresentContext(g_ctx, 0);
+}
+
+/* ── Input ────────────────────────────────────────────────────────── */
+static void handle_key(const Event *e, int *quit) {
     if (e->type != EVENT_KEY_PRESSED) return;
-
     KeyCode kc = e->data.keyboard.keycode;
-    char c = e->data.keyboard.ascii;
+    char    c  = e->data.keyboard.ascii;
 
-    if (kc == KEY_ESCAPE || c == 0x1b || c == 'q' || c == 'Q') { *quit = 1; return; }
+    if (kc == KEY_ESCAPE || c == 'q' || c == 'Q') { *quit = 1; return; }
 
-    if (g->over) {
-        if (kc == KEY_ENTER || c == '\n') {
-            game_init(g);
+    if (g_over) {
+        if (kc == KEY_ENTER || c == '\n' || c == '\r') {
+            game_reset();
+            full_redraw();   /* clears overlay + old snake in one shot */
+            g_needs_redraw = 0;
         }
         return;
     }
 
     if (c == 'p' || c == 'P') {
-        g->paused = !g->paused;
+        g_paused ^= 1;
+        g_needs_redraw = 1;
         return;
     }
 
-    /* Arrows */
-    if (kc == KEY_ARROW_UP && g->s.dir != DIR_DOWN) g->s.dir = DIR_UP;
-    else if (kc == KEY_ARROW_DOWN && g->s.dir != DIR_UP) g->s.dir = DIR_DOWN;
-    else if (kc == KEY_ARROW_LEFT && g->s.dir != DIR_RIGHT) g->s.dir = DIR_LEFT;
-    else if (kc == KEY_ARROW_RIGHT && g->s.dir != DIR_LEFT) g->s.dir = DIR_RIGHT;
-
-    /* Fallback: WASD + hjkl */
-    else if ((c=='w'||c=='W'||c=='k') && g->s.dir != DIR_DOWN) g->s.dir = DIR_UP;
-    else if ((c=='s'||c=='S'||c=='j') && g->s.dir != DIR_UP) g->s.dir = DIR_DOWN;
-    else if ((c=='a'||c=='A'||c=='h') && g->s.dir != DIR_RIGHT) g->s.dir = DIR_LEFT;
-    else if ((c=='d'||c=='D'||c=='l') && g->s.dir != DIR_LEFT) g->s.dir = DIR_RIGHT;
+    if ((kc == KEY_ARROW_UP    || c=='w'||c=='W') && g_dir != D) g_next_dir = U;
+    if ((kc == KEY_ARROW_DOWN  || c=='s'||c=='S') && g_dir != U) g_next_dir = D;
+    if ((kc == KEY_ARROW_LEFT  || c=='a'||c=='A') && g_dir != R) g_next_dir = L;
+    if ((kc == KEY_ARROW_RIGHT || c=='d'||c=='D') && g_dir != L) g_next_dir = R;
 }
 
+static void sleep_ms(uint32_t ms) {
+    uint64_t end = time_ms() + ms;
+    while (time_ms() < end) yield();
+}
+
+/* ── Entry point ──────────────────────────────────────────────────── */
 int md_main(long argc, char **argv) {
     (void)argc; (void)argv;
 
-    puts_raw("snakegfx - Snake in userland (graphics)\n");
-
-    Gfx gfx;
-    int gr = gfx_init(&gfx);
-    if (gr != 0) {
-        printf("snakegfx: graphics init failed (%d). Need framebuffer graphics mode.\n", gr);
+    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &g_dev, &g_ctx, NULL) != NodGL_OK) {
+        puts_raw("snakegfx: NodGL init failed\n");
         sleep(2);
         return 1;
     }
 
-    /* Intentionally avoid printf() in graphics apps; draw text to framebuffer instead. */
+    NodGL_GetScreenResolution(g_dev, &g_sw, &g_sh);
 
-    int efd = evt_open();
+    uint32_t avail_h = g_sh > 32 ? g_sh - 32 : g_sh;
+    uint32_t cw = g_sw / GW;
+    uint32_t ch = avail_h / GH;
+    g_cell = cw < ch ? cw : ch;
+    if (g_cell < 4)  g_cell = 4;
+    if (g_cell > 28) g_cell = 28;
+
+    g_bw = (uint32_t)GW * g_cell;
+    g_bh = (uint32_t)GH * g_cell;
+    g_bx = (g_sw - g_bw) / 2;
+    g_by = (g_sh - g_bh) / 2 + 12;
+
+    int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
     if (efd < 0) {
-        puts_raw("snakegfx: cannot open $/dev/input/event0\n");
+        puts_raw("snakegfx: cannot open event0\n");
+        free(g_ctx);
+        NodGL_ReleaseDevice(g_dev);
         sleep(2);
         return 2;
     }
-    puts_raw("snakegfx: opened event0 (nonblocking)\n");
 
-    rng_seed = (uint32_t)(time_ms() & 0x7fffffff);
-
-    game_init(&g_game);
-
-    puts_raw("Controls: WASD (or HJKL), P pause, Q quit, ENTER restart\n");
-
-    /* One-time draw */
-    draw_init(&gfx, &g_game);
-    gfx_present_full(&gfx);
+    g_seed    = (uint32_t)(time_ms() & 0x7FFFFFFFu);
+    g_hiscore = 0;
+    game_reset();
+    full_redraw();
 
     uint64_t last_tick = time_ms();
-    uint64_t last_draw = 0;
-
+    uint64_t last_hud  = time_ms();
     int quit = 0;
-    uint64_t start = time_ms();
-    while (!quit) {
-        /* keep alive marker in case of instant exit debugging */
-        if (time_ms() - start < 500) {
-            // no-op
-        }
-        /* Non-blocking event poll */
-        Event ev;
-        while (read(efd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
-            handle_event(&g_game, &ev, &quit);
-        }
 
+    while (!quit) {
+        uint64_t frame_start = time_ms();
+        int dirty = 0;
+    
+        Event ev;
+        while (read(efd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev))
+            handle_key(&ev, &quit);
+    
+        if (g_needs_redraw) {
+            draw_hud();
+            NodGL_PresentContext(g_ctx, 0);
+            g_needs_redraw = 0;
+            dirty = 0;
+        }
+    
         uint64_t now = time_ms();
-        if (now - last_tick >= 120) {
-            Pt old_head, old_tail, old_food;
-            int ate = 0;
-            int moved = game_step(&g_game, &old_head, &old_tail, &old_food, &ate);
+    
+        uint32_t interval = 200;
+        if (g_score > 50)  interval = 170;
+        if (g_score > 150) interval = 140;
+        if (g_score > 300) interval = 110;
+        if (g_score > 500) interval = 85;
+    
+        if (!g_over && !g_paused && now - last_tick >= interval) {
+            Pt prev_tail = g_body[g_len - 1];
+            int prev_len = g_len;
+            int moved = game_tick();
+        
             if (moved) {
-                draw_update(&gfx, &g_game, old_head, old_tail, old_food, ate);
+                if (g_len == prev_len)
+                    draw_cell(prev_tail.x, prev_tail.y, C_GRID);
+                draw_cell(g_body[1].x, g_body[1].y, C_BODY);
+                draw_cell(g_body[0].x, g_body[0].y, C_HEAD);
+                draw_cell(g_food.x, g_food.y, C_FOOD);
+                dirty = 1;
             }
+        
+            if (g_over) {
+                full_redraw();
+                draw_overlay("GAME OVER", "ENTER TO RESTART");
+                dirty = 1;
+            }
+        
             last_tick = now;
         }
-
-        /* throttle HUD refresh */
-        if (now - last_draw >= 250) {
-            draw_hud(&gfx, &g_game);
-            gfx_present_full(&gfx);
-            last_draw = now;
+    
+        if (now - last_hud >= 250 && !g_over) {
+            draw_hud();
+            dirty = 1;
+            last_hud = now;
         }
-
-        /* Yield a bit */
-        yield();
+    
+        if (dirty)
+            NodGL_PresentContext(g_ctx, 0);
+    
+        uint64_t elapsed = time_ms() - frame_start;
+        if (elapsed < 16) sleep_ms((uint32_t)(16 - elapsed));
     }
 
     close(efd);
-    
-    NodGL_ReleaseResource(g_device, g_backbuffer_tex);
-    NodGL_ReleaseDevice(g_device);
-    
-    puts_raw("\nBye.\n");
+    free(g_ctx);
+    NodGL_ReleaseDevice(g_dev);
     return 0;
 }
