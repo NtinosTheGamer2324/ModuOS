@@ -1,31 +1,27 @@
-//lib_gfx2d.c
-//
-// Uses VIDEOCTL_CMD2_MAP_CMDBUF / SUBMIT_CMDBUF when available.
-//
-// With the mapped-buffer path the game loop writes commands directly into a
-// page that is shared with the kernel — no copy, no per-command syscall.
-// A single ioctl-style write (SUBMIT_CMDBUF) at present-time tells the kernel
-// "process N commands from the shared buffer", then returns immediately while
-// the GPU/driver works asynchronously.
-//
-// Falls back to the legacy batched-write path when MAP_CMDBUF is unavailable.
+/*
+ * lib_gfx2d.c — ModuOS graphics wrapper, MVC3 backend
+ *
+ * Talks to $/dev/mvc/mvi0 instead of the old $/dev/graphics/video0.
+ * Wire protocol: mvc3.h
+ *
+ * Fast path  — kernel-allocated ring (MAP_RING), one SUBMIT write/frame
+ * Slow path  — malloc'd copy buffer, one write() per flush
+ *
+ * Copyright © 2025-2026 ModuOS Project Contributors — GPL v2.0
+ */
 
 #include "libc.h"
 #include "gfx2d.h"
-#include "../include/moduos/drivers/graphics/videoctl.h"
+#include "mvc3.h"
 
-#define VIDEO0_PATH "$/dev/graphics/video0"
+#define MVI0_PATH "$/dev/mvc/mvi0"
 
-/* Default mapped command buffer size: 1 MB.
- * At 56 bytes per command that's ~18,000 commands — more than enough for
- * a full Teseraris frame including pixel-by-pixel text (which is now span-
- * merged anyway, but belt-and-suspenders). */
-#define MAPPED_CMDBUF_SIZE (1024 * 1024)
+#define GFX2D_RING_SIZE     (1024u * 1024u)
+#define GFX2D_COPY_BUF_SIZE (256u * 1024u)
 
-/* Legacy fallback userspace copy buffer: 256 KB */
-#define COPY_CMDBUF_SIZE (256 * 1024)
+/* ── Internal I/O helpers ──────────────────────────────────────────── */
 
-static int write_full(int fd, void *buf, size_t sz) {
+static int write_full(int fd, const void *buf, size_t sz) {
     ssize_t r = write(fd, buf, sz);
     if (r < 0) return (int)r;
     if ((size_t)r != sz) return -EIO;
@@ -39,65 +35,47 @@ static int read_full(int fd, void *buf, size_t sz) {
     return 0;
 }
 
-/* -----------------------------------------------------------------------
- * Try to establish the zero-copy mapped command buffer path.
- * Sets g->mapped_cmdbuf / g->mapped_cmdbuf_size on success.
- * Returns 0 on success, -1 if the kernel doesn't support it (fall back).
- * ----------------------------------------------------------------------- */
-static int gfx2d_try_map_cmdbuf(gfx2d_t *g) {
-    videoctl2_map_cmdbuf_t req;
-    memset(&req, 0, sizeof(req));
-    req.hdr.magic        = VIDEOCTL_MAGIC2;
-    req.hdr.abi_version  = VIDEOCTL_ABI_VERSION;
-    req.hdr.cmd          = VIDEOCTL_CMD2_MAP_CMDBUF;
-    req.hdr.size_bytes   = sizeof(req);
-    req.size_bytes        = MAPPED_CMDBUF_SIZE;
+/* ── Header builder ────────────────────────────────────────────────── */
 
-    if (write_full(g->fd, &req, sizeof(req)) != 0) return -1;
-    if (read_full(g->fd, &req, sizeof(req))  != 0) return -1;
-
-    if (req.user_addr == 0 || req.actual_size == 0) return -1;
-
-    g->mapped_cmdbuf      = (void *)(uintptr_t)req.user_addr;
-    g->mapped_cmdbuf_size = req.actual_size;
-    g->mapped_cmdbuf_used = 0;
-    g->mapped_cmd_count   = 0;
-    return 0;
+static void hdr_init(mvc3_hdr_t *h, mvc3_cmd_t cmd, uint32_t total_bytes) {
+    h->magic       = MVC3_MAGIC;
+    h->abi_version = MVC3_ABI_VERSION;
+    h->cmd         = (uint32_t)cmd;
+    h->size_bytes  = total_bytes;
 }
 
-/* -----------------------------------------------------------------------
- * Open the graphics device and set up the best available command path.
- * Priority:
- *   1. Kernel-mapped shared buffer (VIDEOCTL_CMD2_MAP_CMDBUF)  — zero-copy
- *   2. Userspace copy buffer + single write() per flush         — one-copy
- * ----------------------------------------------------------------------- */
+/* ── Zero-copy ring path setup ─────────────────────────────────────── */
+
+static int try_map_ring(gfx2d_t *g) {
+    (void)g;
+    return -1; /* disabled — use copy-batch */
+}
+
+/* ── Open / Close ──────────────────────────────────────────────────── */
+
 int gfx2d_open(gfx2d_t *g) {
     if (!g) return -EINVAL;
     memset(g, 0, sizeof(*g));
 
-    int fd = open(VIDEO0_PATH, O_RDWR, 0);
+    int fd = open(MVI0_PATH, O_RDWR, 0);
     if (fd < 0) return -ENOENT;
     g->fd = fd;
 
-    /* Try zero-copy mapped buffer first */
-    if (gfx2d_try_map_cmdbuf(g) == 0) {
+    if (try_map_ring(g) == 0) {
         g->use_mapped_cmdbuf = 1;
-        printf("[GFX2D] Using zero-copy mapped command buffer (%u bytes)\n",
-               g->mapped_cmdbuf_size);
+        printf("[GFX2D/MVC3] zero-copy ring: %u bytes\n", g->mapped_cmdbuf_size);
         return 0;
     }
 
-    /* Fall back: allocate a userspace copy buffer */
-    g->cmdbuf_size = COPY_CMDBUF_SIZE;
+    g->cmdbuf_size = GFX2D_COPY_BUF_SIZE;
     g->cmdbuf      = malloc(g->cmdbuf_size);
     if (g->cmdbuf) {
         g->cmdbuf_used = 0;
         g->cmd_count   = 0;
-        printf("[GFX2D] Using copy-batch command buffer (%u bytes)\n",
-               g->cmdbuf_size);
+        printf("[GFX2D/MVC3] copy-batch buffer: %u bytes\n", g->cmdbuf_size);
     } else {
         g->cmdbuf_size = 0;
-        printf("[GFX2D] Warning: command buffer alloc failed, using direct writes\n");
+        printf("[GFX2D/MVC3] Warning: copy-batch alloc failed, direct writes\n");
     }
 
     return 0;
@@ -105,324 +83,278 @@ int gfx2d_open(gfx2d_t *g) {
 
 int gfx2d_close(gfx2d_t *g) {
     if (!g) return -EINVAL;
-    /* mapped_cmdbuf is kernel-owned memory — do NOT free() it */
-    if (g->cmdbuf) {
-        free(g->cmdbuf);
-        g->cmdbuf = NULL;
-    }
-    if (g->fd >= 0) {
-        close(g->fd);
-        g->fd = -1;
-    }
+    /* mapped_cmdbuf is kernel-owned — do NOT free() it */
+    if (g->cmdbuf) { free(g->cmdbuf); g->cmdbuf = NULL; }
+    if (g->fd >= 0) { close(g->fd); g->fd = -1; }
     return 0;
 }
+
+/* ── GET_INFO ──────────────────────────────────────────────────────── */
 
 int gfx2d_get_info(gfx2d_t *g, gfx2d_info_t *out) {
     if (!g || !out) return -EINVAL;
 
-    videoctl2_info_t req;
+    mvc3_get_info_req_t req;
     memset(&req, 0, sizeof(req));
-    req.hdr.magic       = VIDEOCTL_MAGIC2;
-    req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-    req.hdr.cmd         = VIDEOCTL_CMD2_GET_INFO;
-    req.hdr.size_bytes  = sizeof(req);
+    hdr_init(&req.hdr, MVC3_CMD_GET_INFO, sizeof(req));
 
     int rc = write_full(g->fd, &req, sizeof(req));
     if (rc != 0) return rc;
-    rc = read_full(g->fd, &req, sizeof(req));
-    if (rc != 0) return rc;
 
-    out->width  = req.width;
-    out->height = req.height;
-    out->pitch  = req.pitch;
-    out->bpp    = req.bpp;
-    out->fmt    = req.fmt;
-    out->caps   = req.caps;
-    memcpy(out->driver, req.driver, sizeof(out->driver));
-    out->driver[sizeof(out->driver)-1] = 0;
+    mvc3_get_info_resp_t resp;
+    memset(&resp, 0, sizeof(resp));
+    rc = read_full(g->fd, &resp, sizeof(resp));
+    if (rc != 0) return rc;
+    if (resp.hdr.magic != MVC3_MAGIC) return -EIO;
+
+    out->width  = resp.width;
+    out->height = resp.height;
+    out->pitch  = resp.pitch;
+    out->bpp    = resp.bpp;
+    out->fmt    = resp.fmt;
+    out->caps   = resp.caps;
+    memcpy(out->driver, resp.driver, sizeof(out->driver));
+    out->driver[sizeof(out->driver) - 1] = 0;
     return 0;
 }
 
-/* -----------------------------------------------------------------------
- * Internal: enqueue one videoctl2_enqueue_t into whichever buffer is active.
- * Returns 0 on success.
- * ----------------------------------------------------------------------- */
-static int enqueue_cmd(gfx2d_t *g, const videoctl2_enqueue_t *cmd) {
-    size_t sz = sizeof(*cmd);
+/* ── Internal: enqueue one draw slot ──────────────────────────────── */
 
-    /* --- Zero-copy path: write directly into the mapped kernel buffer --- */
+static int enqueue_slot(gfx2d_t *g, const mvc3_ring_slot_t *slot) {
+
+    /* Zero-copy ring */
     if (g->use_mapped_cmdbuf && g->mapped_cmdbuf) {
-        if (g->mapped_cmdbuf_used + sz <= g->mapped_cmdbuf_size) {
-            memcpy((uint8_t *)g->mapped_cmdbuf + g->mapped_cmdbuf_used, cmd, sz);
-            g->mapped_cmdbuf_used += (uint32_t)sz;
+        uint32_t slot_sz = sizeof(mvc3_ring_slot_t);
+
+        if (g->mapped_cmdbuf_used + slot_sz <= g->mapped_cmdbuf_size) {
+            memcpy((uint8_t *)g->mapped_cmdbuf + g->mapped_cmdbuf_used,
+                   slot, slot_sz);
+            g->mapped_cmdbuf_used += slot_sz;
             g->mapped_cmd_count++;
             return 0;
         }
-        /* Mapped buffer full — flush it mid-frame and carry on.
-         * This should be extremely rare given the 1 MB buffer. */
-        videoctl2_submit_cmdbuf_t sub;
+
+        /* Ring full — flush and retry */
+        mvc3_submit_t sub;
         memset(&sub, 0, sizeof(sub));
-        sub.hdr.magic       = VIDEOCTL_MAGIC2;
-        sub.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-        sub.hdr.cmd         = VIDEOCTL_CMD2_SUBMIT_CMDBUF;
-        sub.hdr.size_bytes  = sizeof(sub);
-        sub.count           = g->mapped_cmd_count;
+        hdr_init(&sub.hdr, MVC3_CMD_SUBMIT, sizeof(sub));
+        sub.count = g->mapped_cmd_count;
         write_full(g->fd, &sub, sizeof(sub));
         g->mapped_cmdbuf_used = 0;
         g->mapped_cmd_count   = 0;
 
-        /* Now retry */
-        memcpy((uint8_t *)g->mapped_cmdbuf, cmd, sz);
-        g->mapped_cmdbuf_used = (uint32_t)sz;
+        memcpy(g->mapped_cmdbuf, slot, slot_sz);
+        g->mapped_cmdbuf_used = slot_sz;
         g->mapped_cmd_count   = 1;
         return 0;
     }
 
-    /* --- Copy-batch path: accumulate in userspace malloc buffer --- */
-    if (g->cmdbuf && g->cmdbuf_used + sz <= g->cmdbuf_size) {
-        memcpy((uint8_t *)g->cmdbuf + g->cmdbuf_used, cmd, sz);
-        g->cmdbuf_used += (uint32_t)sz;
+    /* Copy-batch */
+    mvc3_enqueue_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    hdr_init(&pkt.hdr, MVC3_CMD_ENQUEUE, sizeof(pkt));
+    memcpy(&pkt.slot, slot, sizeof(mvc3_ring_slot_t));
+
+    if (g->cmdbuf && g->cmdbuf_used + sizeof(pkt) <= g->cmdbuf_size) {
+        memcpy((uint8_t *)g->cmdbuf + g->cmdbuf_used, &pkt, sizeof(pkt));
+        g->cmdbuf_used += (uint32_t)sizeof(pkt);
         g->cmd_count++;
         return 0;
     }
 
-    /* --- Last resort: direct synchronous write (slowest) --- */
-    return write_full(g->fd, (void *)cmd, sz);
+    /* Direct write (last resort) */
+    return write_full(g->fd, &pkt, sizeof(pkt));
 }
 
-/* -----------------------------------------------------------------------
- * Public drawing API — all go through enqueue_cmd()
- * ----------------------------------------------------------------------- */
+/* ── Drawing API ───────────────────────────────────────────────────── */
 
 int gfx2d_fill_rect(gfx2d_t *g, uint32_t x, uint32_t y,
                     uint32_t w, uint32_t h, uint32_t argb) {
     if (!g) return -EINVAL;
-
-    videoctl2_enqueue_t req;
-    memset(&req, 0, sizeof(req));
-    req.hdr.magic       = VIDEOCTL_MAGIC2;
-    req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-    req.hdr.cmd         = VIDEOCTL_CMD2_ENQUEUE;
-    req.hdr.size_bytes  = sizeof(req);
-    req.u.fill.op       = VIDEOCTL2_OP_FILL_RECT;
-    req.u.fill.x        = x;
-    req.u.fill.y        = y;
-    req.u.fill.w        = w;
-    req.u.fill.h        = h;
-    req.u.fill.argb     = argb;
-
-    return enqueue_cmd(g, &req);
+    mvc3_ring_slot_t slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.op          = MVC3_OP_FILL_RECT;
+    slot.u.fill.x    = x;
+    slot.u.fill.y    = y;
+    slot.u.fill.w    = w;
+    slot.u.fill.h    = h;
+    slot.u.fill.argb = argb;
+    return enqueue_slot(g, &slot);
 }
 
 int gfx2d_blit_rect(gfx2d_t *g, uint32_t src_x, uint32_t src_y,
                     uint32_t dst_x, uint32_t dst_y, uint32_t w, uint32_t h) {
     if (!g) return -EINVAL;
-
-    videoctl2_enqueue_t req;
-    memset(&req, 0, sizeof(req));
-    req.hdr.magic       = VIDEOCTL_MAGIC2;
-    req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-    req.hdr.cmd         = VIDEOCTL_CMD2_ENQUEUE;
-    req.hdr.size_bytes  = sizeof(req);
-    req.u.blit.op       = VIDEOCTL2_OP_BLIT;
-    req.u.blit.src_x    = src_x;
-    req.u.blit.src_y    = src_y;
-    req.u.blit.dst_x    = dst_x;
-    req.u.blit.dst_y    = dst_y;
-    req.u.blit.w        = w;
-    req.u.blit.h        = h;
-
-    return enqueue_cmd(g, &req);
+    mvc3_ring_slot_t slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.op           = MVC3_OP_BLIT;
+    slot.u.blit.src_x = src_x;
+    slot.u.blit.src_y = src_y;
+    slot.u.blit.dst_x = dst_x;
+    slot.u.blit.dst_y = dst_y;
+    slot.u.blit.w     = w;
+    slot.u.blit.h     = h;
+    return enqueue_slot(g, &slot);
 }
 
 int gfx2d_blit_buf(gfx2d_t *g, uint32_t handle,
                    uint32_t src_x, uint32_t src_y,
                    uint32_t dst_x, uint32_t dst_y,
-                   uint32_t w,     uint32_t h,
+                   uint32_t w, uint32_t h,
                    uint32_t src_pitch, uint32_t src_fmt) {
     if (!g) return -EINVAL;
-
-    videoctl2_enqueue_t req;
-    memset(&req, 0, sizeof(req));
-    req.hdr.magic              = VIDEOCTL_MAGIC2;
-    req.hdr.abi_version        = VIDEOCTL_ABI_VERSION;
-    req.hdr.cmd                = VIDEOCTL_CMD2_ENQUEUE;
-    req.hdr.size_bytes         = sizeof(req);
-    req.u.blit_buf.op          = VIDEOCTL2_OP_BLIT_BUF;
-    req.u.blit_buf.handle      = handle;
-    req.u.blit_buf.src_x       = src_x;
-    req.u.blit_buf.src_y       = src_y;
-    req.u.blit_buf.dst_x       = dst_x;
-    req.u.blit_buf.dst_y       = dst_y;
-    req.u.blit_buf.w           = w;
-    req.u.blit_buf.h           = h;
-    req.u.blit_buf.src_pitch   = src_pitch;
-    req.u.blit_buf.src_fmt     = src_fmt;
-
-    return enqueue_cmd(g, &req);
+    mvc3_ring_slot_t slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.op                   = MVC3_OP_BLIT_BUF;
+    slot.u.blit_buf.handle    = handle;   /* user VA, fits in 32 bits */
+    slot.u.blit_buf.src_x     = src_x;
+    slot.u.blit_buf.src_y     = src_y;
+    slot.u.blit_buf.dst_x     = dst_x;
+    slot.u.blit_buf.dst_y     = dst_y;
+    slot.u.blit_buf.w         = w;
+    slot.u.blit_buf.h         = h;
+    slot.u.blit_buf.src_pitch = src_pitch;
+    slot.u.blit_buf.src_fmt   = src_fmt;
+    return enqueue_slot(g, &slot);
 }
 
-/* -----------------------------------------------------------------------
- * Flush: submit all pending commands then send the FLUSH packet.
- *
- * Zero-copy path: sends SUBMIT_CMDBUF (one small write containing just the
- *   count) — the kernel reads commands directly from the mapped buffer, no
- *   data copy through the syscall boundary.
- *
- * Copy-batch path: writes the whole command batch in one write(), then the
- *   FLUSH packet in a second write().
- * ----------------------------------------------------------------------- */
+/* ── Flush / present ───────────────────────────────────────────────── */
+
 int gfx2d_flush(gfx2d_t *g, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     if (!g) return -EINVAL;
 
-    /* Submit pending commands */
     if (g->use_mapped_cmdbuf && g->mapped_cmdbuf) {
         if (g->mapped_cmd_count > 0) {
-            videoctl2_submit_cmdbuf_t sub;
+            mvc3_submit_t sub;
             memset(&sub, 0, sizeof(sub));
-            sub.hdr.magic       = VIDEOCTL_MAGIC2;
-            sub.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-            sub.hdr.cmd         = VIDEOCTL_CMD2_SUBMIT_CMDBUF;
-            sub.hdr.size_bytes  = sizeof(sub);
-            sub.count           = g->mapped_cmd_count;
-
-            /* This is the ONLY syscall per frame on the fast path.
-             * The kernel reads command data from the shared mapped page —
-             * zero bytes are copied through the write() call itself. */
+            hdr_init(&sub.hdr, MVC3_CMD_SUBMIT, sizeof(sub));
+            sub.count = g->mapped_cmd_count;
             int rc = write_full(g->fd, &sub, sizeof(sub));
             if (rc != 0) return rc;
-
             g->mapped_cmdbuf_used = 0;
             g->mapped_cmd_count   = 0;
         }
     } else if (g->cmdbuf && g->cmdbuf_used > 0) {
-        /* Copy-batch fallback: one write for all commands */
         ssize_t written = write(g->fd, g->cmdbuf, g->cmdbuf_used);
         if (written != (ssize_t)g->cmdbuf_used) return -EIO;
         g->cmdbuf_used = 0;
         g->cmd_count   = 0;
     }
 
-    /* Send the FLUSH / present packet */
-    videoctl2_flush_t req;
-    memset(&req, 0, sizeof(req));
-    req.hdr.magic       = VIDEOCTL_MAGIC2;
-    req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-    req.hdr.cmd         = VIDEOCTL_CMD2_FLUSH;
-    req.hdr.size_bytes  = sizeof(req);
-    req.x = x;
-    req.y = y;
-    req.w = w;
-    req.h = h;
-
-    return write_full(g->fd, &req, sizeof(req));
+    mvc3_flush_t flush;
+    memset(&flush, 0, sizeof(flush));
+    hdr_init(&flush.hdr, MVC3_CMD_FLUSH, sizeof(flush));
+    flush.x = x;
+    flush.y = y;
+    flush.w = w;
+    flush.h = h;
+    return write_full(g->fd, &flush, sizeof(flush));
 }
 
-/* -----------------------------------------------------------------------
- * Synchronous control commands (one-time setup, not in the hot path)
- * ----------------------------------------------------------------------- */
+/* ── Buffer management ─────────────────────────────────────────────── */
 
+/*
+ * gfx2d_alloc_buf
+ * ───────────────
+ * 1. Send MVC3_CMD_ALLOC_BUF — kernel kmalloc's a page-aligned buffer
+ *    and returns its full 64-bit KVA in resp.handle.
+ * 2. Call dev_mmap(offset = MVC3_OFF_BUF_BASE + kva) — kernel walks the
+ *    session mapping table, finds the buffer, and wires its pages into
+ *    the calling process's page table via devfs_mmap_region().
+ * 3. Return the resulting user VA as out_handle (fits in 32 bits since
+ *    ModuOS userspace lives below 4 GiB).
+ *
+ * Fallback: if dev_mmap fails (old kernel / copy-batch mode), malloc a
+ * local buffer.  The kernel can read userspace pages during write(), so
+ * BLIT_BUF still works on the copy-batch path.
+ */
 int gfx2d_alloc_buf(gfx2d_t *g, uint32_t size_bytes, uint32_t fmt,
                     uint32_t *out_handle, uint32_t *out_pitch) {
     if (!g || !out_handle || !out_pitch) return -EINVAL;
 
-    videoctl2_alloc_buf_t req;
+    mvc3_alloc_buf_req_t req;
     memset(&req, 0, sizeof(req));
-    req.hdr.magic       = VIDEOCTL_MAGIC2;
-    req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-    req.hdr.cmd         = VIDEOCTL_CMD2_ALLOC_BUF;
-    req.hdr.size_bytes  = sizeof(req);
-    req.size_bytes       = size_bytes;
-    req.fmt              = fmt;
+    hdr_init(&req.hdr, MVC3_CMD_ALLOC_BUF, sizeof(req));
+    req.size_bytes = size_bytes;
+    req.fmt        = fmt;
+    if (write_full(g->fd, &req, sizeof(req)) != 0) return -EIO;
 
-    int rc = write_full(g->fd, &req, sizeof(req));
-    if (rc != 0) return rc;
-    rc = read_full(g->fd, &req, sizeof(req));
-    if (rc != 0) return rc;
+    mvc3_alloc_buf_resp_t resp;
+    memset(&resp, 0, sizeof(resp));
+    if (read_full(g->fd, &resp, sizeof(resp)) != 0) return -EIO;
+    if (resp.hdr.magic != MVC3_MAGIC || resp.handle == 0) return -ENOMEM;
 
-    *out_handle = req.handle;
-    *out_pitch  = req.pitch;
+    /* Always allocate locally — no mmap */
+    void *buf = malloc(size_bytes);
+    if (!buf) return -ENOMEM;
+
+    *out_handle = (uint32_t)(uintptr_t)buf;
+    *out_pitch  = resp.pitch ? resp.pitch : size_bytes / 4;
     return 0;
 }
 
+/*
+ * gfx2d_map_buf
+ * ─────────────
+ * out_handle from gfx2d_alloc_buf is already the user VA (from dev_mmap
+ * or the malloc fallback), so just cast it back.  No kernel round-trip.
+ */
 int gfx2d_map_buf(gfx2d_t *g, uint32_t handle,
                   void **out_addr, uint32_t *out_size,
                   uint32_t *out_pitch, uint32_t *out_fmt) {
     if (!g || !out_addr || !out_size || !out_pitch || !out_fmt) return -EINVAL;
+    if (handle == 0) return -EINVAL;
 
-    videoctl2_map_buf_t req;
-    memset(&req, 0, sizeof(req));
-    req.hdr.magic       = VIDEOCTL_MAGIC2;
-    req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-    req.hdr.cmd         = VIDEOCTL_CMD2_MAP_BUF;
-    req.hdr.size_bytes  = sizeof(req);
-    req.handle           = handle;
-
-    int rc = write_full(g->fd, &req, sizeof(req));
-    if (rc != 0) return rc;
-    rc = read_full(g->fd, &req, sizeof(req));
-    if (rc != 0) return rc;
-
-    *out_addr  = (void *)(uintptr_t)req.user_addr;
-    *out_size  = req.size_bytes;
-    *out_pitch = req.pitch;
-    *out_fmt   = req.fmt;
+    *out_addr  = (void *)(uintptr_t)handle;
+    *out_size  = 0;
+    *out_pitch = 0;
+    *out_fmt   = 0;
     return 0;
 }
 
-/* -----------------------------------------------------------------------
- * Cursor API (synchronous control, not in the render hot path)
- * ----------------------------------------------------------------------- */
+/* ── Cursor ────────────────────────────────────────────────────────── */
 
 int gfx2d_cursor_set(gfx2d_t *g, uint32_t w, uint32_t h,
                      int32_t hot_x, int32_t hot_y,
                      const uint32_t *argb_pixels) {
     if (!g || !argb_pixels) return -EINVAL;
 
-    videoctl2_cursor_set_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.hdr.magic       = VIDEOCTL_MAGIC2;
-    hdr.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-    hdr.hdr.cmd         = VIDEOCTL_CMD2_CURSOR_SET;
-    hdr.hdr.size_bytes  = (uint32_t)(sizeof(hdr) + (uint64_t)w * h * 4ULL);
-    hdr.w     = w;
-    hdr.h     = h;
-    hdr.hot_x = hot_x;
-    hdr.hot_y = hot_y;
+    uint32_t pixel_bytes = w * h * 4u;
+    uint32_t total = (uint32_t)sizeof(mvc3_cursor_set_t) + pixel_bytes;
+    if (total > sizeof(mvc3_cursor_set_t) + 128u * 128u * 4u) return -EINVAL;
 
-    uint64_t total = hdr.hdr.size_bytes;
-    if (total == 0 || total > 256ULL * 1024ULL) return -EINVAL;
+    uint8_t *buf = (uint8_t *)malloc(total);
+    if (!buf) return -ENOMEM;
 
-    uint8_t *tmp = (uint8_t *)malloc((size_t)total);
-    if (!tmp) return -ENOMEM;
-    memcpy(tmp, &hdr, sizeof(hdr));
-    memcpy(tmp + sizeof(hdr), argb_pixels, (size_t)w * h * 4u);
-    int rc = write_full(g->fd, tmp, (size_t)total);
-    free(tmp);
+    mvc3_cursor_set_t *cs = (mvc3_cursor_set_t *)buf;
+    memset(cs, 0, sizeof(*cs));
+    hdr_init(&cs->hdr, MVC3_CMD_CURSOR_SET, total);
+    cs->w     = w;
+    cs->h     = h;
+    cs->hot_x = hot_x;
+    cs->hot_y = hot_y;
+    memcpy(buf + sizeof(mvc3_cursor_set_t), argb_pixels, pixel_bytes);
+
+    int rc = write_full(g->fd, buf, total);
+    free(buf);
     return rc;
 }
 
 int gfx2d_cursor_move(gfx2d_t *g, int32_t x, int32_t y) {
     if (!g) return -EINVAL;
-    videoctl2_cursor_move_t req;
-    memset(&req, 0, sizeof(req));
-    req.hdr.magic       = VIDEOCTL_MAGIC2;
-    req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-    req.hdr.cmd         = VIDEOCTL_CMD2_CURSOR_MOVE;
-    req.hdr.size_bytes  = sizeof(req);
-    req.x = x;
-    req.y = y;
-    return write_full(g->fd, &req, sizeof(req));
+    mvc3_cursor_move_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    hdr_init(&pkt.hdr, MVC3_CMD_CURSOR_MOVE, sizeof(pkt));
+    pkt.x = x;
+    pkt.y = y;
+    return write_full(g->fd, &pkt, sizeof(pkt));
 }
 
 int gfx2d_cursor_show(gfx2d_t *g, int visible) {
     if (!g) return -EINVAL;
-    videoctl2_cursor_show_t req;
-    memset(&req, 0, sizeof(req));
-    req.hdr.magic       = VIDEOCTL_MAGIC2;
-    req.hdr.abi_version = VIDEOCTL_ABI_VERSION;
-    req.hdr.cmd         = VIDEOCTL_CMD2_CURSOR_SHOW;
-    req.hdr.size_bytes  = sizeof(req);
-    req.visible = visible ? 1u : 0u;
-    return write_full(g->fd, &req, sizeof(req));
+    mvc3_cursor_show_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    hdr_init(&pkt.hdr, MVC3_CMD_CURSOR_SHOW, sizeof(pkt));
+    pkt.visible = visible ? 1u : 0u;
+    return write_full(g->fd, &pkt, sizeof(pkt));
 }
