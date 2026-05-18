@@ -48,6 +48,7 @@
 /* Virtual memory mapping (userland dynamic linker support) */
 #define SYS_MMAP        39
 #define SYS_MUNMAP      40
+#define SYS_DEV_MMAP    51
 /* Networking - REMOVED: Use $/user/network/* (NetMan service) instead */
 /* FS tracing (timing) */
 #define SYS_FS_TRACE        55 /* arg1=0/1 set, returns previous state */
