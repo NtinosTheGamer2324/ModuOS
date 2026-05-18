@@ -4,6 +4,32 @@
 # Avoid strict-mode flags here because some minimal /bin/sh builds behave differently.
 set -e
 
+# Default number of jobs/threads
+JOBS=1
+
+# Parse arguments for -j flag
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -j)
+            if [ -n "$2" ] && [ "${2#-}" = "$2" ]; then
+                JOBS="$2"
+                shift 2
+            else
+                echo "Error: -j requires an argument" >&2
+                exit 1
+            fi
+            ;;
+        -j*)
+            JOBS="${1#-j}"
+            shift 1
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
 # Compiler/Linker
 CC=${CC:-x86_64-elf-gcc}
 LD=${LD:-x86_64-elf-ld}
@@ -12,9 +38,9 @@ LD=${LD:-x86_64-elf-ld}
 GCC_FLAGS_COMMON="-ffreestanding -c -mno-red-zone -O2 -fomit-frame-pointer -nostdlib -I."
 
 # Linker scripts
-LD_SCRIPT_APP="user.ld"        # fixed 0x400000 (ET_EXEC)
-LD_SCRIPT_LD="ld_user.ld"      # interpreter (ET_EXEC)
-LD_SCRIPT_LIB="lib_user.ld"    # shared libs (ET_DYN)
+LD_SCRIPT_APP="user.ld"      # fixed 0x400000 (ET_EXEC)
+LD_SCRIPT_LD="ld_user.ld"    # interpreter (ET_EXEC)
+LD_SCRIPT_LIB="lib_user.ld"  # shared libs (ET_DYN)
 
 BUILD_DIR="build"
 DIST_DIR="dist"
@@ -22,7 +48,11 @@ DIST_DIR="dist"
 rm -rf "$BUILD_DIR" "$DIST_DIR"
 mkdir -p "$BUILD_DIR" "$DIST_DIR"
 
-# Compile userland objects first (Blit needs lib_NodGL.o)
+# --- Phase 0: Compile userland objects (Parallelized) ---
+echo "[BUILD] Compiling source files using $JOBS thread(s)..."
+
+current_jobs=0
+
 for src in *.c; do
     [ -f "$src" ] || continue
 
@@ -40,26 +70,34 @@ for src in *.c; do
     case "$src" in
         lib_demo_gfx.c)
             # Only lib_demo_gfx needs -fPIC because it's truly a shared library
-            "$CC" $GCC_FLAGS_COMMON -fPIC -DLIBC_NO_START "$src" -o "$obj"
+            "$CC" $GCC_FLAGS_COMMON -fPIC -DLIBC_NO_START "$src" -o "$obj" &
             ;;
         lib_*.c)
             # Other lib_* are used for static linking - NO -fPIC
-            "$CC" $GCC_FLAGS_COMMON -DLIBC_NO_START "$src" -o "$obj"
+            "$CC" $GCC_FLAGS_COMMON -DLIBC_NO_START "$src" -o "$obj" &
             ;;
         emu6502.c|tia_pf.c)
             # Emulator/core objects are compiled as support objects (no entry point)
-            "$CC" $GCC_FLAGS_COMMON -DLIBC_NO_START "$src" -o "$obj"
+            "$CC" $GCC_FLAGS_COMMON -DLIBC_NO_START "$src" -o "$obj" &
             ;;
         *)
-            "$CC" $GCC_FLAGS_COMMON "$src" -o "$obj"
+            "$CC" $GCC_FLAGS_COMMON "$src" -o "$obj" &
             ;;
     esac
 
+    # Manage thread pool
+    current_jobs=$((current_jobs + 1))
+    if [ "$current_jobs" -ge "$JOBS" ]; then
+        wait
+        current_jobs=0
+    fi
 done
 
-# Link in two phases so libraries exist before apps that depend on them.
+# Wait for any remaining compilation background jobs to finish
+wait
 
-# Phase 1: shared libs (only lib_demo_gfx is a true shared library)
+# --- Phase 1: shared libs ---
+# (Kept sequential because it's fast and avoids dependency race conditions)
 for obj in "$BUILD_DIR"/lib_*.o; do
     [ -f "$obj" ] || continue
     base=$(basename "${obj%.o}")
@@ -79,7 +117,7 @@ for obj in "$BUILD_DIR"/lib_*.o; do
 
 done
 
-# Phase 2: interpreter + apps
+# --- Phase 2: interpreter + apps ---
 for obj in "$BUILD_DIR"/*.o; do
     [ -f "$obj" ] || continue
     base=$(basename "${obj%.o}")
@@ -141,8 +179,13 @@ for obj in "$BUILD_DIR"/*.o; do
             "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
-
-        minesgfx|calcgfx|snakegfx|raygfx|froggergfx|gfxclock|imgviewer|mousedemo|sysmon|miniwm|neontank|gfxtest|dvdbounce)
+        minesgfx)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static NodGL+fnt) $obj + lib_NodGL.o + lib_gfx2d.o + lib_fnt.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        calcgfx|snakegfx|raygfx|froggergfx|gfxclock|imgviewer|mousedemo|sysmon|miniwm|neontank|gfxtest|dvdbounce)
             bin="$DIST_DIR/${base}.sqr"
             echo "[BUILD] LD(app static NodGL) $obj + lib_NodGL.o + lib_gfx2d.o -> $bin"
             "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" -T "$LD_SCRIPT_APP" -o "$bin" \
@@ -181,7 +224,8 @@ echo "[BUILD] Done. Outputs in $DIST_DIR"
 # Build Blit Engine (after lib_NodGL.o is available)
 echo "[BUILD] Building Blit Engine..."
 if [ -d "../EXTERNAL/Blit" ]; then
-    (cd "../EXTERNAL/Blit" && make all && make install)
+    # Pass the internal -j flag down to Blit's makefile if it supports it
+    (cd "../EXTERNAL/Blit" && make -j"$JOBS" all && make install)
     echo "[BUILD] Blit Engine built and installed"
     # Copy Blit outputs
     if [ -d "../EXTERNAL/Blit/build" ]; then
@@ -191,4 +235,3 @@ if [ -d "../EXTERNAL/Blit" ]; then
 else
     echo "[BUILD] WARNING: Blit Engine not found at ../EXTERNAL/Blit"
 fi
-
