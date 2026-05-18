@@ -129,7 +129,7 @@ build-$(ARCH): $(kernel_object_files) $(drivers_object_files) $(fs_object_files)
 	@echo Building userland apps
 	chmod +x userland/build.sh
 	sed -i 's/\r$$//' userland/build.sh
-	cd userland && sh ./build.sh
+	cd userland && sh ./build.sh -j 12
 	cp -f userland/dist/*.sqr targets/$(ARCH)/iso/Apps/
 	cp -f userland/dist/automan.sqr targets/$(ARCH)/iso/ModuOS/System64/automan.sqr 2>/dev/null || true
 	mkdir -p targets/$(ARCH)/iso/ModuOS/shared/lib

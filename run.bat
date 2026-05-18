@@ -5,6 +5,14 @@ cls
 echo made in greece :)
 
 REM -----------------------------
+REM Check for arguments
+REM -----------------------------
+if "%~1"=="--run-only" (
+    echo [Run-Only Mode] Skipping Docker check and Kernel build.
+    goto start_qemu
+)
+
+REM -----------------------------
 REM Check if Docker is running
 REM -----------------------------
 docker info >nul 2>&1
@@ -29,6 +37,7 @@ REM -----------------------------
 docker run --rm -it --privileged -v /dev:/dev -v "%cd%":/root/env modu-os /bin/bash -c "cd /root/env && make -j12 clean && make -j12 build-AMD64"
 
 
+:start_qemu
 REM -----------------------------
 REM Boot the kernel ISO in QEMU (AHCI with forced PS/2 keyboard)
 REM -----------------------------
@@ -42,7 +51,6 @@ start "cmdQEMU" qemu-system-x86_64 ^
     -smbios type=1,manufacturer="NTLLC",product="DevmanPC",version="1.0",serial="MDMDMDMDMDMD" ^
     -m 1024M ^
     -smp 2 ^
-    -vga qxl ^
     -serial file:com1.log ^
     -serial file:com2.log ^
     -audiodev dsound,id=snd0 ^
