@@ -272,6 +272,25 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             return 0;
         }
 
+        case SYS_DEV_MMAP: {
+            /*
+             * The userland dev_mmap() puts `offset` in r9 (6th SysV arg register).
+             * Our dispatcher only receives 5 args, so we read r9 directly here.
+             * This is safe: r9 is caller-saved and the syscall entry stub has not
+             * clobbered it before reaching this point.
+             */
+            uint64_t s_offset;
+            __asm__ volatile ("mov %%r9, %0" : "=r"(s_offset));
+        
+            void *va = fd_mmap((int)arg1,       /* fd     */
+                               (void*)arg2,     /* hint   */
+                               (size_t)arg3,    /* length */
+                               (int)arg4,       /* prot   */
+                               (int)arg5,       /* flags  */
+                               s_offset);       /* offset */
+            return (uint64_t)(uintptr_t)va;
+        }
+
         default:
             if (kernel_debug_is_med()) {
                 com_write_string(COM1_PORT, "[SYSCALL] Unknown syscall: ");
@@ -546,11 +565,12 @@ void* sys_sbrk(intptr_t increment) {
     if (!p || !p->is_user) return ERR_PTR(EPERM);
 
     if (increment < 0) return ERR_PTR(EINVAL);
+    if (increment == 0) return (void*)(uintptr_t)p->user_heap_end;
 
-    uint64_t old = p->user_heap_end;
+    uint64_t old     = p->user_heap_end;
     uint64_t new_end = old + (uint64_t)increment;
 
-    if (new_end < old) return ERR_PTR(EINVAL); // overflow
+    if (new_end < old) return ERR_PTR(EINVAL); /* overflow */
 
     if (p->user_heap_limit && new_end > p->user_heap_limit)
         return ERR_PTR(ENOMEM);
@@ -558,18 +578,19 @@ void* sys_sbrk(intptr_t increment) {
     if (!is_user_range(old, (uint64_t)increment))
         return ERR_PTR(EACCES);
 
-    uint64_t map_start = (old + 0xFFFULL) & ~0xFFFULL;
-    uint64_t map_end   = (new_end + 0xFFFULL) & ~0xFFFULL;
-
-    if (!is_user_range(map_start, map_end - map_start))
-        return ERR_PTR(EACCES);
+    /* Floor-align old to find the first page boundary we may need to map.
+     * Any page containing bytes below old is already mapped.
+     * Ceil-align new_end to find the last page boundary we must cover. */
+    uint64_t map_start = (old     + 0xFFFULL) & ~0xFFFULL; /* first NEW page */
+    uint64_t map_end   = (new_end + 0xFFFULL) & ~0xFFFULL; /* first page past range */
 
     if (map_end > map_start) {
         size_t pages = (size_t)((map_end - map_start) / 0x1000ULL);
+
         uint64_t phys = phys_alloc_contiguous(pages);
         if (!phys) return ERR_PTR(ENOMEM);
 
-        uint64_t proc_cr3 = p->page_table;
+        uint64_t proc_cr3  = p->page_table;
         uint64_t *proc_pml4 =
             (uint64_t*)phys_to_virt_kernel(proc_cr3 & 0xFFFFFFFFFFFFF000ULL);
 
@@ -583,14 +604,15 @@ void* sys_sbrk(intptr_t increment) {
                 proc_pml4, map_start, phys,
                 (uint64_t)pages * 0x1000ULL,
                 PFLAG_PRESENT | PFLAG_WRITABLE | PFLAG_USER) != 0) {
-
             for (size_t i = 0; i < pages; i++)
                 phys_free_frame(phys + i * 0x1000ULL);
             return ERR_PTR(ENOMEM);
         }
 
-        memset((void*)(uintptr_t)map_start, 0,
-               (size_t)(map_end - map_start));
+        /* Zero via the kernel physmap, not the user VA, so this is safe
+         * regardless of which CR3 is currently loaded. */
+        memset((void*)phys_to_virt_kernel(phys), 0,
+               (size_t)(pages * 0x1000ULL));
     }
 
     p->user_heap_end = new_end;

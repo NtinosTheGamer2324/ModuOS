@@ -731,6 +731,26 @@ ssize_t fd_invoke(int fd,
     return -2;  /* Not supported */
 }
 
+/* mmap a device-backed file descriptor into the calling process's address space.
+ * Only devfs-backed FDs support this (e.g. $/dev/mvc/mvi0 framebuffer).
+ * Returns mapped VA on success, MAP_FAILED ((void*)-1) on error.
+ */
+void *fd_mmap(int fd, void *hint, size_t length, int prot, int flags, uint64_t offset) {
+    fd_init();
+
+    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use)
+        return (void*)-1;
+
+    if (length == 0)
+        return (void*)-1;
+
+    /* Only devfs nodes support mmap for now */
+    if (!fd_table[fd].is_devfs || !fd_table[fd].cached_data)
+        return (void*)-1;
+
+    return devfs_mmap(fd_table[fd].cached_data, hint, length, prot, flags, offset);
+}
+
 /* Seek in file */
 off_t fd_lseek(int fd, off_t offset, int whence) {
     fd_init();

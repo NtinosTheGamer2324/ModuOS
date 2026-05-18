@@ -205,4 +205,6 @@ ssize_t fd_invoke(int fd,
                   const void *in_buf,  size_t in_size,
                   void *out_buf, size_t out_size);
 
+void *fd_mmap(int fd, void *hint, size_t length, int prot, int flags, uint64_t offset);
+
 #endif /* FD_H */
