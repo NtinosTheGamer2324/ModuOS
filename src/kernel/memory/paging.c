@@ -746,7 +746,7 @@ uint64_t paging_virt_to_phys(uint64_t virt) {
     uint64_t pd_entry = pd[pd_idx];
     if (!(pd_entry & PFLAG_PRESENT)) return 0;
     if (pd_entry & (1ULL << 7)) {
-        uint64_t page_phys   = pd_entry & 0xFFFFFFFFFE000000ULL;
+        uint64_t page_phys   = pd_entry & 0xFFFFFFFFFFE00000ULL;
         uint64_t page_offset = virt & 0x1FFFFF;
         return page_phys | page_offset;
     }
@@ -1092,4 +1092,8 @@ void paging_free_process_pml4(uint64_t pml4_phys_addr) {
         com_write_string(COM1_PORT, tmp);
         com_write_string(COM1_PORT, "\n");
     }
+}
+
+uint64_t paging_get_phys_offset(void) {
+    return phys_offset;
 }

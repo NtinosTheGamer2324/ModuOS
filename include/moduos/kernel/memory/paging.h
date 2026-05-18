@@ -79,6 +79,7 @@ void* ioremap_guarded(uint64_t phys_addr, uint64_t size);
 void paging_sync_kernel_mappings(uint64_t *target_pml4);
 int paging_map_kernel_page(uint64_t virt, uint64_t phys, uint64_t flags);
 uint64_t paging_get_master_cr3(void);
+uint64_t paging_get_phys_offset(void);
 
 /*
  * paging_free_process_pml4 — tears down a process PML4 and frees all
