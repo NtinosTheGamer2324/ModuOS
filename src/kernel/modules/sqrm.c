@@ -21,6 +21,7 @@
 #include "moduos/kernel/spinlock.h"
 #include "moduos/drivers/input/input.h"
 
+extern sqrm_gpu_device_t *g_active_gpu;
 static char g_sqrm_current_module_name[64];
 const char *sqrm_get_current_module_name(void) { return g_sqrm_current_module_name; }
 
@@ -1364,6 +1365,40 @@ static void sqrm_sleep_ms_impl(uint64_t ms) {
     }
 }
 
+static const framebuffer_t *gfx_wrap_get_framebuffer(void) {
+    if (!g_active_gpu) return NULL;
+    return &g_active_gpu->fb;
+}
+static uint32_t gfx_wrap_get_caps(void) {
+    if (!g_active_gpu) return 0;
+    return g_active_gpu->caps;
+}
+static int gfx_wrap_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t pixel) {
+    if (!g_active_gpu || !g_active_gpu->fill_rect32_native) return -1;
+    return g_active_gpu->fill_rect32_native(&g_active_gpu->fb, x, y, w, h, pixel);
+}
+static int gfx_wrap_blit_rect(uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) {
+    if (!g_active_gpu || !g_active_gpu->blit_rect32) return -1;
+    return g_active_gpu->blit_rect32(&g_active_gpu->fb, sx, sy, dx, dy, w, h);
+}
+static int gfx_wrap_cursor_move(int32_t x, int32_t y) {
+    if (!g_active_gpu || !g_active_gpu->cursor_move) return -1;
+    return g_active_gpu->cursor_move(x, y);
+}
+static int gfx_wrap_cursor_show(int visible) {
+    if (!g_active_gpu || !g_active_gpu->cursor_show) return -1;
+    return g_active_gpu->cursor_show(visible);
+}
+static int gfx_wrap_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!g_active_gpu || !g_active_gpu->flush) return -1;
+    g_active_gpu->flush(&g_active_gpu->fb, x, y, w, h);
+    return 0;
+}
+static int gfx_wrap_set_mode(uint32_t width, uint32_t height, uint32_t bpp) {
+    if (!g_active_gpu || !g_active_gpu->set_mode) return -1;
+    return g_active_gpu->set_mode(width, height, bpp);
+}
+
 static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *out_api) {
     memset(out_api, 0, sizeof(*out_api));
     out_api->abi_version = 1;
@@ -1437,6 +1472,10 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
         out_api->pci_enable_bus_mastering = pci_enable_bus_mastering;
         out_api->ioremap = ioremap;
         out_api->ioremap_guarded = ioremap_guarded;
+
+        out_api->pci_cfg_read32           = pci_config_read_dword;
+        out_api->pci_cfg_write32          = pci_config_write_dword;
+        out_api->virt_to_phys             = paging_virt_to_phys;
     }
 
     // NET modules also need PCI + MMIO
@@ -1512,6 +1551,17 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
         out_api->pci_cfg_write32          = pci_config_write_dword;
     }
 
+    if (desc->type == SQRM_TYPE_GENERIC) {
+        out_api->gfx_get_framebuffer = gfx_wrap_get_framebuffer;
+        out_api->gfx_get_caps        = gfx_wrap_get_caps;
+        out_api->gfx_fill_rect       = gfx_wrap_fill_rect;
+        out_api->gfx_blit_rect       = gfx_wrap_blit_rect;
+        out_api->gfx_cursor_move     = gfx_wrap_cursor_move;
+        out_api->gfx_cursor_show     = gfx_wrap_cursor_show;
+        out_api->gfx_flush           = gfx_wrap_flush;
+        out_api->gfx_set_mode        = gfx_wrap_set_mode;
+    }
+
     // SQRM services (exports): available to all modules
     out_api->sqrm_service_register = sqrm_service_register_impl;
     out_api->sqrm_service_get      = sqrm_service_get_impl;
@@ -1527,6 +1577,8 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
     out_api->get_smbios_field       = md64api_sqrm_get_smbios_field;
     out_api->phys_total_frames      = phys_total_frames;
     out_api->phys_count_free_frames = phys_count_free_frames;
+
+    out_api->devfs_mmap_region = devfs_mmap_region;
 }
 
 #define NET_CMD_GET_MODE     1u

@@ -281,6 +281,21 @@ typedef struct sqrm_kernel_api {
     const char *(*get_smbios_field)(int field); /* 0=mfr 1=product 2=bios_vendor 3=bios_version */
     uint64_t (*phys_total_frames)(void);
     uint64_t (*phys_count_free_frames)(void);
+
+    // GPU access — GENERIC modules only.
+    // Kernel-side wrappers; NULL if no GPU is registered.
+    const framebuffer_t *(*gfx_get_framebuffer)(void);
+    uint32_t (*gfx_get_caps)(void);
+    int (*gfx_fill_rect)(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t pixel);
+    int (*gfx_blit_rect)(uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y, uint32_t w, uint32_t h);
+    int (*gfx_cursor_move)(int32_t x, int32_t y);
+    int (*gfx_cursor_show)(int visible);
+    int (*gfx_flush)(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+    int (*gfx_set_mode)(uint32_t width, uint32_t height, uint32_t bpp);
+
+    void *(*devfs_mmap_region)(uint64_t phys_or_virt, size_t size,
+                               int prot, int is_phys);
+
 } sqrm_kernel_api_t;
 
 typedef int (*sqrm_module_init_fn)(const sqrm_kernel_api_t *api);

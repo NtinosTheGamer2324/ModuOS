@@ -98,7 +98,14 @@ struct __attribute__((packed)) multiboot_tag_framebuffer {
     uint8_t  framebuffer_bpp;
     uint8_t  framebuffer_type;
     uint16_t reserved;
-    // followed by color info (ignored for now)
+    
+    /* Color info fields */
+    uint8_t  framebuffer_red_field_position;
+    uint8_t  framebuffer_red_mask_size;
+    uint8_t  framebuffer_green_field_position;
+    uint8_t  framebuffer_green_mask_size;
+    uint8_t  framebuffer_blue_field_position;
+    uint8_t  framebuffer_blue_mask_size;
 };
 
 #define MULTIBOOT_FRAMEBUFFER_TYPE_INDEXED  0

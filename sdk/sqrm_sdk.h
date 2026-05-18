@@ -14,7 +14,7 @@
  *
  * Capability-gated API availability by module type:
  *
- *   Field                    FS  DRIVE  USB  AUDIO  GPU  NET  HID  GENERIC
+ *   Field                     FS  DRIVE  USB  AUDIO  GPU  NET  HID  GENERIC
  *   -----------------------  --  -----  ---  -----  ---  ---  ---  -------
  *   kmalloc/kfree             Y    Y     Y     Y     Y    Y    Y     Y
  *   com_write_string          Y    Y     Y     Y     Y    Y    Y     Y
@@ -26,14 +26,23 @@
  *   inb/inw/inl/out*          -    -     -     Y     -    -    -     -
  *   irq_install_handler       -    -     -     Y     -    -    -     -
  *   ioremap / _guarded        -    -     -     Y     Y    Y    Y     -
- *   virt_to_phys              -    -     Y     Y     -    Y    Y     -
+ *   virt_to_phys              -    -     Y     Y     Y    Y    Y     -
  *   pci_*                     -    -     Y     Y     Y    Y    Y     -
- *   pci_cfg_read32/write32    -    -     Y     Y     -    Y    Y     -
+ *   pci_cfg_read32/write32    -    -     Y     Y     Y    Y    Y     -
  *   gfx_register_fb           -    -     -     -     Y    -    -     -
  *   audio_register_pcm        -    -     -     Y     -    -    -     -
  *   fs_register_driver        Y    -     -     -     -    -    -     -
  *   block_get_info/read/write  Y   -     -     -     -    -    -     Y
  *   input_push_event          -    -     -     -     -    -    Y     -
+ *   gfx_get_framebuffer       -    -     -     -     -    -    -     Y
+ *   gfx_get_caps              -    -     -     -     -    -    -     Y
+ *   gfx_fill_rect             -    -     -     -     -    -    -     Y
+ *   gfx_blit_rect             -    -     -     -     -    -    -     Y
+ *   gfx_cursor_move           -    -     -     -     -    -    -     Y
+ *   gfx_cursor_show           -    -     -     -     -    -    -     Y
+ *   gfx_flush                 -    -     -     -     -    -    -     Y
+ *   gfx_set_mode              -    -     -     -     -    -    -     Y
+ *   devfs_mmap_region         -    -     -     -     -    -    -     Y
  */
 
 #include <stdint.h>
@@ -51,6 +60,15 @@ extern "C" {
 #ifndef SQRM_ABI_VERSION
 // Default to v1 for maximum compatibility; modules can opt into v2.
 #define SQRM_ABI_VERSION SQRM_ABI_V1
+#endif
+
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+#if defined(__SIZE_TYPE__)
+typedef __PTRDIFF_TYPE__ ssize_t;
+#else
+typedef long ssize_t;
+#endif
 #endif
 
 #define SQRM_DESC_SYMBOL "sqrm_module_desc"
@@ -198,13 +216,32 @@ typedef struct {
     uint32_t bpp;
 } gfx_mode_t;
 
+typedef enum {
+    FB_MODE_TEXT = 0,
+    FB_MODE_GRAPHICS = 1,
+} framebuffer_mode_t;
+
+typedef enum {
+    FB_FMT_UNKNOWN = 0,
+    FB_FMT_RGB565 = 1,
+    FB_FMT_XRGB8888 = 2,
+} framebuffer_format_t;
+
 typedef struct {
-    void    *addr;
-    uint64_t phys_addr;
+    void *addr;             // linear framebuffer virtual address (kernel)
+    uint64_t phys_addr;     // physical base address of the framebuffer
+    uint64_t size_bytes;    // mapped size in bytes
+
     uint32_t width;
     uint32_t height;
-    uint32_t pitch;
-    uint32_t bpp;
+    uint32_t pitch;         // bytes per scanline
+    uint8_t bpp;            // bits per pixel
+    framebuffer_format_t fmt;
+
+    // For Multiboot2 RGB framebuffers (fb_type=1): channel field positions.
+    uint8_t red_pos, red_mask_size;
+    uint8_t green_pos, green_mask_size;
+    uint8_t blue_pos, blue_mask_size;
 } framebuffer_t;
 
 /* Source scatter-gather descriptor for blit_from_sg32 */
@@ -411,15 +448,6 @@ typedef struct {
     int (*get_info)(void *ctx, audio_device_info_t *out);
 } audio_pcm_ops_t;
 
-/*
- * sqrm_kernel_api_t — field order MUST match include/moduos/kernel/sqrm.h exactly.
- * Opaque pointers are used for kernel-internal types (pci_device_t, framebuffer_t,
- * sqrm_gpu_device_t, Event) that third-party modules do not need to dereference.
- *
- * "capability-gated" means the kernel sets the pointer to NULL if the module type
- * does not have access. Always NULL-check before calling. See the capability table
- * at the top of this header for the full matrix.
- */
 typedef struct sqrm_kernel_api {
     uint32_t abi_version;
     sqrm_module_type_t module_type;
@@ -517,6 +545,21 @@ typedef struct sqrm_kernel_api {
     const char *(*get_smbios_field)(int field); /* 0=mfr 1=product 2=bios_vendor 3=bios_version */
     uint64_t (*phys_total_frames)(void);
     uint64_t (*phys_count_free_frames)(void);
+
+
+    // GPU access — GENERIC modules only.
+    // Kernel-side wrappers; NULL if no GPU is registered.
+    const framebuffer_t *(*gfx_get_framebuffer)(void);
+    uint32_t (*gfx_get_caps)(void);
+    int (*gfx_fill_rect)(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t pixel);
+    int (*gfx_blit_rect)(uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y, uint32_t w, uint32_t h);
+    int (*gfx_cursor_move)(int32_t x, int32_t y);
+    int (*gfx_cursor_show)(int visible);
+    int (*gfx_flush)(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+    int (*gfx_set_mode)(uint32_t width, uint32_t height, uint32_t bpp);
+
+    void *(*devfs_mmap_region)(uint64_t phys_or_virt, size_t size,
+                               int prot, int is_phys);
 } sqrm_kernel_api_t;
 
 typedef int (*sqrm_module_init_fn)(const sqrm_kernel_api_t *api);
