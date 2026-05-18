@@ -1,0 +1,187 @@
+/*
+ * gfx_test.sqrm — SQRM GENERIC module
+ * Now with proper 3D triangle rasterizer test
+ */
+
+#include "sqrm_sdk.h"
+
+/* ------------------------------------------------------------------ */
+/* Module descriptor                                                  */
+/* ------------------------------------------------------------------ */
+
+SQRM_DEFINE_MODULE(SQRM_TYPE_GENERIC, "gfx_test");
+
+/* ------------------------------------------------------------------ */
+/* Globals & Helpers                                                  */
+/* ------------------------------------------------------------------ */
+
+static const sqrm_kernel_api_t *g_api;
+
+static void log(const char *s) {
+    g_api->com_write_string(0x3F8, "[gfx_test] ");
+    g_api->com_write_string(0x3F8, s);
+    g_api->com_write_string(0x3F8, "\n");
+}
+
+static void log_int(const char *prefix, int v) {
+    char buf[32];
+    int neg = (v < 0);
+    unsigned u = neg ? (unsigned)(-v) : (unsigned)v;
+    int pos = 0;
+    if (u == 0) { buf[pos++] = '0'; }
+    else { while (u) { buf[pos++] = '0' + (u % 10); u /= 10; } }
+    if (neg) buf[pos++] = '-';
+    for (int i = 0, j = pos - 1; i < j; i++, j--) {
+        char tmp = buf[i]; buf[i] = buf[j]; buf[j] = tmp;
+    }
+    buf[pos] = 0;
+
+    g_api->com_write_string(0x3F8, "[gfx_test] ");
+    g_api->com_write_string(0x3F8, prefix);
+    g_api->com_write_string(0x3F8, buf);
+    g_api->com_write_string(0x3F8, "\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 1 — colored rectangles                                        */
+/* ------------------------------------------------------------------ */
+static void test_fill_rects(uint32_t w, uint32_t h) {
+    log("TEST 1: colored rectangles");
+
+    static const uint32_t colors[6] = {
+        0xFFFF0000, 0xFF00FF00, 0xFF0000FF,
+        0xFFFFFF00, 0xFF00FFFF, 0xFFFF00FF
+    };
+
+    uint32_t cw = w / 3;
+    uint32_t ch = h / 2;
+    int idx = 0;
+
+    for (uint32_t row = 0; row < 2; row++) {
+        for (uint32_t col = 0; col < 3; col++) {
+            g_api->gfx_fill_rect(col * cw, row * ch, cw, ch, colors[idx++]);
+        }
+    }
+    g_api->gfx_flush(0, 0, w, h);
+    log("TEST 1: done");
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 2 — gradient + border                                         */
+/* ------------------------------------------------------------------ */
+static void test_pattern(uint32_t w, uint32_t h) {
+    log("TEST 2: gradient + border");
+
+    const uint32_t WHITE = 0xFFFFFFFF;
+    const uint32_t border = 4;
+
+    g_api->gfx_fill_rect(0, 0, w, border, WHITE);
+    g_api->gfx_fill_rect(0, h - border, w, border, WHITE);
+    g_api->gfx_fill_rect(0, border, border, h - 2*border, WHITE);
+    g_api->gfx_fill_rect(w - border, border, border, h - 2*border, WHITE);
+
+    uint32_t bands = 16;
+    uint32_t inner_h = h - 2 * border;
+    uint32_t band_h = inner_h / bands;
+    if (band_h == 0) band_h = 1;
+
+    for (uint32_t i = 0; i < bands; i++) {
+        uint8_t intensity = (uint8_t)((i * 255) / (bands - 1));
+        uint32_t color = 0xFF000000 | ((uint32_t)intensity << 16);
+        uint32_t y = border + i * band_h;
+        uint32_t bh = (i == bands-1) ? (h - border - y) : band_h;
+        g_api->gfx_fill_rect(border, y, w - 2*border, bh, color);
+    }
+
+    g_api->gfx_flush(0, 0, w, h);
+    log("TEST 2: done");
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 3 — blit rect                                                 */
+/* ------------------------------------------------------------------ */
+static void test_blit(uint32_t w, uint32_t h) {
+    log("TEST 3: blit rect");
+
+    const uint32_t GREEN = 0xFF00FF00;
+    uint32_t bw = w / 8;
+    uint32_t bh = h / 8;
+
+    g_api->gfx_fill_rect(0, 0, bw, bh, GREEN);
+    g_api->gfx_blit_rect(0, 0, w - bw, 0, bw, bh);
+    g_api->gfx_blit_rect(0, 0, 0, h - bh, bw, bh);
+    g_api->gfx_blit_rect(0, 0, w - bw, h - bh, bw, bh);
+
+    g_api->gfx_flush(0, 0, w, h);
+    log("TEST 3: done");
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 4 — hardware cursor                                           */
+/* ------------------------------------------------------------------ */
+static void test_cursor(uint32_t w, uint32_t h) {
+    log("TEST 4: hardware cursor");
+
+    if (!(g_api->gfx_get_caps() & SQRM_GPU_CAP_HW_CURSOR)) {
+        log("  HW cursor not supported");
+        return;
+    }
+
+    g_api->gfx_cursor_show(1);
+    g_api->gfx_cursor_move(w/2, h/2);
+    g_api->sleep_ms(300);
+
+    static const int32_t offsets[4][2] = {{80,80}, {-80,80}, {80,-80}, {-80,-80}};
+    for (int i = 0; i < 4; i++) {
+        g_api->gfx_cursor_move(w/2 + offsets[i][0], h/2 + offsets[i][1]);
+        g_api->sleep_ms(200);
+    }
+
+    g_api->gfx_cursor_show(0);
+    log("TEST 4: done");
+}
+
+/* ------------------------------------------------------------------ */
+/* Module init                                                        */
+/* ------------------------------------------------------------------ */
+
+int sqrm_module_init(const sqrm_kernel_api_t *api) {
+    g_api = api;
+    log("=== gfx_test starting ===");
+
+    const framebuffer_t *fb = api->gfx_get_framebuffer();
+    if (!fb || !fb->addr) {
+        log("ERROR: no framebuffer available");
+        return -1;
+    }
+
+    uint32_t w = fb->width;
+    uint32_t h = fb->height;
+
+    log_int("fb width  = ", (int)w);
+    log_int("fb height = ", (int)h);
+    log_int("fb bpp    = ", (int)fb->bpp);
+
+    uint32_t caps = api->gfx_get_caps();
+    log_int("gpu caps  = ", (int)caps);
+
+    if (caps & SQRM_GPU_CAP_2D_ACCEL)      log("2D acceleration: YES");
+    if (caps & SQRM_GPU_CAP_3D_TRIANGLES)  log("Triangle rasterizer: YES");
+    if (caps & SQRM_GPU_CAP_HW_CURSOR)     log("HW cursor: YES");
+
+    /* Run demo sequence */
+    test_fill_rects(w, h);
+    api->sleep_ms(1200);
+
+    test_pattern(w, h);
+    api->sleep_ms(1200);
+
+    test_blit(w, h);
+    api->sleep_ms(1200);
+
+    test_cursor(w, h);
+    api->sleep_ms(800);
+
+    log("=== All tests completed successfully ===");
+    return 0;
+}
