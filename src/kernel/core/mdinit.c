@@ -211,7 +211,6 @@ static void devices_late_init(void) {
     //  - input:    $/dev/input/kbd0, $/dev/input/event0
     //  - graphics: $/dev/graphics/video0
     devfs_input_init();
-    devfs_graphics_init();
     devfs_gui_init();
 
     COM_LOG_INFO(COM1_PORT, "Initializing input subsystem");
@@ -246,7 +245,7 @@ static void loading(void) {
     VGA_Write("\\cp      $$ |\\$  /$$ |$$ |  $$ |$$ |  $$ |$$ |  $$ |$$ |  $$ |$$\\   $$ |\\rr\n");
     VGA_Write("\\cp      $$ | \\_/ $$ |\\$$$$$$  |\\$$$$$$$ |\\$$$$$$  | $$$$$$  |\\$$$$$$  |\\rr\n");
     VGA_Write("\\cp      \\__|     \\__| \\______/  \\_______| \\______/  \\______/  \\______/ \\rr");
-    VGA_Write("\\ccv0.3.9\\rr\n");
+    VGA_Write("\\ccv0.6.2\\rr\n");
     VGA_Write("\\cp                                                                          \\rr\n");
     VGA_Write("\\cc                                   Booting...                         \\rr\n\n");
     VGA_Write("\n");
@@ -259,7 +258,7 @@ static void loading(void) {
     VGA_Write("\n");
     VGA_Write("\n");
     VGA_Write("\n");
-    VGA_Write("\n\\cw\\bb                      New Technologies Software 2025                            \\rr");
+    VGA_Write("\n\\cw\\bb                      New Technologies Software 2026                            \\rr");
 }
 
 // ------------------ BOOT DRIVE DETECTION ------------------
