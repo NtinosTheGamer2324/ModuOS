@@ -9,15 +9,21 @@
 //
 // PERFORMANCE NOTES:
 // All draw commands (FillRect, DrawTexture, DrawLine, Clear) are batched into
-// a userspace command buffer (256 KB by default). The buffer is submitted to
-// the kernel driver in ONE write() call inside NodGL_PresentContext().
-// This eliminates the per-draw syscall overhead that caused extreme slowness
-// when rendering text glyph-pixel by pixel or drawing many small rects.
+// a userspace command buffer (ring or copy-batch, managed by gfx2d/MVC3).
+// The buffer is submitted to the kernel driver in ONE write() call inside
+// NodGL_PresentContext() / NodGL_Present().
+// This eliminates per-draw syscall overhead when rendering text glyph-by-glyph
+// or drawing many small rectangles.
+//
+// Backend: MVC3 ($/dev/mvc/mvi0) via lib_gfx2d.
 
 #include "NodGL.h"
 #include "gfx2d.h"
 #include "libc.h"
-#include "../include/moduos/drivers/graphics/videoctl.h"
+
+/* MVC3 / gfx2d capability flags (SQRM_GPU_CAP_* from sqrm_sdk.h) */
+#define MVC3_CAP_2D_ACCEL   (1u << 0)   /* gfx_fill_rect / gfx_blit_rect  */
+#define MVC3_CAP_ALPHA_BLEND (1u << 1)  /* reserved for future blending hw */
 
 #define MAX_RESOURCES 256
 
@@ -28,28 +34,35 @@ typedef struct {
     uint32_t width;
     uint32_t height;
     uint32_t pitch;
-    void *mapped_addr;
+    void    *mapped_addr;
 } NodGL_resource_entry_t;
 
 struct NodGL_device {
-    gfx2d_t gfx2d;
-    NodGL_DeviceCaps caps;
-    NodGL_FeatureLevel feature_level;
+    gfx2d_t                gfx2d;
+    NodGL_DeviceCaps       caps;
+    NodGL_FeatureLevel     feature_level;
     NodGL_resource_entry_t resources[MAX_RESOURCES];
-    uint32_t next_resource_id;
+    uint32_t               next_resource_id;
 };
 
 struct NodGL_context {
-    NodGL_Device device;
+    NodGL_Device   device;
     NodGL_Viewport viewport;
-    NodGL_Rect scissor;
+    NodGL_Rect     scissor;
     NodGL_BlendMode blend_mode;
-    NodGL_Topology topology;
-    uint32_t clear_color;
+    NodGL_Topology  topology;
+    uint32_t        clear_color;
 };
 
 /* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
+/*  Simple global API state                                            */
+/* ------------------------------------------------------------------ */
+
+static NodGL_Device  g_device  = NULL;
+static NodGL_Context g_context = NULL;
+
+/* ------------------------------------------------------------------ */
+/*  Internal helpers                                                   */
 /* ------------------------------------------------------------------ */
 
 const char *NodGL_GetErrorString(int error_code) {
@@ -96,9 +109,9 @@ static NodGL_resource_entry_t *NodGL_alloc_resource_slot(NodGL_Device device) {
 /* ------------------------------------------------------------------ */
 
 int NodGL_CreateDevice(
-    NodGL_FeatureLevel min_feature_level,
-    NodGL_Device *out_device,
-    NodGL_Context *out_context,
+    NodGL_FeatureLevel  min_feature_level,
+    NodGL_Device       *out_device,
+    NodGL_Context      *out_context,
     NodGL_FeatureLevel *out_actual_level)
 {
     if (!out_device || !out_context) return NodGL_ERROR_INVALID_ARGS;
@@ -107,6 +120,7 @@ int NodGL_CreateDevice(
     if (!device) return NodGL_ERROR_OUT_OF_MEMORY;
     memset(device, 0, sizeof(struct NodGL_device));
 
+    /* Open $/dev/mvc/mvi0 via gfx2d */
     if (gfx2d_open(&device->gfx2d) != 0) {
         free(device);
         return NodGL_ERROR_NO_DEVICE;
@@ -119,11 +133,21 @@ int NodGL_CreateDevice(
         return NodGL_ERROR_NO_DEVICE;
     }
 
+    /*
+     * MVC3 capability mapping.
+     * gfx2d_info_t.caps carries the raw SQRM_GPU_CAP_* bitmask forwarded
+     * from the kernel by mvc3's GET_INFO response.
+     *
+     * MVC3_CAP_2D_ACCEL  → NodGL_CAP_HARDWARE_ACCEL
+     *   Set when the GPU driver exposes fill_rect/blit_rect hw acceleration.
+     *   When clear, MVC3 falls back to its software rasterizer — NodGL still
+     *   works, just without the hardware acceleration capability flag.
+     *
+     * MVC3_CAP_ALPHA_BLEND is reserved; no hw blending exposed yet.
+     */
     device->caps.capabilities = 0;
-    if (info.caps & VIDEOCTL2_CAP_ENQUEUE_FILL_RECT)
+    if (info.caps & MVC3_CAP_2D_ACCEL)
         device->caps.capabilities |= NodGL_CAP_HARDWARE_ACCEL;
-    if (info.caps & VIDEOCTL2_CAP_ENQUEUE_BLIT_BUF)
-        device->caps.capabilities |= NodGL_CAP_ALPHA_BLEND;
 
     device->caps.max_texture_width  = 4096;
     device->caps.max_texture_height = 4096;
@@ -131,10 +155,18 @@ int NodGL_CreateDevice(
     device->caps.screen_height      = info.height;
     device->caps.max_buffers        = MAX_RESOURCES;
     device->caps.video_memory_mb    = 64;
+
+    /* Copy driver name from gfx2d_info_t */
     for (uint32_t i = 0; i < 63 && info.driver[i]; i++)
         device->caps.adapter_name[i] = info.driver[i];
     device->caps.adapter_name[63] = 0;
 
+    /*
+     * Feature level selection:
+     *   FEATURE_LEVEL_2_0 — hardware 2D acceleration available
+     *   FEATURE_LEVEL_1_0 — software fallback (mvc3 sw rasterizer)
+     * 3_0 is reserved for future 3D pipeline work.
+     */
     device->feature_level =
         (device->caps.capabilities & NodGL_CAP_HARDWARE_ACCEL)
         ? NodGL_FEATURE_LEVEL_2_0
@@ -147,6 +179,7 @@ int NodGL_CreateDevice(
     }
     device->caps.feature_level = device->feature_level;
 
+    /* Build the immediate context */
     NodGL_Context ctx = (NodGL_Context)malloc(sizeof(struct NodGL_context));
     if (!ctx) {
         gfx2d_close(&device->gfx2d);
@@ -154,20 +187,20 @@ int NodGL_CreateDevice(
         return NodGL_ERROR_OUT_OF_MEMORY;
     }
     memset(ctx, 0, sizeof(struct NodGL_context));
-    ctx->device              = device;
-    ctx->viewport.x          = 0;
-    ctx->viewport.y          = 0;
-    ctx->viewport.width      = (float)info.width;
-    ctx->viewport.height     = (float)info.height;
-    ctx->viewport.min_depth  = 0.0f;
-    ctx->viewport.max_depth  = 1.0f;
-    ctx->scissor.x           = 0;
-    ctx->scissor.y           = 0;
-    ctx->scissor.width       = info.width;
-    ctx->scissor.height      = info.height;
-    ctx->blend_mode          = NodGL_BLEND_NONE;
-    ctx->topology            = NodGL_TOPOLOGY_TRIANGLES;
-    ctx->clear_color         = 0xFF000000;
+    ctx->device             = device;
+    ctx->viewport.x         = 0;
+    ctx->viewport.y         = 0;
+    ctx->viewport.width     = (float)info.width;
+    ctx->viewport.height    = (float)info.height;
+    ctx->viewport.min_depth = 0.0f;
+    ctx->viewport.max_depth = 1.0f;
+    ctx->scissor.x          = 0;
+    ctx->scissor.y          = 0;
+    ctx->scissor.width      = info.width;
+    ctx->scissor.height     = info.height;
+    ctx->blend_mode         = NodGL_BLEND_NONE;
+    ctx->topology           = NodGL_TOPOLOGY_TRIANGLES;
+    ctx->clear_color        = 0xFF000000;
 
     *out_device  = device;
     *out_context = ctx;
@@ -198,19 +231,54 @@ int NodGL_GetScreenResolution(NodGL_Device device,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Present — the ONE place the batch is flushed to the kernel        */
+/*  Present — the ONE place the command batch is flushed              */
 /* ------------------------------------------------------------------ */
 
 int NodGL_PresentContext(NodGL_Context ctx, uint32_t sync_interval) {
     if (!ctx || !ctx->device) return NodGL_ERROR_INVALID_ARGS;
     (void)sync_interval;
+    int rc = gfx2d_flush(&ctx->device->gfx2d,
+                         0, 0,
+                         (uint32_t)ctx->viewport.width,
+                         (uint32_t)ctx->viewport.height);
+    return (rc == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
+}
 
-    /* gfx2d_flush() does two things in sequence:
-     *   1. Writes ALL batched commands to the driver in ONE write() call.
-     *   2. Sends the VIDEOCTL_CMD2_FLUSH packet to present the frame.
-     * Nothing is written to the driver fd before this point. */
-    int result = gfx2d_flush(&ctx->device->gfx2d, 0, 0, 0, 0);
-    return (result == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
+/* ------------------------------------------------------------------ */
+/*  Simple global API                                                  */
+/* ------------------------------------------------------------------ */
+
+int NodGL_Init(void) {
+    if (g_device) return NodGL_OK;   /* already initialised */
+
+    int rc = NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0,
+                                 &g_device, &g_context, NULL);
+    return rc;
+}
+
+void NodGL_Shutdown(void) {
+    if (g_context) { free(g_context); g_context = NULL; }
+    if (g_device)  { NodGL_ReleaseDevice(g_device); g_device = NULL; }
+}
+
+void NodGL_Clear(uint32_t color) {
+    if (!g_context) return;
+    NodGL_ClearContext(g_context, NodGL_CLEAR_COLOR, color, 1.0f, 0);
+}
+
+void NodGL_FillRect(int x, int y, uint32_t width, uint32_t height, uint32_t color) {
+    if (!g_context) return;
+    NodGL_FillRectContext(g_context, (int32_t)x, (int32_t)y, width, height, color);
+}
+
+void NodGL_DrawLine(int x0, int y0, int x1, int y1, uint32_t color) {
+    if (!g_context) return;
+    NodGL_DrawLineContext(g_context, x0, y0, x1, y1, color, 1);
+}
+
+void NodGL_Present(void) {
+    if (!g_context) return;
+    NodGL_PresentContext(g_context, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -218,9 +286,9 @@ int NodGL_PresentContext(NodGL_Context ctx, uint32_t sync_interval) {
 /* ------------------------------------------------------------------ */
 
 int NodGL_CreateTexture(
-    NodGL_Device device,
+    NodGL_Device            device,
     const NodGL_TextureDesc *desc,
-    NodGL_Texture *out_texture)
+    NodGL_Texture           *out_texture)
 {
     if (!device || !desc || !out_texture) return NodGL_ERROR_INVALID_ARGS;
     if (desc->width == 0 || desc->height == 0) return NodGL_ERROR_INVALID_ARGS;
@@ -228,6 +296,10 @@ int NodGL_CreateTexture(
     NodGL_resource_entry_t *res = NodGL_alloc_resource_slot(device);
     if (!res) return NodGL_ERROR_OUT_OF_MEMORY;
 
+    /*
+     * Format tag passed to gfx2d_alloc_buf is opaque to NodGL — it matches
+     * the mvc3 slot src_fmt field and is echoed back by MAP_BUF.
+     */
     uint32_t fmt;
     switch (desc->format) {
         case NodGL_FORMAT_B8G8R8A8_UNORM: fmt = 2; break;
@@ -236,25 +308,26 @@ int NodGL_CreateTexture(
     }
 
     uint32_t gfx_handle = 0, pitch = 0;
-    int result = gfx2d_alloc_buf(&device->gfx2d,
-                                  desc->width * desc->height * 4,
-                                  fmt, &gfx_handle, &pitch);
-    if (result != 0) { res->in_use = 0; return NodGL_ERROR_OUT_OF_MEMORY; }
+    int rc = gfx2d_alloc_buf(&device->gfx2d,
+                              desc->width * desc->height * 4,
+                              fmt, &gfx_handle, &pitch);
+    if (rc != 0) { res->in_use = 0; return NodGL_ERROR_OUT_OF_MEMORY; }
 
     res->handle      = gfx_handle;
     res->format      = desc->format;
     res->width       = desc->width;
     res->height      = desc->height;
-    res->pitch       = pitch;
+    res->pitch = pitch ? pitch : desc->width * 4u;
     res->mapped_addr = NULL;
 
+    /* Upload initial pixel data if provided */
     if (desc->initial_data && desc->initial_data_size > 0) {
-        void *mapped = NULL;
+        void    *mapped = NULL;
         uint32_t sz = 0, p = 0, f = 0;
         if (gfx2d_map_buf(&device->gfx2d, gfx_handle,
-                          &mapped, &sz, &p, &f) == 0) {
-            uint32_t copy = desc->initial_data_size;
-            if (copy > sz) copy = sz;
+                          &mapped, &sz, &p, &f) == 0 && mapped) {
+            uint32_t copy = desc->initial_data_size < sz
+                          ? desc->initial_data_size : sz;
             memcpy(mapped, desc->initial_data, copy);
         }
     }
@@ -264,9 +337,9 @@ int NodGL_CreateTexture(
 }
 
 int NodGL_CreateBuffer(
-    NodGL_Device device,
+    NodGL_Device           device,
     const NodGL_BufferDesc *desc,
-    NodGL_Buffer *out_buffer)
+    NodGL_Buffer           *out_buffer)
 {
     if (!device || !desc || !out_buffer) return NodGL_ERROR_INVALID_ARGS;
     if (desc->size_bytes == 0) return NodGL_ERROR_INVALID_ARGS;
@@ -275,9 +348,9 @@ int NodGL_CreateBuffer(
     if (!res) return NodGL_ERROR_OUT_OF_MEMORY;
 
     uint32_t gfx_handle = 0, pitch = 0;
-    int result = gfx2d_alloc_buf(&device->gfx2d, desc->size_bytes,
-                                  1, &gfx_handle, &pitch);
-    if (result != 0) { res->in_use = 0; return NodGL_ERROR_OUT_OF_MEMORY; }
+    int rc = gfx2d_alloc_buf(&device->gfx2d, desc->size_bytes,
+                              1, &gfx_handle, &pitch);
+    if (rc != 0) { res->in_use = 0; return NodGL_ERROR_OUT_OF_MEMORY; }
 
     res->handle      = gfx_handle;
     res->format      = desc->format;
@@ -291,27 +364,28 @@ int NodGL_CreateBuffer(
 }
 
 int NodGL_MapResource(
-    NodGL_Context ctx,
-    NodGL_Resource resource,
-    void **out_data,
-    uint32_t *out_pitch)
+    NodGL_Context   ctx,
+    NodGL_Resource  resource,
+    void          **out_data,
+    uint32_t       *out_pitch)
 {
     if (!ctx || !ctx->device || !out_data) return NodGL_ERROR_INVALID_ARGS;
 
     NodGL_resource_entry_t *res = NodGL_find_resource(ctx->device, resource);
     if (!res) return NodGL_ERROR_INVALID_ARGS;
 
+    /* Return cached mapping if still valid */
     if (res->mapped_addr) {
         *out_data = res->mapped_addr;
         if (out_pitch) *out_pitch = res->pitch;
         return NodGL_OK;
     }
 
-    void *mapped = NULL;
+    void    *mapped = NULL;
     uint32_t size = 0, pitch = 0, fmt = 0;
-    int result = gfx2d_map_buf(&ctx->device->gfx2d, res->handle,
-                                &mapped, &size, &pitch, &fmt);
-    if (result != 0) return NodGL_ERROR_DEVICE_LOST;
+    int rc = gfx2d_map_buf(&ctx->device->gfx2d, res->handle,
+                            &mapped, &size, &pitch, &fmt);
+    if (rc != 0 || !mapped) return NodGL_ERROR_DEVICE_LOST;
 
     res->mapped_addr = mapped;
     res->pitch       = pitch;
@@ -333,15 +407,15 @@ void NodGL_ReleaseResource(NodGL_Device device, NodGL_Resource resource) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Rendering commands — ALL batched, NONE flush until Present        */
+/*  Rendering commands (all batched — no syscall until Present)       */
 /* ------------------------------------------------------------------ */
 
 int NodGL_ClearContext(
     NodGL_Context ctx,
-    uint32_t flags,
-    uint32_t color,
-    float depth,
-    uint8_t stencil)
+    uint32_t      flags,
+    uint32_t      color,
+    float         depth,
+    uint8_t       stencil)
 {
     if (!ctx || !ctx->device) return NodGL_ERROR_INVALID_ARGS;
     (void)depth; (void)stencil;
@@ -350,9 +424,8 @@ int NodGL_ClearContext(
         ctx->clear_color = color;
         uint32_t w = (uint32_t)ctx->viewport.width;
         uint32_t h = (uint32_t)ctx->viewport.height;
-        /* Enqueued into batch — no write() here */
-        int r = gfx2d_fill_rect(&ctx->device->gfx2d, 0, 0, w, h, color);
-        if (r != 0) return NodGL_ERROR_DEVICE_LOST;
+        int rc = gfx2d_fill_rect(&ctx->device->gfx2d, 0, 0, w, h, color);
+        if (rc != 0) return NodGL_ERROR_DEVICE_LOST;
     }
     return NodGL_OK;
 }
@@ -375,7 +448,6 @@ int NodGL_SetBlendMode(NodGL_Context ctx, NodGL_BlendMode mode) {
     return NodGL_OK;
 }
 
-/* FillRectContext: enqueues into batch — no syscall until Present */
 int NodGL_FillRectContext(
     NodGL_Context ctx,
     int32_t x, int32_t y,
@@ -383,12 +455,11 @@ int NodGL_FillRectContext(
     uint32_t color)
 {
     if (!ctx || !ctx->device) return NodGL_ERROR_INVALID_ARGS;
-    if (width == 0 || height == 0) return NodGL_OK; /* skip zero-area draws */
-
-    int r = gfx2d_fill_rect(&ctx->device->gfx2d,
-                             (uint32_t)x, (uint32_t)y,
-                             width, height, color);
-    return (r == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
+    if (width == 0 || height == 0) return NodGL_OK;
+    int rc = gfx2d_fill_rect(&ctx->device->gfx2d,
+                              (uint32_t)x, (uint32_t)y,
+                              width, height, color);
+    return (rc == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
 }
 
 int NodGL_DrawTexture(
@@ -410,14 +481,13 @@ int NodGL_DrawTexture(
         default:                          fmt = 1; break;
     }
 
-    /* Enqueued — no write() here */
-    int r = gfx2d_blit_buf(&ctx->device->gfx2d,
-                            res->handle,
-                            (uint32_t)src_x, (uint32_t)src_y,
-                            (uint32_t)dst_x, (uint32_t)dst_y,
-                            width, height,
-                            res->pitch, fmt);
-    return (r == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
+    int rc = gfx2d_blit_buf(&ctx->device->gfx2d,
+                             res->handle,
+                             (uint32_t)src_x, (uint32_t)src_y,
+                             (uint32_t)dst_x, (uint32_t)dst_y,
+                             width, height,
+                             res->pitch, fmt);
+    return (rc == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
 }
 
 int NodGL_DrawLineContext(
@@ -432,30 +502,34 @@ int NodGL_DrawLineContext(
 
     int dx = x1 - x0, dy = y1 - y0;
 
-    /* Axis-aligned fast paths — each is one enqueued rect */
+    /* Axis-aligned fast paths — single enqueued fill_rect each */
     if (dy == 0) {
         int xmin = (x0 < x1) ? x0 : x1;
         int len  = (dx < 0) ? -dx : dx;
-        return gfx2d_fill_rect(&ctx->device->gfx2d,
-                               (uint32_t)xmin, (uint32_t)y0,
-                               (uint32_t)(len + 1), thickness, color);
+        int rc   = gfx2d_fill_rect(&ctx->device->gfx2d,
+                                   (uint32_t)xmin, (uint32_t)y0,
+                                   (uint32_t)(len + 1), thickness, color);
+        return (rc == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
     }
     if (dx == 0) {
         int ymin = (y0 < y1) ? y0 : y1;
         int len  = (dy < 0) ? -dy : dy;
-        return gfx2d_fill_rect(&ctx->device->gfx2d,
-                               (uint32_t)x0, (uint32_t)ymin,
-                               thickness, (uint32_t)(len + 1), color);
+        int rc   = gfx2d_fill_rect(&ctx->device->gfx2d,
+                                   (uint32_t)x0, (uint32_t)ymin,
+                                   thickness, (uint32_t)(len + 1), color);
+        return (rc == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
     }
 
-    /* Diagonal: Bresenham with horizontal-span batching.
-     * Multiple pixels on the same scanline collapse into one rect,
-     * so even diagonals generate far fewer enqueue calls. */
+    /*
+     * Diagonal: Bresenham with horizontal-span merging.
+     * Pixels on the same scanline collapse into one fill_rect call,
+     * keeping the number of enqueued commands low even for long diagonals.
+     */
     int abs_dx = (dx < 0) ? -dx : dx;
     int abs_dy = (dy < 0) ? -dy : dy;
     int sx = (x0 < x1) ? 1 : -1;
     int sy = (y0 < y1) ? 1 : -1;
-    int x = x0, y = y0, err = abs_dx - abs_dy;
+    int x  = x0, y = y0, err = abs_dx - abs_dy;
     int span_start_x = x, span_y = y, span_len = 0;
 
     while (1) {
@@ -464,7 +538,8 @@ int NodGL_DrawLineContext(
             span_len++;
         } else {
             if (span_len > 0) {
-                int draw_x = (sx >= 0 || span_len == 1) ? span_start_x : x;
+                int draw_x = (sx >= 0 || span_len == 1)
+                           ? span_start_x : x;
                 gfx2d_fill_rect(&ctx->device->gfx2d,
                                 (uint32_t)draw_x, (uint32_t)span_y,
                                 (uint32_t)span_len, thickness, color);
@@ -495,7 +570,7 @@ int NodGL_DrawSprite(
     uint32_t tint)
 {
     if (!ctx || !ctx->device) return NodGL_ERROR_INVALID_ARGS;
-    (void)rotation; (void)tint;
+    (void)rotation; (void)tint;   /* not yet implemented */
 
     NodGL_resource_entry_t *res = NodGL_find_resource(ctx->device, texture);
     if (!res) return NodGL_ERROR_INVALID_ARGS;
@@ -507,7 +582,7 @@ int NodGL_DrawSprite(
 }
 
 /* ------------------------------------------------------------------ */
-/*  Stub 3D API                                                        */
+/*  Stub 3D API (future expansion)                                    */
 /* ------------------------------------------------------------------ */
 
 int NodGL_SetTopology(NodGL_Context ctx, NodGL_Topology topology) {
@@ -517,14 +592,17 @@ int NodGL_SetTopology(NodGL_Context ctx, NodGL_Topology topology) {
 }
 
 int NodGL_Draw(NodGL_Context ctx, uint32_t v, uint32_t s) {
-    (void)ctx; (void)v; (void)s; return NodGL_ERROR_UNSUPPORTED;
+    (void)ctx; (void)v; (void)s;
+    return NodGL_ERROR_UNSUPPORTED;
 }
 
 int NodGL_DrawIndexed(NodGL_Context ctx, uint32_t ic, uint32_t si, int32_t bv) {
-    (void)ctx; (void)ic; (void)si; (void)bv; return NodGL_ERROR_UNSUPPORTED;
+    (void)ctx; (void)ic; (void)si; (void)bv;
+    return NodGL_ERROR_UNSUPPORTED;
 }
 
 int NodGL_BindVertexBuffer(NodGL_Context ctx, NodGL_Buffer buf,
-                           uint32_t stride, uint32_t offset) {
-    (void)ctx; (void)buf; (void)stride; (void)offset; return NodGL_ERROR_UNSUPPORTED;
+                            uint32_t stride, uint32_t offset) {
+    (void)ctx; (void)buf; (void)stride; (void)offset;
+    return NodGL_ERROR_UNSUPPORTED;
 }
