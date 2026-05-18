@@ -233,17 +233,66 @@ static int hda_corb_put(hda_state_t *h, uint32_t verb) {
     hw16(h, HDAC_CORBWP, wp);
     return 0;
 }
+
+static void hda_log_hex(hda_state_t *h, const char *prefix, uint32_t val) {
+    char buf[80];   /* was 32 — way too small for long prefixes */
+    const char *hex = "0123456789abcdef";
+    int i = 0;
+    const char *p = prefix;
+    while (*p && i < 68) buf[i++] = *p++;   /* leave room for 0x+8hex+\n+\0 */
+    buf[i++] = '0'; buf[i++] = 'x';
+    for (int s = 28; s >= 0; s -= 4)
+        buf[i++] = hex[(val >> s) & 0xFu];
+    buf[i++] = '\n'; buf[i] = '\0';
+    h->api->com_write_string(COM1_PORT, buf);
+}
+
+static void hda_log_nid(hda_state_t *h, uint8_t nid, uint8_t wt,
+                        uint32_t wcap, uint32_t pc) {
+    /* Logs: [hda]   NID XX wtype=Y wcap=ZZZZZZZZ pin_caps=WWWWWWWW */
+    char buf[64];
+    const char *hex = "0123456789abcdef";
+    int i = 0;
+    const char *s = "[hda]   NID ";
+    while (*s) buf[i++] = *s++;
+    buf[i++] = hex[(nid >> 4) & 0xF];
+    buf[i++] = hex[nid & 0xF];
+    s = " wtype=";
+    while (*s) buf[i++] = *s++;
+    buf[i++] = hex[wt & 0xF];
+    s = " wcap=";
+    while (*s) buf[i++] = *s++;
+    for (int sh = 28; sh >= 0; sh -= 4) buf[i++] = hex[(wcap >> sh) & 0xF];
+    if (wt == WT_PIN) {
+        s = " pin_caps=";
+        while (*s) buf[i++] = *s++;
+        for (int sh = 28; sh >= 0; sh -= 4) buf[i++] = hex[(pc >> sh) & 0xF];
+    }
+    buf[i++] = '\n'; buf[i] = '\0';
+    h->api->com_write_string(COM1_PORT, buf);
+}
+
 static int hda_rirb_get(hda_state_t *h, uint32_t *resp) {
-    for (int i = 0; i < 3000; i++) {
+    /* Phase 1: tight spin ~200 µs worth of iterations (no sleep) */
+    for (int i = 0; i < 2000; i++) {
         uint16_t hw_wp = hr16(h, HDAC_RIRBWP) & 0xFFu;
         if (hw_wp != h->rirb_rp) {
             h->rirb_rp = (uint16_t)((h->rirb_rp + 1u) % 256u);
             if (resp) *resp = (uint32_t)(h->rirb[h->rirb_rp] & 0xFFFFFFFFu);
             return 0;
         }
-        hda_sleep(h, 1);
     }
-    return -1;
+    /* Phase 2: yield-then-check, but cap at 50 ms total */
+    for (int i = 0; i < 50; i++) {
+        hda_sleep(h, 1);
+        uint16_t hw_wp = hr16(h, HDAC_RIRBWP) & 0xFFu;
+        if (hw_wp != h->rirb_rp) {
+            h->rirb_rp = (uint16_t)((h->rirb_rp + 1u) % 256u);
+            if (resp) *resp = (uint32_t)(h->rirb[h->rirb_rp] & 0xFFFFFFFFu);
+            return 0;
+        }
+    }
+    return -1; /* timeout in ~50 ms instead of ~3000 ms */
 }
 static int hda_verb(hda_state_t *h, uint8_t cad, uint8_t nid,
                     uint32_t v12, uint8_t param, uint32_t *resp) {
@@ -313,29 +362,56 @@ static int hda_probe_widgets(hda_state_t *h) {
     hda_verb(h, h->codec_addr, 0, V_GET_PARAM, P_NODE_COUNT, &resp);
     uint8_t rs = (uint8_t)((resp >> 16) & 0xFFu);
     uint8_t rc = (uint8_t)(resp & 0xFFu);
+
+    h->api->com_write_string(COM1_PORT, "[hda] probe: root start=");
+    hda_log_hex(h, "", (uint32_t)rs);   /* will print 0x.. on its own line — acceptable for debug */
+    /* simpler: just log the combined resp */
+    hda_log_hex(h, "[hda] root NODE_COUNT resp=", resp);
+
     for (uint8_t n = rs; n < rs + rc; n++) {
         hda_verb(h, h->codec_addr, n, V_GET_PARAM, P_FUNC_TYPE, &resp);
+        hda_log_hex(h, "[hda]  func_type resp=", resp);
         if ((resp & 0xFFu) == 0x01u) { h->afg_nid = n; break; }
     }
-    if (!h->afg_nid) return -1;
+    if (!h->afg_nid) {
+        h->api->com_write_string(COM1_PORT, "[hda] no AFG found\n");
+        return -1;
+    }
+    hda_log_hex(h, "[hda] AFG NID=", (uint32_t)h->afg_nid);
 
     hda_verb(h, h->codec_addr, h->afg_nid, V_SET_POWER, 0x00, NULL);
     hda_sleep(h, 5);
 
     hda_verb(h, h->codec_addr, h->afg_nid, V_GET_PARAM, P_NODE_COUNT, &resp);
+    hda_log_hex(h, "[hda] widget NODE_COUNT resp=", resp);
     uint8_t ws = (uint8_t)((resp >> 16) & 0xFFu);
     uint8_t wc = (uint8_t)(resp & 0xFFu);
+
+    uint8_t first_pin_nid = 0;
+
     for (uint8_t n = ws; n < ws + wc; n++) {
-        uint32_t wcap = 0;
+        uint32_t wcap = 0, pc = 0;
         hda_verb(h, h->codec_addr, n, V_GET_PARAM, P_WIDGET_CAP, &wcap);
         uint8_t wt = (uint8_t)((wcap >> 20) & 0xFu);
-        if (wt == WT_AUDIO_OUT && !h->out_nid) h->out_nid = n;
-        if (wt == WT_PIN && !h->pin_nid) {
-            uint32_t pc = 0;
+        if (wt == WT_PIN)
             hda_verb(h, h->codec_addr, n, V_GET_PARAM, P_PIN_CAPS, &pc);
-            if (pc & (1u << 4)) h->pin_nid = n;
+        hda_log_nid(h, n, wt, wcap, pc);
+
+        if (wt == WT_AUDIO_OUT && !h->out_nid)  h->out_nid = n;
+        if (wt == WT_PIN) {
+            if (!first_pin_nid) first_pin_nid = n;
+            if (!h->pin_nid && (pc & ((1u<<4)|(1u<<5)))) h->pin_nid = n;
         }
     }
+
+    if (!h->pin_nid && first_pin_nid) {
+        h->api->com_write_string(COM1_PORT, "[hda] fallback pin\n");
+        h->pin_nid = first_pin_nid;
+    }
+
+    hda_log_hex(h, "[hda] out_nid=", (uint32_t)h->out_nid);
+    hda_log_hex(h, "[hda] pin_nid=", (uint32_t)h->pin_nid);
+
     return (h->out_nid && h->pin_nid) ? 0 : -2;
 }
 
