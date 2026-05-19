@@ -155,18 +155,6 @@ for obj in "$BUILD_DIR"/*.o; do
                 -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
-        atari)
-            bin="$DIST_DIR/${base}.sqr"
-            echo "[BUILD] LD(app static atari) $obj + emulator objs -> $bin"
-            "$LD" "$obj" \
-                "$BUILD_DIR/lib_gfx2d.o" \
-                "$BUILD_DIR/lib_8bit.o" \
-                "$BUILD_DIR/emu6502.o" \
-                "$BUILD_DIR/tia_pf.o" \
-                "$BUILD_DIR/lib_a2600.o" \
-                -T "$LD_SCRIPT_APP" -o "$bin" \
-                --hash-style=sysv
-            ;;
         pacmangfx)
             bin="$DIST_DIR/${base}.sqr"
             echo "[BUILD] LD(app static $base) $obj + lib_fnt.o -> $bin"
