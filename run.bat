@@ -2,7 +2,7 @@
 setlocal
 cls
 
-echo made in greece :)
+echo made in the hellenic republic :)
 
 REM -----------------------------
 REM Check for arguments
