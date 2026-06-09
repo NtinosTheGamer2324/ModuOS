@@ -2,10 +2,10 @@
 setlocal enabledelayedexpansion
 :menu
 cls
+echo  made in the hellenic republic :)
 echo ==============================================
 echo             Modu-OS Launch Menu
 echo ==============================================
-echo  made in the hellenic republic :)
 echo.
 echo  [1] Build and Run (Full Pipeline)
 echo  [2] Just Run (Skip Docker Build)
