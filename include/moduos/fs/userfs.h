@@ -18,6 +18,7 @@ void userfs_close(void *handle);
 int userfs_directory_exists(const char *path);
 int userfs_list_dir_next(const char *path, int *cookie, char *name_buf, size_t buf_size, int *is_dir);
 void userfs_owner_exited(const char *owner_id);
+void userfs_pid_exited(uint32_t pid);
 
 #ifdef __cplusplus
 }

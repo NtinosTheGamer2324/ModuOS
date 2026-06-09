@@ -636,6 +636,43 @@ void userfs_owner_exited(const char *owner_id) {
 }
 
 /*
+ * Called when a process exits.  Removes all nodes whose owner_pid matches
+ * the given pid, regardless of owner_id.  This is the correct cleanup path
+ * for process exit — owner_id is an arbitrary user-supplied string and cannot
+ * be reliably derived from process metadata (e.g. user_identity_get only
+ * returns "root" for uid=0 processes, not the actual service name).
+ */
+void userfs_pid_exited(uint32_t pid) {
+    if (pid == 0) return;
+
+    char pid_str[16];
+    /* Build a pid string for the log message */
+    int i = 0;
+    uint32_t v = pid;
+    char tmp[12]; int tlen = 0;
+    if (v == 0) { tmp[tlen++] = '0'; }
+    while (v > 0 && tlen < 11) { tmp[tlen++] = '0' + (v % 10); v /= 10; }
+    while (tlen > 0 && i < 14) pid_str[i++] = tmp[--tlen];
+    pid_str[i] = '\0';
+
+    unode_t **pp = &g_owned_head;
+    while (*pp) {
+        unode_t *n = *pp;
+        if (n->owner_pid == pid) {
+            *pp = n->owner_next;
+            unode_t *parent = n->parent;
+            if (parent) ufs_unlink_child(parent, n);
+            ufs_free_node(n);
+            if (parent) ufs_prune(parent);
+            continue;
+        }
+        pp = &(*pp)->owner_next;
+    }
+
+    ufs_log("pid_exited", pid_str, 1);
+}
+
+/*
  * Set read/write callbacks on an already-registered node.
  * Called by the syscall layer after userfs_register_user_path succeeds.
  *
