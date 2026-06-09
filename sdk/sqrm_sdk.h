@@ -29,7 +29,7 @@
  *   virt_to_phys              -    -     Y     Y     Y    Y    Y     -
  *   pci_*                     -    -     Y     Y     Y    Y    Y     -
  *   pci_cfg_read32/write32    -    -     Y     Y     Y    Y    Y     -
- *   gfx_register_fb           -    -     -     -     Y    -    -     -
+ *   gfx_register_framebuffer  -    -     -     -     Y    -    -     -
  *   audio_register_pcm        -    -     -     Y     -    -    -     -
  *   fs_register_driver        Y    -     -     -     -    -    -     -
  *   block_get_info/read/write  Y   -     -     -     -    -    -     Y
@@ -38,6 +38,7 @@
  *   gfx_get_caps              -    -     -     -     -    -    -     Y
  *   gfx_fill_rect             -    -     -     -     -    -    -     Y
  *   gfx_blit_rect             -    -     -     -     -    -    -     Y
+ *   gfx_blit_buffer           -    -     -     -     -    -    -     Y
  *   gfx_cursor_move           -    -     -     -     -    -    -     Y
  *   gfx_cursor_show           -    -     -     -     -    -    -     Y
  *   gfx_flush                 -    -     -     -     -    -    -     Y
@@ -252,28 +253,29 @@ typedef struct {
     uint32_t pitch;
 } gfx_src_sg_t;
 
+/* GPU capability flags — reported in sqrm_gpu_device_t.caps.
+ * SQRM_GPU_CAP_BLIT_BUF is MANDATORY: gfx_register_framebuffer will reject
+ * any GPU device that does not provide a blit_buffer implementation. */
+#define SQRM_GPU_CAP_2D_ACCEL      (1u << 0)  /* Has fill_rect32/blit_rect32      */
+#define SQRM_GPU_CAP_3D_TRIANGLES  (1u << 1)  /* Has draw_triangle                */
+#define SQRM_GPU_CAP_3D_TEXTURES   (1u << 2)  /* Has draw_textured_triangle       */
+#define SQRM_GPU_CAP_HW_CURSOR     (1u << 3)  /* Has cursor hooks                 */
+#define SQRM_GPU_CAP_VSYNC         (1u << 4)  /* Supports vsync                   */
+#define SQRM_GPU_CAP_BLIT_BUF      (1u << 5)  /* Has blit_buffer (MANDATORY)      */
+
 typedef struct sqrm_gpu_device {
     framebuffer_t fb;
-    // Optional: called after drawing into fb.addr to push updates to hardware.
-    // If NULL, fb.addr is assumed to be directly scanned out.
+
+    /* Optional: push framebuffer updates to hardware.
+     * If NULL, fb.addr is assumed to be directly scanned out. */
     void (*flush)(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
-    /* ------------------------------------------------------------
-     * Optional hardware cursor hooks.
-     * If provided, the kernel can move/show the cursor without repainting the framebuffer.
-     * Pixels are ARGB8888 (0xAARRGGBB).
-     * Return 0 on success.
-     * ------------------------------------------------------------ */
+    /* Optional hardware cursor hooks (ARGB8888 pixels). */
     int (*cursor_set_argb32)(uint32_t w, uint32_t h, int32_t hot_x, int32_t hot_y, const uint32_t *pixels_argb);
     int (*cursor_move)(int32_t x, int32_t y);
     int (*cursor_show)(int visible);
 
-    /* ------------------------------------------------------------
-     * Optional 2D acceleration hooks (thread-context only).
-     * These are enabled by default when provided and fb.bpp==32.
-     * All colors are native pixels for the current fb format (max speed).
-     * Return 0 on success, negative on failure.
-     * ------------------------------------------------------------ */
+    /* Optional 2D acceleration hooks (thread-context only, fb.bpp==32). */
     int (*fill_rect32_native)(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t native_pixel);
     int (*blit_rect32)(const framebuffer_t *fb, uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y, uint32_t w, uint32_t h);
     int (*blit_from_sg32)(const framebuffer_t *fb, const gfx_src_sg_t *src,
@@ -281,48 +283,48 @@ typedef struct sqrm_gpu_device {
                           uint32_t dst_x, uint32_t dst_y,
                           uint32_t w, uint32_t h);
 
-    /* ------------------------------------------------------------
-     * Optional 3D acceleration hooks (future).
-     * For basic triangle rasterization and vertex processing.
-     * Return 0 on success, negative on failure.
-     * ------------------------------------------------------------ */
-    int (*draw_triangle)(const framebuffer_t *fb, 
-                        int32_t x0, int32_t y0, uint32_t color0,
-                        int32_t x1, int32_t y1, uint32_t color1,
-                        int32_t x2, int32_t y2, uint32_t color2);
-    
+    /* Optional 3D acceleration hooks. */
+    int (*draw_triangle)(const framebuffer_t *fb,
+                         int32_t x0, int32_t y0, uint32_t color0,
+                         int32_t x1, int32_t y1, uint32_t color1,
+                         int32_t x2, int32_t y2, uint32_t color2);
     int (*draw_textured_triangle)(const framebuffer_t *fb,
-                                 int32_t x0, int32_t y0, float u0, float v0,
-                                 int32_t x1, int32_t y1, float u1, float v1,
-                                 int32_t x2, int32_t y2, float u2, float v2,
-                                 uint32_t texture_id);
+                                  int32_t x0, int32_t y0, float u0, float v0,
+                                  int32_t x1, int32_t y1, float u1, float v1,
+                                  int32_t x2, int32_t y2, float u2, float v2,
+                                  uint32_t texture_id);
 
-    /* Future: vertex buffer submission, transform matrices, etc */
+    /* MANDATORY: copy an external pixel buffer into the framebuffer at
+     * (dst_x, dst_y) for a region of (w x h) pixels, then push the dirty
+     * rect to hardware (equivalent to a flush of that region).
+     *
+     * src_pixels points at the first pixel to copy — the caller (MVC3/
+     * compositor) has already applied any src_x/src_y offset.
+     * src_pitch is the byte stride of the source buffer.
+     *
+     * Must not be NULL — gfx_register_framebuffer rejects devices that
+     * omit this.  A simple software row-copy fallback is acceptable. */
+    int (*blit_buffer)(const framebuffer_t *fb,
+                       uint32_t dst_x, uint32_t dst_y,
+                       const void *src_pixels, uint32_t src_pitch,
+                       uint32_t w, uint32_t h);
 
-    // Optional: request a mode change. Returns 0 on success.
+    /* Optional mode control. */
     int (*set_mode)(uint32_t width, uint32_t height, uint32_t bpp);
-
-    // Optional: enumerate supported modes.
-    // Writes up to max_modes entries into out_modes and returns number of modes written.
-    // Returns negative on error.
     int (*enumerate_modes)(gfx_mode_t *out_modes, uint32_t max_modes);
 
-    // Optional: capability flags (indicate which acceleration is supported)
+    /* Capability flags — see SQRM_GPU_CAP_* above.
+     * SQRM_GPU_CAP_BLIT_BUF is set automatically by the kernel when
+     * blit_buffer is non-NULL; GPU LKMs should set it explicitly too. */
     uint32_t caps;
-    #define SQRM_GPU_CAP_2D_ACCEL      (1u << 0)  // Has fill_rect32/blit_rect32
-    #define SQRM_GPU_CAP_3D_TRIANGLES  (1u << 1)  // Has draw_triangle
-    #define SQRM_GPU_CAP_3D_TEXTURES   (1u << 2)  // Has draw_textured_triangle
-    #define SQRM_GPU_CAP_HW_CURSOR     (1u << 3)  // Has cursor hooks
-    #define SQRM_GPU_CAP_VSYNC         (1u << 4)  // Supports vsync
 
-    // Optional: called on shutdown/unload (not implemented yet)
+    /* Optional: called on shutdown/unload. */
     void (*shutdown)(void);
 } sqrm_gpu_device_t;
 
 /* ---- Optional shared service ABIs (exported via sqrm_service_register/get) ---- */
 
 // Network service API (L2 NIC API). Return negative errno on failure.
-// Note: higher-level networking (DHCP/DNS/HTTP/etc) is not part of this NIC ABI.
 typedef struct {
     int (*get_link_up)(void);
     int (*get_mtu)(uint32_t *out);
@@ -332,21 +334,18 @@ typedef struct {
     int (*rx_consume)(void);
 } sqrm_net_api_v1_t;
 
-// USB service API (minimal core). Intended to be implemented by a usb core module.
+// USB service API (minimal core).
 typedef struct {
     int (*get_controller_count)(void);
     int (*get_device_count)(void);
-    int (*enumerate)(void); // request a (re)enumeration
+    int (*enumerate)(void);
 } sqrm_usb_api_v1_t;
 
-// HID service API (minimal). Intended to be implemented by a hid module.
+// HID service API (minimal).
 typedef struct {
     int (*get_keyboard_present)(void);
     int (*get_mouse_present)(void);
 } sqrm_hid_api_v1_t;
-
-// USB controller ABI (used by usb core to bind to controllers).
-// Service name convention: "usbctl_uhci" / "usbctl_ohci" / "usbctl_ehci"
 
 typedef enum {
     SQRM_USB_SPEED_LOW  = 1,
@@ -369,22 +368,15 @@ typedef struct {
 } __attribute__((packed)) sqrm_usb_setup_packet_t;
 
 typedef struct {
-    // Target
-    uint8_t dev_addr;   // USB device address (0 for default)
-    uint8_t endpoint;   // endpoint number
-    uint8_t speed;      // sqrm_usb_speed_t
-    uint8_t xfer_type;  // sqrm_usb_xfer_type_t
-
-    // CONTROL only
+    uint8_t dev_addr;
+    uint8_t endpoint;
+    uint8_t speed;
+    uint8_t xfer_type;
     sqrm_usb_setup_packet_t setup;
-
-    // Data stage
     void   *data;
     uint32_t length;
-    uint8_t direction_in; // 1=IN, 0=OUT
-
-    // Results
-    int32_t status;        // 0 or -errno
+    uint8_t direction_in;
+    int32_t status;
     uint32_t actual_length;
 } sqrm_usb_transfer_v1_t;
 
@@ -394,16 +386,12 @@ typedef uint32_t sqrm_usb_xfer_handle_t;
 typedef struct {
     uint8_t bus, device, function;
     uint8_t irq_line;
-    uint16_t io_base;   // UHCI uses IO space
+    uint16_t io_base;
 } sqrm_uhci_controller_info_v1_t;
 
 typedef struct {
-    // discovery
     int (*get_controller_count)(void);
     int (*get_controller_info)(int index, sqrm_uhci_controller_info_v1_t *out);
-
-    // transfer submission
-    // submit copies/uses fields in xfer (implementation-defined); on success returns nonzero handle.
     sqrm_usb_xfer_handle_t (*submit)(int controller_index, sqrm_usb_transfer_v1_t *xfer);
     int (*wait)(sqrm_usb_xfer_handle_t handle, uint32_t timeout_ms);
     int (*cancel)(sqrm_usb_xfer_handle_t handle);
@@ -411,10 +399,6 @@ typedef struct {
 
 /* ---- Kernel API table passed to modules ---- */
 
-/*
- * sqrm_dma_buffer_t — mirrors the kernel's dma_buffer_t exactly.
- * Must not be forward-declared differently elsewhere in this header.
- */
 typedef struct {
     void    *virt;
     uint64_t phys;
@@ -453,21 +437,18 @@ typedef struct sqrm_kernel_api {
     sqrm_module_type_t module_type;
     const char *module_name;
 
-    /* logging — always available */
+    /* Logging — always available */
     int (*com_write_string)(uint16_t port, const char *s);
 
-    /* memory — always available */
+    /* Memory — always available */
     void *(*kmalloc)(size_t sz);
     void (*kfree)(void *p);
 
-    /* DMA — AUDIO modules only; NULL for all other types.
-     * HDA/AC97 use this for CORB/RIRB/BDL/PCM ring buffers.
-     * Always NULL-check; fall back to kmalloc+virt_to_phys if NULL. */
+    /* DMA — AUDIO modules only; NULL for all other types. */
     int (*dma_alloc)(sqrm_dma_buffer_t *out, size_t size, size_t align);
     void (*dma_free)(sqrm_dma_buffer_t *buf);
 
-    /* Port I/O — AUDIO modules only; NULL for all other types.
-     * AUDIO modules use raw CF8/CFC PCI scanning (same pattern as AC97). */
+    /* Port I/O — AUDIO modules only; NULL for all other types. */
     uint8_t  (*inb)(uint16_t port);
     uint16_t (*inw)(uint16_t port);
     uint32_t (*inl)(uint16_t port);
@@ -475,8 +456,7 @@ typedef struct sqrm_kernel_api {
     void (*outw)(uint16_t port, uint16_t val);
     void (*outl)(uint16_t port, uint32_t val);
 
-    /* IRQ — AUDIO modules only; NULL for all other types.
-     * Install a handler for the HDA/AC97 PCI IRQ line. */
+    /* IRQ — AUDIO modules only; NULL for all other types. */
     void (*irq_install_handler)(int irq, void (*handler)(void));
     void (*irq_uninstall_handler)(int irq);
     void (*pic_send_eoi)(uint8_t irq);
@@ -493,15 +473,16 @@ typedef struct sqrm_kernel_api {
     /* DEVFS — always available */
     int (*devfs_register_path)(const char *path, const void *ops, void *ctx);
 
-    /* Multiboot2 header — raw pointer to the MB2 info struct from the bootloader.
-     * Parse MB2 tags directly from this pointer. Always valid after boot. */
+    /* Multiboot2 header — raw pointer to the MB2 info struct from the bootloader. */
     const void *multiboot2_header;
 
     /* Input injection — HID modules only */
     void (*input_push_event)(const void *event);
 
-    /* Graphics — GPU modules only */
-    int (*gfx_register_framebuffer)(const void *gpu_dev);
+    /* Graphics registration — GPU modules only.
+     * Takes a fully populated sqrm_gpu_device_t; rejects devices with
+     * NULL blit_buffer (returns non-zero on failure). */
+    int (*gfx_register_framebuffer)(const sqrm_gpu_device_t *gpu_dev);
     int (*gfx_update_framebuffer)(const void *fb);
 
     /* PCI — AUDIO, GPU, NET, USB, HID modules; NULL for FS, DRIVE, GENERIC. */
@@ -520,16 +501,13 @@ typedef struct sqrm_kernel_api {
     void* (*ioremap)(uint64_t phys_addr, uint64_t size);
     void* (*ioremap_guarded)(uint64_t phys_addr, uint64_t size);
 
-    /* Address translation — AUDIO, NET, USB, HID modules.
-     * AUDIO fallback: if dma_alloc is NULL use kmalloc + virt_to_phys.
-     * Returns physical address for a kernel virtual address, or 0 if unmapped. */
+    /* Address translation — AUDIO, NET, USB, HID modules. */
     uint64_t (*virt_to_phys)(uint64_t virt);
 
     /* Blockdev — FS and GENERIC modules only */
     int (*block_get_info)(blockdev_handle_t h, blockdev_info_t *out);
     int (*block_read)(blockdev_handle_t h, uint64_t lba, uint32_t count, void *buf, size_t buf_sz);
     int (*block_write)(blockdev_handle_t h, uint64_t lba, uint32_t count, const void *buf, size_t buf_sz);
-
     int (*block_get_handle_for_vdrive)(int vdrive_id, blockdev_handle_t *out_handle);
     int (*block_register)(const void *ops, void *ctx, blockdev_handle_t *out_handle);
 
@@ -546,9 +524,7 @@ typedef struct sqrm_kernel_api {
     uint64_t (*phys_total_frames)(void);
     uint64_t (*phys_count_free_frames)(void);
 
-
-    // GPU access — GENERIC modules only.
-    // Kernel-side wrappers; NULL if no GPU is registered.
+    /* GPU access — GENERIC modules only; NULL if no GPU registered. */
     const framebuffer_t *(*gfx_get_framebuffer)(void);
     uint32_t (*gfx_get_caps)(void);
     int (*gfx_fill_rect)(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t pixel);
@@ -557,6 +533,11 @@ typedef struct sqrm_kernel_api {
     int (*gfx_cursor_show)(int visible);
     int (*gfx_flush)(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
     int (*gfx_set_mode)(uint32_t width, uint32_t height, uint32_t bpp);
+
+    /* Copy an external pixel buffer into the active framebuffer — GENERIC only.
+     * Kernel wrapper for the active GPU's blit_buffer hook. */
+    int (*gfx_blit_buffer)(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
+                           const void *src_buf, uint32_t src_stride);
 
     void *(*devfs_mmap_region)(uint64_t phys_or_virt, size_t size,
                                int prot, int is_phys);

@@ -17,6 +17,11 @@ int sw_blit_rect32(const framebuffer_t *fb,
                    uint32_t dst_x, uint32_t dst_y,
                    uint32_t w, uint32_t h);
 
+int sw_blit_buffer(const framebuffer_t *fb,
+                   uint32_t dst_x, uint32_t dst_y,
+                   const void *src_pixels, uint32_t src_pitch,
+                   uint32_t w, uint32_t h);
+
 int sw_cursor_set_argb32(uint32_t w, uint32_t h,
                           int32_t hot_x, int32_t hot_y,
                           const uint32_t *pixels_argb);

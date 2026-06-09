@@ -919,7 +919,11 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
         /* Mode switching requires HW ring; SW path returns -1 */
         .set_mode           = sw_set_mode,
         .enumerate_modes    = qxl_enumerate_modes,
+        /* blit_buffer: required by MVC3 / compositor */
+        .blit_buffer        = sw_blit_buffer,
         .shutdown           = NULL,
+        .caps               = SQRM_GPU_CAP_2D_ACCEL | SQRM_GPU_CAP_HW_CURSOR
+                            | SQRM_GPU_CAP_BLIT_BUF,
     };
 
     int rc = api->gfx_register_framebuffer(&gpu);

@@ -90,6 +90,16 @@ int gfx_register_framebuffer_from_sqrm(const sqrm_gpu_device_t *dev) {
     if (!dev) return -1;
     if (!dev->fb.addr || dev->fb.width == 0 || dev->fb.height == 0) return -2;
 
+    /* blit_buffer is mandatory for MVC3 and the compositor. GPU LKMs must
+     * provide it — a simple software row-copy is sufficient. Reject early
+     * with a clear error so missing implementations are caught at load time. */
+    if (!dev->blit_buffer) {
+        com_write_string(COM1_PORT,
+            "[GFX] SQRM GPU rejected: blit_buffer is NULL "
+            "(GPU LKMs must implement blit_buffer)\n");
+        return -3;
+    }
+
     /* Debug: print framebuffer descriptor. */
     com_write_string(COM1_PORT, "[GFX] fb addr=");
     com_print_hex64((uint64_t)(uintptr_t)dev->fb.addr);
@@ -107,6 +117,10 @@ int gfx_register_framebuffer_from_sqrm(const sqrm_gpu_device_t *dev) {
      * dependent on the module's memory remaining valid. */
     g_active_gpu_storage = *dev;
     g_active_gpu = &g_active_gpu_storage;
+
+    /* Ensure SQRM_GPU_CAP_BLIT_BUF is set — we already verified blit_buffer
+     * is non-NULL above, so the cap must reflect reality. */
+    g_active_gpu->caps |= SQRM_GPU_CAP_BLIT_BUF;
 
     /* Some SQRM GPU modules only supply a kernel virtual address.
      * VGA_SetFrameBuffer() requires phys_addr and size_bytes; derive them if missing. */

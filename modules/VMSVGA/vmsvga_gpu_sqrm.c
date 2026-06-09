@@ -302,6 +302,41 @@ static void vmsvga_flush(const framebuffer_t *fb,
     fifo_write(&u, sizeof(u));
 }
 
+/* Software blit_buffer: copies an external pixel buffer into the framebuffer
+ * and issues an SVGA UPDATE command to push it to the virtual display.
+ * src_pixels already points at the first pixel to copy (caller applies
+ * src_x/src_y offset); src_pitch is the source row stride in bytes. */
+static int vmsvga_blit_buffer(const framebuffer_t *fb,
+                               uint32_t dst_x, uint32_t dst_y,
+                               const void *src_pixels, uint32_t src_pitch,
+                               uint32_t w, uint32_t h)
+{
+    if (!fb || !fb->addr || !src_pixels) return -1;
+    if (w == 0 || h == 0)               return 0;
+
+    if (dst_x >= fb->width  || dst_y >= fb->height) return 0;
+    if (dst_x + w > fb->width)  w = fb->width  - dst_x;
+    if (dst_y + h > fb->height) h = fb->height - dst_y;
+
+    uint32_t bpp_bytes = (fb->bpp + 7u) / 8u;
+    uint32_t row_bytes = w * bpp_bytes;
+
+    const uint8_t *src_row = (const uint8_t *)src_pixels;
+          uint8_t *dst_row = (uint8_t *)fb->addr
+                             + (uint64_t)dst_y * fb->pitch
+                             + (uint64_t)dst_x * bpp_bytes;
+
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t b = 0; b < row_bytes; b++)
+            dst_row[b] = src_row[b];
+        src_row += src_pitch;
+        dst_row += fb->pitch;
+    }
+
+    vmsvga_flush(fb, dst_x, dst_y, w, h);
+    return 0;
+}
+
 static int svga_negotiate_id(void) {
     uint32_t ids[] = { SVGA_ID_2, SVGA_ID_1, SVGA_ID_0 };
     for (int i = 0; i < 3; i++) {
@@ -429,10 +464,11 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     g_dev.fill_rect32_native = g_fifo ? vmsvga_fill_rect32_native : NULL;
     g_dev.blit_rect32        = g_fifo ? vmsvga_blit_rect32       : NULL;
     g_dev.blit_from_sg32     = vmsvga_blit_from_sg32;
+    g_dev.blit_buffer        = vmsvga_blit_buffer;
     g_dev.enumerate_modes    = NULL;
     g_dev.set_mode           = NULL;
     g_dev.shutdown           = NULL;
-    g_dev.caps               = g_fifo ? SQRM_GPU_CAP_2D_ACCEL : 0;
+    g_dev.caps               = (g_fifo ? SQRM_GPU_CAP_2D_ACCEL : 0) | SQRM_GPU_CAP_BLIT_BUF;
 
     if (has_3d && g_fifo) {
         g_dev.draw_triangle = draw_triangle_hw;

@@ -17,6 +17,7 @@
 #include "moduos/arch/AMD64/interrupts/pic.h"
 #include "moduos/arch/AMD64/interrupts/timer.h"
 #include "moduos/kernel/memory/paging.h"
+#include "moduos/kernel/memory/usercopy.h"
 #include "moduos/kernel/io/io.h"
 #include "moduos/kernel/spinlock.h"
 #include "moduos/drivers/input/input.h"
@@ -1399,6 +1400,12 @@ static int gfx_wrap_set_mode(uint32_t width, uint32_t height, uint32_t bpp) {
     return g_active_gpu->set_mode(width, height, bpp);
 }
 
+static int gfx_wrap_blit_buffer(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h, 
+                                const void *src_buf, uint32_t src_stride) {
+    if (!g_active_gpu || !g_active_gpu->blit_buffer) return -1;
+    return g_active_gpu->blit_buffer(&g_active_gpu->fb, dx, dy, src_buf, src_stride, w, h);
+}
+
 static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *out_api) {
     memset(out_api, 0, sizeof(*out_api));
     out_api->abi_version = 1;
@@ -1556,6 +1563,7 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
         out_api->gfx_get_caps        = gfx_wrap_get_caps;
         out_api->gfx_fill_rect       = gfx_wrap_fill_rect;
         out_api->gfx_blit_rect       = gfx_wrap_blit_rect;
+        out_api->gfx_blit_buffer     = gfx_wrap_blit_buffer;
         out_api->gfx_cursor_move     = gfx_wrap_cursor_move;
         out_api->gfx_cursor_show     = gfx_wrap_cursor_show;
         out_api->gfx_flush           = gfx_wrap_flush;
@@ -1604,45 +1612,59 @@ typedef struct {
     uint8_t  data[1500];
 } sqrm_net_reply_t;
 
-// Stored as node->ctx so open() can access the net api pointer
+/* Stored as node->ctx so open() can access the net api pointer */
 typedef struct {
     sqrm_net_api_v1_t *net;
 } sqrm_net_node_ctx_t;
 
-// Per-open context: one staged reply at a time
+/* Per-open context: one staged reply at a time */
 typedef struct {
     sqrm_net_api_v1_t *net;
-    sqrm_net_reply_t   reply;
-    uint32_t           reply_off;
-    int                reply_ready;
+    sqrm_net_reply_t   reply;       /* kernel-side staging buffer          */
+    uint32_t           reply_off;   /* bytes already consumed by read()    */
+    int                reply_ready; /* 1 = reply waiting, 0 = empty        */
 } sqrm_net_open_ctx_t;
 
 static int g_net_index = 0;
 
-static void* sqrm_net_devfs_open(void *ctx, int flags) {
+/* ── open / close ─────────────────────────────────────────────────────── */
+
+static void *sqrm_net_devfs_open(void *ctx, int flags)
+{
     (void)flags;
-    sqrm_net_node_ctx_t *nc = (sqrm_net_node_ctx_t*)ctx;
-    sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t*)kmalloc(sizeof(sqrm_net_open_ctx_t));
+    sqrm_net_node_ctx_t *nc = (sqrm_net_node_ctx_t *)ctx;
+    sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t *)kmalloc(sizeof(*oc));
     if (!oc) return NULL;
     memset(oc, 0, sizeof(*oc));
     oc->net = nc ? nc->net : NULL;
     return oc;
 }
 
-static int sqrm_net_devfs_close(void *ctx) {
+static int sqrm_net_devfs_close(void *ctx)
+{
     if (ctx) kfree(ctx);
     return 0;
 }
 
-static ssize_t sqrm_net_devfs_read(void *ctx, void *buf, size_t count) {
-    sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t*)ctx;
-    if (!oc || !buf) return -1;
-    if (!oc->reply_ready) return 0;
+/* ── read()  –  copy staged reply out to user buffer ─────────────────── */
+
+static ssize_t sqrm_net_devfs_read(void *ctx, void *user_buf, size_t count)
+{
+    sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t *)ctx;
+    if (!oc || !user_buf) return -1;
+    if (!oc->reply_ready)  return 0;
 
     uint32_t total  = (uint32_t)sizeof(sqrm_net_reply_t);
     uint32_t remain = total - oc->reply_off;
     uint32_t n      = (remain < (uint32_t)count) ? remain : (uint32_t)count;
-    memcpy(buf, (uint8_t*)&oc->reply + oc->reply_off, n);
+
+    /* The devfs read callback receives a kernel buffer (already allocated by
+     * sys_readfile).  Do NOT call usercopy_to_user here — the syscall layer
+     * owns the user↔kernel copy; we just fill the kernel buffer. */
+    memcpy(user_buf,
+           (const uint8_t *)&oc->reply + oc->reply_off,
+           n);
+
     oc->reply_off += n;
     if (oc->reply_off >= total) {
         oc->reply_ready = 0;
@@ -1651,21 +1673,34 @@ static ssize_t sqrm_net_devfs_read(void *ctx, void *buf, size_t count) {
     return (ssize_t)n;
 }
 
-static ssize_t sqrm_net_devfs_write(void *ctx, const void *buf, size_t count) {
-    sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t*)ctx;
-    if (!oc || !buf || count < sizeof(uint32_t)) return -1;
+/* ── write()  –  copy cmd in from user, execute, stage reply ─────────── */
+
+static ssize_t sqrm_net_devfs_write(void *ctx, const void *user_buf, size_t count)
+{
+    sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t *)ctx;
+    if (!oc || !user_buf || count < sizeof(uint32_t)) return -1;
 
     sqrm_net_api_v1_t *net = oc->net;
     if (!net) return -1;
 
-    const sqrm_net_cmd_t *cmd = (const sqrm_net_cmd_t*)buf;
-    sqrm_net_reply_t     *rep = &oc->reply;
+    /* ── Safe copy: user buffer → kernel cmd struct ────────────────── */
+    sqrm_net_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+
+    size_t copy_len = (count < sizeof(cmd)) ? count : sizeof(cmd);
+    /* The devfs write callback receives a kernel buffer (already copied from
+     * userspace by sys_writefile).  Do NOT call usercopy_from_user here —
+     * the syscall layer owns the user↔kernel copy; just memcpy it in. */
+    memcpy(&cmd, user_buf, copy_len);
+
+    /* ── Build reply entirely in kernel memory ──────────────────────── */
+    sqrm_net_reply_t *rep = &oc->reply;
     memset(rep, 0, sizeof(*rep));
-    rep->cmd    = cmd->cmd;
+    rep->cmd    = cmd.cmd;
     rep->status = 0;
     rep->len    = 0;
 
-    switch (cmd->cmd) {
+    switch (cmd.cmd) {
 
         case NET_CMD_GET_MODE: {
             uint32_t mode = NET_MODE_ETH;
@@ -1693,8 +1728,7 @@ static ssize_t sqrm_net_devfs_write(void *ctx, const void *buf, size_t count) {
 
         case NET_CMD_GET_MAC: {
             if (!net->get_mac) { rep->status = -1; break; }
-            uint8_t mac[6];
-            memset(mac, 0, sizeof(mac));
+            uint8_t mac[6] = {0};
             net->get_mac(mac);
             memcpy(rep->data, mac, 6);
             rep->len = 6;
@@ -1703,14 +1737,16 @@ static ssize_t sqrm_net_devfs_write(void *ctx, const void *buf, size_t count) {
 
         case NET_CMD_TX_FRAME: {
             if (!net->tx_frame) { rep->status = -1; break; }
-            if (cmd->len == 0 || cmd->len > 1500) { rep->status = -2; break; }
-            rep->status = net->tx_frame(cmd->data, cmd->len);
+            if (cmd.len == 0 || cmd.len > 1500) { rep->status = -2; break; }
+            /* cmd.data is already in kernel memory (copied above) */
+            rep->status = net->tx_frame(cmd.data, cmd.len);
             break;
         }
 
         case NET_CMD_RX_POLL: {
             if (!net->rx_poll) { rep->status = -1; break; }
             size_t got = 0;
+            /* rep->data is kernel memory — safe to pass directly */
             int rc = net->rx_poll(rep->data, sizeof(rep->data), &got);
             if (rc != 0) { rep->status = rc; break; }
             rep->len = (uint32_t)got;
@@ -1728,6 +1764,8 @@ static ssize_t sqrm_net_devfs_write(void *ctx, const void *buf, size_t count) {
     return (ssize_t)count;
 }
 
+/* ── devfs ops table ──────────────────────────────────────────────────── */
+
 static const devfs_device_ops_t g_sqrm_net_ops = {
     .name  = "net",
     .open  = sqrm_net_devfs_open,
@@ -1736,23 +1774,28 @@ static const devfs_device_ops_t g_sqrm_net_ops = {
     .close = sqrm_net_devfs_close,
 };
 
-static void sqrm_net_autoregister_devfs(const sqrm_module_desc_t *desc) {
+/* ── Auto-registration (called after a NIC SQRM module loads) ─────────── */
+
+static void sqrm_net_autoregister_devfs(const sqrm_module_desc_t *desc)
+{
     size_t api_sz = 0;
-    const sqrm_net_api_v1_t *net = (const sqrm_net_api_v1_t*)sqrm_service_get_impl("net", &api_sz);
+    const sqrm_net_api_v1_t *net =
+        (const sqrm_net_api_v1_t *)sqrm_service_get_impl("net", &api_sz);
     if (!net || api_sz < sizeof(sqrm_net_api_v1_t)) {
-        com_write_string(COM1_PORT, "[SQRM] NET module did not register 'net' service\n");
+        com_write_string(COM1_PORT,
+            "[SQRM] NET module did not register 'net' service\n");
         return;
     }
 
-    // Allocate permanent node ctx (lives as long as the devfs node)
-    sqrm_net_node_ctx_t *nc = (sqrm_net_node_ctx_t*)kmalloc(sizeof(sqrm_net_node_ctx_t));
+    sqrm_net_node_ctx_t *nc =
+        (sqrm_net_node_ctx_t *)kmalloc(sizeof(sqrm_net_node_ctx_t));
     if (!nc) {
         com_write_string(COM1_PORT, "[SQRM] NET node ctx alloc failed\n");
         return;
     }
-    nc->net = (sqrm_net_api_v1_t*)net;
+    nc->net = (sqrm_net_api_v1_t *)net;
 
-    // Build canonical name: net0, net1, net2...
+    /* Build canonical name: net0, net1, net2 … */
     char name[16];
     name[0] = 'n'; name[1] = 'e'; name[2] = 't';
     itoa(g_net_index, name + 3, 10);
@@ -1767,8 +1810,7 @@ static void sqrm_net_autoregister_devfs(const sqrm_module_desc_t *desc) {
     if (rc != 0) {
         kfree(nc);
         com_write_string(COM1_PORT, "[SQRM] NET devfs register failed (rc=");
-        char rcbuf[12];
-        itoa(rc, rcbuf, 10);
+        char rcbuf[12]; itoa(rc, rcbuf, 10);
         com_write_string(COM1_PORT, rcbuf);
         com_write_string(COM1_PORT, "): ");
         com_write_string(COM1_PORT, path);

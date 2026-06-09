@@ -264,62 +264,60 @@ static void sw_blit_buf(const framebuffer_t *fb,
 
 /* ── Draw-slot dispatcher ──────────────────────────────────────────── */
 
-static void dispatch_slot(const mvc3_ring_slot_t *slot) {
+static void dispatch_slot(mvc3_session_t *s, const mvc3_ring_slot_t *slot) {
     if (!slot) return;
 
-    const framebuffer_t *fb = g_api->gfx_get_framebuffer
-                            ? g_api->gfx_get_framebuffer()
-                            : (const framebuffer_t *)0;
-    uint32_t caps  = g_api->gfx_get_caps ? g_api->gfx_get_caps() : 0u;
-    int      hw_2d = (caps & SQRM_GPU_CAP_2D_ACCEL) && g_api->gfx_fill_rect;
+    const framebuffer_t *fb = g_api->gfx_get_framebuffer ? g_api->gfx_get_framebuffer() : NULL;
+    if (!fb) return;
 
-    /* LOG EVERYTHING */
-    if (slot->op == MVC3_OP_FILL_RECT) {
-        log("DISPATCH: FILL_RECT");
-        if (!fb)      { log("  -> fb is NULL, sw_fill_rect will no-op"); }
-        if (!fb->addr){ log("  -> fb->addr is NULL"); }
-        if (hw_2d)    { log("  -> taking HW path"); }
-        else          { log("  -> taking SW path"); }
-    } else if (slot->op == MVC3_OP_BLIT) {
-        log("DISPATCH: BLIT");
-    } else if (slot->op == MVC3_OP_BLIT_BUF) {
-        log("DISPATCH: BLIT_BUF");
-    } else {
-        log("DISPATCH: unknown op");
-    }
+    uint32_t caps = g_api->gfx_get_caps ? g_api->gfx_get_caps() : 0u;
+    int hw_2d = (caps & SQRM_GPU_CAP_2D_ACCEL);
 
     switch (slot->op) {
     case MVC3_OP_FILL_RECT:
         if (hw_2d && g_api->gfx_fill_rect)
-            g_api->gfx_fill_rect(slot->u.fill.x, slot->u.fill.y,
-                                 slot->u.fill.w, slot->u.fill.h,
-                                 slot->u.fill.argb);
+            g_api->gfx_fill_rect(slot->u.fill.x, slot->u.fill.y, slot->u.fill.w, slot->u.fill.h, slot->u.fill.argb);
         else
-            sw_fill_rect(fb, slot->u.fill.x, slot->u.fill.y,
-                         slot->u.fill.w, slot->u.fill.h, slot->u.fill.argb);
+            sw_fill_rect(fb, slot->u.fill.x, slot->u.fill.y, slot->u.fill.w, slot->u.fill.h, slot->u.fill.argb);
         break;
 
     case MVC3_OP_BLIT:
         if (hw_2d && g_api->gfx_blit_rect)
-            g_api->gfx_blit_rect(slot->u.blit.src_x, slot->u.blit.src_y,
-                                 slot->u.blit.dst_x, slot->u.blit.dst_y,
-                                 slot->u.blit.w,     slot->u.blit.h);
+            g_api->gfx_blit_rect(slot->u.blit.src_x, slot->u.blit.src_y, slot->u.blit.dst_x, slot->u.blit.dst_y, slot->u.blit.w, slot->u.blit.h);
         else
-            sw_blit_rect(fb, slot->u.blit.src_x, slot->u.blit.src_y,
-                         slot->u.blit.dst_x, slot->u.blit.dst_y,
-                         slot->u.blit.w,     slot->u.blit.h);
+            sw_blit_rect(fb, slot->u.blit.src_x, slot->u.blit.src_y, slot->u.blit.dst_x, slot->u.blit.dst_y, slot->u.blit.w, slot->u.blit.h);
         break;
 
-    case MVC3_OP_BLIT_BUF:
-        /* handle is a 32-bit user VA — cast to 64-bit for sw_blit_buf */
-        sw_blit_buf(fb,
-                    (uint64_t)slot->u.blit_buf.handle,
-                    slot->u.blit_buf.src_x,    slot->u.blit_buf.src_y,
-                    slot->u.blit_buf.dst_x,    slot->u.blit_buf.dst_y,
-                    slot->u.blit_buf.w,        slot->u.blit_buf.h,
-                    slot->u.blit_buf.src_pitch);
-        break;
+    case MVC3_OP_BLIT_BUF: {
+        /* 'handle' is the User Virtual Address of the source pixel buffer.
+         * This code runs in the write() syscall context of the submitting
+         * process, so the User VA is valid for kernel reads via usercopy. */
+        uint64_t user_ptr = (uint64_t)slot->u.blit_buf.handle;
 
+        if ((caps & SQRM_GPU_CAP_BLIT_BUF) && g_api->gfx_blit_buffer) {
+            /* Hardware/driver blit path: gfx_blit_buffer routes into the
+             * GPU LKM's blit_buffer hook which reads from the kernel-mapped
+             * copy of the user buffer prepared by sw_blit_buf, or handles
+             * the usercopy itself.  Either way we pass the adjusted pointer
+             * accounting for src_x / src_y offsets. */
+            uint32_t bpp_bytes = (fb->bpp + 7u) / 8u;
+            const uint8_t *src_ptr = (const uint8_t *)(uintptr_t)user_ptr;
+            src_ptr += (uint64_t)slot->u.blit_buf.src_y * slot->u.blit_buf.src_pitch;
+            src_ptr += (uint64_t)slot->u.blit_buf.src_x * bpp_bytes;
+            g_api->gfx_blit_buffer(slot->u.blit_buf.dst_x, slot->u.blit_buf.dst_y,
+                                   slot->u.blit_buf.w,     slot->u.blit_buf.h,
+                                   src_ptr,                slot->u.blit_buf.src_pitch);
+        } else {
+            /* Software fallback: sw_blit_buf walks the user VA row by row,
+             * copying pixels directly into the framebuffer KVA. */
+            sw_blit_buf(fb, user_ptr,
+                        slot->u.blit_buf.src_x,    slot->u.blit_buf.src_y,
+                        slot->u.blit_buf.dst_x,    slot->u.blit_buf.dst_y,
+                        slot->u.blit_buf.w,        slot->u.blit_buf.h,
+                        slot->u.blit_buf.src_pitch);
+        }
+        break;
+    }
     default: break;
     }
 }
@@ -416,22 +414,17 @@ static void handle_map_ring(mvc3_session_t *s, const mvc3_map_ring_req_t *req) {
 }
 
 static void handle_submit(mvc3_session_t *s, const mvc3_submit_t *sub) {
-    if (!s->ring) {
-        log("SUBMIT: ring is NULL, dropping");
-        return;
-    }
+    if (!s->ring) return;
     uint64_t count = sub->count;
-    log("SUBMIT: dispatching slots");
     if (count > s->ring_slot_count) count = s->ring_slot_count;
-    for (uint64_t i = 0; i < count; i++)
-        dispatch_slot(&s->ring[(s->ring_head + i) % s->ring_slot_count]);
+    for (uint64_t i = 0; i < count; i++) {
+        dispatch_slot(s, &s->ring[(s->ring_head + i) % s->ring_slot_count]);
+    }
     s->ring_head = (s->ring_head + count) % s->ring_slot_count;
 }
 
-static void handle_enqueue(const mvc3_enqueue_t *pkt) {
-    mvc3_ring_slot_t slot;
-    memcpy_local(&slot, &pkt->slot, sizeof(slot));
-    dispatch_slot(&slot);
+static void handle_enqueue(mvc3_session_t *s, const mvc3_enqueue_t *pkt) {
+    dispatch_slot(s, &pkt->slot);
 }
 
 static void handle_flush(const mvc3_flush_t *pkt) {
@@ -554,7 +547,7 @@ static uint32_t process_packet(mvc3_session_t *s) {
         break;
     case MVC3_CMD_ENQUEUE:
         if (consumed >= sizeof(mvc3_enqueue_t))
-            handle_enqueue((const mvc3_enqueue_t *)s->pkt_buf);
+            handle_enqueue(s, (const mvc3_enqueue_t *)s->pkt_buf);
         break;
     case MVC3_CMD_FLUSH:
         if (consumed >= sizeof(mvc3_flush_t))
@@ -576,7 +569,6 @@ static uint32_t process_packet(mvc3_session_t *s) {
         if (consumed >= sizeof(mvc3_cursor_show_t))
             handle_cursor_show((const mvc3_cursor_show_t *)s->pkt_buf);
         break;
-    case MVC3_CMD_CURSOR_SET: break; /* silently consume */
     default: break;
     }
     return consumed;

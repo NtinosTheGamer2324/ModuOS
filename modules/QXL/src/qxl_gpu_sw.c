@@ -341,3 +341,44 @@ int sw_set_mode(uint32_t width, uint32_t height, uint32_t bpp) {
     (void)width; (void)height; (void)bpp;
     return -1; // Requires hardware; not implemented in SW path.
 }
+// ---------------------------------------------------------------------------
+// sw_blit_buffer
+//
+// Copies an arbitrary external pixel buffer (src_pixels, src_pitch) into the
+// framebuffer at (dst_x, dst_y) for a region of (w x h) pixels, then flushes
+// the dirty rectangle via qxl_flush().
+//
+// src_pixels must already point at the first pixel to copy (i.e. src_x/src_y
+// offsets have been applied by the caller — MVC3 does this before the call).
+// src_pitch is the byte stride of the source buffer (may be wider than w*bpp).
+// ---------------------------------------------------------------------------
+int sw_blit_buffer(const framebuffer_t *fb,
+                   uint32_t dst_x, uint32_t dst_y,
+                   const void *src_pixels, uint32_t src_pitch,
+                   uint32_t w, uint32_t h)
+{
+    if (!fb || !fb->addr || !src_pixels) return -1;
+    if (w == 0 || h == 0)               return 0;
+
+    // Clamp to framebuffer bounds.
+    if (dst_x >= fb->width  || dst_y >= fb->height) return 0;
+    if (dst_x + w > fb->width)  w = fb->width  - dst_x;
+    if (dst_y + h > fb->height) h = fb->height - dst_y;
+
+    uint32_t bpp_bytes = (fb->bpp + 7u) / 8u;
+    uint32_t row_bytes = w * bpp_bytes;
+
+    const uint8_t *src_row = (const uint8_t *)src_pixels;
+          uint8_t *dst_row = (uint8_t *)fb->addr
+                             + (uint64_t)dst_y * fb->pitch
+                             + (uint64_t)dst_x * bpp_bytes;
+
+    for (uint32_t y = 0; y < h; y++) {
+        memcpy(dst_row, src_row, row_bytes);
+        src_row += src_pitch;
+        dst_row += fb->pitch;
+    }
+
+    qxl_flush(fb, dst_x, dst_y, w, h);
+    return 0;
+}

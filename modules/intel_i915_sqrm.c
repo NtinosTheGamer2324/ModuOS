@@ -226,26 +226,70 @@ static int intel_i915_init_display(void) {
     return 0;
 }
 
+// Software blit_buffer fallback for i915 (until HW modesetting is implemented).
+// Copies src_pixels row-by-row into the linear framebuffer; no HW flush needed
+// since the GMADR aperture is directly scanned out by the display engine.
+static int i915_sw_blit_buffer(const framebuffer_t *fb,
+                                uint32_t dst_x, uint32_t dst_y,
+                                const void *src_pixels, uint32_t src_pitch,
+                                uint32_t w, uint32_t h)
+{
+    if (!fb || !fb->addr || !src_pixels) return -1;
+    if (w == 0 || h == 0)               return 0;
+
+    if (dst_x >= fb->width  || dst_y >= fb->height) return 0;
+    if (dst_x + w > fb->width)  w = fb->width  - dst_x;
+    if (dst_y + h > fb->height) h = fb->height - dst_y;
+
+    uint32_t bpp_bytes = (fb->bpp + 7u) / 8u;
+    uint32_t row_bytes = w * bpp_bytes;
+
+    const uint8_t *src_row = (const uint8_t *)src_pixels;
+          uint8_t *dst_row = (uint8_t *)fb->addr
+                             + (uint64_t)dst_y * fb->pitch
+                             + (uint64_t)dst_x * bpp_bytes;
+
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t b = 0; b < row_bytes; b++)
+            dst_row[b] = src_row[b];
+        src_row += src_pitch;
+        dst_row += fb->pitch;
+    }
+    return 0;
+}
+
 // Register framebuffer with kernel
 static int intel_i915_register_fb(void) {
     if (!g_api->gfx_register_framebuffer) {
         g_api->com_write_string(COM1_PORT, "[i915] WARNING: gfx_register_framebuffer not available\n");
         return -1;
     }
-    
-    framebuffer_t fb;
-    fb.addr = (uint32_t *)g_gmadr;
-    fb.width = g_fb_width;
-    fb.height = g_fb_height;
-    fb.pitch = g_fb_pitch;
-    fb.bpp = g_fb_bpp;
-    
-    int rc = g_api->gfx_register_framebuffer(&fb);
+
+    sqrm_gpu_device_t gpu;
+    /* zero-init so unset hooks are NULL */
+    for (size_t i = 0; i < sizeof(gpu); i++) ((uint8_t *)&gpu)[i] = 0;
+
+    gpu.fb.addr       = (void *)g_gmadr;
+    gpu.fb.width      = g_fb_width;
+    gpu.fb.height     = g_fb_height;
+    gpu.fb.pitch      = g_fb_pitch;
+    gpu.fb.bpp        = g_fb_bpp;
+    gpu.fb.fmt        = FB_FMT_XRGB8888;
+
+    /* NULL flush: GMADR aperture is directly scanned out — no explicit push needed. */
+    gpu.flush         = NULL;
+
+    /* blit_buffer is mandatory */
+    gpu.blit_buffer   = i915_sw_blit_buffer;
+
+    gpu.caps          = SQRM_GPU_CAP_BLIT_BUF;
+
+    int rc = g_api->gfx_register_framebuffer(&gpu);
     if (rc != 0) {
         g_api->com_write_string(COM1_PORT, "[i915] ERROR: Failed to register framebuffer\n");
         return rc;
     }
-    
+
     g_api->com_write_string(COM1_PORT, "[i915] Framebuffer registered with kernel\n");
     return 0;
 }

@@ -156,7 +156,11 @@ typedef struct sqrm_gpu_device {
     #define SQRM_GPU_CAP_3D_TEXTURES   (1u << 2)  // Has draw_textured_triangle
     #define SQRM_GPU_CAP_HW_CURSOR     (1u << 3)  // Has cursor hooks
     #define SQRM_GPU_CAP_VSYNC         (1u << 4)  // Supports vsync
+    #define SQRM_GPU_CAP_BLIT_BUF      (1u << 5)  // Has blit_buffer (mandatory for all GPU LKMs)
 
+    int (*blit_buffer)(const framebuffer_t *fb, uint32_t dst_x, uint32_t dst_y,
+                       const void *src_pixels, uint32_t src_pitch,
+                       uint32_t w, uint32_t h);
     // Optional: called on shutdown/unload (not implemented yet)
     void (*shutdown)(void);
 } sqrm_gpu_device_t;
@@ -295,6 +299,9 @@ typedef struct sqrm_kernel_api {
 
     void *(*devfs_mmap_region)(uint64_t phys_or_virt, size_t size,
                                int prot, int is_phys);
+
+    int (*gfx_blit_buffer)(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h, 
+                           const void *src_buf, uint32_t src_stride);
 
 } sqrm_kernel_api_t;
 

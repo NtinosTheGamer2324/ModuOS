@@ -113,15 +113,33 @@ static int sw_blit_from_sg32(const framebuffer_t *fb, const gfx_src_sg_t *src,
     return 0;
 }
 
+/* NEW: Software blit_buffer implementation */
+static int sw_blit_buffer(const framebuffer_t *fb, uint32_t dst_x, uint32_t dst_y,
+                          const void *src_pixels, uint32_t src_pitch,
+                          uint32_t w, uint32_t h)
+{
+    if (!src_pixels || dst_x + w > fb->width || dst_y + h > fb->height)
+        return -1;
+
+    const uint8_t *src_line = (const uint8_t *)src_pixels;
+    uint8_t *dst_line       = (uint8_t *)fb->addr + dst_y * fb->pitch + dst_x * 4;
+
+    for (uint32_t i = 0; i < h; ++i) {
+        memcpy(dst_line, src_line, w * 4);
+        src_line += src_pitch;
+        dst_line += fb->pitch;
+    }
+    return 0;
+}
+
 // ====================== Proper Flush with Software Cursor ======================
 
 static void sw_flush(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
-    (void)x; (void)y; (void)w; (void)h; // We can ignore partial for simplicity, or optimize later
+    (void)x; (void)y; (void)w; (void)h; 
 
     if (!g_cursor_visible || !g_cursor_buffer) return;
 
-    // Composite software cursor
     int32_t cx = g_cursor_x - g_cursor_hot_x;
     int32_t cy = g_cursor_y - g_cursor_hot_y;
 
@@ -138,15 +156,15 @@ static void sw_flush(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w
 
         for (int32_t xx = start_x; xx < end_x; ++xx) {
             uint32_t pixel = *src++;
-            if (pixel & 0xFF000000) {           // Alpha test (non-transparent)
-                *dst = pixel;                   // Simple replace (you can do proper blending)
+            if (pixel & 0xFF000000) {           
+                *dst = pixel;                   
             }
             dst++;
         }
     }
 }
 
-// ====================== Software Triangle Rasterizer (Optional but included) ======================
+// ====================== Software Triangle Rasterizer ======================
 
 static int sw_draw_triangle(const framebuffer_t *fb,
                             int32_t x0, int32_t y0, uint32_t c0,
@@ -163,23 +181,18 @@ static int sw_draw_triangle(const framebuffer_t *fb,
     maxx = maxx > (int32_t)fb->width  - 1 ? (int32_t)fb->width  - 1 : maxx;
     maxy = maxy > (int32_t)fb->height - 1 ? (int32_t)fb->height - 1 : maxy;
 
-    // Integer cross product for edge function
-    // area2 = (x1-x0)*(y2-y0) - (x2-x0)*(y1-y0)  [2x triangle area, signed]
     int32_t area2 = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
     if (area2 == 0) return 0;
 
     for (int32_t y = miny; y <= maxy; ++y) {
         for (int32_t x = minx; x <= maxx; ++x) {
-            // Edge functions (all integer)
             int32_t w0 = (x1 - x0) * (y - y0) - (x  - x0) * (y1 - y0);
             int32_t w1 = (x2 - x1) * (y - y1) - (x  - x1) * (y2 - y1);
             int32_t w2 = (x0 - x2) * (y - y2) - (x  - x2) * (y0 - y2);
 
-            // Flip for CW winding
             if (area2 < 0) { w0 = -w0; w1 = -w1; w2 = -w2; area2 = -area2; }
 
             if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
-                // Interpolate color channels with integer weights
                 uint32_t r = ((uint32_t)w0 * ((c0 >> 16) & 0xFF) +
                               (uint32_t)w1 * ((c1 >> 16) & 0xFF) +
                               (uint32_t)w2 * ((c2 >> 16) & 0xFF)) / (uint32_t)area2;
@@ -208,7 +221,7 @@ static int sw_cursor_set_argb32(uint32_t w, uint32_t h, int32_t hot_x, int32_t h
     g_cursor_h = h;
     g_cursor_hot_x = hot_x;
     g_cursor_hot_y = hot_y;
-    g_cursor_buffer = (uint32_t*)pixels_argb;   // Pointer to user data (caller must keep alive)
+    g_cursor_buffer = (uint32_t*)pixels_argb;   
     return 0;
 }
 
@@ -269,6 +282,9 @@ int sqrm_module_init(const sqrm_kernel_api_t *api)
     g_gpu_dev.fill_rect32_native     = sw_fill_rect32_native;
     g_gpu_dev.blit_rect32            = sw_blit_rect32;
     g_gpu_dev.blit_from_sg32         = sw_blit_from_sg32;
+    
+    /* ASSIGN NEW BLIT_BUFFER FUNCTION */
+    g_gpu_dev.blit_buffer            = sw_blit_buffer;
 
     g_gpu_dev.cursor_set_argb32      = sw_cursor_set_argb32;
     g_gpu_dev.cursor_move            = sw_cursor_move;
@@ -276,7 +292,7 @@ int sqrm_module_init(const sqrm_kernel_api_t *api)
 
     g_gpu_dev.draw_triangle          = sw_draw_triangle;
 
-    g_gpu_dev.caps = SQRM_GPU_CAP_2D_ACCEL | SQRM_GPU_CAP_HW_CURSOR | SQRM_GPU_CAP_3D_TRIANGLES;
+    g_gpu_dev.caps = SQRM_GPU_CAP_2D_ACCEL | SQRM_GPU_CAP_HW_CURSOR | SQRM_GPU_CAP_3D_TRIANGLES | SQRM_GPU_CAP_BLIT_BUF;
 
     return api->gfx_register_framebuffer(&g_gpu_dev);
 }
