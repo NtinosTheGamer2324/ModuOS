@@ -521,7 +521,6 @@ void pci_dump_device(pci_device_t *dev) {
 // ============================================================================
 
 void pci_init(void) {
-    COM_LOG_INFO(COM1_PORT, "Initializing PCI subsystem");
     
     pci_device_count = 0;
     pci_driver_count = 0;
@@ -529,11 +528,9 @@ void pci_init(void) {
     int count = pci_scan_bus();
     
     if (count == 0) {
-        COM_LOG_WARN(COM1_PORT, "No PCI devices found");
+        COM_LOG_WARN(COM1_PORT, "No PCI devices found (this is impossible on modern hardware.)");
         return;
     }
-    
-    COM_LOG_OK(COM1_PORT, "PCI subsystem initialized");
     
     // Dump all devices
     for (int i = 0; i < pci_device_count; i++) {
