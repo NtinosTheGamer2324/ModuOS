@@ -268,47 +268,56 @@ int gfx2d_flush(gfx2d_t *g, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
  * local buffer.  The kernel can read userspace pages during write(), so
  * BLIT_BUF still works on the copy-batch path.
  */
+/* ── Updated Buffer Management ─────────────────────────────────────── */
+
 int gfx2d_alloc_buf(gfx2d_t *g, uint32_t size_bytes, uint32_t fmt,
                     uint32_t *out_handle, uint32_t *out_pitch) {
     if (!g || !out_handle || !out_pitch) return -EINVAL;
 
+    /* 1. Allocate local memory in userspace */
+    void *buf = malloc(size_bytes);
+    if (!buf) return -ENOMEM;
+    memset(buf, 0, size_bytes);
+
+    /* 2. Notify kernel to get device-specific metadata (pitch/format) */
     mvc3_alloc_buf_req_t req;
     memset(&req, 0, sizeof(req));
     hdr_init(&req.hdr, MVC3_CMD_ALLOC_BUF, sizeof(req));
     req.size_bytes = size_bytes;
     req.fmt        = fmt;
-    if (write_full(g->fd, &req, sizeof(req)) != 0) return -EIO;
+    
+    if (write_full(g->fd, &req, sizeof(req)) != 0) {
+        free(buf);
+        return -EIO;
+    }
 
     mvc3_alloc_buf_resp_t resp;
-    memset(&resp, 0, sizeof(resp));
-    if (read_full(g->fd, &resp, sizeof(resp)) != 0) return -EIO;
-    if (resp.hdr.magic != MVC3_MAGIC || resp.handle == 0) return -ENOMEM;
+    if (read_full(g->fd, &resp, sizeof(resp)) != 0) {
+        free(buf);
+        return -EIO;
+    }
 
-    /* Always allocate locally — no mmap */
-    void *buf = malloc(size_bytes);
-    if (!buf) return -ENOMEM;
-
+    /* 3. The handle is simply the User Virtual Address */
     *out_handle = (uint32_t)(uintptr_t)buf;
-    *out_pitch  = resp.pitch ? resp.pitch : size_bytes / 4;
+    
+    /* Use kernel-suggested pitch if provided, otherwise calculate default */
+    *out_pitch  = resp.pitch ? resp.pitch : (size_bytes / 4);
+    
     return 0;
 }
 
-/*
- * gfx2d_map_buf
- * ─────────────
- * out_handle from gfx2d_alloc_buf is already the user VA (from dev_mmap
- * or the malloc fallback), so just cast it back.  No kernel round-trip.
- */
 int gfx2d_map_buf(gfx2d_t *g, uint32_t handle,
                   void **out_addr, uint32_t *out_size,
                   uint32_t *out_pitch, uint32_t *out_fmt) {
-    if (!g || !out_addr || !out_size || !out_pitch || !out_fmt) return -EINVAL;
-    if (handle == 0) return -EINVAL;
+    if (!g || !out_addr) return -EINVAL;
 
-    *out_addr  = (void *)(uintptr_t)handle;
-    *out_size  = 0;
-    *out_pitch = 0;
-    *out_fmt   = 0;
+    /* Handle is already the pointer */
+    *out_addr = (void *)(uintptr_t)handle;
+    
+    if (out_size)  *out_size = 0; 
+    if (out_pitch) *out_pitch = 0;
+    if (out_fmt)   *out_fmt = 0;
+    
     return 0;
 }
 

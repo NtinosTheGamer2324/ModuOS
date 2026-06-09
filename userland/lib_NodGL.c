@@ -462,6 +462,8 @@ int NodGL_FillRectContext(
     return (rc == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
 }
 
+/* ── Updated NodGL Rendering Commands ──────────────────────────────── */
+
 int NodGL_DrawTexture(
     NodGL_Context ctx,
     NodGL_Texture texture,
@@ -474,19 +476,24 @@ int NodGL_DrawTexture(
     NodGL_resource_entry_t *res = NodGL_find_resource(ctx->device, texture);
     if (!res) return NodGL_ERROR_INVALID_ARGS;
 
-    uint32_t fmt;
+    /* MVC3/gfx2d specific format identifiers:
+     * 1: Default/Raw, 2: B8G8R8A8, 3: R5G6B5 */
+    uint32_t mvc_fmt;
     switch (res->format) {
-        case NodGL_FORMAT_B8G8R8A8_UNORM: fmt = 2; break;
-        case NodGL_FORMAT_R5G6B5_UNORM:   fmt = 3; break;
-        default:                          fmt = 1; break;
+        case NodGL_FORMAT_B8G8R8A8_UNORM: mvc_fmt = 2; break;
+        case NodGL_FORMAT_R5G6B5_UNORM:   mvc_fmt = 3; break;
+        default:                          mvc_fmt = 1; break;
     }
 
+    /* This call now passes the Userland VA (handle) which the kernel 
+     * will validate against its session mapping table. */
     int rc = gfx2d_blit_buf(&ctx->device->gfx2d,
                              res->handle,
                              (uint32_t)src_x, (uint32_t)src_y,
                              (uint32_t)dst_x, (uint32_t)dst_y,
                              width, height,
-                             res->pitch, fmt);
+                             res->pitch, mvc_fmt);
+
     return (rc == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
 }
 
