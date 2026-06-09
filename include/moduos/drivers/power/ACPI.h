@@ -174,10 +174,4 @@ madt_t* acpi_get_madt(void);
 void acpi_shutdown(void);
 void acpi_reboot(void);
 
-/* Information and debugging */
-void acpi_print_info(void);
-void acpi_list_tables(void);
-void acpi_parse_madt(void);
-void acpi_print_info(void);
-
 #endif /* ACPI_H */
