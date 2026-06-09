@@ -311,10 +311,12 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
 int sys_exit(int status) {
     process_t* proc = process_get_current();
     if (proc) {
-        const char *owner = user_identity_get(proc);
-        if (owner && owner[0]) {
-            userfs_owner_exited(owner);
-        }
+        /* Clean up userfs nodes by PID — reliable regardless of owner_id.
+         * The old owner_id-based path (user_identity_get → "root") only matched
+         * nodes registered with owner_id="root", silently missing any node
+         * registered with a different name (e.g. "netctl", "calc", etc.),
+         * leaving dangling nodes backed by a dead process. */
+        userfs_pid_exited(proc->pid);
         fd_close_all(proc->pid);
         com_write_string(COM1_PORT, "[SYS_EXIT] pid=");
         char pbuf[12];
@@ -1318,39 +1320,10 @@ int sys_userfs_register(const userfs_user_node_t *user_node) {
     kpath[sizeof(kpath) - 1] = '\0';
     kowner[sizeof(kowner) - 1] = '\0';
 
-    /* ===== DEBUG ===== */
-    com_write_string(COM1_PORT, "\n[SYS] ===== REGISTER CALL =====\n");
-
-    com_write_string(COM1_PORT, "[SYS] PATH: '");
-    com_write_string(COM1_PORT, kpath);
-    com_write_string(COM1_PORT, "'\n");
-
-    com_write_string(COM1_PORT, "[SYS] OWNER: '");
-    com_write_string(COM1_PORT, kowner);
-    com_write_string(COM1_PORT, "'\n");
-
-    /* HEX DUMP (first 32 bytes) */
-    com_write_string(COM1_PORT, "[SYS] PATH HEX: ");
-    for (int i = 0; i < 32; i++) {
-        char buf[8];
-        itoa((unsigned char)kpath[i], buf, 16);
-        com_write_string(COM1_PORT, buf);
-        com_write_string(COM1_PORT, " ");
-    }
-    com_write_string(COM1_PORT, "\n");
-
     int rc = userfs_register_user_path(kpath, kowner, req.perms);
     if (rc == 0) {
         rc = userfs_set_ops(kpath, &req.ops, req.ctx);
     }
-
-    com_write_string(COM1_PORT, "[SYS] RESULT rc=");
-    char rbuf[16];
-    itoa(rc, rbuf, 10);
-    com_write_string(COM1_PORT, rbuf);
-    com_write_string(COM1_PORT, "\n");
-
-    com_write_string(COM1_PORT, "[SYS] =========================\n\n");
 
     return rc;
 }
