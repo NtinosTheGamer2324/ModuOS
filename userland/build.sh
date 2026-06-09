@@ -96,6 +96,29 @@ done
 # Wait for any remaining compilation background jobs to finish
 wait
 
+# --- Phase 0b: Compile coreutils objects (Parallelized) ---
+echo "[BUILD] Compiling coreutils source files using $JOBS thread(s)..."
+
+current_jobs=0
+
+for src in coreutils/*.c; do
+    [ -f "$src" ] || continue
+
+    base=$(basename "$src")
+    obj="$BUILD_DIR/coreutils_${base%.c}.o"
+    echo "[BUILD] CC $src -> $obj"
+
+    "$CC" $GCC_FLAGS_COMMON -Icoreutils "$src" -o "$obj" &
+
+    current_jobs=$((current_jobs + 1))
+    if [ "$current_jobs" -ge "$JOBS" ]; then
+        wait
+        current_jobs=0
+    fi
+done
+
+wait
+
 # --- Phase 1: shared libs ---
 # (Kept sequential because it's fast and avoids dependency race conditions)
 for obj in "$BUILD_DIR"/lib_*.o; do
@@ -104,7 +127,7 @@ for obj in "$BUILD_DIR"/lib_*.o; do
     
     # Skip libraries that are only used for static linking
     case "$base" in
-        lib_NodGL|lib_NodGL_shader|lib_sw_shader|lib_gfx2d|lib_fnt|lib_NodGL_syscalls|lib_8bit|lib_a2600|lib_json|lib_pakzip)
+        lib_NodGL|lib_NodGL_shader|lib_sw_shader|lib_gfx2d|lib_fnt|lib_8bit|lib_a2600|lib_json|lib_pakzip)
             # These are static-only libraries, skip creating .sqrl
             continue
             ;;
@@ -191,10 +214,14 @@ for obj in "$BUILD_DIR"/*.o; do
             "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_NodGL_shader.o" "$BUILD_DIR/lib_sw_shader.o" "$BUILD_DIR/lib_gfx2d.o" -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
-        ttyman)
+        ntosiux_ttyman)
             bin="$DIST_DIR/${base}.sqr"
-            echo "[BUILD] LD(app static ttyman) $obj + lib_NodGL_syscalls.o + lib_fnt.o -> $bin"
-            "$LD" "$obj" "$BUILD_DIR/lib_NodGL_syscalls.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+            echo "[BUILD] LD(app static ttyman) $obj + lib_NodGL.o + lib_fnt.o + lib_gfx2d.o -> $bin"
+            "$LD" "$obj" \
+                "$BUILD_DIR/lib_NodGL.o" \
+                "$BUILD_DIR/lib_fnt.o" \
+                "$BUILD_DIR/lib_gfx2d.o" \
+                -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
         *)
@@ -207,15 +234,26 @@ for obj in "$BUILD_DIR"/*.o; do
 
 done
 
+# --- Phase 2b: Link coreutils apps ---
+echo "[BUILD] Linking coreutils apps..."
+
+for obj in "$BUILD_DIR"/coreutils_*.o; do
+    [ -f "$obj" ] || continue
+    # Strip the "coreutils_" prefix to recover the original tool name
+    base=$(basename "${obj%.o}")
+    toolname="${base#coreutils_}"
+    bin="$DIST_DIR/${toolname}.sqr"
+    echo "[BUILD] LD(coreutil) $obj -> $bin"
+    "$LD" "$obj" -T "$LD_SCRIPT_APP" -o "$bin" --hash-style=sysv
+done
+
 echo "[BUILD] Done. Outputs in $DIST_DIR"
 
 # Build Blit Engine (after lib_NodGL.o is available)
 echo "[BUILD] Building Blit Engine..."
 if [ -d "../EXTERNAL/Blit" ]; then
-    # Pass the internal -j flag down to Blit's makefile if it supports it
     (cd "../EXTERNAL/Blit" && make -j"$JOBS" all && make install)
     echo "[BUILD] Blit Engine built and installed"
-    # Copy Blit outputs
     if [ -d "../EXTERNAL/Blit/build" ]; then
         echo "[BUILD] Copying Blit executables to $DIST_DIR..."
         cp ../EXTERNAL/Blit/build/*.sqr "$DIST_DIR/" 2>/dev/null || true
