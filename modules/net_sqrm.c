@@ -67,5 +67,6 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
         }
     }
 
-    return 0;
+    // return -1 so we don't get register as a network device (since we don't actually implement one)
+    return -1;
 }
