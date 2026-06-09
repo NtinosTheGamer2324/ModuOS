@@ -44,7 +44,7 @@
 /* User identity */
 #define SYS_GETUID      33
 #define SYS_SETUID      34
-/* Graphics/VGA - REMOVED: Use $/dev/graphics/video0 instead */
+/* Graphics/VGA - REMOVED: ~~Use $/dev/graphics/video0 instead~~ use $/dev/mvc/mvi0*/
 /* Virtual memory mapping (userland dynamic linker support) */
 #define SYS_MMAP        39
 #define SYS_MUNMAP      40
