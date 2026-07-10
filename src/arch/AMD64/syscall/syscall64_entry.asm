@@ -93,6 +93,22 @@ syscall64_entry:
     mov rsp, rbp
     mov [rsp], rax          ; return value into saved-rax slot
 
+    ; Check need_resched before returning to userspace.  If the timer IRQ
+    ; fired during this syscall and marked the current process for preemption,
+    ; we honour it here so the process doesn't get an extra unearned time slice
+    ; just because it happened to be in a syscall.
+    ; Interrupts are still off (FMASK cleared IF on entry); schedule() is safe
+    ; to call here on the kernel stack — it will re-enable interrupts via
+    ; popfq inside context_switch_asm when it switches to the next process.
+extern should_reschedule
+extern schedule
+    call should_reschedule
+    test eax, eax
+    jz syscall64_entry_return
+    call schedule
+    ; After schedule() returns we are the current process again; fall through
+    ; to restore registers and iretq back to userspace.
+
 syscall64_entry_return:
     pop rax
     pop rbx

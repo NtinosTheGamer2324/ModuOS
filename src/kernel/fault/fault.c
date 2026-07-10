@@ -651,10 +651,10 @@ void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame) {
      */
     {
         const uint64_t KHEAP_START = 0xFFFF800000000000ULL;
-        const uint64_t KHEAP_MAX   = KHEAP_START + (32ULL * 1024 * 1024);
+        extern uint64_t kheap_max;
 
         uint64_t page_base = faulting_address & ~0xFFFULL;
-        if (!(error_code & PF_PRESENT) && page_base >= KHEAP_START && page_base < KHEAP_MAX) {
+        if (!(error_code & PF_PRESENT) && page_base >= KHEAP_START && page_base < kheap_max) {
             uint64_t pa = phys_alloc_frame();
             if (!pa) {
                 com_write_string(COM1_PORT, "[PF] OOM: cannot demand-map heap page\n");

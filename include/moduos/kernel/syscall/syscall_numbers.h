@@ -67,6 +67,13 @@
 #define SYS_UNMOUNT     66  /* unmount(slot) -> 0 or -errno */
 #define SYS_MOUNTS      67  /* mounts(buf, buflen) -> count or -errno */
 
+/* Direct Drive I/O, no FS layer. Requires mdman permision (UID0)*/
+#define SYS_VDRIVE_WRITE 96
+#define SYS_VDRIVE_READ  97
+#define SYS_VDRIVE_WRITE_SECTOR 98
+#define SYS_VDRIVE_READ_SECTOR 99
+
+
 /* POSIX fd operations */
 #define SYS_DUP         68  /* dup(oldfd) -> newfd or -errno */
 #define SYS_DUP2        69  /* dup2(oldfd, newfd) -> newfd or -errno */
@@ -93,6 +100,7 @@
 #define SYS_SETPGID            92  /* setpgid(pid, pgid) -> 0 or -errno */
 #define SYS_GETPGID            93  /* getpgid(pid) -> pgid or -errno */
 #define SYS_GETSID             94  /* getsid(pid) -> sid or -errno */
+#define SYS_FCNTL              95  /* fcntl(fd, cmd, arg) -> value or -errno */
 
 /* ioctl commands for controlling terminal */
 #define TIOCSCTTY              0x540E  /* Set controlling terminal */
@@ -126,4 +134,3 @@
 #define SYS_RT_SIGRETURN   25
 
 #endif
-

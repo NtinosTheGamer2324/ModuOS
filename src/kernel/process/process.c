@@ -33,7 +33,7 @@
 #define KERNEL_STACK_SIZE 16384
 #endif
 #ifndef USER_STACK_SIZE
-#define USER_STACK_SIZE 65536
+#define USER_STACK_SIZE (512 * 1024)  /* 512 KB — enough for deep call stacks in the display server and compositor */
 #endif
 
 extern void scheduler_add_process(process_t *proc);

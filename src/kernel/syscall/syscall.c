@@ -169,6 +169,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_OPENDIR: return sys_opendir((const char*)arg1);
         case SYS_READDIR: return sys_readdir((int)arg1, (char*)arg2, (size_t)arg3, (int*)arg4, (uint32_t*)arg5);
         case SYS_CLOSEDIR: return sys_closedir((int)arg1);
+        case SYS_FCNTL:   return sys_fcntl((int)arg1, (int)arg2, (void*)arg3);
         /* SYS_INPUT  (28) removed - use $/dev/input/kbd0 or $/dev/input/event0 idk.*/
         /* SYS_SSTATS (29) removed - use $/dev/md64api/sysinfo via DevFS instead. */
 
@@ -291,6 +292,104 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             return (uint64_t)(uintptr_t)va;
         }
 
+        //these can brick your filesystem.
+        case SYS_VDRIVE_WRITE: {
+            process_t *proc = process_get_current();
+        
+            if (proc->uid == 0) {
+                uint8_t  vdrive_id = (uint8_t)(uintptr_t)arg1;
+                uint64_t lba       = (uint64_t)(uintptr_t)arg2;
+                uint32_t count     = (uint32_t)(uintptr_t)arg3;
+                size_t   buf_size  = (size_t)count * 512;
+            
+                void *kbuf = kmalloc(buf_size);
+                if (!kbuf) return -ENOMEM;
+            
+                if (usercopy_from_user(kbuf, (const void *)(uintptr_t)arg4, buf_size) != 0) {
+                    kfree(kbuf);
+                    return -EFAULT;
+                }
+            
+                int ret = vdrive_write(vdrive_id, lba, count, kbuf);
+                kfree(kbuf);
+                return ret;
+            } else {
+                return -EPERM;
+            }
+        }
+
+        case SYS_VDRIVE_WRITE_SECTOR: {
+            process_t *proc = process_get_current();
+            if (proc->uid == 0) {
+                uint8_t  vdrive_id = (uint8_t)(uintptr_t)arg1;
+                uint64_t lba       = (uint64_t)(uintptr_t)arg2;
+            
+                void *kbuf = kmalloc(512);
+                if (!kbuf) return -ENOMEM;
+            
+                if (usercopy_from_user(kbuf, (const void *)(uintptr_t)arg3, 512) != 0) {
+                    kfree(kbuf);
+                    return -EFAULT;
+                }
+            
+                int ret = vdrive_write_sector(vdrive_id, lba, kbuf);
+                kfree(kbuf);
+                return ret;
+            } else {
+                return -EPERM;
+            }
+        }
+
+        case SYS_VDRIVE_READ: {
+            process_t *proc = process_get_current();
+        
+            if (proc->uid == 0) {
+                uint8_t  vdrive_id = (uint8_t)(uintptr_t)arg1;
+                uint64_t lba       = (uint64_t)(uintptr_t)arg2;
+                uint32_t count     = (uint32_t)(uintptr_t)arg3;
+                size_t   buf_size  = (size_t)count * 512;
+            
+                void *kbuf = kmalloc(buf_size);
+                if (!kbuf) return -ENOMEM;
+            
+                int ret = vdrive_read(vdrive_id, lba, count, kbuf);
+                if (ret == 0) {
+                    if (usercopy_to_user((void *)(uintptr_t)arg4, kbuf, buf_size) != 0) {
+                        ret = -EFAULT;
+                    }
+                }
+            
+                kfree(kbuf);
+                return ret;
+            } else {
+                return -EPERM;
+            }
+        }
+
+        case SYS_VDRIVE_READ_SECTOR: {
+            process_t *proc = process_get_current();
+            if (proc->uid == 0) {
+                uint8_t  vdrive_id = (uint8_t)(uintptr_t)arg1;
+                uint64_t lba       = (uint64_t)(uintptr_t)arg2;
+            
+                void *kbuf = kmalloc(512);
+                if (!kbuf) return -ENOMEM;
+            
+                int ret = vdrive_read_sector(vdrive_id, lba, kbuf);
+                if (ret == 0) {
+                    if (usercopy_to_user((void *)(uintptr_t)arg3, kbuf, 512) != 0) {
+                        ret = -EFAULT;
+                    }
+                }
+            
+                kfree(kbuf);
+                return ret;
+            } else {
+                return -EPERM;
+            }
+        }
+
+
         default:
             if (kernel_debug_is_med()) {
                 com_write_string(COM1_PORT, "[SYSCALL] Unknown syscall: ");
@@ -404,6 +503,7 @@ ssize_t sys_writefile(int fd, const char *user_buf, size_t count) {
 
         if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
             VGA_WriteN(kbuf, n);
+            com_write_string(COM3_PORT, kbuf);
             total += n;
             continue;
         }
@@ -911,7 +1011,7 @@ int sys_chdir(const char *path) {
     char kpath[256];
     if (copy_string_from_user(path, kpath, sizeof(kpath)) != 0) return -1;
 
-    // Resolve relative paths against CWD for both / and $/ namespaces
+    // Resolve relative paths against CWD — identical to sys_open
     const char *p = kpath;
     char full_path[256];
     if (!(p[0] == '/' || (p[0] == '$' && p[1] == '/'))) {
@@ -926,98 +1026,41 @@ int sys_chdir(const char *path) {
         p = full_path;
     }
 
-    // DEVVFS routing: $/mnt/<drive>/... maps to a real mount
-    if (p[0] == '$' && p[1] == '/') {
-        // Normalize $/ paths so proc->cwd never contains /.. or /.
-        char norm[256];
-        strncpy(norm, p, sizeof(norm) - 1);
-        norm[sizeof(norm) - 1] = 0;
-        path_normalize_inplace(norm);
-        p = norm;
-        fs_path_resolved_t r;
-        if (fs_resolve_path(proc, p, &r) != 0) return -1;
-        if (r.route == FS_ROUTE_USERLAND) {
-            const char *node = r.rel_path;
-            while (*node == '/') node++;
-            if (strncmp(node, "user", 4) == 0 && (node[4] == 0 || node[4] == '/')) {
-                node += 4;
-                while (*node == '/') node++;
-            }
-            if (!userfs_directory_exists(node)) return -1;
+    fs_path_resolved_t r;
+    if (fs_resolve_path(proc, p, &r) != 0) return -1;
+
+    com_printf(COM1_PORT, "[chdir] p='%s' route=%d rel='%s' slot=%d\n",
+               p, r.route, r.rel_path, r.mount_slot);
+
+    if (r.route == FS_ROUTE_DEVVFS) {
+        if (r.devvfs_kind == 0 || r.devvfs_kind == 1) {
             strncpy(proc->cwd, p, sizeof(proc->cwd) - 1);
             proc->cwd[sizeof(proc->cwd) - 1] = 0;
             return 0;
         }
-        if (r.route != FS_ROUTE_MOUNT) return -1;
-        fs_mount_t *mount = fs_get_mount(r.mount_slot);
-        if (!mount || !mount->valid) return -1;
-        if (!fs_directory_exists(mount, r.rel_path)) return -1;
+        return -1;
+    }
+
+    if (r.route == FS_ROUTE_USERLAND) {
+        const char *node = r.rel_path;
+        while (*node == '/') node++;
+        if (!userfs_directory_exists(node)) return -1;
         strncpy(proc->cwd, p, sizeof(proc->cwd) - 1);
         proc->cwd[sizeof(proc->cwd) - 1] = 0;
         return 0;
     }
 
-    // Normal FS chdir for / paths
-    // If no filesystem is mounted, can't change directory
-    if (proc->current_slot < 0) return -1;
-
-    // Get the mount
-    fs_mount_t* mount = fs_get_mount(proc->current_slot);
-    if (!mount || !mount->valid) return -1;
-
-    // Build absolute path
-    char new_path[256];
-    if (p[0] == '/') {
-        // Absolute path
-        strncpy(new_path, p, sizeof(new_path) - 1);
-        new_path[sizeof(new_path) - 1] = '\0';
-    } else {
-        // Relative path - join with current directory
-        if (strcmp(proc->cwd, "/") == 0) {
-            strcpy(new_path, "/");
-            strncat(new_path, p, sizeof(new_path) - strlen(new_path) - 1);
-        } else {
-            strcpy(new_path, proc->cwd);
-            strcat(new_path, "/");
-            strncat(new_path, p, sizeof(new_path) - strlen(new_path) - 1);
-        }
-    }
-    
-    // Handle special cases (use kernel copy kpath, not the user pointer path)
-    if (strcmp(kpath, "..") == 0) {
-        // Go to parent directory
-        char *last_slash = NULL;
-        for (char *p = proc->cwd; *p; p++) {
-            if (*p == '/') last_slash = p;
-        }
-        if (last_slash == proc->cwd) {
-            strcpy(new_path, "/");
-        } else if (last_slash) {
-            strncpy(new_path, proc->cwd, last_slash - proc->cwd);
-            new_path[last_slash - proc->cwd] = '\0';
-        } else {
-            strcpy(new_path, "/");
-        }
-    } else if (strcmp(kpath, ".") == 0) {
+    if (r.route == FS_ROUTE_MOUNT) {
+        fs_mount_t *mount = fs_get_mount(r.mount_slot);
+        if (!mount || !mount->valid) return -1;
+        if (!fs_directory_exists(mount, r.rel_path)) return -1;
+        strncpy(proc->cwd, p, sizeof(proc->cwd) - 1);
+        proc->cwd[sizeof(proc->cwd) - 1] = 0;
+        proc->current_slot = r.mount_slot;
         return 0;
     }
-    
-    // Normalize path (remove trailing slashes)
-    size_t len = strlen(new_path);
-    if (len > 1 && new_path[len - 1] == '/') {
-        new_path[len - 1] = '\0';
-    }
-    
-    // Verify the directory exists
-    if (!fs_directory_exists(mount, new_path)) {
-        return -1;
-    }
-    
-    // Update process CWD
-    strncpy(proc->cwd, new_path, sizeof(proc->cwd) - 1);
-    proc->cwd[sizeof(proc->cwd) - 1] = '\0';
-    
-    return 0;
+
+    return -1;
 }
 
 char* sys_getcwd(char *buf, size_t size) {
@@ -1271,6 +1314,10 @@ static int sys_vfs_mbrinit(const vfs_mbrinit_req_t *user_req) {
 
     kfree(mbr);
     return rc;
+}
+
+int sys_fcntl(int fd, int cmd, uint64_t arg) {
+    return fd_fcntl(fd, cmd, arg);
 }
 
 int sys_closedir(int fd) {

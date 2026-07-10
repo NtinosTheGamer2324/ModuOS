@@ -123,8 +123,19 @@ int usercopy_to_user(void *user_dst, const void *kernel_src, size_t n) {
     return 0;
 }
 
+
+#define USER_SPACE_LIMIT 0x00007FFFFFFFFFFFULL
+
 int usercopy_from_user(void *kernel_dst, const void *user_src, size_t n) {
+    
+    uint64_t start = (uint64_t)(uintptr_t)user_src;
+
     if (!kernel_dst || (!user_src && n)) return -1;
+
+    if (start >= USER_SPACE_LIMIT || (start + n) > USER_SPACE_LIMIT) {
+        return -3; // Return an error if address is in kernel range
+    }
+
     if (!user_range_is_mapped((uint64_t)(uintptr_t)user_src, n)) return -2;
 
     process_t *proc = process_get_current();

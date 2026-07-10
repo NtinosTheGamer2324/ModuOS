@@ -1400,9 +1400,8 @@ static int gfx_wrap_set_mode(uint32_t width, uint32_t height, uint32_t bpp) {
     return g_active_gpu->set_mode(width, height, bpp);
 }
 
-static int gfx_wrap_blit_buffer(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h, 
+static int gfx_wrap_blit_buffer(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
                                 const void *src_buf, uint32_t src_stride) {
-    if (!g_active_gpu || !g_active_gpu->blit_buffer) return -1;
     return g_active_gpu->blit_buffer(&g_active_gpu->fb, dx, dy, src_buf, src_stride, w, h);
 }
 
@@ -1444,6 +1443,10 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
     out_api->ticks_to_ms = ticks_to_ms;
     out_api->ms_to_ticks = ms_to_ticks;
     out_api->sleep_ms = sqrm_sleep_ms_impl;
+
+    out_api->usercopy_from_user = usercopy_from_user;
+    out_api->usercopy_to_user = usercopy_to_user;
+    out_api->usercopy_string_from_user = usercopy_string_from_user;
 
     // blockdev APIs: FS and GENERIC modules (GENERIC needs read-only info for sysinfo)
     if (desc->type == SQRM_TYPE_FS || desc->type == SQRM_TYPE_GENERIC) {
@@ -1559,6 +1562,9 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
     }
 
     if (desc->type == SQRM_TYPE_GENERIC) {
+        com_write_string(COM1_PORT, "[SQRM] build_api: wiring GENERIC gfx for ");
+        com_write_string(COM1_PORT, desc->name ? desc->name : "(null)");
+        com_write_string(COM1_PORT, "\n");
         out_api->gfx_get_framebuffer = gfx_wrap_get_framebuffer;
         out_api->gfx_get_caps        = gfx_wrap_get_caps;
         out_api->gfx_fill_rect       = gfx_wrap_fill_rect;
@@ -1568,6 +1574,9 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
         out_api->gfx_cursor_show     = gfx_wrap_cursor_show;
         out_api->gfx_flush           = gfx_wrap_flush;
         out_api->gfx_set_mode        = gfx_wrap_set_mode;
+        com_write_string(COM1_PORT, "[SQRM] build_api: gfx_blit_buffer ptr=");
+        com_write_hex64(COM1_PORT, (uint64_t)(uintptr_t)gfx_wrap_blit_buffer);
+        com_write_string(COM1_PORT, "\n");
     }
 
     // SQRM services (exports): available to all modules

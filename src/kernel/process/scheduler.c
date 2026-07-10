@@ -521,12 +521,59 @@ uint64_t scheduler_get_clock_ticks(void)  { return sched_state.clock_ticks;  }
 uint32_t scheduler_get_nr_running(void)   { return sched_state.nr_running;   }
 
 // ---------------------------------------------------------------------------
+// Debug
+// ---------------------------------------------------------------------------
+
+// Minimal decimal formatter — avoids a printf dependency in the kernel COM path.
+static void com_write_u64(uint64_t v) {
+    char buf[21];
+    int  i = 20;
+    buf[i] = '\0';
+    if (v == 0) {
+        buf[--i] = '0';
+    } else {
+        while (v) {
+            buf[--i] = '0' + (v % 10);
+            v /= 10;
+        }
+    }
+    com_write_string(COM1_PORT, buf + i);
+}
+
+static void rbtree_print_inorder(const rbtree_node_t *n) {
+    if (!n) return;
+    rbtree_print_inorder(n->left);
+    process_t *p = sched_proc_of((rbtree_node_t *)n);
+    com_write_string(COM1_PORT, "  pid=");
+    com_write_u64(p->pid);
+    com_write_string(COM1_PORT, " vrt=");
+    com_write_u64(n->vruntime);
+    com_write_string(COM1_PORT, " state=");
+    com_write_u64(p->state);
+    com_write_string(COM1_PORT, " name=");
+    com_write_string(COM1_PORT, p->name ? p->name : "?");
+    com_write_string(COM1_PORT, n->is_red ? " RED\n" : " BLK\n");
+    rbtree_print_inorder(n->right);
+}
+
+void debug_print_ready_queue(void) {
+    com_write_string(COM1_PORT, "[SCHED] Queue (vruntime order):\n");
+    spinlock_lock(&sched_lock);
+    rbtree_print_inorder(sched_state.root);
+    spinlock_unlock(&sched_lock);
+    com_write_string(COM1_PORT, "[SCHED] ---\n");
+}
+
+// ---------------------------------------------------------------------------
 // schedule()
 //
 // The re-enqueue of prev and the pick of next happen under one lock
 // acquisition so there is never a window where prev is both in the tree
 // and selected as next.
 // ---------------------------------------------------------------------------
+
+static uint64_t last_sched_dump_ms = 0;
+static uint64_t last_sched_dump_tick = 0;  /* add with other globals */
 
 void schedule(void) {
     if (!sched_enabled)
@@ -547,10 +594,24 @@ void schedule(void) {
         prev->state = PROCESS_STATE_READY;
     }
 
+    /* ── QUEUE DUMP every 2 seconds (2000 ticks at 1kHz) ─────────────── */
+    if (sched_state.clock_ticks - last_sched_dump_tick >= 2000) {
+        last_sched_dump_tick = sched_state.clock_ticks;
+        com_write_string(COM1_PORT, "[SCHED] queue (nr=");
+        char nbuf[16]; itoa((int)sched_state.nr_running, nbuf, 10);
+        com_write_string(COM1_PORT, nbuf);
+        com_write_string(COM1_PORT, ") min_vrt=");
+        com_write_u64(sched_state.min_vruntime);
+        com_write_string(COM1_PORT, ":\n");
+        rbtree_print_inorder(sched_state.root);
+        com_write_string(COM1_PORT, "[SCHED] ---\n");
+    }
+    /* ───────────────────────────────────────────────────────────────────── */
+
     rbtree_node_t *lm = sched_state.root;
     if (lm) {
         while (lm->left) lm = lm->left;
-        next = sched_proc_of(lm);   // container_of — replaces lm->process
+        next = sched_proc_of(lm);
         rbtree_remove(next);
     }
 
@@ -586,10 +647,55 @@ void scheduler_tick(void) {
 
     sched_update_curr(p, TICK_NS);
 
-    if (sched_state.nr_running > 0 &&
-        p->vruntime > sched_state.min_vruntime + MIN_GRANULARITY_NS)
+    /* The running process is not in the tree, so nr_running counts only
+     * processes that are *waiting* to run.  With a single user process,
+     * nr_running == 0 but we still want to mark need_resched so the IRQ
+     * return path can invoke schedule() and let the idle process or any
+     * newly-woken processes run.  Drop the nr_running guard. */
+    if (p->vruntime > sched_state.min_vruntime + MIN_GRANULARITY_NS)
         p->need_resched = 1;
+
+    int woke_someone = 0;
+
+        for (int i = 1; i < MAX_PROCESSES; i++) {   /* skip PID 0 (idle) */
+        process_t *sp = process_table[i];
+        if (!sp)
+            continue;
+        if (sp->state != PROCESS_STATE_SLEEPING)
+            continue;
+        if (sp->sleep_ticks == 0)
+            continue;
+
+        sp->sleep_ticks--;
+        if (sp->sleep_ticks == 0) {
+            /*
+             * Timer expired.  process_sleep() always uses the process's
+             * own PID cast to a pointer as the wait channel.  Use
+             * wait_channel directly to cover any future variants.
+             */
+            void *ch = sp->wait_channel ? sp->wait_channel
+                                        : (void *)(uintptr_t)sp->pid;
+            sp->wait_channel = NULL;
+            wakeup(ch);
+            woke_someone = 1;
+        }
+    }
+
+    /*
+     * If the CPU is currently idle (PID 0) and we just woke a process up,
+     * don't wait for the IRQ-return preemption path to notice — it skips
+     * rescheduling when interrupting kernel-mode code (idle's hlt loop),
+     * so a newly-woken process would otherwise sit READY in the tree
+     * forever while idle keeps halting. Calling schedule() here is safe:
+     * idle holds no locks across hlt, and schedule() will pick the
+     * newly-woken (lowest-vruntime) process as next.
+     */
+    if (woke_someone && p->pid == 0) {
+        p->need_resched = 0;
+        schedule();
+    }
 }
+
 
 // ---------------------------------------------------------------------------
 // sleep / wakeup
@@ -630,48 +736,4 @@ int should_reschedule(void) {
 void clear_need_resched(void) {
     if (current)
         current->need_resched = 0;
-}
-
-// ---------------------------------------------------------------------------
-// Debug
-// ---------------------------------------------------------------------------
-
-// Minimal decimal formatter — avoids a printf dependency in the kernel COM path.
-static void com_write_u64(uint64_t v) {
-    char buf[21];
-    int  i = 20;
-    buf[i] = '\0';
-    if (v == 0) {
-        buf[--i] = '0';
-    } else {
-        while (v) {
-            buf[--i] = '0' + (v % 10);
-            v /= 10;
-        }
-    }
-    com_write_string(COM1_PORT, buf + i);
-}
-
-static void rbtree_print_inorder(const rbtree_node_t *n) {
-    if (!n)
-        return;
-    rbtree_print_inorder(n->left);
-    // container_of replaces the old n->process back-pointer.
-    process_t *p = sched_proc_of((rbtree_node_t *)n);
-    com_write_string(COM1_PORT, "  pid=");
-    com_write_u64(p->pid);
-    com_write_string(COM1_PORT, " vruntime=");
-    com_write_u64(n->vruntime);
-    com_write_string(COM1_PORT, n->is_red ? " RED\n" : " BLK\n");
-    rbtree_print_inorder(n->right);
-}
-
-void debug_print_ready_queue(void) {
-    if (!kernel_debug_is_on())
-        return;
-    com_write_string(COM1_PORT, "[SCHED-DEBUG] Run queue (vruntime order):\n");
-    spinlock_lock(&sched_lock);
-    rbtree_print_inorder(sched_state.root);
-    spinlock_unlock(&sched_lock);
-    com_write_string(COM1_PORT, "[SCHED-DEBUG] ---\n");
 }

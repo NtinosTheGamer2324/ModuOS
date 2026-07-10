@@ -1,6 +1,7 @@
 //memory.c
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/paging.h"
+#include "moduos/kernel/memory/kheap.h"
 #include "moduos/kernel/memory/phys.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/multiboot2.h"
@@ -26,6 +27,12 @@ void memory_system_init(void *mb2)
 
     com_write_string(COM1_PORT, "[MEM] Step 3: Initializing paging system (copying bootloader mappings)...\n");
     paging_init();
+    paging_set_pt_alloc_unrestricted();
+    com_write_string(COM1_PORT, "[MEM] PT allocator unrestricted (physmap live)\n");
+
+    com_write_string(COM1_PORT, "[MEM] Step 3.5: Initializing kernel heap...\n");
+    kheap_init();
+    com_write_string(COM1_PORT, "[MEM] Kernel heap initialized.\n");
 
     // Graphics init deferred to GPU drivers; stay in VGA text mode.
     {
@@ -176,7 +183,6 @@ void memory_system_init(void *mb2)
      */
     com_write_string(COM1_PORT, "[MEM] Step 4: Skipping full identity mapping (physmap enabled)\n");
 
-    /* ADD THESE DEBUG LINES */
     com_write_string(COM1_PORT, "[MEM] Step 4 complete (skipped)\n");
     com_write_string(COM1_PORT, "[MEM] Memory system initialized successfully!\n");
     com_write_string(COM1_PORT, "[MEM] Kernel heap is now available via kmalloc()\n");

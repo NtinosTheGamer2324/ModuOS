@@ -2,6 +2,8 @@
 
 global irq_stubs
 extern irq_dispatch
+extern schedule
+extern should_reschedule
 
 %macro IRQ_STUB 1
 global irq_stub%1
@@ -32,6 +34,21 @@ irq_stub%1:
     mov rdi, %1
     call irq_dispatch
 
+    ; Only preempt when returning to userspace (CPL 3).
+    ; The iretq frame is now at [rsp + 15*8]: RIP, CS, RFLAGS, RSP, SS.
+    ; CS is at offset +8 from RIP, i.e. [rsp + 15*8 + 8].
+    test word [rsp + 15*8 + 8], 3
+    jz .no_preempt_%1
+
+    ; Returning to ring-3: check need_resched and invoke schedule() if set.
+    ; Interrupts are still disabled here (we're in IRQ context), which is
+    ; exactly the condition schedule() needs to do a safe context switch.
+    call should_reschedule
+    test eax, eax
+    jz .no_preempt_%1
+    call schedule
+
+.no_preempt_%1:
     pop r15
     pop r14
     pop r13

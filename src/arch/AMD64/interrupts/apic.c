@@ -50,7 +50,7 @@ void apic_timer_irq_handler_c(void) {
 }
 
 void apic_spurious_irq_handler_c(void) {
-    /* Per Intel SDM §10.9: spurious interrupts must NOT generate an EOI.
+    /* Per Intel SDM  10.9: spurious interrupts must NOT generate an EOI.
      * Sending one corrupts the LAPIC ISR state machine. */
     (void)0;
 }

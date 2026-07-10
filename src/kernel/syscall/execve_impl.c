@@ -615,6 +615,21 @@ int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *
     if (old_pml4_phys_to_free)
         phys_free_frame(old_pml4_phys_to_free);
 
+    /* ── 10a. Update process name to reflect the new executable ───────── *
+     * Without this, p->name retains the parent's name across execve()    *
+     * (inherited via fork()'s strncpy of parent->name), which makes       *
+     * scheduler dumps and process listings show the old program name      *
+     * (e.g. "automan.sqr") for a process that is actually running a       *
+     * completely different binary (e.g. "zenith5.1.sqr").                 */
+    {
+        const char *base = rel;
+        for (const char *q = rel; *q; q++) {
+            if (*q == '/') base = q + 1;
+        }
+        strncpy(p->name, base, PROCESS_NAME_MAX - 1);
+        p->name[PROCESS_NAME_MAX - 1] = 0;
+    }
+
     /* ── 10. Update process env ───────────────────────────────────────── */
     if (p->envp) {
         for (int i = 0; i < p->envc; i++) if (p->envp[i]) kfree(p->envp[i]);

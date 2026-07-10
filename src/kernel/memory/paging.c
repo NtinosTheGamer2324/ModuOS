@@ -24,6 +24,7 @@ void paging_set_smp_started(void) {
 #define PAGE_MASK (~0xFFFULL)
 #define PAGE_SIZE  4096ULL
 #define PAGE_MASK_2M (~0x1FFFFFULL)  /* 2MB page mask */
+#define PAGING_PT_ALLOC_LIMIT (1ULL * 1024 * 1024 * 1024)  /* 1 GiB */
 
 /* VGA text buffer is at 0xB8000 - we must preserve this! */
 #define VGA_TEXT_BUFFER 0xB8000ULL
@@ -37,6 +38,7 @@ static uint64_t kernel_master_cr3 = 0;
 
 /* phys_to_virt offset. Starts at 0 (identity). */
 static uint64_t phys_offset = 0; /* 0 means identity mapping */
+static int pt_alloc_unrestricted = 0;
 
 /* MMIO virtual address space tracking */
 static uint64_t ioremap_base = 0;
@@ -59,19 +61,18 @@ void *phys_to_virt_kernel(uint64_t phys) {
     return phys_to_virt(phys);
 }
 
-#ifndef PAGING_PT_ALLOC_LIMIT
-#define PAGING_PT_ALLOC_LIMIT 0x04000000ULL /* 64MB */
-#endif
+void paging_set_pt_alloc_unrestricted(void) {
+    pt_alloc_unrestricted = 1;
+}
 
 static uint64_t *alloc_pt_page(void) {
-    uint64_t phys = phys_alloc_frame_below(PAGING_PT_ALLOC_LIMIT);
-    if (!phys) {
-        return NULL;
-    }
+    uint64_t phys = pt_alloc_unrestricted
+        ? phys_alloc_frame()
+        : phys_alloc_frame_below(PAGING_PT_ALLOC_LIMIT);
 
+    if (!phys) return NULL;
     void *v = phys_to_virt(phys);
-    if (!v) return NULL;
-
+    if (!v) { phys_free_frame(phys); return NULL; }
     memset(v, 0, PAGE_SIZE);
     return (uint64_t *)v;
 }

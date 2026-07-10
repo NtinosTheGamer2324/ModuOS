@@ -60,6 +60,7 @@ uint64_t paging_get_pte(uint64_t virt);
 int paging_set_pte(uint64_t virt, uint64_t pte);
 
 void *phys_to_virt_kernel(uint64_t phys);
+void paging_set_pt_alloc_unrestricted(void);
 
 /* A small reserved kernel-only scratch mapping area (2 pages) intended for
  * short-lived temporary mappings (e.g., fork page copying). The returned base

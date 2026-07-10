@@ -12,7 +12,7 @@
 
 /* --- CONFIGURATION --- */
 #define KHEAP_START      0xFFFF800000000000ULL
-#define KHEAP_MAX        (KHEAP_START + (32ULL * 1024 * 1024))
+/* KHEAP_MAX is now set at runtime in kheap_init() based on available RAM. */
 #define KHEAP_PAGE_FLAGS (PFLAG_PRESENT | PFLAG_WRITABLE)
 
 #if defined(FBCON_DEBUG) && (FBCON_DEBUG >= 2)
@@ -56,6 +56,7 @@ static struct free_node *free_list = NULL;
 static uint64_t heap_alloc_next   = KHEAP_START;
 static uint64_t total_allocations = 0;
 static uint64_t failed_allocations = 0;
+uint64_t kheap_max = 0;
 
 static spinlock_t kheap_spinlock __attribute__((aligned(64)));
 
@@ -187,6 +188,32 @@ static uint64_t find_and_remove_free_block(uint64_t pages) {
 
 void kheap_init(void) {
     spinlock_init(&kheap_spinlock);
+
+    /* Dynamic heap ceiling: scale with physical RAM, capped at 2 GiB.
+     * We query the physical allocator for the total managed frame count.
+     * If phys isn't ready yet, fall back to a safe 64 MiB minimum.
+     */
+    uint64_t total_bytes = phys_total_frames() * (uint64_t)PAGE_SIZE;
+
+    uint64_t heap_size;
+    if      (total_bytes < 512ULL * 1024 * 1024)          heap_size =  64ULL * 1024 * 1024;
+    else if (total_bytes < 2ULL  * 1024 * 1024 * 1024)    heap_size = 256ULL * 1024 * 1024;
+    else if (total_bytes < 8ULL  * 1024 * 1024 * 1024)    heap_size = 512ULL * 1024 * 1024;
+    else                                                    heap_size =   2ULL * 1024 * 1024 * 1024;
+
+    /* Never exceed 1/8 of total RAM (keep headroom for process mappings etc.) */
+    uint64_t cap = total_bytes / 8;
+    if (cap < 64ULL * 1024 * 1024) cap = 64ULL * 1024 * 1024;  /* always at least 64 MiB */
+    if (heap_size > cap) heap_size = cap;
+
+    kheap_max = KHEAP_START + heap_size;
+
+    com_write_string(COM1_PORT, "[KHEAP] heap max=");
+    char buf[32];
+    /* reuse your existing uint64_to_hex helper */
+    uint64_to_hex(kheap_max, buf, sizeof(buf));
+    com_write_string(COM1_PORT, buf);
+    com_write_string(COM1_PORT, "\n");
 }
 
 void *kmalloc(size_t size) {
@@ -202,7 +229,7 @@ void *kmalloc(size_t size) {
     int      used_bump    = 0;
 
     if (!virt) {
-        if (heap_alloc_next + pages * PAGE_SIZE > KHEAP_MAX) {
+        if (heap_alloc_next + pages * PAGE_SIZE > kheap_max) {
             log_oom(size, "virtual address space exhausted");
             spinlock_unlock(&kheap_spinlock);
             return NULL;
@@ -304,7 +331,7 @@ void kfree(void *ptr) {
 
     uint64_t p = (uint64_t)(uintptr_t)ptr;
 
-    if (p < KHEAP_START || p >= KHEAP_MAX) {
+    if (p < KHEAP_START || p >= kheap_max) {
         com_write_string(COM1_PORT, "[KHEAP] WARNING: kfree on non-heap pointer=");
         char pb[32]; uint64_to_hex(p, pb, sizeof(pb));
         com_write_string(COM1_PORT, pb);

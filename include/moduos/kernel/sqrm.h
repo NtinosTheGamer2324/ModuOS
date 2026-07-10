@@ -141,6 +141,10 @@ typedef struct sqrm_gpu_device {
 
     /* Future: vertex buffer submission, transform matrices, etc */
 
+    int (*blit_buffer)(const framebuffer_t *fb, uint32_t dst_x, uint32_t dst_y,
+                       const void *src_pixels, uint32_t src_pitch,
+                       uint32_t w, uint32_t h);
+
     // Optional: request a mode change. Returns 0 on success.
     int (*set_mode)(uint32_t width, uint32_t height, uint32_t bpp);
 
@@ -158,9 +162,6 @@ typedef struct sqrm_gpu_device {
     #define SQRM_GPU_CAP_VSYNC         (1u << 4)  // Supports vsync
     #define SQRM_GPU_CAP_BLIT_BUF      (1u << 5)  // Has blit_buffer (mandatory for all GPU LKMs)
 
-    int (*blit_buffer)(const framebuffer_t *fb, uint32_t dst_x, uint32_t dst_y,
-                       const void *src_pixels, uint32_t src_pitch,
-                       uint32_t w, uint32_t h);
     // Optional: called on shutdown/unload (not implemented yet)
     void (*shutdown)(void);
 } sqrm_gpu_device_t;
@@ -296,13 +297,15 @@ typedef struct sqrm_kernel_api {
     int (*gfx_cursor_show)(int visible);
     int (*gfx_flush)(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
     int (*gfx_set_mode)(uint32_t width, uint32_t height, uint32_t bpp);
-
+    int (*gfx_blit_buffer)(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h, 
+                           const void *src_buf, uint32_t src_stride);
+                           
     void *(*devfs_mmap_region)(uint64_t phys_or_virt, size_t size,
                                int prot, int is_phys);
 
-    int (*gfx_blit_buffer)(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h, 
-                           const void *src_buf, uint32_t src_stride);
-
+    int (*usercopy_from_user)(void *kernel_dst, const void *user_src, size_t n);
+    int (*usercopy_to_user)(void *user_dst, const void *kernel_src, size_t n);
+    int (*usercopy_string_from_user)(char *kernel_dst, const char *user_src, size_t max_len);
 } sqrm_kernel_api_t;
 
 typedef int (*sqrm_module_init_fn)(const sqrm_kernel_api_t *api);
