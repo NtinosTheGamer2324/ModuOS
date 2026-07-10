@@ -40,6 +40,7 @@ int md_main(long argc, char **argv) {
     }
 
     /* ── Ping the gateway ───────────────────────────────────────────── */
+/*
     {
         netctl_ping_req_t req = {
             .cmd        = NETCTL_CMD_PING,
@@ -57,6 +58,7 @@ int md_main(long argc, char **argv) {
                 printf("Ping: failed (status %d)\n", resp.status);
         }
     }
+*/
 
     /* ── Send a UDP packet ──────────────────────────────────────────── */
     {

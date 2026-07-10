@@ -19,7 +19,7 @@ LD      := x86_64-elf-ld
 LDFLAGS := -nostdlib -static
 
 # ── netctl service ────────────────────────────────────────────────────
-SERVICE_TARGET := netctl.elf
+SERVICE_TARGET := netctl.sqr
 SERVICE_SRCS   := \
     src/main.c           \
     src/driver.c         \
@@ -32,7 +32,7 @@ SERVICE_SRCS   := \
 SERVICE_OBJS := $(patsubst src/%.c, build/%.o, $(SERVICE_SRCS))
 
 # ── example client ────────────────────────────────────────────────────
-EXAMPLE_TARGET := test.elf
+EXAMPLE_TARGET := test.sqr
 EXAMPLE_SRCS   := examples/test.c
 EXAMPLE_OBJS   := build/examples/test.o
 

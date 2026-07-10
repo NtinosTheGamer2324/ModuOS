@@ -230,7 +230,7 @@ static void decode_block_huffman(State *s,
     }
 }
 
-/* Fixed Huffman trees (RFC 1951 §3.2.6) */
+/* Fixed Huffman trees (RFC 1951  3.2.6) */
 static void decode_block_fixed(State *s) {
     u8 lengths[FIXLCODES + MAXDCODES];
     u32 i;
