@@ -18,6 +18,17 @@ The majority of the ModuOS project is licensed under the **GNU General Public Li
 
 ---
 
+## 1.5 FOR CONTRIBUTORS
+
+If you wish to contribute to this project, you are required to read and agree to the Contributor License Agreement (CLA) before submitting any contributions.
+
+* **Contributor License Agreement:** `LICENSES/CLA.md`
+  * Contributors may add their own name or GitHub username to `LICENSES/CONTRIBUTORS.txt` to receive credit for their contributions.
+  * Unauthorized removal or modification of contributor credits without the contributor's permission is prohibited. Such actions may result in project sanctions and may create legal liability under applicable laws.
+  * This Contributor License Agreement is intended to comply with applicable European Union and Hellenic copyright law.
+
+---
+
 ## 2. QXL Architecture Headers (Modified MIT)
 The QXL Graphics Headers are licensed under a **Modified MIT License** with a mandatory attribution clause. This ensures that the architecture can be ported while credit remains with **NTSoftware**.
 
@@ -33,3 +44,4 @@ For the full text of these licenses, please refer to:
 
 - `LICENSES/GNU_GPLv2.0.txt`
 - `LICENSES/NTSoftware-QXLHeaders/mod_MIT.txt`
+- `LICENSES/CLA.md`
