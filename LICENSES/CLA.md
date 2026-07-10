@@ -10,7 +10,7 @@ Due to privacy considerations, the Copyright Owner's full legal name is not publ
 
 The official GitHub profile of the Copyright Owner is provided as the primary public identity reference:
 
-[\[GitHub profile URL\]](https://github.com/NtinosTheGamer2324)
+[GitHub Profile](https://github.com/NtinosTheGamer2324)
 
 The following names refer to the same project owner:
 
@@ -44,7 +44,7 @@ If you do not agree with these terms, please do not submit contributions to this
 
 ## 5. APPLICABLE LAW
 
-This Contributor License Agreement is intended to comply with applicable European Union and Greek copyright law.
+This Contributor License Agreement is intended to comply with applicable European Union and Hellenic copyright law.
 
 Contributors are responsible for ensuring that they have the legal ability to submit contributions under this agreement.
 
