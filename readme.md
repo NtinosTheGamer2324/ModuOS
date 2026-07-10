@@ -12,16 +12,17 @@
 ## ✨ Features
 
 - **Custom 64-bit Kernel**: Long mode x86-64 kernel with Multiboot2 support
+- **SQRM Module System**: Dynamic Loadable Kernel Module (LKM) runtime for running system services, hardware drivers, and APIs
 - **Memory Management**: Physical memory allocator, virtual memory with paging, kernel heap
 - **Process Management**: Multitasking, context switching, ELF executable loading, syscall interface
 - **Drivers**: 
-  - Storage: ATA/ATAPI, AHCI/SATA support
-  - Graphics: VBE text mode
+  - Storage: ATA/ATAPI, AHCI/SATA support, virtual drive (`vDrive`)
+  - Graphics: Graphics text mode, MVC3 graphics path, QXL/VMSVGA support
   - Input: PS/2 keyboard and mouse
   - System: PCI enumeration, ACPI, RTC, PIC/Timer
-- **File Systems**: FAT32 and ISO9660 (read-only) with virtual file system layer
-- **Userland**: Basic applications and games (cat, echo, shell, games)
-- **Built-in Games**: Raycaster FPS, Snake (Eat Fruit), Stack Blocks, Vertical Ping Pong, Mine Sweeper
+- **File Systems & Formats**: FAT32, ISO9660 (read-only), DevFS (device-tree filesystem), UserFS (IPC-based filesystem), and custom `.tpk`/`.pak` archives
+- **Graphics Subsystem**: FlareX window compositor (X11-inspired) and NodDS display server
+- **Userland**: Rich suite of system utilities (package manager, disk partitioner), games, and custom font tools (BDF, TTF, PF2 to `.fnt` compilers)
 
 ---
 
@@ -166,13 +167,23 @@ Once booted, you can run:
 - `sh` - Simple shell
 - `memtest` - Memory testing utility
 - `neofetch` - System information display
+- `lsblk` - List block storage devices
+- `mdparted` - Disk partitioning utility
+- `pakman` - Package manager for `.pak` files
+- `imgview <file>` - Interactive image viewer
+- `ilib_viewer <file>` - Interactive `.ilib` asset library viewer
+- `tvd_player <file>` - Video/media player for `.tvd` formats
+- `paintgfx` - Graphical canvas drawing application
 
-### Games
+### Games & Demos
 - **Raycaster FPS** - First-person perspective game
 - **Eat Fruit** (Snake) - Classic snake game
 - **Stack Blocks** - Block stacking puzzle
 - **Vertical Ping Pong** - Pong variant
 - **Mine Sweeper** - Minesweeper clone
+- **maze2d** - Interactive 2D maze generator and game
+- **nodds_demo** - Demonstration of the NodDS windowing system
+- **screensaver** - Graphical screensaver animation
 
 ---
 
