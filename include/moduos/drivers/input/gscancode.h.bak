@@ -1,0 +1,206 @@
+#ifndef G_SCANCODES_H
+#define G_SCANCODES_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+// a Global Cross PS/2 - USB Scancode set.
+
+typedef enum {
+    K_NONE = 0,
+
+    // keyboard ROW 1 (F1-12, + MEDIA)
+    K_ESC = 0x01,
+    K_F1 = 0x02,
+    K_F2 = 0x03,
+    K_F3 = 0x04,
+    K_F4 = 0x05,
+    K_F5 = 0x06,
+    K_F6 = 0x07,
+    K_F7 = 0x08,
+    K_F8 = 0x09,
+    K_F9 = 0x0A,
+    K_F10 = 0x0B,
+    K_F11 = 0x0C,
+    K_F12 = 0x0D,
+    K_PRINT_SCREEN = 0x0E,
+    K_SCROLL_LOCK = 0x0F,
+    K_PAUSE = 0x10,
+
+    // keyboard ROW 2 (QWERTY, + NUMPAD)
+    K_TILDE = 0x11,
+    K_1 = 0x12,
+    K_2 = 0x13,
+    K_3 = 0x14,
+    K_4 = 0x15,
+    K_5 = 0x16,
+    K_6 = 0x17,
+    K_7 = 0x18,
+    K_8 = 0x19,
+    K_9 = 0x1A,
+    K_0 = 0x1B,
+    K_MINUS = 0x1C,
+    K_EQUAL = 0x1D,
+    K_BACKSPACE = 0x1E,
+    K_INSERT = 0x1F,
+    K_HOME = 0x20,
+    K_PAGE_UP = 0x21,
+    K_NUM_LOCK = 0x22,
+    K_NUMPAD_DIVIDE = 0x23,
+    K_NUMPAD_MULTIPLY = 0x24,
+    K_NUMPAD_SUBTRACT = 0x25,
+    // keyboard ROW 3 (QWERTY, + NUMPAD)
+    K_TAB = 0x26,
+    K_Q = 0x27,
+    K_W = 0x28,
+    K_E = 0x29,
+    K_R = 0x2A,
+    K_T = 0x2B,
+    K_Y = 0x2C,
+    K_U = 0x2D,
+    K_I = 0x2E,
+    K_O = 0x2F,
+    K_P = 0x30,
+    K_LEFT_BRACKET = 0x31,
+    K_RIGHT_BRACKET = 0x32,
+    K_ENTER = 0x33,
+    K_DELETE = 0x34,
+    K_END = 0x35,
+    K_PAGE_DOWN = 0x36,
+    K_NUMPAD_7 = 0x37,
+    K_NUMPAD_8 = 0x38,
+    K_NUMPAD_9 = 0x39,
+    K_NUMPAD_ADD = 0x3A,
+    // keyboard ROW 4 (QWERTY, + NUMPAD)
+    K_CAPS_LOCK = 0x3B,
+    K_A = 0x3C,
+    K_S = 0x3D,
+    K_D = 0x3E,
+    K_F = 0x3F,
+    K_G = 0x40,
+    K_H = 0x41,
+    K_J = 0x42,
+    K_K = 0x43,
+    K_L = 0x44,
+    K_SEMICOLON = 0x45,
+    K_APOSTROPHE = 0x46,
+    K_BACKSLASH = 0x47,
+    K_NUMPAD_4 = 0x48,
+    K_NUMPAD_5 = 0x49,
+    K_NUMPAD_6 = 0x4A,
+    
+    // keyboard ROW 5 (QWERTY, + NUMPAD)
+    K_LEFT_SHIFT = 0x4B,
+    K_Z = 0x4C,
+    K_X = 0x4D,
+    K_C = 0x4E,
+    K_V = 0x4F,
+    K_B = 0x50,
+    K_N = 0x51,
+    K_M = 0x52,
+    K_COMMA = 0x53,
+    K_PERIOD = 0x54,
+    K_SLASH = 0x55,
+    K_RIGHT_SHIFT = 0x56,
+    K_UP_ARROW = 0x57,
+    K_NUMPAD_1 = 0x58,
+    K_NUMPAD_2 = 0x59,
+    K_NUMPAD_3 = 0x5A,
+    K_NUMPAD_ENTER = 0x5B,
+    // keyboard ROW 6 (QWERTY, + NUMPAD)
+    K_LEFT_CTRL = 0x5C,
+    K_SUPER = 0x5D,
+    K_LEFT_ALT = 0x5E,
+    K_SPACE = 0x5F,
+    K_RIGHT_ALT_GR = 0x60,
+    K_RIGHT_CTRL = 0x61,
+    K_LEFT_ARROW = 0x62,
+    K_DOWN_ARROW = 0x63,
+    K_RIGHT_ARROW = 0x64,
+    K_NUMPAD_0 = 0x65,
+    K_NUMPAD_DELETE = 0x66,
+    
+    // Media Keys
+    K_MEDIA_MUTE = 0x67,
+    K_MEDIA_VOLUME_DOWN = 0x68,
+    K_MEDIA_VOLUME_UP = 0x69,
+    K_MEDIA_PLAY_BACK = 0x6A,
+    K_MEDIA_PLAY_PAUSE = 0x6B,
+    K_MEDIA_PLAY_FORWARD = 0x6C,
+
+} key_scancodes_t;
+
+typedef enum {
+    KEY_RELEASED = 0,
+    KEY_PRESSED = 1
+} key_state_t;
+
+typedef struct {
+    uint8_t shift_l : 1;
+    uint8_t shift_r : 1;
+    uint8_t ctrl_l : 1;
+    uint8_t ctrl_r : 1;
+    uint8_t alt_l : 1;
+    uint8_t alt_r : 1;
+    uint8_t super : 1;
+    uint8_t caps_lock : 1;
+
+} modifier_state_t;
+
+typedef struct {
+    key_scancodes_t scancode;
+    key_state_t state;
+    modifier_state_t modifiers;
+} key_event_t;
+
+// mouse
+
+typedef enum {
+    MOUSE_BUTTON_LEFT = 0x01,
+    MOUSE_BUTTON_RIGHT = 0x02,
+    MOUSE_BUTTON_MIDDLE = 0x04,
+    MOUSE_BUTTON_BACK = 0x08,
+    MOUSE_BUTTON_FORWARD = 0x10
+} mouse_button_t;
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+    int32_t wheel_delta; // For mouse wheel events
+    mouse_button_t button_state; // what button pressed (LMB, RMB, MMB, etc.)
+} mouse_event_t;
+
+//GAMEPAD
+
+typedef enum {
+    BTN_PRESSED = 0,
+    BTN_RELEASED = 1
+} btn_state_t;
+
+typedef struct {
+    btn_state_t a;
+    btn_state_t b;
+    btn_state_t x;
+    btn_state_t y;
+    btn_state_t left_bumper;
+    btn_state_t right_bumper;
+    btn_state_t back;
+    btn_state_t start;
+    btn_state_t left_stick;
+    btn_state_t right_stick;
+    btn_state_t left_trigger;
+    btn_state_t right_trigger;
+} gamepad_buttons_t;
+
+typedef struct {
+    uint16_t stick_x; // 0-65535
+    uint16_t stick_y; // 0-65535
+} analog_stick_t;
+
+typedef struct {
+    analog_stick_t left_stick;
+    analog_stick_t right_stick;
+    gamepad_buttons_t buttons;
+} gamepad_event_t;
+
+#endif // G_SCANCODES_H

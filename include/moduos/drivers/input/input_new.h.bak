@@ -1,0 +1,56 @@
+#ifndef INPUT_NEW_H
+#define INPUT_NEW_H
+
+#include "moduos/drivers/input/gscancode.h"
+
+#define DEVFS_INPUT_SUBSYSTEM_PATH "$/dev/n_input/"
+#define MAX_INPUT_DEVICES 32
+#define INPUT_EVENT_QUEUE_SIZE 64
+#define INPUT_NODE_NAME_MAX 16
+
+typedef enum {
+    DEVICE_TYPE_PS2_KEYBOARD,
+    DEVICE_TYPE_USB_KEYBOARD,
+    DEVICE_TYPE_PS2_MOUSE,
+    DEVICE_TYPE_USB_MOUSE,
+    DEVICE_TYPE_TOUCHSCREEN,
+    DEVICE_TYPE_GAMEPAD,
+    DEVICE_TYPE_UNKNOWN
+} device_type_t;
+
+/* one event's worth of raw payload; which member is valid is derived
+ * from the owning device's `type` at read time, so no tag is stored here */
+typedef union {
+    key_event_t key;
+    mouse_event_t mouse;
+    gamepad_event_t gamepad;
+} raw_input_event_t;
+
+typedef struct {
+    raw_input_event_t data;
+} queued_input_event_t;
+
+typedef struct {
+    const char* device_name;
+    device_type_t type;
+    uint64_t secret_id; // Unique identifier for the device, used for authentication
+
+    char node_name[INPUT_NODE_NAME_MAX]; // e.g. "kbd0", filled in on register
+
+    // single-producer (IRQ/driver) / single-consumer (devfs read) ring buffer
+    queued_input_event_t queue[INPUT_EVENT_QUEUE_SIZE];
+    uint32_t queue_head; // consumer-owned
+    uint32_t queue_tail; // producer-owned
+    uint32_t dropped_count; // incremented when enqueue_event() overwrites unread events
+} input_device_t;
+
+int init_new_input(void);
+
+void push_key_event(key_event_t event, input_device_t* device);
+void push_mouse_event(mouse_event_t event, input_device_t* device);
+void push_gamepad_event(gamepad_event_t event, input_device_t* device);
+
+int register_input_device(input_device_t* device);
+int remove_input_device(input_device_t* device);
+
+#endif // INPUT_NEW_H

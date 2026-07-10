@@ -1,0 +1,12 @@
+#ifndef KERNEL_DRIVER_NEW_PS2_H
+#define KERNEL_DRIVER_NEW_PS2_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+int ps2_new_init(void);
+void kbd_irq_handler(void);
+
+
+#endif // KERNEL_DRIVER_NEW_PS2_H
