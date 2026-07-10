@@ -1,0 +1,448 @@
+#include "moduos/kernel/io/io.h"
+#include "moduos/drivers/input/ps2/ports.h"
+#include "moduos/drivers/input/ps2/scancodes.h"
+#include "moduos/drivers/input/gscancode.h"
+#include "moduos/arch/AMD64/interrupts/pic.h"
+#include "moduos/drivers/input/ps2/ps2_new.h"
+#include "moduos/drivers/input/input_new.h"
+#include "moduos/kernel/macros.h"
+
+/* ---------------------------------------------------------------------- *
+ * Low level port helpers (built on top of ports.h's PS2_DATA_PORT /
+ * PS2_COMMAND_PORT / PS2_STATUS_OUTPUT_BUFFER / PS2_STATUS_INPUT_BUFFER)
+ * ---------------------------------------------------------------------- */
+static inline void ps2_wait_input_clear(void) {
+    // wait until controller is ready to accept a command/data byte
+    while (inb(PS2_COMMAND_PORT) & PS2_STATUS_INPUT_BUFFER) { }
+}
+
+static inline void ps2_wait_output_full(void) {
+    // wait until controller has a byte ready for us to read
+    while (!(inb(PS2_COMMAND_PORT) & PS2_STATUS_OUTPUT_BUFFER)) { }
+}
+
+static inline void ps2_flush_output_buffer(void) {
+    while (inb(PS2_COMMAND_PORT) & PS2_STATUS_OUTPUT_BUFFER) {
+        (void)inb(PS2_DATA_PORT);
+    }
+}
+
+static void ps2_send_command(uint8_t cmd) {
+    ps2_wait_input_clear();
+    outb(PS2_COMMAND_PORT, cmd);
+}
+
+static uint8_t ps2_read_data(void) {
+    ps2_wait_output_full();
+    return inb(PS2_DATA_PORT);
+}
+
+static void ps2_write_data(uint8_t data) {
+    ps2_wait_input_clear();
+    outb(PS2_DATA_PORT, data);
+}
+
+/* ---------------------------------------------------------------------- *
+ * A crude "unique-enough" id source for device secret_id, since there's
+ * no RNG hooked up yet. Reads the CPU timestamp counter.
+ * ---------------------------------------------------------------------- */
+static inline uint64_t read_tsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* ---------------------------------------------------------------------- *
+ * Input subsystem device registration
+ * ---------------------------------------------------------------------- */
+static input_device_t ps2_keyboard_device = {
+    .device_name = "PS/2 Keyboard",
+    .type = DEVICE_TYPE_PS2_KEYBOARD,
+    .secret_id = 0, // filled in at init time with read_tsc()
+};
+
+/* ---------------------------------------------------------------------- *
+ * Controller + first-port (keyboard) initialization
+ * ---------------------------------------------------------------------- */
+
+// return true on success
+int ps2_new_init(void) {
+    // 1. Disable both ports while we configure the controller
+    COM_LOG_INFO(COM1_PORT, "Disable both ports while we configure the controller");
+    ps2_send_command(PS2_CMD_DISABLE_PORT1);
+    ps2_send_command(PS2_CMD_DISABLE_PORT2);
+
+    // 2. Flush anything left sitting in the output buffer
+    COM_LOG_INFO(COM1_PORT, "Flushing output buffer");
+    ps2_flush_output_buffer();
+
+    // 3. Read the controller config byte, disable IRQs + translation while
+    //    we finish setup, then write it back
+    COM_LOG_INFO(COM1_PORT, "Disabling IRQs + translation in controller config byte");
+    ps2_send_command(PS2_CMD_READ_CONFIG);
+    uint8_t config = ps2_read_data();
+    config &= ~(PS2_CONFIG_PORT1_IRQ_EN | PS2_CONFIG_PORT2_IRQ_EN | PS2_CONFIG_PORT1_TRANSLATE);
+    ps2_send_command(PS2_CMD_WRITE_CONFIG);
+    ps2_write_data(config);
+
+    // 4. Controller self-test
+    COM_LOG_INFO(COM1_PORT, "Performing controller self-test");
+    ps2_send_command(PS2_CMD_SELF_TEST);
+    if (ps2_read_data() != PS2_SELF_TEST_PASS) {
+        return -1;
+    }
+
+    COM_LOG_INFO(COM1_PORT, "Interface test for port 1 (the keyboard port)");
+    // 5. Interface test for port 1 (the keyboard port)
+    ps2_send_command(PS2_CMD_TEST_PORT1);
+    if (ps2_read_data() != PS2_PORT_TEST_PASS) {
+        return -1;
+    }
+
+    COM_LOG_INFO(COM1_PORT, "Enabling port 1 (the keyboard port)");
+    // 6. Enable port 1
+    ps2_send_command(PS2_CMD_ENABLE_PORT1);
+
+    COM_LOG_INFO(COM1_PORT, "Resetting the keyboard itself");
+    // 7. Reset the keyboard itself
+    ps2_write_data(KB_CMD_RESET);
+    uint8_t r1 = ps2_read_data();
+    uint8_t r2 = ps2_read_data();
+    if (!((r1 == KB_RESP_ACK && r2 == KB_RESP_SELF_TEST_OK) ||
+          (r1 == KB_RESP_SELF_TEST_OK && r2 == KB_RESP_ACK))) {
+        return -1;
+    }
+
+    COM_LOG_INFO(COM1_PORT, "Force scan code set 2");
+    // 8. Force scan code set 2
+    ps2_write_data(KB_CMD_SET_SCANCODE_SET);
+    if (ps2_read_data() != KB_RESP_ACK) return -1;
+    ps2_write_data(0x02);
+    if (ps2_read_data() != KB_RESP_ACK) return -1;
+
+    COM_LOG_INFO(COM1_PORT, "Enabling scanning (device actually starts sending key events)");
+    // 9. Enable scanning (device actually starts sending key events)
+    ps2_write_data(KB_CMD_ENABLE_SCANNING);
+    if (ps2_read_data() != KB_RESP_ACK) return -1;
+
+    COM_LOG_INFO(COM1_PORT, "Re-enable port 1 IRQ in the controller config byte");
+    // 10. Re-enable port 1 IRQ in the controller config byte
+    ps2_send_command(PS2_CMD_READ_CONFIG);
+    config = ps2_read_data();
+    config |= PS2_CONFIG_PORT1_IRQ_EN;
+    ps2_send_command(PS2_CMD_WRITE_CONFIG);
+    ps2_write_data(config);
+    
+    // 11. Register this device with the input subsystem so push_key_event
+    //     has somewhere to deliver events.
+    COM_LOG_INFO(COM1_PORT, "Registering PS/2 keyboard device with input subsystem\n");
+    ps2_keyboard_device.secret_id = read_tsc();
+    if (register_input_device(&ps2_keyboard_device) != 0) {
+        return -1;
+    }
+
+    COM_LOG_INFO(COM1_PORT, "Unmasking IRQ1 (keyboard) at the PIC");
+    // 12. Unmask IRQ1 (keyboard) at the PIC.
+    pic_unmask_irq(1);
+
+    return 0;
+}
+
+/* ---------------------------------------------------------------------- *
+ * PS/2 Scan Code Set 2 -> gscancode_t translation
+ *
+ * `extended` = true means this byte was preceded by a 0xE0 prefix
+ * (arrows, right ctrl/alt, insert/home/etc, numpad enter/divide, GUI keys).
+ *
+ * Print Screen and Pause are multi-byte sequences that don't fit a
+ * single-byte lookup — they're fully intercepted by the state machine
+ * in keyboard_irq_handler() below and never reach this function.
+ * ---------------------------------------------------------------------- */
+static key_scancodes_t ps2_set2_to_gscancode(uint8_t scancode, bool extended) {
+    if (!extended) {
+        switch (scancode) {
+            // Row 1
+            case 0x76: return K_ESC;
+            case 0x05: return K_F1;
+            case 0x06: return K_F2;
+            case 0x04: return K_F3;
+            case 0x0C: return K_F4;
+            case 0x03: return K_F5;
+            case 0x0B: return K_F6;
+            case 0x83: return K_F7;
+            case 0x0A: return K_F8;
+            case 0x01: return K_F9;
+            case 0x09: return K_F10;
+            case 0x78: return K_F11;
+            case 0x07: return K_F12;
+            case 0x7E: return K_SCROLL_LOCK;
+
+            // Row 2
+            case 0x0E: return K_TILDE;
+            case 0x16: return K_1;
+            case 0x1E: return K_2;
+            case 0x26: return K_3;
+            case 0x25: return K_4;
+            case 0x2E: return K_5;
+            case 0x36: return K_6;
+            case 0x3D: return K_7;
+            case 0x3E: return K_8;
+            case 0x46: return K_9;
+            case 0x45: return K_0;
+            case 0x4E: return K_MINUS;
+            case 0x55: return K_EQUAL;
+            case 0x66: return K_BACKSPACE;
+            case 0x77: return K_NUM_LOCK;
+            case 0x7C: return K_NUMPAD_MULTIPLY;
+            case 0x7B: return K_NUMPAD_SUBTRACT;
+
+            // Row 3
+            case 0x0D: return K_TAB;
+            case 0x15: return K_Q;
+            case 0x1D: return K_W;
+            case 0x24: return K_E;
+            case 0x2D: return K_R;
+            case 0x2C: return K_T;
+            case 0x35: return K_Y;
+            case 0x3C: return K_U;
+            case 0x43: return K_I;
+            case 0x44: return K_O;
+            case 0x4D: return K_P;
+            case 0x54: return K_LEFT_BRACKET;
+            case 0x5B: return K_RIGHT_BRACKET;
+            case 0x5D: return K_BACKSLASH;
+            case 0x5A: return K_ENTER;
+            case 0x6C: return K_NUMPAD_7;
+            case 0x75: return K_NUMPAD_8;
+            case 0x7D: return K_NUMPAD_9;
+            case 0x79: return K_NUMPAD_ADD;
+
+            // Row 4
+            case 0x58: return K_CAPS_LOCK;
+            case 0x1C: return K_A;
+            case 0x1B: return K_S;
+            case 0x23: return K_D;
+            case 0x2B: return K_F;
+            case 0x34: return K_G;
+            case 0x33: return K_H;
+            case 0x3B: return K_J;
+            case 0x42: return K_K;
+            case 0x4B: return K_L;
+            case 0x4C: return K_SEMICOLON;
+            case 0x52: return K_APOSTROPHE;
+            case 0x6B: return K_NUMPAD_4;
+            case 0x73: return K_NUMPAD_5;
+            case 0x74: return K_NUMPAD_6;
+
+            // Row 5
+            case 0x12: return K_LEFT_SHIFT;
+            case 0x1A: return K_Z;
+            case 0x22: return K_X;
+            case 0x21: return K_C;
+            case 0x2A: return K_V;
+            case 0x32: return K_B;
+            case 0x31: return K_N;
+            case 0x3A: return K_M;
+            case 0x41: return K_COMMA;
+            case 0x49: return K_PERIOD;
+            case 0x4A: return K_SLASH;   // non-extended 0x4A is plain Slash;
+                                          // real numpad divide always arrives as E0 4A.
+            case 0x59: return K_RIGHT_SHIFT;
+            case 0x69: return K_NUMPAD_1;
+            case 0x72: return K_NUMPAD_2;
+            case 0x7A: return K_NUMPAD_3;
+
+            // Row 6
+            case 0x14: return K_LEFT_CTRL;
+            case 0x11: return K_LEFT_ALT;
+            case 0x29: return K_SPACE;
+            case 0x70: return K_NUMPAD_0;
+            case 0x71: return K_NUMPAD_DELETE;
+
+            default: return K_NONE;
+        }
+    }
+
+    // extended (0xE0-prefixed) byte
+    switch (scancode) {
+        case 0x14: return K_RIGHT_CTRL;
+        case 0x11: return K_RIGHT_ALT_GR;
+        case 0x1F: return K_SUPER;   // Left GUI
+        case 0x27: return K_SUPER;   // Right GUI
+        case 0x2F: return K_NONE;    // "Apps"/Menu key, no gscancode slot yet
+
+        case 0x70: return K_INSERT;
+        case 0x6C: return K_HOME;
+        case 0x7D: return K_PAGE_UP;
+        case 0x71: return K_DELETE;
+        case 0x69: return K_END;
+        case 0x7A: return K_PAGE_DOWN;
+
+        case 0x75: return K_UP_ARROW;
+        case 0x6B: return K_LEFT_ARROW;
+        case 0x72: return K_DOWN_ARROW;
+        case 0x74: return K_RIGHT_ARROW;
+
+        case 0x4A: return K_NUMPAD_DIVIDE;
+        case 0x5A: return K_NUMPAD_ENTER;
+
+        // Media keys (typical Set 2 extended codes)
+        case 0x23: return K_MEDIA_MUTE;
+        case 0x21: return K_MEDIA_VOLUME_DOWN;
+        case 0x32: return K_MEDIA_VOLUME_UP;
+        case 0x15: return K_MEDIA_PLAY_BACK;
+        case 0x34: return K_MEDIA_PLAY_PAUSE;
+        case 0x4D: return K_MEDIA_PLAY_FORWARD;
+
+        default: return K_NONE;
+    }
+}
+
+/* ---------------------------------------------------------------------- *
+ * IRQ handler
+ * ---------------------------------------------------------------------- */
+
+static modifier_state_t modifiers = {0};
+
+static bool is_extended = false;   // saw 0xE0 prefix, next byte is extended
+static bool is_break = false;      // saw 0xF0 prefix, next byte is a "released" event
+
+// Multi-byte sequences that don't fit the normal prefix+code model:
+//   Pause:        E1 14 77 E1 F0 14 F0 77   (single burst, no break code)
+//   PrintScreen makes/breaks as two chained extended codes:
+//     make:  E0 12 E0 7C
+//     break: E0 F0 7C E0 F0 12
+typedef enum {
+    SPECIAL_NONE = 0,
+    SPECIAL_PAUSE,
+    SPECIAL_PRTSC_MAKE,
+    SPECIAL_PRTSC_BREAK
+} special_seq_t;
+
+static special_seq_t special = SPECIAL_NONE;
+static uint8_t special_step = 0;
+
+static void emit_key_event(key_scancodes_t code, key_state_t state) {
+    if (code == K_NONE) return;
+
+    switch (code) {
+        case K_LEFT_SHIFT:    modifiers.shift_l   = (state == KEY_PRESSED); break;
+        case K_RIGHT_SHIFT:   modifiers.shift_r   = (state == KEY_PRESSED); break;
+        case K_LEFT_CTRL:     modifiers.ctrl_l    = (state == KEY_PRESSED); break;
+        case K_RIGHT_CTRL:    modifiers.ctrl_r    = (state == KEY_PRESSED); break;
+        case K_LEFT_ALT:      modifiers.alt_l     = (state == KEY_PRESSED); break;
+        case K_RIGHT_ALT_GR:  modifiers.alt_r     = (state == KEY_PRESSED); break;
+        case K_SUPER:         modifiers.super     = (state == KEY_PRESSED); break;
+        case K_CAPS_LOCK:
+            // caps lock is a toggle, only flip on press (not release)
+            if (state == KEY_PRESSED) modifiers.caps_lock ^= 1;
+            break;
+        default: break;
+    }
+
+    key_event_t event = {
+        .scancode = code,
+        .state = state,
+        .modifiers = modifiers,
+    };
+    push_key_event(event, &ps2_keyboard_device);
+}
+
+// this will just deliver SCANCODES to the input subsystem, not characters and will NOT print the character that got pressed.
+
+void kbd_irq_handler(void) {
+    uint8_t byte = inb(PS2_DATA_PORT);
+
+    // ---- continuing a multi-byte special sequence already in progress ----
+    if (special == SPECIAL_PAUSE) {
+        static const uint8_t pause_rest[] = { 0x14, 0x77, 0xE1, 0xF0, 0x14, 0xF0, 0x77 };
+        if (byte == pause_rest[special_step]) {
+            special_step++;
+            if (special_step == sizeof(pause_rest)) {
+                // Pause has no break code on real hardware; deliver a
+                // single press event for it.
+                emit_key_event(K_PAUSE, KEY_PRESSED);
+                special = SPECIAL_NONE;
+                special_step = 0;
+            }
+        } else {
+            // malformed/unexpected byte, drop the partial sequence
+            special = SPECIAL_NONE;
+            special_step = 0;
+        }
+        return;
+    }
+
+    if (special == SPECIAL_PRTSC_MAKE) {
+        static const uint8_t rest[] = { 0xE0, 0x7C };
+        if (byte == rest[special_step]) {
+            special_step++;
+            if (special_step == sizeof(rest)) {
+                emit_key_event(K_PRINT_SCREEN, KEY_PRESSED);
+                special = SPECIAL_NONE;
+                special_step = 0;
+            }
+        } else {
+            special = SPECIAL_NONE;
+            special_step = 0;
+        }
+        return;
+    }
+
+    if (special == SPECIAL_PRTSC_BREAK) {
+        static const uint8_t rest[] = { 0xE0, 0xF0, 0x12 };
+        if (byte == rest[special_step]) {
+            special_step++;
+            if (special_step == sizeof(rest)) {
+                emit_key_event(K_PRINT_SCREEN, KEY_RELEASED);
+                special = SPECIAL_NONE;
+                special_step = 0;
+            }
+        } else {
+            special = SPECIAL_NONE;
+            special_step = 0;
+        }
+        return;
+    }
+
+    // ---- not mid-sequence: check for sequence starters ----
+    if (byte == 0xE1) {
+        special = SPECIAL_PAUSE;
+        special_step = 0;
+        return;
+    }
+
+    if (byte == 0xE0) {
+        is_extended = true;
+        return;
+    }
+    if (byte == 0xF0) {
+        is_break = true;
+        return;
+    }
+
+    // Print Screen make begins as an extended 0x12 (E0 12 ...)
+    if (is_extended && !is_break && byte == 0x12) {
+        special = SPECIAL_PRTSC_MAKE;
+        special_step = 0;
+        is_extended = false;
+        return;
+    }
+    // Print Screen break begins as an extended break of 0x7C (E0 F0 7C ...)
+    if (is_extended && is_break && byte == 0x7C) {
+        special = SPECIAL_PRTSC_BREAK;
+        special_step = 0;
+        is_extended = false;
+        is_break = false;
+        return;
+    }
+
+    // ---- ordinary single-byte code ----
+    key_scancodes_t code = ps2_set2_to_gscancode(byte, is_extended);
+    key_state_t state = is_break ? KEY_RELEASED : KEY_PRESSED;
+    emit_key_event(code, state);
+
+    // reset prefix state for the next byte sequence
+    is_extended = false;
+    is_break = false;
+}

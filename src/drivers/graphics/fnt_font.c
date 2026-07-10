@@ -231,24 +231,95 @@ void fnt_render_glyph(const fnt_glyph_t *glyph, void *fb,
     }
 }
 
+/* UTF-8 decoder — decodes one codepoint from *str, advances the pointer.
+ * Returns the codepoint, or 0xFFFD (replacement char) on invalid sequences. */
+static uint32_t utf8_next(const char **str) {
+    const uint8_t *s = (const uint8_t *)*str;
+    uint32_t cp;
+    int bytes;
+
+    if (!s || !*s) return 0;
+
+    if (*s < 0x80) {
+        /* 0xxxxxxx — single byte ASCII */
+        cp    = *s;
+        bytes = 1;
+    } else if ((*s & 0xE0) == 0xC0) {
+        /* 110xxxxx 10xxxxxx — 2 bytes */
+        cp    = *s & 0x1F;
+        bytes = 2;
+    } else if ((*s & 0xF0) == 0xE0) {
+        /* 1110xxxx 10xxxxxx 10xxxxxx — 3 bytes */
+        cp    = *s & 0x0F;
+        bytes = 3;
+    } else if ((*s & 0xF8) == 0xF0) {
+        /* 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx — 4 bytes */
+        cp    = *s & 0x07;
+        bytes = 4;
+    } else {
+        /* Invalid lead byte */
+        *str += 1;
+        return 0xFFFD;
+    }
+
+    /* Validate and consume continuation bytes */
+    for (int i = 1; i < bytes; i++) {
+        if ((s[i] & 0xC0) != 0x80) {
+            /* Invalid continuation byte — skip the lead byte only */
+            *str += 1;
+            return 0xFFFD;
+        }
+        cp = (cp << 6) | (s[i] & 0x3F);
+    }
+
+    /* Reject overlong encodings and surrogate halves */
+    if ((bytes == 2 && cp < 0x80)   ||
+        (bytes == 3 && cp < 0x800)  ||
+        (bytes == 4 && cp < 0x10000)||
+        (cp >= 0xD800 && cp <= 0xDFFF) ||
+        (cp > 0x10FFFF)) {
+        *str += 1;
+        return 0xFFFD;
+    }
+
+    *str += bytes;
+    return cp;
+}
+
 int fnt_string_width(fnt_font_t *font, const char *text) {
     if (!font || !text) return 0;
-    
+
     int width = 0;
-    
     while (*text) {
-        /* Simple ASCII for now (TODO: proper UTF-8 decoding) */
-        uint32_t codepoint = (uint8_t)*text;
-        text++;
-        
-        fnt_glyph_t *glyph = fnt_get_glyph(font, codepoint);
+        uint32_t cp = utf8_next(&text);
+        if (cp == 0) break;
+
+        fnt_glyph_t *glyph = fnt_get_glyph(font, cp);
+        width += glyph ? glyph->width : font->header.glyph_width / 2;
+    }
+    return width;
+}
+
+void fnt_render_string(fnt_font_t *font, const char *text,
+                       void *fb, int x, int y, int pitch, int bpp,
+                       uint32_t fg_color, uint32_t bg_color) {
+    if (!font || !text || !fb) return;
+
+    int cx = x;
+    while (*text) {
+        uint32_t cp = utf8_next(&text);
+        if (cp == 0) break;
+
+        fnt_glyph_t *glyph = fnt_get_glyph(font, cp);
+        if (!glyph) {
+            /* Fall back to replacement char U+FFFD, then a box */
+            glyph = fnt_get_glyph(font, 0xFFFD);
+        }
         if (glyph) {
-            width += glyph->width;
+            fnt_render_glyph(glyph, fb, cx, y, pitch, bpp, fg_color, bg_color);
+            cx += glyph->width;
         } else {
-            /* Use default width for missing glyphs */
-            width += font->header.glyph_width / 2;
+            cx += font->header.glyph_width / 2;
         }
     }
-    
-    return width;
 }

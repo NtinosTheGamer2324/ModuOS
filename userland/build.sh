@@ -165,8 +165,26 @@ for obj in "$BUILD_DIR"/*.o; do
             ;;
         paintgfx)
             bin="$DIST_DIR/${base}.sqr"
-            echo "[BUILD] LD(app static gfx2d) $obj + lib_gfx2d.o -> $bin"
-            "$LD" "$obj" "$BUILD_DIR/lib_gfx2d.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+            echo "[BUILD] LD(app static gfx2d) $obj + lib_nodgl.o + lib_gfx2d.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        ilib_viewer)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static gfx2d) $obj + lib_nodgl.o + lib_gfx2d.o + lib_fnt.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        imgview)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static gfx2d) $obj + lib_nodgl.o + lib_gfx2d.o + lib_fnt.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        tvd_player)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static gfx2d) $obj + lib_nodgl.o + lib_gfx2d.o + lib_fnt.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
         pakman)
@@ -196,10 +214,36 @@ for obj in "$BUILD_DIR"/*.o; do
             "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
-        calcgfx|snakegfx|raygfx|froggergfx|gfxclock|imgviewer|mousedemo|sysmon|miniwm|neontank|gfxtest|dvdbounce)
+        nodds)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static NodGL) $obj + lib_NodGL.o + lib_gfx2d.o + lib_fnt.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        nodds_demo)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static NodGL) $obj + nodds_client.o + lib_fnt.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/nodds_client.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+            
+        calcgfx|snakegfx|raygfx|froggergfx|gfxclock|mousedemo|sysmon|miniwm|neontank|gfxtest)
             bin="$DIST_DIR/${base}.sqr"
             echo "[BUILD] LD(app static NodGL) $obj + lib_NodGL.o + lib_gfx2d.o -> $bin"
             "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+
+        screensaver)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static NodGL) $obj + lib_NodGL.o + lib_gfx2d.o + lib_fnt.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        maze2d)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static NodGL) $obj + lib_NodGL.o + lib_gfx2d.o + lib_fnt.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
         NodGL_demo|NodGL_benchmark|NodGL_triangle|NodGL_stress_test|NodGLDiag)

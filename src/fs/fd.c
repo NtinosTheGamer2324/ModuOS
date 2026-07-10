@@ -14,6 +14,7 @@
 #include "moduos/fs/userfs.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/fs/MDFS/mdfs.h"
+#include "moduos/kernel/errno.h"
 
 /* Pipe ring buffer — shared between read and write fd entries. */
 #define PIPE_BUF_SIZE 4096
@@ -980,6 +981,49 @@ int fd_pipe(int fds[2]) {
     fds[0] = rfd;
     fds[1] = wfd;
     return 0;
+}
+
+/* fcntl() — get/set file descriptor flags.
+ *
+ * F_GETFL: returns the current flags as a user-space O_* bitmask.
+ * F_SETFL: sets flags from a user-space O_* bitmask.
+ *          Only O_NONBLOCK (0x0800) is acted on; other bits are ignored.
+ *
+ * This allows userspace to do:
+ *   fcntl(fd, F_SETFL, O_NONBLOCK)   — make pipe read non-blocking
+ *   fcntl(fd, F_GETFL, 0)            — query current flags
+ */
+int fd_fcntl(int fd, int cmd, int arg) {
+    fd_init();
+    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use)
+        return -EBADF;
+
+    switch (cmd) {
+        case F_GETFL: {
+            /* Translate internal flags back to O_* */
+            int oflags = 0;
+            if ((fd_table[fd].flags & FD_FLAG_READ) &&
+                (fd_table[fd].flags & FD_FLAG_WRITE))
+                oflags |= 2; /* O_RDWR */
+            else if (fd_table[fd].flags & FD_FLAG_WRITE)
+                oflags |= 1; /* O_WRONLY */
+            /* else O_RDONLY = 0 */
+            if (fd_table[fd].flags & FD_FLAG_APPEND)   oflags |= 0x0400;
+            if (fd_table[fd].flags & FD_FLAG_NONBLOCK)  oflags |= 0x0800;
+            return oflags;
+        }
+
+        case F_SETFL:
+            /* Only O_NONBLOCK (0x0800) is supported via F_SETFL */
+            if (arg & 0x0800)
+                fd_table[fd].flags |= FD_FLAG_NONBLOCK;
+            else
+                fd_table[fd].flags &= ~FD_FLAG_NONBLOCK;
+            return 0;
+
+        default:
+            return -EINVAL;
+    }
 }
 
 /* Close all FDs for a process */

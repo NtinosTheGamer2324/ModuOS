@@ -5,6 +5,8 @@
 #include "moduos/drivers/Drive/SATA/satapi.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/macros.h"
+#include "moduos/fs/devfs.h"
+#include "moduos/fs/fs.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include <stddef.h>
@@ -393,6 +395,195 @@ static int vdrive_register_sata_drive(int sata_port, const sata_device_t *sata_d
     return vdrive_id;
 }
 
+// Drive Info.
+typedef struct {
+    uint8_t vdrive_id;
+    int     offset;
+} vdrive_info_open_t;
+
+static void *vdrive_info_open(void *ctx, int flags) {
+    (void)flags;
+    // ctx is the vdrive_devfs_ctx_t we passed at register time
+    uint8_t id = *(uint8_t *)ctx;
+    vdrive_info_open_t *h = kmalloc(sizeof(vdrive_info_open_t));
+    if (!h) return NULL;
+    h->vdrive_id = id;
+    h->offset    = 0;
+    return h;
+}
+
+static ssize_t vdrive_info_read(void *ctx, void *buf, size_t count) {
+    vdrive_info_open_t *h = (vdrive_info_open_t *)ctx;
+    vdrive_t *d = vdrive_get(h->vdrive_id);
+    if (!d || !d->present) return -1;
+
+    char info[2048];
+    int n = 0;
+
+    // ── Basic drive info ──────────────────────────────────────────────
+    n += snprintf(info + n, sizeof(info) - n,
+        "vdrive_id:     %u\n"
+        "model:         %s\n"
+        "serial:        %s\n"
+        "type:          %s\n"
+        "backend:       %s\n"
+        "backend_id:    %u\n"
+        "status:        %s\n"
+        "sector_size:   %u\n"
+        "total_sectors: %llu\n"
+        "capacity_mb:   %llu\n"
+        "capacity_gb:   %llu\n"
+        "lba48:         %u\n"
+        "dma:           %u\n"
+        "read_only:     %u\n"
+        "reads:         %llu\n"
+        "writes:        %llu\n"
+        "errors:        %llu\n",
+        (unsigned)d->vdrive_id,
+        d->model[0]  ? d->model  : "(unknown)",
+        d->serial[0] ? d->serial : "(none)",
+        vdrive_get_type_string(d->type),
+        vdrive_get_backend_string(d->backend),
+        (unsigned)d->backend_id,
+        vdrive_get_status_string(d->status),
+        (unsigned)d->sector_size,
+        (unsigned long long)d->total_sectors,
+        (unsigned long long)d->capacity_mb,
+        (unsigned long long)d->capacity_gb,
+        (unsigned)d->supports_lba48,
+        (unsigned)d->supports_dma,
+        (unsigned)d->read_only,
+        (unsigned long long)d->reads,
+        (unsigned long long)d->writes,
+        (unsigned long long)d->errors
+    );
+
+    // ── MBR partition table ───────────────────────────────────────────
+    n += snprintf(info + n, sizeof(info) - n, "partitions:    4\n");
+
+    for (int p = 1; p <= 4; p++) {
+        uint32_t start_lba = 0, sectors = 0;
+        uint8_t  mbr_type  = 0;
+        int rc = fs_mbr_get_partition(d->vdrive_id, p, &start_lba, &sectors, &mbr_type);
+
+        if (rc != 0 || sectors == 0) {
+            n += snprintf(info + n, sizeof(info) - n,
+                "part%d_present:  0\n", p);
+            continue;
+        }
+
+        // Human-readable MBR type string
+        const char *type_str = "unknown";
+        switch (mbr_type) {
+            case 0x00: type_str = "empty";    break;
+            case 0x0B: type_str = "fat32";    break;
+            case 0x0C: type_str = "fat32lba"; break;
+            case 0x83: type_str = "linux";    break;
+            case 0xE1: type_str = "mdfs";     break;
+            case 0xCD: type_str = "iso9660";  break;
+        }
+
+        uint64_t part_mb = ((uint64_t)sectors * d->sector_size) / (1024 * 1024);
+
+        n += snprintf(info + n, sizeof(info) - n,
+            "part%d_present:  1\n"
+            "part%d_lba:      %u\n"
+            "part%d_sectors:  %u\n"
+            "part%d_mb:       %llu\n"
+            "part%d_type:     0x%02X\n"
+            "part%d_fs:       %s\n",
+            p,
+            p, (unsigned)start_lba,
+            p, (unsigned)sectors,
+            p, (unsigned long long)part_mb,
+            p, (unsigned)mbr_type,
+            p, type_str
+        );
+
+        // Check if this partition is currently mounted and on which slot
+        for (int slot = 0; slot < MAX_MOUNTS; slot++) {
+            int    slot_vdrive = -1;
+            uint32_t slot_lba  = 0;
+            fs_type_t slot_fs  = FS_TYPE_UNKNOWN;
+            if (fs_get_mount_info(slot, &slot_vdrive, &slot_lba, &slot_fs) != 0) continue;
+            if (slot_vdrive != (int)d->vdrive_id) continue;
+            if (slot_lba    != start_lba)         continue;
+
+            char label[64] = "(none)";
+            fs_get_mount_label(slot, label, sizeof(label));
+
+            n += snprintf(info + n, sizeof(info) - n,
+                "part%d_mounted:  1\n"
+                "part%d_slot:     %d\n"
+                "part%d_fstype:   %s\n"
+                "part%d_label:    %s\n",
+                p,
+                p, slot,
+                p, fs_type_name(slot_fs),
+                p, label
+            );
+            break;
+        }
+    }
+
+    if (h->offset >= n) return 0;
+    int avail = n - h->offset;
+    if ((int)count > avail) count = (size_t)avail;
+    memcpy(buf, info + h->offset, count);
+    h->offset += (int)count;
+    return (ssize_t)count;
+}
+
+static int vdrive_info_close(void *ctx) {
+    kfree(ctx);
+    return 0;
+}
+
+// ── Registration (call at end of vdrive_init) ─────────────────────────────
+
+void vdrive_register_devfs_nodes(void) {
+    devfs_owner_t owner = { .kind = DEVFS_OWNER_KERNEL, .id = "vdrive" };
+
+    for (int i = 0; i < vdrive_system.drive_count; i++) {
+        vdrive_t *d = &vdrive_system.drives[i];
+        if (!d->present) continue;
+
+        // Sanitize model: spaces -> dashes, trim trailing dashes
+        char model_safe[41];
+        strncpy(model_safe, d->model[0] ? d->model : "Unknown", 40);
+        model_safe[40] = '\0';
+        for (int j = 0; model_safe[j]; j++)
+            if (model_safe[j] == ' ') model_safe[j] = '-';
+        int len = strlen(model_safe);
+        while (len > 0 && model_safe[len-1] == '-') model_safe[--len] = '\0';
+
+        // Build node path
+        char node_path[64];
+        snprintf(node_path, sizeof(node_path), "vDrive%d-%s", i, model_safe);
+
+        // id_ctx first — needed for cleanup in all error paths below
+        uint8_t *id_ctx = kmalloc(sizeof(uint8_t));
+        if (!id_ctx) continue;
+        *id_ctx = (uint8_t)i;
+
+        // name must outlive this function — copy to heap
+        char *name_copy = kmalloc(strlen(node_path) + 1);
+        if (!name_copy) { kfree(id_ctx); continue; }
+        strcpy(name_copy, node_path);
+
+        devfs_device_ops_t *ops = kmalloc(sizeof(devfs_device_ops_t));
+        if (!ops) { kfree(id_ctx); kfree(name_copy); continue; }
+        memset(ops, 0, sizeof(*ops));
+        ops->name  = name_copy;
+        ops->open  = vdrive_info_open;
+        ops->read  = vdrive_info_read;
+        ops->close = vdrive_info_close;
+
+        devfs_register_path(node_path, ops, id_ctx, owner);
+        com_printf(COM1_PORT, "[vDrive] Registered $/dev/%s\n", node_path);
+    }
+}
+
 // ===========================================================================
 // Initialization
 // ===========================================================================
@@ -477,6 +668,8 @@ int vdrive_init(void) {
         vdrive_system.initialized = 1;
         return VDRIVE_ERR_NO_DRIVES;
     }
+
+    vdrive_register_devfs_nodes();
     
     vdrive_system.initialized = 1;
     COM_LOG_OK(COM1_PORT, "vDrive subsystem initialized");

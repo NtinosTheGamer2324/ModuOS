@@ -2606,7 +2606,6 @@ int fat32_find_file(int handle, const char* path, struct fat_dir_entry* out_entr
         /* Last component reached */
         if (path[path_idx] == '\0') {
             memcpy(out_entry, &entry, sizeof(struct fat_dir_entry));
-            kfree(buf);
             return 0;
         }
     }

@@ -5,7 +5,6 @@
 #include <stdbool.h>
 #include "moduos/drivers/graphics/framebuffer.h"
 #include "moduos/drivers/graphics/bitmap_font.h"
-#include "moduos/drivers/graphics/bmp_font.h"
 #include "moduos/drivers/graphics/pf2.h"
 #include "moduos/drivers/graphics/fnt_font.h"
 
@@ -28,10 +27,6 @@ typedef struct {
     /* Current colors in VGA 0..15 indices */
     uint8_t fg;
     uint8_t bg;
-
-    /* Optional BMP atlas font */
-    bmp_font_t bmp_font;
-    int bmp_font_ready;
 
     /* Optional PF2 font (Unicode) - pointer owned by caller */
     const pf2_font_t *pf2_font;

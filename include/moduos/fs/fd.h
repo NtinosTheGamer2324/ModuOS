@@ -16,10 +16,15 @@ typedef int64_t ssize_t;
 #define MAX_FDS 256
 
 /* File descriptor flags */
-#define FD_FLAG_READ   0x01
-#define FD_FLAG_WRITE  0x02
-#define FD_FLAG_APPEND 0x04
-#define FD_FLAG_CREATE 0x08
+#define FD_FLAG_READ     0x01
+#define FD_FLAG_WRITE    0x02
+#define FD_FLAG_APPEND   0x04
+#define FD_FLAG_CREATE   0x08
+#define FD_FLAG_NONBLOCK 0x10  /* non-blocking I/O (pipe reads return immediately) */
+
+/* fcntl() commands */
+#define F_GETFL  3   /* get file status flags */
+#define F_SETFL  4   /* set file status flags */
 
 /* Open flags (similar to POSIX) */
 #define O_RDONLY  0x0000
@@ -68,6 +73,11 @@ typedef struct {
 
 /* Pipe fd operations */
 int fd_pipe(int fds[2]);
+
+/* fcntl() — get/set file descriptor flags.
+ * cmd: F_GETFL returns current flags; F_SETFL sets flags (O_NONBLOCK supported).
+ */
+int fd_fcntl(int fd, int cmd, int arg);
 
 /**
  * Initialize file descriptor table

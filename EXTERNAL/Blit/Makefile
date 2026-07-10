@@ -1,5 +1,5 @@
 # Blit Engine - Properly Organized Makefile
-# Copyright © 2026 ModuOS Project Contributors
+# Copyright © 2026 New Technologies Software
 
 # Compiler and linker
 CC = gcc

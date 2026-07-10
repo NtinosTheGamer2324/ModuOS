@@ -3,7 +3,7 @@
  *
  * Registers $/dev/mvc/mvi0 as a DevFS node.
  *
- * Copyright © 2025-2026 ModuOS Project Contributors — GPL v2.0
+ * Copyright © 2025-2026 New Technologies Software — GPL v2.0
  */
 
 #include <stdint.h>
@@ -38,6 +38,34 @@ static void log(const char *s) {
     g_api->com_write_string(0x3F8, "[mvc3] ");
     g_api->com_write_string(0x3F8, s);
     g_api->com_write_string(0x3F8, "\n");
+}
+
+#define MVC3_COM2_PORT 0x2F8
+
+static void log2(const char *s) {
+    g_api->com_write_string(MVC3_COM2_PORT, "[mvc3] ");
+    g_api->com_write_string(MVC3_COM2_PORT, s);
+    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+}
+
+/* Minimal unsigned 64-bit -> hex string, zero-padded to 16 chars, "0x" prefixed. */
+static void u64_to_hex(uint64_t v, char *out /* must hold 19 bytes: "0x" + 16 hex + NUL */) {
+    static const char digits[] = "0123456789abcdef";
+    out[0] = '0';
+    out[1] = 'x';
+    for (int i = 0; i < 16; i++) {
+        out[2 + i] = digits[(v >> ((15 - i) * 4)) & 0xF];
+    }
+    out[18] = '\0';
+}
+
+/* Logs "name=0x..." to COM2, no trailing newline. */
+static void log2_kv(const char *name, uint64_t value) {
+    char hexbuf[19];
+    u64_to_hex(value, hexbuf);
+    g_api->com_write_string(MVC3_COM2_PORT, name);
+    g_api->com_write_string(MVC3_COM2_PORT, "=");
+    g_api->com_write_string(MVC3_COM2_PORT, hexbuf);
 }
 
 /* ── Per-session off-screen buffer tracking ────────────────────────── */
@@ -282,6 +310,20 @@ static void dispatch_slot(mvc3_session_t *s, const mvc3_ring_slot_t *slot) {
         break;
 
     case MVC3_OP_BLIT:
+        log2("BLIT received from userland");
+        log2_kv("  src_x", slot->u.blit.src_x);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  src_y", slot->u.blit.src_y);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  dst_x", slot->u.blit.dst_x);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  dst_y", slot->u.blit.dst_y);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  w", slot->u.blit.w);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  h", slot->u.blit.h);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+    
         if (hw_2d && g_api->gfx_blit_rect)
             g_api->gfx_blit_rect(slot->u.blit.src_x, slot->u.blit.src_y, slot->u.blit.dst_x, slot->u.blit.dst_y, slot->u.blit.w, slot->u.blit.h);
         else
@@ -289,33 +331,134 @@ static void dispatch_slot(mvc3_session_t *s, const mvc3_ring_slot_t *slot) {
         break;
 
     case MVC3_OP_BLIT_BUF: {
-        /* 'handle' is the User Virtual Address of the source pixel buffer.
-         * This code runs in the write() syscall context of the submitting
-         * process, so the User VA is valid for kernel reads via usercopy. */
-        uint64_t user_ptr = (uint64_t)slot->u.blit_buf.handle;
-
-        if ((caps & SQRM_GPU_CAP_BLIT_BUF) && g_api->gfx_blit_buffer) {
-            /* Hardware/driver blit path: gfx_blit_buffer routes into the
-             * GPU LKM's blit_buffer hook which reads from the kernel-mapped
-             * copy of the user buffer prepared by sw_blit_buf, or handles
-             * the usercopy itself.  Either way we pass the adjusted pointer
-             * accounting for src_x / src_y offsets. */
-            uint32_t bpp_bytes = (fb->bpp + 7u) / 8u;
-            const uint8_t *src_ptr = (const uint8_t *)(uintptr_t)user_ptr;
-            src_ptr += (uint64_t)slot->u.blit_buf.src_y * slot->u.blit_buf.src_pitch;
-            src_ptr += (uint64_t)slot->u.blit_buf.src_x * bpp_bytes;
-            g_api->gfx_blit_buffer(slot->u.blit_buf.dst_x, slot->u.blit_buf.dst_y,
-                                   slot->u.blit_buf.w,     slot->u.blit_buf.h,
-                                   src_ptr,                slot->u.blit_buf.src_pitch);
-        } else {
-            /* Software fallback: sw_blit_buf walks the user VA row by row,
-             * copying pixels directly into the framebuffer KVA. */
-            sw_blit_buf(fb, user_ptr,
-                        slot->u.blit_buf.src_x,    slot->u.blit_buf.src_y,
-                        slot->u.blit_buf.dst_x,    slot->u.blit_buf.dst_y,
-                        slot->u.blit_buf.w,        slot->u.blit_buf.h,
-                        slot->u.blit_buf.src_pitch);
+        log2("BLIT_BUF: received");
+    
+        uint64_t user_va  = (uint64_t)slot->u.blit_buf.handle;
+        uint32_t bpp_bytes_src = 4; /* buffers are always ARGB8888 */
+        uint64_t row_bytes = (uint64_t)slot->u.blit_buf.w * bpp_bytes_src;
+        uint64_t copy_bytes = row_bytes * slot->u.blit_buf.h;
+    
+        log2_kv("  handle/user_va", user_va);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  src_x", slot->u.blit_buf.src_x);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  src_y", slot->u.blit_buf.src_y);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  dst_x", slot->u.blit_buf.dst_x);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  dst_y", slot->u.blit_buf.dst_y);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  w", slot->u.blit_buf.w);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  h", slot->u.blit_buf.h);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  src_pitch", slot->u.blit_buf.src_pitch);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  row_bytes (computed)", row_bytes);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  copy_bytes (computed)", copy_bytes);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+    
+        /* Bound the copy to something sane before allocating. */
+        if (copy_bytes == 0 || copy_bytes > (16u * 1024u * 1024u)) {
+            log2_kv("  BAIL: copy_bytes out of range", copy_bytes);
+            g_api->com_write_string(MVC3_COM2_PORT, "\n");
+            break;
         }
+    
+        if (user_va == 0) {
+            log2("  BAIL: handle/user_va is NULL");
+            break;
+        }
+    
+        uint8_t *tmp = (uint8_t *)g_api->kmalloc(copy_bytes);
+        log2_kv("  tmp kva", (uint64_t)(uintptr_t)tmp);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        if (!tmp) {
+            log2("  BAIL: kmalloc failed");
+            break;
+        }
+    
+        /* Copy row-by-row from the user buffer (respecting src_pitch)
+         * into a tightly-packed kernel buffer using a real usercopy. */
+        int ok = 1;
+        for (uint32_t r = 0; r < slot->u.blit_buf.h; r++) {
+            uint64_t src_uva = user_va
+                              + (uint64_t)(slot->u.blit_buf.src_y + r) * slot->u.blit_buf.src_pitch
+                              + (uint64_t)slot->u.blit_buf.src_x * bpp_bytes_src;
+            uint64_t dst_kva = (uint64_t)(uintptr_t)(tmp + (uint64_t)r * row_bytes);
+        
+            if (r == 0 || r == slot->u.blit_buf.h - 1) {
+                /* log first and last row so we can spot bad VA arithmetic */
+                log2_kv("  usercopy row", r);
+                g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                log2_kv("    src_uva", src_uva);
+                g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                log2_kv("    dst_kva", dst_kva);
+                g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                log2_kv("    row_bytes", row_bytes);
+                g_api->com_write_string(MVC3_COM2_PORT, "\n");
+            }
+        
+            if (g_api->usercopy_from_user(tmp + (uint64_t)r * row_bytes,
+                                    (const void *)(uintptr_t)src_uva,
+                                    row_bytes) != (int *)0) {
+                log2_kv("  BAIL: usercopy_from_user failed at row", r);
+                g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                log2_kv("    src_uva was", src_uva);
+                g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                ok = 0;
+                break;
+            }
+        }
+    
+        log2_kv("  usercopy ok", (uint64_t)ok);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+    
+        if (ok) {
+            log2_kv("  caps", (uint64_t)caps);
+            g_api->com_write_string(MVC3_COM2_PORT, "\n");
+            log2_kv("  SQRM_GPU_CAP_BLIT_BUF set",
+                    (uint64_t)!!(caps & SQRM_GPU_CAP_BLIT_BUF));
+            g_api->com_write_string(MVC3_COM2_PORT, "\n");
+            log2_kv("  gfx_blit_buffer ptr",
+                    (uint64_t)(uintptr_t)g_api->gfx_blit_buffer);
+            g_api->com_write_string(MVC3_COM2_PORT, "\n");
+            
+            if ((caps & SQRM_GPU_CAP_BLIT_BUF) && g_api->gfx_blit_buffer) {
+                log2("  path: HW gfx_blit_buffer");
+                g_api->gfx_blit_buffer(slot->u.blit_buf.dst_x, slot->u.blit_buf.dst_y,
+                                       slot->u.blit_buf.w,     slot->u.blit_buf.h,
+                                       tmp,                    (uint32_t)row_bytes);
+                log2("  HW blit done");
+            } else {
+                log2("  path: SW sw_blit_buf");
+                const framebuffer_t *fb2 = fb; /* fb already fetched above */
+                log2_kv("  fb ptr",   (uint64_t)(uintptr_t)fb2);
+                g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                if (fb2) {
+                    log2_kv("  fb->width",  fb2->width);
+                    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                    log2_kv("  fb->height", fb2->height);
+                    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                    log2_kv("  fb->bpp",    fb2->bpp);
+                    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                    log2_kv("  fb->pitch",  fb2->pitch);
+                    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                    log2_kv("  fb->addr",   (uint64_t)(uintptr_t)fb2->addr);
+                    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+                }
+                sw_blit_buf(fb2, (uint64_t)(uintptr_t)tmp,
+                            0, 0,
+                            slot->u.blit_buf.dst_x, slot->u.blit_buf.dst_y,
+                            slot->u.blit_buf.w,     slot->u.blit_buf.h,
+                            (uint32_t)row_bytes);
+                log2("  SW blit done");
+            }
+        }
+    
+        g_api->kfree(tmp);
+        log2("BLIT_BUF: done");
         break;
     }
     default: break;
@@ -696,9 +839,112 @@ static devfs_device_ops_t g_ops_mvi0 = {
     .can_replace = (void *)0,
 };
 
+/* ── Self-test ─────────────────────────────────────────────────────── */
+
+#define MVC3_SELFTEST_W 64u
+#define MVC3_SELFTEST_H 64u
+
+static void mvc3_selftest_blit(void) {
+    const framebuffer_t *fb = g_api->gfx_get_framebuffer
+                            ? g_api->gfx_get_framebuffer() : (void *)0;
+    if (!fb || !fb->addr) {
+        log("selftest: no framebuffer, skipping");
+        return;
+    }
+
+    uint32_t caps = g_api->gfx_get_caps ? g_api->gfx_get_caps() : 0u;
+
+    /* ── Red buffer ── */
+    uint64_t  src_pitch_red = (uint64_t)MVC3_SELFTEST_W * 4u;
+    uint64_t  src_size_red  = src_pitch_red * MVC3_SELFTEST_H;
+    uint32_t *src_buf_red   = (uint32_t *)g_api->kmalloc(src_size_red);
+    if (!src_buf_red) {
+        log("selftest: kmalloc failed for red buffer, skipping");
+        return;
+    }
+    for (uint64_t i = 0; i < (src_size_red / 4u); i++)
+        src_buf_red[i] = 0xFFFF0000;
+
+    log2_kv("selftest caps", (uint64_t)caps);
+    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+    log2_kv("selftest SQRM_GPU_CAP_BLIT_BUF set",
+            (uint64_t)!!(caps & SQRM_GPU_CAP_BLIT_BUF));
+    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+    log2_kv("selftest g_api->gfx_blit_buffer",
+            (uint64_t)(uintptr_t)g_api->gfx_blit_buffer);
+    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+    log2_kv("selftest fb->addr", (uint64_t)(uintptr_t)fb->addr);
+    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+    log2_kv("selftest fb->width",  (uint64_t)fb->width);
+    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+    log2_kv("selftest fb->height", (uint64_t)fb->height);
+    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+    log2_kv("selftest src_buf_red", (uint64_t)(uintptr_t)src_buf_red);
+    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+
+    if ((caps & SQRM_GPU_CAP_BLIT_BUF) && g_api->gfx_blit_buffer) {
+        log2("selftest red: taking HW path");
+        g_api->gfx_blit_buffer(0, 0, MVC3_SELFTEST_W, MVC3_SELFTEST_H,
+                               src_buf_red, (uint32_t)src_pitch_red);
+        log2("selftest red: HW path done");
+    } else {
+        log2("selftest red: taking SW path");
+        log2_kv("  reason: cap_set",
+                (uint64_t)!!(caps & SQRM_GPU_CAP_BLIT_BUF));
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        log2_kv("  reason: fn_ptr",
+                (uint64_t)(uintptr_t)g_api->gfx_blit_buffer);
+        g_api->com_write_string(MVC3_COM2_PORT, "\n");
+        sw_blit_buf(fb, (uint64_t)(uintptr_t)src_buf_red,
+                    0, 0, 0, 0,
+                    MVC3_SELFTEST_W, MVC3_SELFTEST_H,
+                    (uint32_t)src_pitch_red);
+        log2("selftest red: SW path done");
+    }
+
+    g_api->kfree(src_buf_red);
+    log("selftest: blitted red square at (0,0)");
+
+    /* ── Green buffer ── */
+    uint64_t  src_pitch = (uint64_t)MVC3_SELFTEST_W * 4u;
+    uint64_t  src_size  = src_pitch * MVC3_SELFTEST_H;
+    uint32_t *src_buf   = (uint32_t *)g_api->kmalloc(src_size);
+    if (!src_buf) {
+        log("selftest: kmalloc failed for green buffer, skipping");
+        return;
+    }
+    for (uint64_t i = 0; i < (src_size / 4u); i++)
+        src_buf[i] = 0xFF00FF00;
+
+    log2_kv("selftest green src_buf", (uint64_t)(uintptr_t)src_buf);
+    g_api->com_write_string(MVC3_COM2_PORT, "\n");
+
+    if ((caps & SQRM_GPU_CAP_BLIT_BUF) && g_api->gfx_blit_buffer) {
+        log2("selftest green: taking HW path");
+        g_api->gfx_blit_buffer(100, 100, MVC3_SELFTEST_W, MVC3_SELFTEST_H,
+                               src_buf, (uint32_t)src_pitch);
+        log2("selftest green: HW path done");
+    } else {
+        log2("selftest green: taking SW path");
+        sw_blit_buf(fb, (uint64_t)(uintptr_t)src_buf,
+                    0, 0, 100, 100,
+                    MVC3_SELFTEST_W, MVC3_SELFTEST_H,
+                    (uint32_t)src_pitch);
+        log2("selftest green: SW path done");
+    }
+
+    /* ── Flush ── */
+    if ((caps & SQRM_GPU_CAP_2D_ACCEL) && g_api->gfx_flush)
+        g_api->gfx_flush(0, 0, fb->width, fb->height);
+
+    g_api->kfree(src_buf);
+    log("selftest: blitted green square at (100,100)");
+    log("selftest: blit self-test complete");
+}
+
 /* ── Module init ───────────────────────────────────────────────────── */
 
-int sqrm_init(const sqrm_kernel_api_t *api) {
+int sqrm_module_init(const sqrm_kernel_api_t *api) {
     if (!api || !api->devfs_register_path) return -1;
     g_api = api;
     memset_local(g_sessions, 0, sizeof(g_sessions));
@@ -706,9 +952,15 @@ int sqrm_init(const sqrm_kernel_api_t *api) {
     devfs_owner_t owner = { DEVFS_OWNER_KERNEL, "mvc3" };
     api->devfs_register_path("mvc/mvi0", &g_ops_mvi0, (void *)0);
 
+    log2_kv("sizeof ring_slot", sizeof(mvc3_ring_slot_t));
+    log2_kv("sizeof enqueue",   sizeof(mvc3_enqueue_t));
+
     log("$/dev/mvc/mvi0 registered");
     log("ring  : " MVC3_DEFAULT_RING_BYTES_STR " byte default (zero-copy when mmap available)");
     log("fb    : mappable via MVC3_OFF_FB offset");
     log("bufs  : mappable via MVC3_OFF_BUF_BASE + kva offset");
+
+    mvc3_selftest_blit();
+
     return 0;
 }

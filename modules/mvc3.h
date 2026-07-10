@@ -25,7 +25,7 @@
  * Userland accumulates MVC3_CMD_ENQUEUEs in a malloc'd buffer, then
  * write()s the whole buffer in one call followed by MVC3_CMD_FLUSH.
  *
- * Copyright © 2025-2026 ModuOS Project Contributors — GPL v2.0
+ * Copyright © 2025-2026 New Technologies Software — GPL v2.0
  */
 
 #include <stdint.h>
@@ -111,8 +111,15 @@ typedef struct __attribute__((packed)) {
 /*
  * Fixed-size 64-byte slot (one cache line).
  * Written directly into the mapped ring by userland.
+ *
+ * NOTE: blit_buf.handle is uint64_t so it can hold a full 64-bit user VA
+ * on ModuOS.  User VAs live in the low canonical half (0x0000...–0x7FFF...),
+ * well within 64 bits.  A 32-bit field would silently truncate any address
+ * above 4 GiB and cause usercopy_from_user to read from a garbage address,
+ * producing a silent no-op blit.  The slot is padded to 72 bytes to keep
+ * the blit_buf union self-consistent; add 8 bytes to the _raw pad below.
  */
-typedef struct __attribute__((packed, aligned(64))) {
+typedef struct __attribute__((packed)) {
     uint32_t op;          /* mvc3_draw_op_t                            */
     uint32_t _pad;
 
@@ -131,10 +138,12 @@ typedef struct __attribute__((packed, aligned(64))) {
         } blit;
 
         /* MVC3_OP_BLIT_BUF
-         * handle is the USER VA of the off-screen buffer (32-bit on
-         * ModuOS userland ABI, since user VA < 4 GiB). */
+         * handle is the full 64-bit USER VA of the off-screen buffer.
+         * Must be 64-bit: user heap on ModuOS can live above 4 GiB and a
+         * 32-bit field would silently truncate it, causing usercopy_from_user
+         * to receive a garbage address and blit nothing (silent failure). */
         struct {
-            uint32_t handle;
+            uint64_t handle;   /* was uint32_t — MUST be uint64_t        */
             uint32_t src_x, src_y;
             uint32_t dst_x, dst_y;
             uint32_t w, h;
@@ -142,7 +151,7 @@ typedef struct __attribute__((packed, aligned(64))) {
             uint32_t src_fmt;
         } blit_buf;
 
-        uint8_t _raw[56];   /* pad to 64 bytes total */
+        uint8_t _raw[64];   /* pad union to 64 bytes (slot total = 72) */
     } u;
 } mvc3_ring_slot_t;
 

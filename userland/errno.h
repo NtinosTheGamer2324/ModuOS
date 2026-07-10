@@ -12,6 +12,7 @@
 #define EBADF   9
 #define ECHILD  10
 #define EAGAIN  11
+#define EWOULDBLOCK 11
 #define ENOMEM  12
 #define EACCES  13
 #define EFAULT  14
@@ -34,5 +35,6 @@
 #define EPIPE   32
 #define EDOM    33
 #define ERANGE  34
+
 
 #define ENOSYS  38

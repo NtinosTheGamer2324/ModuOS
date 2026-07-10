@@ -50,6 +50,7 @@ void path_normalize_inplace(char *path) {
     } else {
         out[oi++] = '/';
     }
+    out[oi] = 0;
 
     for (size_t i = 0; i < n; i++) {
         if (oi > 0 && out[oi - 1] != '/') out[oi++] = '/';

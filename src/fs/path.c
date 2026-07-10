@@ -131,8 +131,20 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
     out->mount_slot = -1;
     out->mount = NULL;
 
-    // Default: current
-    if (!(path[0] == '$' && path[1] == '/')) {
+    // Determine if path is system-absolute (/... or $/...)
+    int is_absolute = 0;
+    int is_virtual = (path[0] == '$');
+    const char *p = path;
+
+    if (path[0] == '$' && path[1] == '/') {
+        is_absolute = 1;
+        p = path + 2;
+    } else if (path[0] == '/') {
+        is_absolute = 1;
+        p = path + 1;
+    }
+
+    if (!is_absolute) {
         out->route = FS_ROUTE_CURRENT;
         out->mount_slot = proc->current_slot;
         out->mount = fs_get_mount(proc->current_slot);
@@ -141,17 +153,26 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
         return (out->mount && out->mount->valid) ? 0 : -1;
     }
 
-    // $/...
-    const char *p = path + 2;
+    // System-absolute resolution
     while (*p == '/') p++;
 
-    // $/ or $//... => DEVVFS root
+    // / or $/ => system root
     if (*p == 0) {
-        out->route = FS_ROUTE_DEVVFS;
-        out->devvfs_kind = 0;
-        out->rel_path[0] = '/';
-        out->rel_path[1] = 0;
-        return 0;
+        if (is_virtual) {
+            out->route = FS_ROUTE_DEVVFS;
+            out->devvfs_kind = 0;
+            out->rel_path[0] = '/';
+            out->rel_path[1] = 0;
+            return 0;
+        } else {
+            // Treat / as root of current drive
+            out->route = FS_ROUTE_CURRENT;
+            out->mount_slot = proc->current_slot;
+            out->mount = fs_get_mount(proc->current_slot);
+            out->rel_path[0] = '/';
+            out->rel_path[1] = 0;
+            return (out->mount && out->mount->valid) ? 0 : -1;
+        }
     }
 
     // extract first component
@@ -167,7 +188,7 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
 
     if (comp[0] == 0) return -1;
 
-    if (str_ieq(comp, "mnt")) {
+    if (is_virtual && str_ieq(comp, "mnt")) {
         if (*rest == 0) {
             out->route = FS_ROUTE_DEVVFS;
             out->devvfs_kind = 1;
@@ -219,7 +240,7 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
         return -1;
     }
 
-    if (str_ieq(comp, "dev")) {
+    if (is_virtual && str_ieq(comp, "dev")) {
         // DEVVFS
         //  - $/dev            => list devices (kind=2)
         //  - $/dev/input      => list input devices (kind=3)
@@ -231,14 +252,21 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
             char subc[64] = {0};
             size_t si = 0;
             while (rest[si] && rest[si] != '/' && si + 1 < sizeof(subc)) {
-                subc[si] = rest[si];
-                si++;
+                subc[si] = rest[si]; si++;
             }
             subc[si] = 0;
-            const char *subrest = rest + si;
-            while (*subrest == '/') subrest++;
-
-            // DEVFS is now hierarchical; treat any $/dev/<subpath> uniformly.
+        
+            // Check if this is a vDrive info node: $/dev/vDriveN or $/dev/vDriveN-Model
+            int vdid = -1;
+            int part = 0;
+            if (devvfs_parse_drive(subc, &vdid, &part) == 0) {
+                out->route       = FS_ROUTE_DEVVFS;
+                out->devvfs_kind = 5;          // NEW: drive info node
+                out->devvfs_drive = vdid;
+                out->rel_path[0] = '/';
+                out->rel_path[1] = 0;
+                return 0;
+            }
         }
 
         out->devvfs_kind = 2;
@@ -250,7 +278,7 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
         return 0;
     }
 
-    if (str_ieq(comp, "user")) {
+    if (is_virtual && str_ieq(comp, "user")) {
         out->route = FS_ROUTE_USERLAND;
         out->rel_path[0] = '/';
         out->rel_path[1] = 0;
@@ -258,6 +286,17 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
             strncat(out->rel_path, rest, sizeof(out->rel_path) - 2);
         }
         return 0;
+    }
+
+    // Fallback: If no special component matched, treat it as relative to current_slot
+    // (but keep the full path if it started with '/')
+    if (path[0] == '/') {
+        out->route = FS_ROUTE_CURRENT;
+        out->mount_slot = proc->current_slot;
+        out->mount = fs_get_mount(proc->current_slot);
+        strncpy(out->rel_path, path, sizeof(out->rel_path) - 1);
+        out->rel_path[sizeof(out->rel_path) - 1] = 0;
+        return (out->mount && out->mount->valid) ? 0 : -1;
     }
 
     return -1;

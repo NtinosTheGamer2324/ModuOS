@@ -541,6 +541,10 @@ typedef struct sqrm_kernel_api {
 
     void *(*devfs_mmap_region)(uint64_t phys_or_virt, size_t size,
                                int prot, int is_phys);
+
+    int (*usercopy_from_user)(void *kernel_dst, const void *user_src, size_t n);
+    int (*usercopy_to_user)(void *user_dst, const void *kernel_src, size_t n);
+    int (*usercopy_string_from_user)(char *kernel_dst, const char *user_src, size_t max_len);
 } sqrm_kernel_api_t;
 
 typedef int (*sqrm_module_init_fn)(const sqrm_kernel_api_t *api);

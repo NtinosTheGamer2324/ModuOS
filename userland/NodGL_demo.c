@@ -1,6 +1,6 @@
 // NodGL Demo - Showcase modern graphics API for ModuOS
 //
-// Copyright © 2025-2026 ModuOS Project Contributors
+// Copyright © 2025-2026 New Technologies Software
 // Licensed under GPL v2.0 - See LICENSE.md
 
 #include "NodGL.h"

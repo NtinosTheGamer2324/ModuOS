@@ -388,6 +388,12 @@ static inline int stat(const char *path, fs_file_info_t *out_info) {
     return (int)syscall(SYS_STAT, (long)path, (long)out_info, (long)sizeof(*out_info));
 }
 
+typedef long off_t;
+
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
 static inline long lseek(int fd, long offset, int whence) {
     return syscall(SYS_LSEEK, (long)fd, (long)offset, (long)whence);
 }
@@ -444,80 +450,8 @@ static inline ssize_t write(int fd, const void *buf, size_t count) {
 
 /* ============================================================
    PRINTING UTILITIES
+   (print_uint/long/etc removed — use snprintf/ulltoa from string.h)
    ============================================================ */
-
-static void print_uint(unsigned int n, int base, int upper) {
-    char buf[32];
-    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-
-    if (n == 0) {
-        putc('0');
-        return;
-    }
-
-    int i = 0;
-    while (n > 0) {
-        buf[i++] = digits[n % base];
-        n /= base;
-    }
-
-    while (i > 0)
-        putc(buf[--i]);
-}
-
-static void print_int(int n) {
-    if (n < 0) {
-        putc('-');
-        n = -n;
-    }
-    print_uint((unsigned)n, 10, 0);
-}
-
-static void print_ulong(unsigned long n, int base, int upper) {
-    char buf[64];
-    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-
-    if (n == 0) {
-        putc('0');
-        return;
-    }
-
-    int i = 0;
-    while (n > 0) {
-        buf[i++] = digits[n % base];
-        n /= base;
-    }
-
-    while (i > 0)
-        putc(buf[--i]);
-}
-
-static void print_ulonglong(unsigned long long n, int base, int upper) {
-    char buf[64];
-    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-
-    if (n == 0) {
-        putc('0');
-        return;
-    }
-
-    int i = 0;
-    while (n > 0) {
-        buf[i++] = digits[n % base];
-        n /= base;
-    }
-
-    while (i > 0)
-        putc(buf[--i]);
-}
-
-static void print_long(long n) {
-    if (n < 0) {
-        putc('-');
-        n = -n;
-    }
-    print_ulong((unsigned long)n, 10, 0);
-}
 
 /* String conversion utilities */
 static inline long strtol(const char *str, char **endptr, int base) {
@@ -576,250 +510,41 @@ static inline long strtol(const char *str, char **endptr, int base) {
 }
 
 /* ============================================================
-   printf()
+   printf / sprintf / vprintf
+   All formatting is handled by snprintf() in string.h.
+   These are thin wrappers — no duplicated engine here.
    ============================================================ */
+
+/*
+ * vprintf — write a va_list format string to STDOUT.
+ * Uses a 2 KiB stack buffer; output longer than that is silently truncated.
+ * For unbounded output, call snprintf into a malloc'd buffer yourself.
+ */
+static int vprintf(const char *fmt, va_list ap) {
+    char buf[2048];
+    /* snprintf takes '...' not va_list, so we need a small shim.
+     * We format into buf using the same engine via a bounce call. */
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if (n > 0) write(STDOUT_FILENO, buf, (size_t)(n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1));
+    return n;
+}
 
 static int printf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-
-    while (*fmt) {
-        /* Fast path: write literal runs in one syscall (preserves UTF-8 bytes) */
-        if (*fmt != '%') {
-            const char *start = fmt;
-            while (*fmt && *fmt != '%') fmt++;
-            if (fmt > start) {
-                write(STDOUT_FILENO, start, (size_t)(fmt - start));
-                continue;
-            }
-        }
-
-        /* Format handling */
-        if (*fmt == '%') {
-            fmt++;
-
-            int longmod = 0;
-            int longlongmod = 0;
-
-            if (*fmt == 'l') {
-                longmod = 1;
-                fmt++;
-                if (*fmt == 'l') {
-                    longlongmod = 1;
-                    fmt++;
-                }
-            }
-
-            switch (*fmt) {
-                case 'c': {
-                    char ch = (char)va_arg(ap, int);
-                    write(STDOUT_FILENO, &ch, 1);
-                    break;
-                }
-
-                case 's': {
-                    const char *s = va_arg(ap, const char*);
-                    if (!s) s = "(null)";
-                    write(STDOUT_FILENO, s, strlen(s));
-                    break;
-                }
-
-                case 'd':
-                case 'i':
-                    if (longlongmod) {
-                        long long n = va_arg(ap, long long);
-                        if (n < 0) {
-                            char m = '-';
-                            write(STDOUT_FILENO, &m, 1);
-                            n = -n;
-                        }
-                        print_ulonglong((unsigned long long)n, 10, 0);
-                    } else if (longmod) {
-                        print_long(va_arg(ap, long));
-                    } else {
-                        print_int(va_arg(ap, int));
-                    }
-                    break;
-
-                case 'u':
-                    if (longlongmod)
-                        print_ulonglong(va_arg(ap, unsigned long long), 10, 0);
-                    else if (longmod)
-                        print_ulong(va_arg(ap, unsigned long), 10, 0);
-                    else
-                        print_uint(va_arg(ap, unsigned int), 10, 0);
-                    break;
-
-                case 'x':
-                    if (longlongmod)
-                        print_ulonglong(va_arg(ap, unsigned long long), 16, 0);
-                    else if (longmod)
-                        print_ulong(va_arg(ap, unsigned long), 16, 0);
-                    else
-                        print_uint(va_arg(ap, unsigned int), 16, 0);
-                    break;
-
-                case 'X':
-                    if (longlongmod)
-                        print_ulonglong(va_arg(ap, unsigned long long), 16, 1);
-                    else if (longmod)
-                        print_ulong(va_arg(ap, unsigned long), 16, 1);
-                    else
-                        print_uint(va_arg(ap, unsigned int), 16, 1);
-                    break;
-
-                case '%': {
-                    char p = '%';
-                    write(STDOUT_FILENO, &p, 1);
-                    break;
-                }
-
-                default: {
-                    char pct = '%';
-                    write(STDOUT_FILENO, &pct, 1);
-                    if (*fmt) write(STDOUT_FILENO, fmt, 1);
-                    break;
-                }
-            }
-
-            if (*fmt) fmt++;
-        }
-    }
-
+    int r = vprintf(fmt, ap);
     va_end(ap);
-    return 0;
+    return r;
 }
 
-/* sprintf - format to a string buffer */
+/* sprintf — unbounded format to buffer. Prefer snprintf. */
 static int sprintf(char *str, const char *fmt, ...) {
     if (!str) return -1;
-    
     va_list ap;
     va_start(ap, fmt);
-    
-    char *out = str;
-    
-    while (*fmt) {
-        if (*fmt != '%') {
-            const char *start = fmt;
-            while (*fmt && *fmt != '%') fmt++;
-            size_t len = fmt - start;
-            memcpy(out, start, len);
-            out += len;
-            continue;
-        }
-        
-        if (*fmt == '%') {
-            fmt++;
-            
-            int longmod = 0;
-            int longlongmod = 0;
-            
-            if (*fmt == 'l') {
-                longmod = 1;
-                fmt++;
-                if (*fmt == 'l') {
-                    longlongmod = 1;
-                    fmt++;
-                }
-            }
-            
-            switch (*fmt) {
-                case 'c': {
-                    *out++ = (char)va_arg(ap, int);
-                    break;
-                }
-                
-                case 's': {
-                    const char *s = va_arg(ap, const char*);
-                    if (!s) s = "(null)";
-                    size_t len = strlen(s);
-                    memcpy(out, s, len);
-                    out += len;
-                    break;
-                }
-                
-                case 'd':
-                case 'i': {
-                    char buf[32];
-                    int val;
-                    if (longlongmod) {
-                        long long n = va_arg(ap, long long);
-                        val = (int)n; /* truncate for simplicity */
-                    } else if (longmod) {
-                        val = (int)va_arg(ap, long);
-                    } else {
-                        val = va_arg(ap, int);
-                    }
-                    
-                    int neg = 0;
-                    if (val < 0) {
-                        neg = 1;
-                        val = -val;
-                    }
-                    
-                    int i = 0;
-                    if (val == 0) {
-                        buf[i++] = '0';
-                    } else {
-                        while (val > 0) {
-                            buf[i++] = '0' + (val % 10);
-                            val /= 10;
-                        }
-                    }
-                    
-                    if (neg) *out++ = '-';
-                    while (i > 0) *out++ = buf[--i];
-                    break;
-                }
-                
-                case 'u':
-                case 'x':
-                case 'X': {
-                    char buf[32];
-                    unsigned int val;
-                    int base = (*fmt == 'u') ? 10 : 16;
-                    const char *digits = (*fmt == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
-                    
-                    if (longlongmod) {
-                        val = (unsigned int)va_arg(ap, unsigned long long);
-                    } else if (longmod) {
-                        val = (unsigned int)va_arg(ap, unsigned long);
-                    } else {
-                        val = va_arg(ap, unsigned int);
-                    }
-                    
-                    int i = 0;
-                    if (val == 0) {
-                        buf[i++] = '0';
-                    } else {
-                        while (val > 0) {
-                            buf[i++] = digits[val % base];
-                            val /= base;
-                        }
-                    }
-                    
-                    while (i > 0) *out++ = buf[--i];
-                    break;
-                }
-                
-                case '%':
-                    *out++ = '%';
-                    break;
-                    
-                default:
-                    *out++ = '%';
-                    if (*fmt) *out++ = *fmt;
-                    break;
-            }
-            
-            if (*fmt) fmt++;
-        }
-    }
-    
-    *out = '\0';
+    int r = vsnprintf(str, (size_t)0x7fffffff, fmt, ap);
     va_end(ap);
-    return (int)(out - str);
+    return r;
 }
 
 /* ============================================================
@@ -1286,6 +1011,23 @@ static inline int userfs_register(const userfs_user_node_t *node) {
     return (int)syscall(SYS_USERFS_REGISTER, (uint64_t)node, 0, 0);
 }
 
+/* UNSAFE RAW READ/WRITE TO DISK (need to be mdman (UID 0)) */
+static inline int vdrive_write(uint8_t vdrive_id, uint64_t lba, uint32_t count, const void *buffer) {
+    return syscall4(SYS_VDRIVE_WRITE, (long)vdrive_id, (long)lba, (long)count, (long)buffer);
+}
+
+static inline int vdrive_write_sector(uint8_t vdrive_id, uint64_t lba, const void *buffer) {
+    return syscall(SYS_VDRIVE_WRITE_SECTOR, (long)vdrive_id, (long)lba, (long)buffer);
+}
+
+static inline int vdrive_read(uint8_t vdrive_id, uint64_t lba, uint32_t count, void *buffer) {
+    return syscall4(SYS_VDRIVE_READ, (long)vdrive_id, (long)lba, (long)count, (long)buffer);
+}
+
+static inline int vdrive_read_sector(uint8_t vdrive_id, uint64_t lba, void *buffer) {
+    return syscall(SYS_VDRIVE_READ_SECTOR, (long)vdrive_id, (long)lba, (long)buffer);
+}
+
 static inline int userfs_register_path(const char *path, uint32_t perms) {
     userfs_user_node_t node;
     memset(&node, 0, sizeof(node));
@@ -1448,4 +1190,8 @@ static inline void rt_sigreturn(void) {
         :: "i"(SYS_RT_SIGRETURN)
         : "rax", "rcx", "r11", "memory"
     );
+}
+
+static inline int fcntl(int fd, int cmd, long arg) {
+    return (int)syscall(SYS_FCNTL, (long)fd, (long)cmd, (long)arg);
 }

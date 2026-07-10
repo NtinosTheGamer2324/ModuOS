@@ -1,0 +1,280 @@
+#include "moduos/drivers/input/input_new.h"
+#include "moduos/drivers/input/gscancode.h"
+#include "moduos/kernel/macros.h"
+#include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/memory/kheap.h"
+#include "moduos/kernel/interrupts/irq_lock.h"
+#include "moduos/kernel/interrupts/hlt_wait.h"
+#include "moduos/fs/devfs.h"
+#include "moduos/fs/fd.h" // O_NONBLOCK
+#include "moduos/kernel/memory/usercopy.h"
+
+input_device_t g_input_devices[MAX_INPUT_DEVICES];
+static devfs_device_ops_t s_input_devfs_ops[MAX_INPUT_DEVICES]; // persistent storage — devfs stores this pointer, not a copy
+
+#define INPUT_DEVFS_RELATIVE_DIR (DEVFS_INPUT_SUBSYSTEM_PATH + 6) // "$/dev/n_input/" -> "n_input/"
+
+/* ---- node-name assignment ---- */
+
+typedef enum {
+    INPUT_CAT_KEYBOARD = 0,
+    INPUT_CAT_MOUSE,
+    INPUT_CAT_GAMEPAD,
+    INPUT_CAT_UNKNOWN,
+    INPUT_CAT_COUNT
+} input_category_t;
+
+static uint32_t s_category_counters[INPUT_CAT_COUNT] = {0};
+
+static input_category_t input_device_category(device_type_t type) {
+    switch (type) {
+        case DEVICE_TYPE_PS2_KEYBOARD:
+        case DEVICE_TYPE_USB_KEYBOARD:
+            return INPUT_CAT_KEYBOARD;
+        case DEVICE_TYPE_PS2_MOUSE:
+        case DEVICE_TYPE_USB_MOUSE:
+        case DEVICE_TYPE_TOUCHSCREEN:
+            return INPUT_CAT_MOUSE;
+        case DEVICE_TYPE_GAMEPAD:
+            return INPUT_CAT_GAMEPAD;
+        default:
+            return INPUT_CAT_UNKNOWN;
+    }
+}
+
+static const char* input_category_prefix(input_category_t cat) {
+    switch (cat) {
+        case INPUT_CAT_KEYBOARD: return "kbd";
+        case INPUT_CAT_MOUSE:    return "mse";
+        case INPUT_CAT_GAMEPAD:  return "pad";
+        default:                 return "unk";
+    }
+}
+
+static void utoa_dec(uint32_t value, char* out) {
+    char tmp[10];
+    int i = 0;
+    if (value == 0) { out[0] = '0'; out[1] = '\0'; return; }
+    while (value > 0) { tmp[i++] = '0' + (value % 10); value /= 10; }
+    int j = 0;
+    while (i > 0) out[j++] = tmp[--i];
+    out[j] = '\0';
+}
+
+static void build_node_name(char* out, size_t out_size, device_type_t type) {
+    input_category_t cat = input_device_category(type);
+    const char* prefix = input_category_prefix(cat);
+    uint32_t index = s_category_counters[cat]++;
+
+    char num[11];
+    utoa_dec(index, num);
+
+    size_t p = 0;
+    while (prefix[p] && p + 1 < out_size) { out[p] = prefix[p]; p++; }
+    size_t n = 0;
+    while (num[n] && p + 1 < out_size) { out[p++] = num[n++]; }
+    out[p] = '\0';
+}
+
+/* ---- ring buffer (single producer: IRQ/driver, single consumer: reader) ---- */
+
+static bool queue_is_empty(input_device_t* dev) {
+    return dev->queue_head == dev->queue_tail;
+}
+static bool queue_is_full(input_device_t* dev) {
+    return ((dev->queue_tail + 1) % INPUT_EVENT_QUEUE_SIZE) == dev->queue_head;
+}
+
+static void enqueue_event(input_device_t* dev, const void* data, size_t size) {
+    uint64_t f = irq_save();
+    if (queue_is_full(dev)) {
+        // drop oldest to make room; count it so a daemon can notice gaps later
+        dev->queue_head = (dev->queue_head + 1) % INPUT_EVENT_QUEUE_SIZE;
+        dev->dropped_count++;
+    }
+    memcpy(&dev->queue[dev->queue_tail].data, data, size);
+    dev->queue_tail = (dev->queue_tail + 1) % INPUT_EVENT_QUEUE_SIZE;
+    irq_restore(f);
+}
+
+/* ---- devfs glue ----
+ *
+ * Per-open state, returned by ops->open() and handed back to us on every
+ * read/close via `ctx`. This is how we learn the O_NONBLOCK flag from this
+ * particular open() call -- devfs.c's devfs_apply_open_flags() only knows
+ * about the legacy "kbd0"/"event0" names, so it will never set flags on our
+ * n_input/* nodes. Capturing it ourselves here is the supported mechanism
+ * (see devfs_open_fn in devfs.h) and doesn't require touching devfs.c.
+ */
+typedef struct {
+    input_device_t* dev;
+    int flags;
+} input_open_ctx_t;
+
+static void* input_devfs_open(void* ctx, int flags) {
+    input_device_t* dev = (input_device_t*)ctx;
+    input_open_ctx_t* oc = (input_open_ctx_t*)kmalloc(sizeof(input_open_ctx_t));
+    if (!oc) return NULL;
+    oc->dev = dev;
+    oc->flags = flags;
+    return oc;
+}
+
+static int input_devfs_close(void* ctx) {
+    if (ctx) kfree(ctx);
+    return 0;
+}
+
+static size_t event_size_for_category(input_category_t cat) {
+    switch (cat) {
+        case INPUT_CAT_KEYBOARD: return sizeof(key_event_t);
+        case INPUT_CAT_MOUSE:    return sizeof(mouse_event_t);
+        case INPUT_CAT_GAMEPAD:  return sizeof(gamepad_event_t);
+        default: return 0;
+    }
+}
+
+static ssize_t input_devfs_read(void* ctx, void* buf, size_t count) {
+    input_open_ctx_t* oc = (input_open_ctx_t*)ctx;
+    if (!oc || !oc->dev || !buf) return -1;
+    input_device_t* dev = oc->dev;
+
+    if (!dev->device_name) return -1;
+
+    size_t elem_size = event_size_for_category(input_device_category(dev->type));
+    if (elem_size == 0 || count < elem_size) return -1;
+
+    if ((oc->flags & O_NONBLOCK) && queue_is_empty(dev)) return 0;
+
+    while (queue_is_empty(dev)) {
+        hlt_wait_preserve_if();
+        if (!dev->device_name) return -1;
+    }
+
+    size_t max_events = count / elem_size;
+    size_t produced = 0;
+    uint8_t* out = (uint8_t*)buf;
+
+    while (produced < max_events && !queue_is_empty(dev)) {
+        uint64_t f = irq_save();
+        memcpy(out, &dev->queue[dev->queue_head].data, elem_size);
+        dev->queue_head = (dev->queue_head + 1) % INPUT_EVENT_QUEUE_SIZE;
+        irq_restore(f);
+
+        out += elem_size;
+        produced++;
+    }
+
+    return (ssize_t)(produced * elem_size);
+}
+
+static ssize_t input_devfs_write(void* ctx, const void* buf, size_t count) {
+    (void)ctx; (void)buf; (void)count;
+    return -1; // no LED/rumble control yet
+}
+
+/* ---- public API ---- */
+
+int init_new_input(void) {
+    COM_LOG_INFO(COM1_PORT, "Initializing new input subsystem");
+    for (int i = 0; i < MAX_INPUT_DEVICES; i++) {
+        g_input_devices[i].device_name = NULL;
+    }
+    memset(s_input_devfs_ops, 0, sizeof(s_input_devfs_ops));
+    for (int i = 0; i < INPUT_CAT_COUNT; i++) {
+        s_category_counters[i] = 0;
+    }
+    return 0;
+}
+
+int register_input_device(input_device_t* device) {
+    for (int i = 0; i < MAX_INPUT_DEVICES; i++) {
+        if (g_input_devices[i].device_name != NULL) continue;
+
+        g_input_devices[i] = *device;
+        input_device_t* slot = &g_input_devices[i];
+        slot->queue_head = 0;
+        slot->queue_tail = 0;
+        slot->dropped_count = 0;
+        build_node_name(slot->node_name, sizeof(slot->node_name), slot->type);
+
+        // devfs_register_path stores this pointer as-is (no internal copy),
+        // so it must outlive this function -- use the slot-indexed static
+        // table, not a stack local.
+        devfs_device_ops_t* ops = &s_input_devfs_ops[i];
+        memset(ops, 0, sizeof(*ops));
+        ops->name  = slot->node_name;
+        ops->open  = input_devfs_open;
+        ops->read  = input_devfs_read;
+        ops->write = input_devfs_write;
+        ops->close = input_devfs_close;
+
+        devfs_owner_t owner = { .kind = DEVFS_OWNER_KERNEL, .id = "kernel" };
+
+        char path[sizeof("n_input/") + INPUT_NODE_NAME_MAX];
+        strcpy(path, INPUT_DEVFS_RELATIVE_DIR);
+        strcat(path, slot->node_name);
+
+        if (devfs_register_path(path, ops, slot, owner) != 0) {
+            COM_LOG_ERROR(COM1_PORT, "Failed to create devfs node for: %s\n", slot->device_name);
+            slot->device_name = NULL; // roll back
+            return -1;
+        }
+
+        COM_LOG_OK(COM1_PORT, "Registered input device: %s as $/dev/%s\n", slot->device_name, path);
+        return 0;
+    }
+    COM_LOG_ERROR(COM1_PORT, "Failed to register input device: %s\n", device->device_name);
+    return -1;
+}
+
+int remove_input_device(input_device_t* device) {
+    for (int i = 0; i < MAX_INPUT_DEVICES; i++) {
+        if (g_input_devices[i].device_name == NULL) continue;
+        if (g_input_devices[i].secret_id != device->secret_id) continue;
+
+        char path[sizeof("n_input/") + INPUT_NODE_NAME_MAX];
+        strcpy(path, INPUT_DEVFS_RELATIVE_DIR);
+        strcat(path, g_input_devices[i].node_name);
+
+        int r = devfs_unregister_path(path);
+        if (r != 0) {
+            COM_LOG_ERROR(COM1_PORT, "devfs_unregister_path failed (%d) for: %s\n", r, path);
+            // fall through and tombstone anyway so reads/writes stop dead
+        }
+
+        g_input_devices[i].device_name = NULL;
+        g_input_devices[i].queue_head = 0;
+        g_input_devices[i].queue_tail = 0;
+        return 0;
+    }
+    return -1;
+}
+
+static input_device_t* find_device_by_secret_id(uint64_t secret_id) {
+    for (int i = 0; i < MAX_INPUT_DEVICES; i++) {
+        if (g_input_devices[i].device_name != NULL &&
+            g_input_devices[i].secret_id == secret_id) {
+            return &g_input_devices[i];
+        }
+    }
+    return NULL;
+}
+
+void push_key_event(key_event_t event, input_device_t* device) {
+    input_device_t* real = find_device_by_secret_id(device->secret_id);
+    if (!real) return;
+    enqueue_event(real, &event, sizeof(event));
+}
+
+void push_mouse_event(mouse_event_t event, input_device_t* device) {
+    input_device_t* real = find_device_by_secret_id(device->secret_id);
+    if (!real) return;
+    enqueue_event(real, &event, sizeof(event));
+}
+
+void push_gamepad_event(gamepad_event_t event, input_device_t* device) {
+    input_device_t* real = find_device_by_secret_id(device->secret_id);
+    if (!real) return;
+    enqueue_event(real, &event, sizeof(event));
+}

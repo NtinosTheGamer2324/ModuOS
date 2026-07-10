@@ -41,26 +41,21 @@ const char* get_pc_name() {
     const char* path = "/ModuOS/System64/pcname.txt";
     fs_file_info_t file_info;
 
-    // 1. Get file stats to determine the size
     if (stat(path, &file_info) < 0) {
-        return NULL; 
+        return NULL;
     }
 
-    // 2. Open the file
     int fd = open(path, O_RDONLY, 0);
     if (fd < 0) {
         return NULL;
     }
 
-    // 3. Allocate memory (+1 for null terminator)
-    // We use the 'size' field from the fs_file_info_t struct
     char* buffer = (char*)malloc(file_info.size + 1);
     if (!buffer) {
         close(fd);
         return NULL;
     }
 
-    // 4. Read the content
     ssize_t bytes_read = read(fd, buffer, file_info.size);
     if (bytes_read < 0) {
         free(buffer);
@@ -68,7 +63,6 @@ const char* get_pc_name() {
         return NULL;
     }
 
-    // 5. Null-terminate and cleanup
     buffer[bytes_read] = '\0';
     close(fd);
 
@@ -84,8 +78,8 @@ int md_main(long argc, char **argv) {
     printf(ANSI_ORANGE "Type 'help' for available builtin commands.\n" ANSI_RESET);
     printf(ANSI_ORANGE "Run ls /Apps/ to see installed applications.\n" ANSI_RESET);
 
-    /* Keep large buffers as statics to avoid stack growth on each iteration. */
     static char cwd[256];
+    static char prev_cwd[256] = "/";
     static char command[64];
     static char args[192];
     static char app_path[256];
@@ -94,10 +88,10 @@ int md_main(long argc, char **argv) {
     const char* host = get_pc_name();
 
     while (g_running) {
-        /* CWD syscall not yet implemented; show root. */
-        cwd[0] = '/'; cwd[1] = '\0';
+        if (getcwd(cwd, sizeof(cwd)) == NULL) {
+            strcpy(cwd, "?");
+        }
 
-        /* Use the md64api identity syscall to get UID; fall back to 1. */
         int who = (int)syscall(SYS_GETUID, 0, 0, 0);
         if (who < 0) who = 1;
 
@@ -125,10 +119,45 @@ int md_main(long argc, char **argv) {
             printf("Command       Description\n");
             printf("--------------------------\n");
             printf(" help     |    Show this help\n");
+            printf(" cd <dir> |    Change directory\n");
+            printf(" pwd      |    Show current directory\n");
             printf(" exit     |    Exit shell\n");
             printf("--------------------------\n");
         } else if (strcmp(command, "exit") == 0) {
             g_running = 0;
+
+        } else if (strcmp(command, "cd") == 0) {
+            // Strip leading whitespace
+            char *p = args;
+            while (*p == ' ' || *p == '\t') p++;
+        
+            // Strip trailing whitespace and control chars
+            int len = strlen(p);
+            while (len > 0 && (unsigned char)p[len - 1] <= ' ') {
+                p[--len] = '\0';
+            }
+        
+            // Strip trailing slash unless it's just "/"
+            while (len > 1 && p[len - 1] == '/') {
+                p[--len] = '\0';
+            }
+        
+            const char *target = (len == 0) ? "/" : p;
+        
+            char saved[256];
+            if (getcwd(saved, sizeof(saved)) == NULL) {
+                strcpy(saved, "/");
+            }
+        
+            int ret = chdir(target);
+            if (ret != 0) {
+                printf("%scd: %s: error %d%s\n", ANSI_RED, target, -ret, ANSI_RESET);
+            } else {
+                strcpy(prev_cwd, saved);
+            }
+        } else if (strcmp(command, "pwd") == 0) {
+            printf("%s\n", cwd);
+
         } else if (strlen(command) > 0) {
             snprintf(app_path, sizeof(app_path), "/Apps/%s.sqr", command);
 

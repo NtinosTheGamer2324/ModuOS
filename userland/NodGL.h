@@ -7,7 +7,7 @@
 // It uses common industry patterns but is not derived from any proprietary API.
 // See LICENSE_RDX.md for full legal notice and implementation details.
 //
-// Copyright © 2025-2026 ModuOS Project Contributors
+// Copyright © 2025-2026 New Technologies Software
 // Licensed under GPL v2.0 - See LICENSE.md
 
 #include <stdint.h>

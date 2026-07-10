@@ -9,7 +9,7 @@
 // - Game loop helpers
 // - Math utilities
 //
-// Copyright © 2026 ModuOS Project Contributors
+// Copyright © 2026 New Technologies Software
 // Licensed under GPL v2.0
 
 #include "NodGL.h"

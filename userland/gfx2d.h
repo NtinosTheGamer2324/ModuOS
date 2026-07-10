@@ -6,6 +6,13 @@
  * existing callers need zero changes.  The implementation now targets
  * $/dev/mvc/mvi0 and speaks the MVC3 wire protocol (mvc3.h).
  *
+ * Handle widths
+ * ─────────────
+ * All buffer handles are now uint64_t end-to-end so they can carry a full
+ * 64-bit user VA without truncation.  The ModuOS user heap can live above
+ * 4 GiB; a 32-bit field would silently corrupt addresses in that range and
+ * cause usercopy_from_user to read garbage, producing silent blit failures.
+ *
  * Copyright © 2025-2026 ModuOS Project Contributors — GPL v2.0
  */
 
@@ -23,6 +30,37 @@ typedef struct {
     uint32_t caps;
     char     driver[32];
 } gfx2d_info_t;
+
+/* ── Per-buffer tracking ────────────────────────────────────────────── */
+
+/*
+ * Each entry records one off-screen buffer allocated via gfx2d_alloc_buf.
+ *
+ * kva        — the 64-bit kernel virtual address returned by ALLOC_BUF.
+ *              Passed back to MAP_BUF so the kernel can locate the allocation
+ *              in its session mapping table.
+ * user_va    — the userspace virtual address after MAP_BUF.  This is what
+ *              BLIT_BUF slots carry: the kernel reads from this VA via
+ *              usercopy during the write() syscall.  On kernels without
+ *              devfs_mmap_region it falls back to a malloc'd pointer whose
+ *              pages are equally readable by the kernel during write().
+ * size_bytes — original allocation size; returned by gfx2d_map_buf so
+ *              callers know how many bytes they may write.
+ * pitch      — bytes per row as suggested by the kernel (or a default).
+ * fmt        — format tag echoed back by MAP_BUF.
+ * kva_mapped — 1 if user_va came from a kernel mmap (do NOT free it),
+ *              0 if it came from a local malloc (free it in gfx2d_close).
+ */
+typedef struct {
+    uint64_t kva;
+    void    *user_va;
+    uint32_t size_bytes;
+    uint32_t pitch;
+    uint32_t fmt;
+    int      kva_mapped;  /* 1 = kernel-owned mapping, 0 = local malloc */
+} gfx2d_buf_t;
+
+#define GFX2D_MAX_BUFS 64
 
 /* ── Device handle ─────────────────────────────────────────────────── */
 
@@ -52,6 +90,16 @@ typedef struct {
     uint32_t cmdbuf_size;   /* allocated size in bytes                   */
     uint32_t cmdbuf_used;   /* bytes written this frame                  */
     uint32_t cmd_count;     /* commands written this frame               */
+
+    /* -------------------------------------------------------------------
+     * Off-screen buffer table
+     *
+     * Populated by gfx2d_alloc_buf.  Stores kva + user_va so that
+     * gfx2d_map_buf can return accurate size/pitch/fmt metadata and
+     * gfx2d_close can free any locally-malloc'd fallback buffers.
+     * ------------------------------------------------------------------ */
+    gfx2d_buf_t bufs[GFX2D_MAX_BUFS];
+    uint32_t    n_bufs;
 } gfx2d_t;
 
 /* ── Public API ────────────────────────────────────────────────────── */
@@ -76,19 +124,37 @@ int  gfx2d_blit_rect(gfx2d_t *g,
                      uint32_t dst_x, uint32_t dst_y,
                      uint32_t w, uint32_t h);
 
-/* Blit from an off-screen buffer (allocated with gfx2d_alloc_buf). */
-int  gfx2d_blit_buf(gfx2d_t *g, uint32_t handle,
+/* Blit from an off-screen buffer (allocated with gfx2d_alloc_buf).
+ * handle is the full 64-bit user VA returned by gfx2d_alloc_buf. */
+int  gfx2d_blit_buf(gfx2d_t *g, uint64_t handle,
                     uint32_t src_x, uint32_t src_y,
                     uint32_t dst_x, uint32_t dst_y,
                     uint32_t w,     uint32_t h,
                     uint32_t src_pitch, uint32_t src_fmt);
 
-/* Allocate an off-screen pixel buffer. */
+/* Allocate an off-screen pixel buffer.
+ *
+ * Sends MVC3_CMD_ALLOC_BUF to get a kernel-allocated, page-aligned buffer,
+ * then sends MVC3_CMD_MAP_BUF to map it into the calling process's VA.
+ * Falls back to a local malloc if the kernel mmap is unavailable (old
+ * kernels / copy-batch mode) — the kernel can still read those pages via
+ * usercopy during write(), so BLIT_BUF works on both paths.
+ *
+ * out_handle receives the full 64-bit user VA of the mapped buffer.
+ *            Pass it back unchanged to gfx2d_blit_buf / gfx2d_map_buf.
+ * out_pitch  receives the kernel-suggested row stride in bytes.
+ */
 int  gfx2d_alloc_buf(gfx2d_t *g, uint32_t size_bytes, uint32_t fmt,
-                     uint32_t *out_handle, uint32_t *out_pitch);
+                     uint64_t *out_handle, uint32_t *out_pitch);
 
-/* Map an allocated buffer into userspace. */
-int  gfx2d_map_buf(gfx2d_t *g, uint32_t handle,
+/* Map an allocated buffer into userspace (lookup by handle).
+ *
+ * handle is the 64-bit user VA returned by gfx2d_alloc_buf.
+ * Returns the user VA, size, pitch, and format stored in the buffer table.
+ * The VA is already mapped — this call does NOT issue another MAP_BUF to
+ * the kernel; it just exposes what gfx2d_alloc_buf recorded.
+ */
+int  gfx2d_map_buf(gfx2d_t *g, uint64_t handle,
                    void **out_addr, uint32_t *out_size,
                    uint32_t *out_pitch, uint32_t *out_fmt);
 

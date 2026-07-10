@@ -1055,7 +1055,7 @@ static int init_graphics(void) {
     NodGL_GetScreenResolution(g_device, &g_screen_w, &g_screen_h);
 
     // Try to load the system font; fall back to a built-in 8x16 stub if missing.
-    g_font = load_font_from_file("/ModuOS/System64/fonts/system.fnt");
+    g_font = load_font_from_file("/ModuOS/shared/assets/fonts/Terminus.fnt");
     if (!g_font) {
         // If no font file exists the render functions will produce blank glyphs —
         // the terminal is still functional, just invisible text.

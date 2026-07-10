@@ -1,6 +1,6 @@
 #!/bin/bash
 # Blit Engine - Build Script
-# Copyright © 2026 ModuOS Project Contributors
+# Copyright © 2026 New Technologies Software
 
 set -e
 

@@ -196,120 +196,326 @@ static inline void itoa(int value, char *str, int base) {
 
 /* --- 6. THE PRINTF ENGINE --- */
 
+/*
+ * snprintf — bounded format-to-buffer.
+ *
+ * Supported:
+ *   Specifiers : d i u x X o p s c %
+ *   Length mods: l  ll  z (size_t)
+ *   Flags      : -  0  +  (space)  #
+ *   Width      : %10d  %-10s
+ *   Precision  : %.4s  %08.4d
+ *
+ * Always NUL-terminates. Returns total characters that would have been
+ * written (C99 semantics), even if truncated.
+ */
 static inline int snprintf(char *str, size_t size, const char *fmt, ...) {
     if (!str || size == 0) return 0;
 
-    va_list args;
-    va_start(args, fmt);
+    va_list ap;
+    va_start(ap, fmt);
 
     char *out = str;
-    size_t rem = size ? size - 1 : 0;
-    int total = 0;
+    size_t rem = size - 1;   /* reserve one byte for NUL */
+    int total  = 0;
 
-    for (const char *p = fmt; *p; p++) {
-        if (*p == '%' && *(p+1)) {
-            p++;
-            char buf[64]; memset(buf, 0, 64);
-            int long_flag = 0;
-            int longlong_flag = 0;
+/* Emit one character — always count it, only store if room left */
+#define _EMIT(ch) do { if (rem > 0) { *out++ = (char)(ch); rem--; } total++; } while(0)
+#define _EMITS(s, n) do { for (int _i = 0; _i < (int)(n); _i++) _EMIT((s)[_i]); } while(0)
 
-            // Handle length modifiers
-            if (*p == 'l') {
-                long_flag = 1;
-                p++;
-                if (*p == 'l') {
-                    longlong_flag = 1;
-                    p++;
-                }
+    for (const char *p = fmt; *p; ) {
+        if (*p != '%') { _EMIT(*p++); continue; }
+        p++;                        /* skip '%' */
+        if (!*p) break;
+
+        /* ── Flags ── */
+        int flag_left  = 0;
+        int flag_zero  = 0;
+        int flag_plus  = 0;
+        int flag_space = 0;
+        int flag_hash  = 0;
+        for (;;) {
+            if      (*p == '-') { flag_left  = 1; p++; }
+            else if (*p == '0') { flag_zero  = 1; p++; }
+            else if (*p == '+') { flag_plus  = 1; p++; }
+            else if (*p == ' ') { flag_space = 1; p++; }
+            else if (*p == '#') { flag_hash  = 1; p++; }
+            else break;
+        }
+
+        /* ── Width ── */
+        int width = 0;
+        while (*p >= '0' && *p <= '9') { width = width * 10 + (*p++ - '0'); }
+
+        /* ── Precision ── */
+        int prec = -1;
+        if (*p == '.') {
+            p++; prec = 0;
+            while (*p >= '0' && *p <= '9') { prec = prec * 10 + (*p++ - '0'); }
+        }
+
+        /* ── Length modifier ── */
+        int lmod = 0; /* 0=int  1=long  2=long long  3=size_t */
+        if (*p == 'l') {
+            lmod = 1; p++;
+            if (*p == 'l') { lmod = 2; p++; }
+        } else if (*p == 'z') {
+            lmod = 3; p++;
+        }
+
+        char spec = *p++;
+
+        /* ── String / char: handle directly (no numeric pipeline) ── */
+        if (spec == 's') {
+            const char *s = va_arg(ap, const char *);
+            if (!s) s = "(null)";
+            int slen = (int)strlen(s);
+            if (prec >= 0 && slen > prec) slen = prec;
+            int pad = (width > slen) ? (width - slen) : 0;
+            if (!flag_left) for (int i = 0; i < pad; i++) _EMIT(' ');
+            _EMITS(s, slen);
+            if ( flag_left) for (int i = 0; i < pad; i++) _EMIT(' ');
+            continue;
+        }
+        if (spec == 'c') {
+            char c = (char)va_arg(ap, int);
+            int pad = (width > 1) ? (width - 1) : 0;
+            if (!flag_left) for (int i = 0; i < pad; i++) _EMIT(' ');
+            _EMIT(c);
+            if ( flag_left) for (int i = 0; i < pad; i++) _EMIT(' ');
+            continue;
+        }
+        if (spec == '%') { _EMIT('%'); continue; }
+
+        /* ── Numeric: convert to string in tmp[], then emit with padding ── */
+        char tmp[68];
+        int  val_len  = 0;
+        char sign_ch  = 0;  /* '-'  '+'  ' '  or 0 */
+
+        switch (spec) {
+
+        case 'd': case 'i': {
+            long long n;
+            if      (lmod == 2) n = va_arg(ap, long long);
+            else if (lmod == 1) n = va_arg(ap, long);
+            else if (lmod == 3) n = (long long)va_arg(ap, size_t);
+            else                n = va_arg(ap, int);
+            if      (n < 0)      { sign_ch = '-'; ulltoa((unsigned long long)-n, tmp, 10, 0); }
+            else if (flag_plus)  { sign_ch = '+'; ulltoa((unsigned long long) n, tmp, 10, 0); }
+            else if (flag_space) { sign_ch = ' '; ulltoa((unsigned long long) n, tmp, 10, 0); }
+            else                 {                ulltoa((unsigned long long) n, tmp, 10, 0); }
+            val_len = (int)strlen(tmp);
+            break;
+        }
+
+        case 'u': {
+            unsigned long long n;
+            if      (lmod == 2) n = va_arg(ap, unsigned long long);
+            else if (lmod == 1) n = va_arg(ap, unsigned long);
+            else if (lmod == 3) n = va_arg(ap, size_t);
+            else                n = (unsigned long long)va_arg(ap, unsigned int);
+            ulltoa(n, tmp, 10, 0);
+            val_len = (int)strlen(tmp);
+            break;
+        }
+
+        case 'o': {
+            unsigned long long n;
+            if      (lmod == 2) n = va_arg(ap, unsigned long long);
+            else if (lmod == 1) n = va_arg(ap, unsigned long);
+            else                n = (unsigned long long)va_arg(ap, unsigned int);
+            ulltoa(n, tmp, 8, 0);
+            val_len = (int)strlen(tmp);
+            /* # flag: prepend "0" if not already "0" */
+            if (flag_hash && tmp[0] != '0') {
+                memmove(tmp + 1, tmp, (size_t)val_len + 1);
+                tmp[0] = '0'; val_len++;
             }
+            break;
+        }
 
-            switch (*p) {
-                case 's': {
-                    const char *s = va_arg(args, const char*);
-                    if (!s) s = "(null)";
-                    for (int i=0; s[i]; i++, total++) {
-                        if (rem > 0) { *out++ = s[i]; rem--; }
-                    }
-                    break;
-                }
-                case 'd':
-                case 'i': {
-                    if (longlong_flag) {
-                        long long val = va_arg(args, long long);
-                        if (val < 0) { *buf = '-'; ulltoa((unsigned long long)(-val), buf+1, 10, 0); }
-                        else ulltoa((unsigned long long)val, buf, 10, 0);
-                    } else if (long_flag) {
-                        long val = va_arg(args, long);
-                        if (val < 0) { *buf = '-'; ulltoa((unsigned long)(-val), buf+1, 10, 0); }
-                        else ulltoa((unsigned long)val, buf, 10, 0);
-                    } else {
-                        int val = va_arg(args, int);
-                        if (val < 0) { *buf = '-'; ulltoa((unsigned int)(-val), buf+1, 10, 0); }
-                        else ulltoa((unsigned int)val, buf, 10, 0);
-                    }
-                    for (int i=0; buf[i]; i++, total++) {
-                        if (rem > 0) { *out++ = buf[i]; rem--; }
-                    }
-                    break;
-                }
-                case 'u': {
-                    if (longlong_flag) ulltoa(va_arg(args, unsigned long long), buf, 10, 0);
-                    else if (long_flag) ulltoa(va_arg(args, unsigned long), buf, 10, 0);
-                    else ulltoa(va_arg(args, unsigned int), buf, 10, 0);
-                    for (int i=0; buf[i]; i++, total++) {
-                        if (rem > 0) { *out++ = buf[i]; rem--; }
-                    }
-                    break;
-                }
-                case 'x':
-                case 'X': {
-                    int upper = (*p == 'X');
-                    if (longlong_flag) ulltoa(va_arg(args, unsigned long long), buf, 16, upper);
-                    else if (long_flag) ulltoa(va_arg(args, unsigned long), buf, 16, upper);
-                    else ulltoa(va_arg(args, unsigned int), buf, 16, upper);
-                    for (int i=0; buf[i]; i++, total++) {
-                        if (rem > 0) { *out++ = buf[i]; rem--; }
-                    }
-                    break;
-                }
-                case 'p': {
-                    unsigned long long ptr = (unsigned long long)va_arg(args, void*);
-                    strcpy(buf, "0x");
-                    char tmp[32]; memset(tmp, 0, 32);
-                    ulltoa(ptr, tmp, 16, 0);
-                    strncat(buf, tmp, sizeof(buf)-strlen(buf)-1);
-                    for (int i=0; buf[i]; i++, total++) {
-                        if (rem > 0) { *out++ = buf[i]; rem--; }
-                    }
-                    break;
-                }
-                case 'c': {
-                    char c = (char)va_arg(args, int);
-                    if (rem > 0) { *out++ = c; rem--; }
-                    total++;
-                    break;
-                }
-                case '%': {
-                    if (rem > 0) { *out++ = '%'; rem--; }
-                    total++;
-                    break;
-                }
-                default:
-                    // Unknown specifier: print literally
-                    if (rem > 0) { *out++ = '%'; rem--; }
-                    total++;
-                    if (rem > 0) { *out++ = *p; rem--; }
-                    total++;
-                    break;
+        case 'x': case 'X': {
+            unsigned long long n;
+            if      (lmod == 2) n = va_arg(ap, unsigned long long);
+            else if (lmod == 1) n = va_arg(ap, unsigned long);
+            else if (lmod == 3) n = va_arg(ap, size_t);
+            else                n = (unsigned long long)va_arg(ap, unsigned int);
+            ulltoa(n, tmp, 16, spec == 'X');
+            val_len = (int)strlen(tmp);
+            /* # flag: prepend "0x" / "0X" for non-zero values */
+            if (flag_hash && n != 0) {
+                memmove(tmp + 2, tmp, (size_t)val_len + 1);
+                tmp[0] = '0'; tmp[1] = (spec == 'X') ? 'X' : 'x';
+                val_len += 2;
             }
-        } else {
-            if (rem > 0) { *out++ = *p; rem--; }
-            total++;
+            break;
+        }
+
+        case 'p': {
+            unsigned long long n = (unsigned long long)(uintptr_t)va_arg(ap, void *);
+            tmp[0] = '0'; tmp[1] = 'x';
+            ulltoa(n, tmp + 2, 16, 0);
+            val_len = (int)strlen(tmp);
+            break;
+        }
+
+        default:
+            /* Unknown specifier — emit literally */
+            _EMIT('%'); _EMIT(spec);
+            continue;
+        }
+
+        /* ── Emit numeric value with sign, zero-pad, width-pad ── */
+        {
+            int sign_w   = sign_ch ? 1 : 0;
+            int zpad     = (prec >= 0 && prec > val_len) ? (prec - val_len) : 0;
+            int content  = sign_w + zpad + val_len;
+            int pad      = (width > content) ? (width - content) : 0;
+            /* zero-fill only when: flag_zero set, not left-aligned, no precision */
+            int use_zero = flag_zero && !flag_left && prec < 0;
+
+            if (!flag_left && !use_zero) for (int i = 0; i < pad; i++) _EMIT(' ');
+            if (sign_ch) _EMIT(sign_ch);
+            if (!flag_left &&  use_zero) for (int i = 0; i < pad; i++) _EMIT('0');
+            for (int i = 0; i < zpad; i++) _EMIT('0');
+            _EMITS(tmp, val_len);
+            if ( flag_left) for (int i = 0; i < pad; i++) _EMIT(' ');
         }
     }
 
+#undef _EMIT
+#undef _EMITS
+
     *out = '\0';
-    va_end(args);
+    va_end(ap);
     return total;
 }
 
+static inline void *memchr(const void *s, int c, size_t n) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (n--) {
+        if (*p == (unsigned char)c) return (void *)p;
+        p++;
+    }
+    return NULL;
+}
+/* vsnprintf — va_list variant of snprintf.
+ * vprintf in libc.h calls this; add it here so string.h is self-contained.
+ */
+static inline int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
+    if (!str || size == 0) return 0;
+
+    char *out = str;
+    size_t rem = size - 1;
+    int total  = 0;
+
+#define _EMIT(ch) do { if (rem > 0) { *out++ = (char)(ch); rem--; } total++; } while(0)
+#define _EMITS(s, n) do { for (int _i = 0; _i < (int)(n); _i++) _EMIT((s)[_i]); } while(0)
+
+    for (const char *p = fmt; *p; ) {
+        if (*p != '%') { _EMIT(*p++); continue; }
+        p++; if (!*p) break;
+
+        int flag_left=0,flag_zero=0,flag_plus=0,flag_space=0,flag_hash=0;
+        for(;;){
+            if(*p=='-'){flag_left=1;p++;}
+            else if(*p=='0'){flag_zero=1;p++;}
+            else if(*p=='+'){flag_plus=1;p++;}
+            else if(*p==' '){flag_space=1;p++;}
+            else if(*p=='#'){flag_hash=1;p++;}
+            else break;
+        }
+        int width=0;
+        while(*p>='0'&&*p<='9'){width=width*10+(*p++-'0');}
+        int prec=-1;
+        if(*p=='.'){p++;prec=0;while(*p>='0'&&*p<='9'){prec=prec*10+(*p++-'0');}}
+        int lmod=0;
+        if(*p=='l'){lmod=1;p++;if(*p=='l'){lmod=2;p++;}}
+        else if(*p=='z'){lmod=3;p++;}
+
+        char spec=*p++;
+        char tmp[68]; int val_len=0; char sign_ch=0;
+
+        if(spec=='s'){
+            const char *s=va_arg(ap,const char*); if(!s)s="(null)";
+            int slen=(int)strlen(s); if(prec>=0&&slen>prec)slen=prec;
+            int pad=(width>slen)?(width-slen):0;
+            if(!flag_left)for(int i=0;i<pad;i++)_EMIT(' ');
+            _EMITS(s,slen);
+            if(flag_left)for(int i=0;i<pad;i++)_EMIT(' ');
+            continue;
+        }
+        if(spec=='c'){
+            char c=(char)va_arg(ap,int);
+            int pad=(width>1)?(width-1):0;
+            if(!flag_left)for(int i=0;i<pad;i++)_EMIT(' ');
+            _EMIT(c);
+            if(flag_left)for(int i=0;i<pad;i++)_EMIT(' ');
+            continue;
+        }
+        if(spec=='%'){_EMIT('%');continue;}
+
+        switch(spec){
+        case 'd':case 'i':{
+            long long n;
+            if(lmod==2)n=va_arg(ap,long long);
+            else if(lmod==1)n=va_arg(ap,long);
+            else if(lmod==3)n=(long long)va_arg(ap,size_t);
+            else n=va_arg(ap,int);
+            if(n<0){sign_ch='-';ulltoa((unsigned long long)-n,tmp,10,0);}
+            else if(flag_plus){sign_ch='+';ulltoa((unsigned long long)n,tmp,10,0);}
+            else if(flag_space){sign_ch=' ';ulltoa((unsigned long long)n,tmp,10,0);}
+            else{ulltoa((unsigned long long)n,tmp,10,0);}
+            val_len=(int)strlen(tmp); break;}
+        case 'u':{
+            unsigned long long n;
+            if(lmod==2)n=va_arg(ap,unsigned long long);
+            else if(lmod==1)n=va_arg(ap,unsigned long);
+            else if(lmod==3)n=va_arg(ap,size_t);
+            else n=(unsigned long long)va_arg(ap,unsigned int);
+            ulltoa(n,tmp,10,0); val_len=(int)strlen(tmp); break;}
+        case 'o':{
+            unsigned long long n;
+            if(lmod==2)n=va_arg(ap,unsigned long long);
+            else if(lmod==1)n=va_arg(ap,unsigned long);
+            else n=(unsigned long long)va_arg(ap,unsigned int);
+            ulltoa(n,tmp,8,0); val_len=(int)strlen(tmp);
+            if(flag_hash&&tmp[0]!='0'){memmove(tmp+1,tmp,val_len+1);tmp[0]='0';val_len++;}
+            break;}
+        case 'x':case 'X':{
+            unsigned long long n;
+            if(lmod==2)n=va_arg(ap,unsigned long long);
+            else if(lmod==1)n=va_arg(ap,unsigned long);
+            else if(lmod==3)n=va_arg(ap,size_t);
+            else n=(unsigned long long)va_arg(ap,unsigned int);
+            ulltoa(n,tmp,16,spec=='X'); val_len=(int)strlen(tmp);
+            if(flag_hash&&n!=0){memmove(tmp+2,tmp,val_len+1);tmp[0]='0';tmp[1]=(spec=='X')?'X':'x';val_len+=2;}
+            break;}
+        case 'p':{
+            unsigned long long n=(unsigned long long)(uintptr_t)va_arg(ap,void*);
+            tmp[0]='0';tmp[1]='x';ulltoa(n,tmp+2,16,0);val_len=(int)strlen(tmp);break;}
+        default: _EMIT('%'); _EMIT(spec); continue;
+        }
+
+        {
+            int sign_w=sign_ch?1:0;
+            int zpad=(prec>=0&&prec>val_len)?(prec-val_len):0;
+            int content=sign_w+zpad+val_len;
+            int pad=(width>content)?(width-content):0;
+            int use_zero=flag_zero&&!flag_left&&prec<0;
+            if(!flag_left&&!use_zero)for(int i=0;i<pad;i++)_EMIT(' ');
+            if(sign_ch)_EMIT(sign_ch);
+            if(!flag_left&&use_zero)for(int i=0;i<pad;i++)_EMIT('0');
+            for(int i=0;i<zpad;i++)_EMIT('0');
+            _EMITS(tmp,val_len);
+            if(flag_left)for(int i=0;i<pad;i++)_EMIT(' ');
+        }
+    }
+
+#undef _EMIT
+#undef _EMITS
+
+    *out = '\0';
+    va_end(ap);
+    return total;
+}

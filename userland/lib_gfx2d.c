@@ -7,6 +7,25 @@
  * Fast path  — kernel-allocated ring (MAP_RING), one SUBMIT write/frame
  * Slow path  — malloc'd copy buffer, one write() per flush
  *
+ * Buffer allocation (gfx2d_alloc_buf):
+ *   1. MVC3_CMD_ALLOC_BUF  — kernel kmalloc's a page-aligned buffer and
+ *      returns its full 64-bit KVA in resp.handle.
+ *   2. MVC3_CMD_MAP_BUF    — kernel walks the session mapping table, finds
+ *      the buffer by KVA, and wires its pages into the calling process's
+ *      page table via devfs_mmap_region().  Returns the user VA.
+ *   3. The full 64-bit user VA is stored in the buffer table and returned
+ *      as *out_handle (uint64_t).  It also goes into every BLIT_BUF ring
+ *      slot; the kernel reads from it via usercopy during write().
+ *   Fallback: if MAP_BUF returns user_addr == 0 (old kernel / no mmap),
+ *      malloc a local buffer instead.  The kernel can read userspace pages
+ *      during write(), so BLIT_BUF still works on the copy-batch path.
+ *
+ * Handle width
+ * ────────────
+ * All handles exposed in the public API are now uint64_t so that addresses
+ * above 4 GiB are never silently truncated.  Internally the ring slot
+ * blit_buf.handle field is already uint64_t (see mvc3.h).
+ *
  * Copyright © 2025-2026 ModuOS Project Contributors — GPL v2.0
  */
 
@@ -81,8 +100,27 @@ int gfx2d_open(gfx2d_t *g) {
     return 0;
 }
 
+/* ── Buffer table cleanup ──────────────────────────────────────────── */
+
+static void free_bufs(gfx2d_t *g) {
+    for (uint32_t i = 0; i < g->n_bufs; i++) {
+        /*
+         * kva_mapped == 1  →  user_va is a kernel-owned mmap.  It will be
+         *                     unmapped automatically when the fd is closed.
+         *                     Do NOT free() it.
+         * kva_mapped == 0  →  user_va is a local malloc fallback.  Free it.
+         */
+        if (!g->bufs[i].kva_mapped && g->bufs[i].user_va) {
+            free(g->bufs[i].user_va);
+        }
+        g->bufs[i].user_va = NULL;
+    }
+    g->n_bufs = 0;
+}
+
 int gfx2d_close(gfx2d_t *g) {
     if (!g) return -EINVAL;
+    free_bufs(g);
     /* mapped_cmdbuf is kernel-owned — do NOT free() it */
     if (g->cmdbuf) { free(g->cmdbuf); g->cmdbuf = NULL; }
     if (g->fd >= 0) { close(g->fd); g->fd = -1; }
@@ -197,7 +235,7 @@ int gfx2d_blit_rect(gfx2d_t *g, uint32_t src_x, uint32_t src_y,
     return enqueue_slot(g, &slot);
 }
 
-int gfx2d_blit_buf(gfx2d_t *g, uint32_t handle,
+int gfx2d_blit_buf(gfx2d_t *g, uint64_t handle,
                    uint32_t src_x, uint32_t src_y,
                    uint32_t dst_x, uint32_t dst_y,
                    uint32_t w, uint32_t h,
@@ -206,7 +244,7 @@ int gfx2d_blit_buf(gfx2d_t *g, uint32_t handle,
     mvc3_ring_slot_t slot;
     memset(&slot, 0, sizeof(slot));
     slot.op                   = MVC3_OP_BLIT_BUF;
-    slot.u.blit_buf.handle    = handle;   /* user VA, fits in 32 bits */
+    slot.u.blit_buf.handle    = handle;   /* full 64-bit user VA */
     slot.u.blit_buf.src_x     = src_x;
     slot.u.blit_buf.src_y     = src_y;
     slot.u.blit_buf.dst_x     = dst_x;
@@ -253,72 +291,84 @@ int gfx2d_flush(gfx2d_t *g, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 
 /* ── Buffer management ─────────────────────────────────────────────── */
 
-/*
- * gfx2d_alloc_buf
- * ───────────────
- * 1. Send MVC3_CMD_ALLOC_BUF — kernel kmalloc's a page-aligned buffer
- *    and returns its full 64-bit KVA in resp.handle.
- * 2. Call dev_mmap(offset = MVC3_OFF_BUF_BASE + kva) — kernel walks the
- *    session mapping table, finds the buffer, and wires its pages into
- *    the calling process's page table via devfs_mmap_region().
- * 3. Return the resulting user VA as out_handle (fits in 32 bits since
- *    ModuOS userspace lives below 4 GiB).
- *
- * Fallback: if dev_mmap fails (old kernel / copy-batch mode), malloc a
- * local buffer.  The kernel can read userspace pages during write(), so
- * BLIT_BUF still works on the copy-batch path.
- */
-/* ── Updated Buffer Management ─────────────────────────────────────── */
-
 int gfx2d_alloc_buf(gfx2d_t *g, uint32_t size_bytes, uint32_t fmt,
-                    uint32_t *out_handle, uint32_t *out_pitch) {
+                    uint64_t *out_handle, uint32_t *out_pitch)
+{
     if (!g || !out_handle || !out_pitch) return -EINVAL;
+    if (g->n_bufs >= GFX2D_MAX_BUFS)    return -ENOMEM;
 
-    /* 1. Allocate local memory in userspace */
-    void *buf = malloc(size_bytes);
-    if (!buf) return -ENOMEM;
-    memset(buf, 0, size_bytes);
-
-    /* 2. Notify kernel to get device-specific metadata (pitch/format) */
+    /* Send ALLOC_BUF so the kernel knows about this buffer
+     * and can accept BLIT_BUF commands referencing it. */
     mvc3_alloc_buf_req_t req;
     memset(&req, 0, sizeof(req));
     hdr_init(&req.hdr, MVC3_CMD_ALLOC_BUF, sizeof(req));
     req.size_bytes = size_bytes;
     req.fmt        = fmt;
-    
-    if (write_full(g->fd, &req, sizeof(req)) != 0) {
-        free(buf);
-        return -EIO;
-    }
+
+    if (write_full(g->fd, &req, sizeof(req)) != 0) return -EIO;
 
     mvc3_alloc_buf_resp_t resp;
-    if (read_full(g->fd, &resp, sizeof(resp)) != 0) {
-        free(buf);
-        return -EIO;
-    }
+    memset(&resp, 0, sizeof(resp));
+    if (read_full(g->fd, &resp, sizeof(resp)) != 0) return -EIO;
+    if (resp.handle == 0) return -ENOMEM;
 
-    /* 3. The handle is simply the User Virtual Address */
-    *out_handle = (uint32_t)(uintptr_t)buf;
-    
-    /* Use kernel-suggested pitch if provided, otherwise calculate default */
-    *out_pitch  = resp.pitch ? resp.pitch : (size_bytes / 4);
-    
+    /*
+     * Skip MAP_BUF entirely — devfs_mmap_region is broken.
+     * Allocate locally; kernel reads these pages via usercopy
+     * during write() syscall, so BLIT_BUF works fine.
+     */
+    gfx2d_buf_t *b = &g->bufs[g->n_bufs];
+    b->kva        = resp.handle;
+    b->size_bytes = size_bytes;
+    b->fmt        = fmt;
+    b->kva_mapped = 0;
+    b->pitch      = resp.pitch ? resp.pitch : size_bytes / 4u;
+
+    b->user_va = malloc(size_bytes);
+    if (!b->user_va) return -ENOMEM;
+    memset(b->user_va, 0, size_bytes);
+
+    g->n_bufs++;
+
+    /*
+     * Return the full 64-bit user VA as the handle.
+     * Callers must store it as uint64_t and pass it back unchanged to
+     * gfx2d_blit_buf / gfx2d_map_buf.  Never truncate to 32 bits.
+     */
+    *out_handle = (uint64_t)(uintptr_t)b->user_va;
+    *out_pitch  = b->pitch;
     return 0;
 }
 
-int gfx2d_map_buf(gfx2d_t *g, uint32_t handle,
+int gfx2d_map_buf(gfx2d_t *g, uint64_t handle,
                   void **out_addr, uint32_t *out_size,
-                  uint32_t *out_pitch, uint32_t *out_fmt) {
+                  uint32_t *out_pitch, uint32_t *out_fmt)
+{
     if (!g || !out_addr) return -EINVAL;
 
-    /* Handle is already the pointer */
-    *out_addr = (void *)(uintptr_t)handle;
-    
-    if (out_size)  *out_size = 0; 
+    void *va = (void *)(uintptr_t)handle;
+
+    /*
+     * Look up by user VA (64-bit) in the buffer table so we can return
+     * accurate size/pitch/fmt.  gfx2d_alloc_buf is the only code that
+     * adds entries, so anything not in the table is an invalid handle.
+     */
+    for (uint32_t i = 0; i < g->n_bufs; i++) {
+        if (g->bufs[i].user_va == va) {
+            *out_addr = va;
+            if (out_size)  *out_size  = g->bufs[i].size_bytes;
+            if (out_pitch) *out_pitch = g->bufs[i].pitch;
+            if (out_fmt)   *out_fmt   = g->bufs[i].fmt;
+            return 0;
+        }
+    }
+
+    /* Handle not found */
+    *out_addr = NULL;
+    if (out_size)  *out_size  = 0;
     if (out_pitch) *out_pitch = 0;
-    if (out_fmt)   *out_fmt = 0;
-    
-    return 0;
+    if (out_fmt)   *out_fmt   = 0;
+    return -EINVAL;
 }
 
 /* ── Cursor ────────────────────────────────────────────────────────── */

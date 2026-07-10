@@ -43,16 +43,18 @@ REM Boot the kernel ISO in QEMU (AHCI with forced PS/2 keyboard)
 REM -----------------------------
 echo. > com1.log
 echo. > com2.log
+echo. > com3.log
 timeout /t 1 /nobreak >nul
 
 REM Start QEMU
 start "cmdQEMU" qemu-system-x86_64 ^
     -machine pc ^
     -smbios type=1,manufacturer="NTLLC",product="DevmanPC",version="1.0",serial="MDMDMDMDMDMD" ^
-    -m 1024M ^
+    -m 4096M ^
     -smp 2 ^
     -serial file:com1.log ^
     -serial file:com2.log ^
+    -serial file:com3.log ^
     -audiodev dsound,id=snd0 ^
     -device intel-hda -device hda-duplex,audiodev=snd0 ^
     -netdev user,id=u1 -device e1000,netdev=u1,mac=52:54:00:12:34:56 ^
@@ -69,6 +71,6 @@ start "cmdQEMU" qemu-system-x86_64 ^
 
 timeout /t 1 /nobreak >nul
 
-".\vendor\NTSoftware\Log Viewer.exe" com1.log com2.log
+".\vendor\NTSoftware\Log Viewer.exe" com1.log com2.log com3.log
 
 endlocal

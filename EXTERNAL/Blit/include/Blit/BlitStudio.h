@@ -2,7 +2,7 @@
 // BlitStudio - Visual Game Editor for Blit Engine
 // Create games without writing code!
 //
-// Copyright © 2026 ModuOS Project Contributors
+// Copyright © 2026 New Technologies Software
 // Licensed under GPL v2.0
 
 #include <Blit/Blit.h>

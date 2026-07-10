@@ -22,19 +22,20 @@
 #include "libc.h"
 
 /* MVC3 / gfx2d capability flags (SQRM_GPU_CAP_* from sqrm_sdk.h) */
-#define MVC3_CAP_2D_ACCEL   (1u << 0)   /* gfx_fill_rect / gfx_blit_rect  */
-#define MVC3_CAP_ALPHA_BLEND (1u << 1)  /* reserved for future blending hw */
+#define MVC3_CAP_2D_ACCEL    (1u << 0)   /* gfx_fill_rect / gfx_blit_rect  */
+#define MVC3_CAP_ALPHA_BLEND (1u << 1)   /* reserved for future blending hw */
 
 #define MAX_RESOURCES 256
 
 typedef struct {
-    uint32_t in_use;
-    uint32_t handle;
+    uint32_t     in_use;
+    uint32_t     handle;      /* stable resource ID — never changes after alloc  */
+    uint64_t     gfx_handle;  /* full 64-bit user VA from gfx2d_alloc_buf (for BLIT_BUF) */
     NodGL_Format format;
-    uint32_t width;
-    uint32_t height;
-    uint32_t pitch;
-    void    *mapped_addr;
+    uint32_t     width;
+    uint32_t     height;
+    uint32_t     pitch;
+    void        *mapped_addr;
 } NodGL_resource_entry_t;
 
 struct NodGL_device {
@@ -82,6 +83,13 @@ uint32_t NodGL_ColorARGB(uint8_t a, uint8_t r, uint8_t g, uint8_t b) {
            ((uint32_t)g <<  8) | (uint32_t)b;
 }
 
+/*
+ * NodGL_find_resource — locate a slot by its stable resource ID.
+ *
+ * The resource ID is the sequential counter value stored in res->handle by
+ * NodGL_alloc_resource_slot.  It must never be overwritten with gfx_handle
+ * (the 64-bit user VA) — those are kept separately in res->gfx_handle.
+ */
 static NodGL_resource_entry_t *NodGL_find_resource(NodGL_Device device,
                                                     NodGL_Resource id) {
     if (!device) return NULL;
@@ -307,17 +315,34 @@ int NodGL_CreateTexture(
         default:                          fmt = 1; break;
     }
 
-    uint32_t gfx_handle = 0, pitch = 0;
+    /*
+     * gfx2d now hands back the full 64-bit user VA as the buffer handle
+     * (handle widths were widened so addresses above 4 GiB on ModuOS's
+     * user heap aren't silently truncated). NodGL stores it in
+     * res->gfx_handle, which is uint64_t.
+     */
+    uint64_t gfx_handle = 0;
+    uint32_t pitch = 0;
     int rc = gfx2d_alloc_buf(&device->gfx2d,
                               desc->width * desc->height * 4,
                               fmt, &gfx_handle, &pitch);
     if (rc != 0) { res->in_use = 0; return NodGL_ERROR_OUT_OF_MEMORY; }
 
-    res->handle      = gfx_handle;
+    /*
+     * IMPORTANT: res->handle is the stable resource ID set by
+     * NodGL_alloc_resource_slot.  Do NOT overwrite it with gfx_handle —
+     * NodGL_find_resource searches by handle, so clobbering it would make
+     * every subsequent DrawTexture / MapResource call fail to find this slot.
+     *
+     * gfx_handle (the 64-bit user VA from gfx2d_alloc_buf) lives in
+     * res->gfx_handle.  It is what we pass to gfx2d_blit_buf and
+     * gfx2d_map_buf.
+     */
+    res->gfx_handle  = gfx_handle;
     res->format      = desc->format;
     res->width       = desc->width;
     res->height      = desc->height;
-    res->pitch = pitch ? pitch : desc->width * 4u;
+    res->pitch       = pitch ? pitch : desc->width * 4u;
     res->mapped_addr = NULL;
 
     /* Upload initial pixel data if provided */
@@ -325,13 +350,17 @@ int NodGL_CreateTexture(
         void    *mapped = NULL;
         uint32_t sz = 0, p = 0, f = 0;
         if (gfx2d_map_buf(&device->gfx2d, gfx_handle,
-                          &mapped, &sz, &p, &f) == 0 && mapped) {
-            uint32_t copy = desc->initial_data_size < sz
+                          &mapped, &sz, &p, &f) == 0 && mapped && sz > 0) {
+            uint32_t copy = (desc->initial_data_size < sz)
                           ? desc->initial_data_size : sz;
             memcpy(mapped, desc->initial_data, copy);
         }
     }
 
+    /*
+     * Return the stable resource ID to the caller.  This is what they pass
+     * back to DrawTexture, MapResource, ReleaseResource, etc.
+     */
     *out_texture = res->handle;
     return NodGL_OK;
 }
@@ -347,12 +376,14 @@ int NodGL_CreateBuffer(
     NodGL_resource_entry_t *res = NodGL_alloc_resource_slot(device);
     if (!res) return NodGL_ERROR_OUT_OF_MEMORY;
 
-    uint32_t gfx_handle = 0, pitch = 0;
+    uint64_t gfx_handle = 0;
+    uint32_t pitch = 0;
     int rc = gfx2d_alloc_buf(&device->gfx2d, desc->size_bytes,
                               1, &gfx_handle, &pitch);
     if (rc != 0) { res->in_use = 0; return NodGL_ERROR_OUT_OF_MEMORY; }
 
-    res->handle      = gfx_handle;
+    /* Same rule: handle = resource ID (untouched), gfx_handle = 64-bit user VA */
+    res->gfx_handle  = gfx_handle;
     res->format      = desc->format;
     res->width       = 0;
     res->height      = 0;
@@ -383,14 +414,14 @@ int NodGL_MapResource(
 
     void    *mapped = NULL;
     uint32_t size = 0, pitch = 0, fmt = 0;
-    int rc = gfx2d_map_buf(&ctx->device->gfx2d, res->handle,
+    int rc = gfx2d_map_buf(&ctx->device->gfx2d, res->gfx_handle,
                             &mapped, &size, &pitch, &fmt);
     if (rc != 0 || !mapped) return NodGL_ERROR_DEVICE_LOST;
 
     res->mapped_addr = mapped;
-    res->pitch       = pitch;
-    *out_data        = mapped;
-    if (out_pitch) *out_pitch = pitch;
+    if (pitch) res->pitch = pitch;
+    *out_data = mapped;
+    if (out_pitch) *out_pitch = res->pitch;
     return NodGL_OK;
 }
 
@@ -462,8 +493,6 @@ int NodGL_FillRectContext(
     return (rc == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
 }
 
-/* ── Updated NodGL Rendering Commands ──────────────────────────────── */
-
 int NodGL_DrawTexture(
     NodGL_Context ctx,
     NodGL_Texture texture,
@@ -473,6 +502,11 @@ int NodGL_DrawTexture(
 {
     if (!ctx || !ctx->device) return NodGL_ERROR_INVALID_ARGS;
 
+    /*
+     * Look up by stable resource ID (res->handle).
+     * This works correctly now that NodGL_CreateTexture no longer overwrites
+     * res->handle with the gfx user VA.
+     */
     NodGL_resource_entry_t *res = NodGL_find_resource(ctx->device, texture);
     if (!res) return NodGL_ERROR_INVALID_ARGS;
 
@@ -485,10 +519,13 @@ int NodGL_DrawTexture(
         default:                          mvc_fmt = 1; break;
     }
 
-    /* This call now passes the Userland VA (handle) which the kernel 
-     * will validate against its session mapping table. */
+    /*
+     * Pass gfx_handle (the full 64-bit user VA) to gfx2d_blit_buf.
+     * The kernel validates it against the session mapping table and reads
+     * the pixel data via usercopy during the write() syscall.
+     */
     int rc = gfx2d_blit_buf(&ctx->device->gfx2d,
-                             res->handle,
+                             res->gfx_handle,
                              (uint32_t)src_x, (uint32_t)src_y,
                              (uint32_t)dst_x, (uint32_t)dst_y,
                              width, height,

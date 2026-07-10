@@ -33,11 +33,6 @@ static void (*g_flush_hook)(const framebuffer_t *fb, uint32_t x, uint32_t y, uin
 /* Prevent re-entrancy if the flush hook itself ends up triggering console output. */
 static bool g_in_flush = false;
 
-/* optional BMP font (owned buffer loaded from FS) */
-static void *g_fbcon_font_bmp_buf = NULL;
-static size_t g_fbcon_font_bmp_size = 0;
-static int g_fbcon_font_bmp_loaded = 0;
-
 /* optional PF2 unicode font */
 static fnt_font_t *g_fbcon_fnt = NULL;
 static int g_fbcon_fnt_loaded = 0;
@@ -110,9 +105,8 @@ static void vga_try_init_fb_console(void) {
         int slot = kernel_get_boot_slot();
         if (slot >= 0) {
             /* Try FNT unicode font (custom format) first */
-            #if 1
             if (!g_fbcon_fnt_loaded) {
-                const char *fntp = "/ModuOS/shared/assets/fonts/Unicode.fnt";
+                const char *fntp = "/ModuOS/shared/assets/fonts/Terminus.fnt";
                 void *fnt_buf = NULL;
                 size_t fnt_size = 0;
                 int fr = hvfs_read(slot, fntp, &fnt_buf, &fnt_size);
@@ -122,52 +116,8 @@ static void vga_try_init_fb_console(void) {
                     if (g_fbcon_fnt) {
                         g_fbcon_fnt_loaded = 1;
                         fbcon_set_fnt_font(&g_fbcon, g_fbcon_fnt);
-                        com_write_string(COM1_PORT, "[FBCON] Using FNT font: /ModuOS/shared/assets/fonts/Unicode.fnt\n");
+                        com_write_string(COM1_PORT, "[FBCON] Using FNT font: /ModuOS/shared/assets/fonts/Terminus.fnt\n");
                     }
-                }
-            }
-            #endif
-            
-            /* Optional BMP atlas font */
-            if (!g_fbcon_font_bmp_loaded) {
-                const char *path = "/ModuOS/shared/fonts/ModuOSDEF.bmp";
-                int r = hvfs_read(slot, path, &g_fbcon_font_bmp_buf, &g_fbcon_font_bmp_size);
-                if (r == 0 && g_fbcon_font_bmp_buf && g_fbcon_font_bmp_size) {
-                    int fr = fbcon_set_bmp_font_moduosdef(&g_fbcon, g_fbcon_font_bmp_buf, g_fbcon_font_bmp_size);
-                    if (fr == 0) {
-                        if (kernel_debug_is_med()) {
-                            com_write_string(COM1_PORT, "[FBCON] Using BMP font: ");
-                            com_write_string(COM1_PORT, path);
-                            com_write_string(COM1_PORT, "\n");
-                        }
-                        if (kernel_debug_is_on()) {
-                            com_printf(COM1_PORT,
-                                       "[FBCON] BMP: w=%u h=%u cell=%ux%u alpha=%s thr=%u invert=%u\n",
-                                       (unsigned)g_fbcon.bmp_font.img.width,
-                                       (unsigned)g_fbcon.bmp_font.img.height,
-                                       (unsigned)g_fbcon.bmp_font.cell_w,
-                                       (unsigned)g_fbcon.bmp_font.cell_h,
-                                       (g_fbcon.bmp_font.img.amask != 0) ? "yes" : "no",
-                                       (unsigned)g_fbcon.bmp_font.threshold,
-                                       (unsigned)g_fbcon.bmp_font.invert);
-                            com_printf(COM1_PORT,
-                                       "[FBCON] BMP masks: r=0x%08x g=0x%08x b=0x%08x a=0x%08x\n",
-                                       (unsigned)g_fbcon.bmp_font.img.rmask,
-                                       (unsigned)g_fbcon.bmp_font.img.gmask,
-                                       (unsigned)g_fbcon.bmp_font.img.bmask,
-                                       (unsigned)g_fbcon.bmp_font.img.amask);
-                        }
-                    } else {
-                        if (kernel_debug_is_med()) {
-                            com_write_string(COM1_PORT, "[FBCON] BMP font parse failed; keeping built-in font\n");
-                        }
-                    }
-                    g_fbcon_font_bmp_loaded = 1; /* don't retry endlessly */
-                } else {
-                    if (kernel_debug_is_med()) {
-                        com_write_string(COM1_PORT, "[FBCON] Could not read ModuOSDEF.bmp; keeping built-in font\n");
-                    }
-                    g_fbcon_font_bmp_loaded = 1; /* don't retry endlessly */
                 }
             }
         }
@@ -333,9 +283,6 @@ void VGA_ReinitFrameBufferConsole(void) {
 
         if (g_fbcon_fnt_loaded && g_fbcon_fnt) {
             fbcon_set_fnt_font(&g_fbcon, g_fbcon_fnt);
-        }
-        if (g_fbcon_font_bmp_loaded && g_fbcon_font_bmp_buf && g_fbcon_font_bmp_size) {
-            fbcon_set_bmp_font_moduosdef(&g_fbcon, g_fbcon_font_bmp_buf, g_fbcon_font_bmp_size);
         }
     }
 }

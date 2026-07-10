@@ -1,19 +1,15 @@
 // ModuOS System Services
 // This file is read by automan (PID 1) on boot
 
-setenv OS_NAME=ModuOS
-setenv OS_VER=-0.6.1
-setenv KERNEL=MDSYS
-setenv KERNEL_PATH=/ModuOS/System64/mdsys.sqr
-setenv KERNEL_VER=0.6.0
-setenv PATH=/Apps;/ModuOS/System64/
 
 // Core system services
 // critical /Apps/ntosiux_ttyman.sqr
-// service /Apps/netman.sqr
-
+// service /ModuOS/System64/Apps/netd.sqr
 // User services
-//service /Apps/userman.sqr
-
-// Login shell on TTY1
+// service /Apps/userman.sqr
+// service /Apps/calc_service.sqr
 bg /Apps/zenith5.1.sqr
+
+//bg /Apps/nodds.sqr
+//bg /Apps/nodds_demo.sqr
+//bg /Apps/ninput_test.sqr

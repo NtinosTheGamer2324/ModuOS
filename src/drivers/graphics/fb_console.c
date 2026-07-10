@@ -346,27 +346,15 @@ void fbcon_set_cursor_pos(fb_console_t *c, uint32_t row, uint32_t col) {
 int fbcon_init(fb_console_t *c, const framebuffer_t *fb) {
     if (!c || !fb || !fb->addr || fb->width == 0 || fb->height == 0 || fb->pitch == 0) return -1;
     memset(c, 0, sizeof(*c));
-    /* utf8_pending_* already zeroed */
 
     c->fb = *fb;
     c->ready = true;
-
-    /* Cursor enabled by default (static underline cursor). */
     c->cursor_enabled = true;
     c->cursor_drawn = false;
-
     c->fg = 0x07;
     c->bg = 0x00;
-
-    c->bmp_font_ready = 0;
-    c->bmp_render_w = 0;
-    c->bmp_render_h = 0;
-
-
-    /* Small margin helps avoid any top-edge glitches */
     c->margin_top = 2;
     c->margin_left = 2;
-
     c->cell_w = BITMAP_FONT_W;
     c->cell_h = BITMAP_FONT_H;
 
@@ -392,32 +380,6 @@ void fbcon_set_fnt_font(fb_console_t *c, const fnt_font_t *font) {
         if (font->header.glyph_width) c->cell_w = font->header.glyph_width;
         if (font->header.glyph_height) c->cell_h = font->header.glyph_height;
     }
-}
-
-int fbcon_set_bmp_font_moduosdef(fb_console_t *c, const void *bmp_buf, size_t bmp_size) {
-    if (!c || !bmp_buf || bmp_size < 64) return -1;
-    int r = bmp_font_init_moduosdef(&c->bmp_font, bmp_buf, bmp_size);
-    if (r != 0) {
-        c->bmp_font_ready = 0;
-        return r;
-    }
-    /* Sanity: reject obviously broken atlas layouts */
-    if (c->bmp_font.cols == 0 || c->bmp_font.rows == 0 || c->bmp_font.cell_w == 0 || c->bmp_font.cell_h == 0) {
-        c->bmp_font_ready = 0;
-        return -2;
-    }
-
-    c->bmp_font_ready = 1;
-
-    /* Render downscaled for usability; source cells are 30x30.
-     * 12x16 is readable and closer to a classic terminal size.
-     */
-    c->bmp_render_w = 12;
-    c->bmp_render_h = 16;
-
-    c->cell_w = c->bmp_render_w;
-    c->cell_h = c->bmp_render_h;
-    return 0;
 }
 
 void fbcon_set_text_color(fb_console_t *c, uint8_t fg, uint8_t bg) {
@@ -526,36 +488,13 @@ static int fbcon_draw_glyph_fnt(fb_console_t *c, uint32_t cp, uint16_t *out_adva
 }
 
 static void fbcon_draw_glyph(fb_console_t *c, uint8_t ch) {
-    uint8_t fr,fg,fb, br,bg,bb;
-    vga16_to_rgb(c->fg, &fr,&fg,&fb);
-    vga16_to_rgb(c->bg, &br,&bg,&bb);
-    uint32_t fpx = fb_pack_rgb888(&c->fb, fr,fg,fb);
-    uint32_t bpx = fb_pack_rgb888(&c->fb, br,bg,bb);
+    uint8_t fr, fg, fb, br, bg, bb;
+    vga16_to_rgb(c->fg, &fr, &fg, &fb);
+    vga16_to_rgb(c->bg, &br, &bg, &bb);
+    uint32_t fpx = fb_pack_rgb888(&c->fb, fr, fg, fb);
+    uint32_t bpx = fb_pack_rgb888(&c->fb, br, bg, bb);
 
-    /* Fill cell background */
     fb_fill_rect(&c->fb, c->x, c->y, c->cell_w, c->cell_h, bpx);
-
-    if (c->bmp_font_ready) {
-        /* Downscale glyph by sampling from the 30x30 source cell */
-        uint32_t dst_w = c->bmp_render_w ? c->bmp_render_w : c->cell_w;
-        uint32_t dst_h = c->bmp_render_h ? c->bmp_render_h : c->cell_h;
-
-        /* Hard safety: avoid divide-by-zero even if configuration/state is corrupted. */
-        if (dst_w == 0 || dst_h == 0 || c->bmp_font.cell_w == 0 || c->bmp_font.cell_h == 0) {
-            return;
-        }
-
-        for (uint32_t yy = 0; yy < dst_h; yy++) {
-            uint32_t sy = (yy * (uint32_t)c->bmp_font.cell_h) / dst_h;
-            for (uint32_t xx = 0; xx < dst_w; xx++) {
-                uint32_t sx = (xx * (uint32_t)c->bmp_font.cell_w) / dst_w;
-                if (bmp_font_glyph_pixel_on(&c->bmp_font, ch, (uint16_t)sx, (uint16_t)sy)) {
-                    fb_put_pixel(&c->fb, c->x + xx, c->y + yy, fpx);
-                }
-            }
-        }
-        return;
-    }
 
     const uint8_t *g = bitmap_font_glyph8x16(ch);
     if (!g) return;
@@ -563,8 +502,7 @@ static void fbcon_draw_glyph(fb_console_t *c, uint8_t ch) {
     for (uint32_t yy = 0; yy < BITMAP_FONT_H; yy++) {
         uint8_t row = g[yy];
         for (uint32_t xx = 0; xx < BITMAP_FONT_W; xx++) {
-            uint8_t bit = (uint8_t)(0x80u >> xx);
-            if (row & bit) {
+            if (row & (0x80u >> xx)) {
                 fb_put_pixel(&c->fb, c->x + xx, c->y + yy, fpx);
             }
         }
