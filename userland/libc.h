@@ -898,7 +898,7 @@ static inline int waitpid(int pid, int *status, int options) {
     return (int)r;
 }
 
-/* POSIX wait - wait for any child process */
+/* POSIX wait - wait for any child process, and NTOSIUX setuid_of_other_process */
 static inline int wait(int *status) {
     long r = syscall(SYS_WAIT, (long)status, 0, 0);
     if (r < 0) { errno = (int)(-r); return -1; }
@@ -913,6 +913,13 @@ static inline int setuid(int uid) {
     return (int)syscall(SYS_SETUID, (long)uid, 0, 0);
 }
 
+static inline int setuid_of_other_process(int uid, uint32_t target) {
+    return (int)syscall(SYS_SETUID_OF_OTHER_PROCESS, (long)target, (long)uid, 0);
+}
+
+static inline int getuid_of_other_process(uint32_t target) {
+    return (int)syscall(SYS_GETUID_OF_OTHER_PROCESS, (long)target, 0, 0);
+}
 
 static inline void sleep(unsigned int sec) {
     syscall(SYS_SLEEP, sec, 0, 0);

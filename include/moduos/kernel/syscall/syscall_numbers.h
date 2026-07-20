@@ -42,8 +42,10 @@
 #define SYS_VFS_GETPART 37
 #define SYS_VFS_MBRINIT 41
 /* User identity */
+#define SYS_GETUID_OF_OTHER_PROCESS 32
 #define SYS_GETUID      33
 #define SYS_SETUID      34
+#define SYS_SETUID_OF_OTHER_PROCESS 35
 /* Graphics/VGA - REMOVED: ~~Use $/dev/graphics/video0 instead~~ use $/dev/mvc/mvi0*/
 /* Virtual memory mapping (userland dynamic linker support) */
 #define SYS_MMAP        39

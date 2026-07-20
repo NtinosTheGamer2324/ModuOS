@@ -134,16 +134,40 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_GETPPID: return sys_getppid();
         case SYS_GETUID: {
             process_t *p = process_get_current();
-            return p ? (long)p->uid : 0;
+            return (long)p->uid;
         }
+
+        case SYS_GETUID_OF_OTHER_PROCESS: {
+            process_t *target = process_get_by_pid((uint32_t)arg1);
+            process_t *self = process_get_current();
+            if (!self) return (uint64_t)-(int64_t)EINVAL;
+            if (!target) return (uint64_t)-(int64_t)EINVAL;
+            if (self->uid != 0) {
+                com_printf(COM2_PORT, "%d", self->uid);
+                return (uint64_t)-(int64_t)EPERM;
+            }
+            return (long)target->uid;
+        }
+
         case SYS_SETUID: {
             process_t *p = process_get_current();
             if (!p) return (uint64_t)-(int64_t)EPERM;
-            if (p->uid == KERNEL_UID) return (uint64_t)-(int64_t)EPERM;
+            if (p->uid != KERNEL_UID && p->uid != 0) return (uint64_t)-(int64_t)EPERM;
             if ((uint32_t)arg1 == KERNEL_UID) return (uint64_t)-(int64_t)EPERM;
-            if (p->uid != 0) return (uint64_t)-(int64_t)EPERM;
             p->uid = (uint32_t)arg1;
             p->euid = (uint32_t)arg1;
+            return 0;
+        }
+
+        case SYS_SETUID_OF_OTHER_PROCESS: {
+            process_t *self = process_get_current();
+            process_t *target = process_get_by_pid((uint32_t)arg1);
+            if (!self) return (uint64_t)-(int64_t)EPERM;
+            if (!target) return (uint64_t)-(int64_t)EINVAL;
+            if (self->uid != KERNEL_UID && self->uid != 0) return (uint64_t)-(int64_t)EPERM;
+            if ((uint32_t)arg2 == KERNEL_UID) return (uint64_t)-(int64_t)EPERM;
+            target->uid = (uint32_t)arg2;
+            target->euid = (uint32_t)arg2;
             return 0;
         }
 
