@@ -435,6 +435,8 @@ static ssize_t userfs_invoke_owner_callback(unode_t *node, int is_read,
         return -1;
     }
 
+    uint64_t irq_flags = irq_save();
+
     uint64_t old_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
 
@@ -444,22 +446,23 @@ static ssize_t userfs_invoke_owner_callback(unode_t *node, int is_read,
 
     ssize_t rc = -1;
 
-    if (is_read == 1) {                    // read
+    if (is_read == 1) {
         if (node->ops.read)
             rc = node->ops.read(node->ops_ctx, out_buf, out_size);
     }
-    else if (is_read == 0) {               // write
+    else if (is_read == 0) {
         if (node->ops.write)
             rc = node->ops.write(node->ops_ctx, in_buf, in_size);
     }
-    else {                                 // invoke
-        if (node->ops.invoke)
-            rc = node->ops.invoke(node->ops_ctx, in_buf, in_size, out_buf, out_size);
+    else {
+        rc = node->ops.invoke(node->ops_ctx, in_buf, in_size, out_buf, out_size);
     }
 
     if (owner_cr3 && (old_cr3 & ~0xFFFULL) != owner_cr3) {
         __asm__ volatile("mov %0, %%cr3" :: "r"(old_cr3) : "memory");
     }
+
+    irq_restore(irq_flags);
 
     return rc;
 }
@@ -532,7 +535,7 @@ ssize_t userfs_invoke(void *handle,
     if (!h || !h->node || h->node->type != UNODE_DEV)
         return -1;
 
-    if (!ufs_check_access(h->node, 0, 1))        // is_invoke = 1
+    if (!ufs_check_access(h->node, 0, 1))
         return -2;
 
     if (!h->node->ops.invoke)
