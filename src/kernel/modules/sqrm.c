@@ -1562,9 +1562,6 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
     }
 
     if (desc->type == SQRM_TYPE_GENERIC) {
-        com_write_string(COM1_PORT, "[SQRM] build_api: wiring GENERIC gfx for ");
-        com_write_string(COM1_PORT, desc->name ? desc->name : "(null)");
-        com_write_string(COM1_PORT, "\n");
         out_api->gfx_get_framebuffer = gfx_wrap_get_framebuffer;
         out_api->gfx_get_caps        = gfx_wrap_get_caps;
         out_api->gfx_fill_rect       = gfx_wrap_fill_rect;
@@ -1574,9 +1571,7 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
         out_api->gfx_cursor_show     = gfx_wrap_cursor_show;
         out_api->gfx_flush           = gfx_wrap_flush;
         out_api->gfx_set_mode        = gfx_wrap_set_mode;
-        com_write_string(COM1_PORT, "[SQRM] build_api: gfx_blit_buffer ptr=");
         com_write_hex64(COM1_PORT, (uint64_t)(uintptr_t)gfx_wrap_blit_buffer);
-        com_write_string(COM1_PORT, "\n");
     }
 
     // SQRM services (exports): available to all modules
