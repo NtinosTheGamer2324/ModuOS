@@ -99,13 +99,13 @@ int md_main(long argc, char **argv) {
             if (who == 0) {
                 printf("\n┌─%s# %s%d@%s\n└─[%s]>", ANSI_RED, ANSI_RESET, who, host, cwd);
             } else {
-                printf("\n┌─%s# %s%d@%s\n└─[%s]>", ANSI_GREEN, ANSI_RESET, who, host, cwd);
+                printf("\n┌─%s$ %s%d@%s\n└─[%s]>", ANSI_GREEN, ANSI_RESET, who, host, cwd);
             }
         } else {
             if (who == 0) {
                 printf("\n┌─%s# %s%d@{unknown}\n└─[%s]>", ANSI_RED, ANSI_RESET, who, cwd);
             } else {
-                printf("\n┌─%s# %s%d@{unknown}\n└─[%s]>", ANSI_GREEN, ANSI_RESET, who, cwd);
+                printf("\n┌─%s$ %s%d@{unknown}\n└─[%s]>", ANSI_GREEN, ANSI_RESET, who, cwd);
             }
         }
 
