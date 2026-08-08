@@ -7,7 +7,8 @@
 // service /ModuOS/System64/Apps/netd.sqr
 // User services
 // service /Apps/userman.sqr
-// service /Apps/calc_service.sqr
+service /Apps/calc_service.sqr
+bg /Apps/userctl.sqr
 bg /Apps/zenith5.1.sqr
 
 //bg /Apps/nodds.sqr
