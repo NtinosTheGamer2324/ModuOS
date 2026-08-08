@@ -3,7 +3,6 @@
 #include "moduos/arch/AMD64/interrupts/idt.h"
 #include "moduos/kernel/memory/string.h" // itoa
 #include "moduos/arch/AMD64/interrupts/pic.h"
-#include "moduos/arch/AMD64/interrupts/ioapic.h"
 #include "moduos/kernel/COM/com.h"
 
 extern void (*irq_stubs[16])(); // from isr.asm
@@ -59,11 +58,7 @@ void irq_dispatch(uint8_t irq) {
 
     irq_depth--;
 
-    if (ioapic_is_enabled()) {
-        ioapic_eoi();
-    } else {
-        pic_send_eoi(irq);
-    }
+    pic_send_eoi(irq);
 }
 
 void irq_init(void) {
