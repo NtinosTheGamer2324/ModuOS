@@ -9,6 +9,7 @@
 #include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/memory/string.h"
+#include "moduos/kernel/debug.h"
 
 // cpu_state_t has the same layout as cpu_context_t (9 uint64_t fields).
 // Forward-declare it as an opaque type so we can call the legacy asm stub
@@ -60,12 +61,14 @@ void switch_to(process_t *prev, process_t *next) {
         prev->page_table = old_cr3;
     }
     
-    // DEBUG: Log switches involving PID 2, and check if we're corrupting it
+    // DEBUG: Log switches involving PID 2, and check if we're corrupting it.
+    // All of this is spammy diagnostic tracing — only emit it at max debug
+    // level (KDBG_ON); med/off stay silent.
     extern process_t *process_get_by_pid(uint32_t);
     process_t *pid2 = process_get_by_pid(2);
     static uint64_t last_pid2_page_table = 0;
     static uint64_t pid2_addr_logged = 0;
-    if (pid2 && !pid2_addr_logged) {
+    if (kernel_debug_is_on() && pid2 && !pid2_addr_logged) {
         extern int com_write_string(uint16_t, const char*);
         extern int com_write_hex64(uint16_t, uint64_t);
         com_write_string(0x3F8, "[DEBUG] PID 2 process struct is at 0x");
@@ -73,9 +76,10 @@ void switch_to(process_t *prev, process_t *next) {
         com_write_string(0x3F8, "\n");
         pid2_addr_logged = 1;
     }
-    
-    if ((prev && (prev->pid == 2 || prev->pid == 4)) || (next->pid == 2 || next->pid == 4) || 
-        (pid2 && pid2->page_table != last_pid2_page_table)) {
+
+    if (kernel_debug_is_on() &&
+        ((prev && (prev->pid == 2 || prev->pid == 4)) || (next->pid == 2 || next->pid == 4) ||
+         (pid2 && pid2->page_table != last_pid2_page_table))) {
         extern int com_write_string(uint16_t, const char*);
         extern int com_write_hex64(uint16_t, uint64_t);
         extern char *itoa(int, char*, int);

@@ -3,6 +3,7 @@
 #include "moduos/arch/AMD64/cpu.h"
 #include "moduos/kernel/percpu.h"
 #include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/debug.h"
 #include <stdint.h>
 
 /*
@@ -33,17 +34,20 @@ void amd64_syscall_set_kernel_stack(uint64_t rsp0) {
     if (local)
         local->syscall_rsp0 = rsp0;
 
-    com_write_string(COM1_PORT, "[TSS] Set RSP0=0x");
-    char buf[17];
-    /* Print as a single 16-digit hex value. */
-    static const char hex[] = "0123456789abcdef";
-    for (int i = 15; i >= 0; i--) {
-        buf[i] = hex[rsp0 & 0xF];
-        rsp0 >>= 4;
+    if (kernel_debug_is_on()) {
+        com_write_string(COM1_PORT, "[TSS] Set RSP0=0x");
+        char buf[17];
+        /* Print as a single 16-digit hex value. */
+        static const char hex[] = "0123456789abcdef";
+        uint64_t v = rsp0;
+        for (int i = 15; i >= 0; i--) {
+            buf[i] = hex[v & 0xF];
+            v >>= 4;
+        }
+        buf[16] = '\0';
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, "\n");
     }
-    buf[16] = '\0';
-    com_write_string(COM1_PORT, buf);
-    com_write_string(COM1_PORT, "\n");
 }
 
 uint64_t amd64_syscall_get_kernel_stack(void) {

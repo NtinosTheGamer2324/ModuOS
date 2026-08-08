@@ -595,7 +595,9 @@ void schedule(void) {
     }
 
     /* ── QUEUE DUMP every 2 seconds (2000 ticks at 1kHz) ─────────────── */
-    if (sched_state.clock_ticks - last_sched_dump_tick >= 2000) {
+    /* Only spam COM when debug is at max (KDBG_ON) — med/off stay quiet. */
+    if (kernel_debug_is_on() &&
+        sched_state.clock_ticks - last_sched_dump_tick >= 2000) {
         last_sched_dump_tick = sched_state.clock_ticks;
         com_write_string(COM1_PORT, "[SCHED] queue (nr=");
         char nbuf[16]; itoa((int)sched_state.nr_running, nbuf, 10);
