@@ -27,8 +27,6 @@ void memory_smoke_test(void);
 #include "moduos/arch/AMD64/interrupts/irq.h"
 #include "moduos/arch/AMD64/interrupts/pic.h"
 #include "moduos/arch/AMD64/interrupts/timer.h"
-#include "moduos/arch/AMD64/interrupts/apic.h"
-#include "moduos/arch/AMD64/interrupts/ioapic.h"
 
 // Optional USB HID debug polling (compile-time gated)
 void hid_debug_poll_early(void);
@@ -583,14 +581,6 @@ static void init(uint64_t mb2_ptr_init) {
     if (acpi_init() == 0) {
         acpi_initialized = 1;
         COM_LOG_OK(COM1_PORT, "ACPI initialized");
-
-        // APIC/LAPIC/IOAPIC init temporarily disabled (work in progress).
-        // Re-enable once APIC interrupt vectors/EOI are fully stable.
-        // (void)apic_init_from_madt();
-        // (void)apic_timer_init(1000);
-        // if (ioapic_init_from_madt() == 0) {
-        //     for (int i = 0; i < 16; i++) pic_mask_irq((uint8_t)i);
-        // }
     } else {
         COM_LOG_WARN(COM1_PORT, "ACPI initialization failed");
     }
