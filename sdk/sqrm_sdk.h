@@ -444,7 +444,9 @@ typedef struct sqrm_kernel_api {
     void *(*kmalloc)(size_t sz);
     void (*kfree)(void *p);
 
-    /* DMA — AUDIO modules only; NULL for all other types. */
+    /* DMA — ~~AUDIO modules only; NULL for all other types.~~ 
+    ALL SQRM Types can use DMA.
+    */
     int (*dma_alloc)(sqrm_dma_buffer_t *out, size_t size, size_t align);
     void (*dma_free)(sqrm_dma_buffer_t *buf);
 
