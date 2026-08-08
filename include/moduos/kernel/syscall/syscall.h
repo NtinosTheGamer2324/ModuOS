@@ -53,7 +53,7 @@ int sys_closedir(int fd);
 int sys_userfs_register(const userfs_user_node_t *user_node);
 
 /* VM mapping (for userland ld.so) */
-void* sys_mmap(void *addr, size_t size, int prot, int flags);
+void* sys_mmap(void *addr, size_t size, int prot, int flags, int fd);
 int   sys_munmap(void *addr, size_t size);
 
 md64api_sysinfo_data* sys_get_sysinfo(void);

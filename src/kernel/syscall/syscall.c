@@ -198,7 +198,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         /* SYS_SSTATS (29) removed - use $/dev/md64api/sysinfo via DevFS instead. */
 
         case SYS_MMAP:
-            return (uint64_t)sys_mmap((void*)arg1, (size_t)arg2, (int)arg3, (int)arg4);
+            return (uint64_t)sys_mmap((void*)arg1, (size_t)arg2, (int)arg3, (int)arg4, (int)arg5);
         case SYS_MUNMAP:
             return (uint64_t)sys_munmap((void*)arg1, (size_t)arg2);
         case SYS_VFS_MKFS:
@@ -745,55 +745,68 @@ void* sys_sbrk(intptr_t increment) {
     return (void*)(uintptr_t)old;
 }
 
-/* VM mapping (MVP). prot: bit0=R bit1=W bit2=X (X currently ignored)
- * flags: bit0=FIXED, bit1=ANON (only anon supported)
- * SECURITY UPDATE: Protect kernel memory
- */
-void* sys_mmap(void *addr, size_t size, int prot, int flags) {
+#define MAP_FIXED  0x1
+#define MAP_ANON   0x2
+#define PROT_R 0x1
+#define PROT_W 0x2
+#define PROT_X 0x4
+
+void* sys_mmap(void *addr, size_t size, int prot, int flags, int fd) {
     process_t *p = process_get_current();
     if (!p || !p->is_user) return ERR_PTR(EPERM);
     if (size == 0) return ERR_PTR(EINVAL);
 
     uint64_t sz = ((uint64_t)size + 0xFFFULL) & ~0xFFFULL;
+    uint64_t v  = (uint64_t)(uintptr_t)addr;
+    int fixed = (flags & MAP_FIXED) != 0;
+    int anon  = (flags & MAP_ANON) != 0;
 
-    uint64_t v = (uint64_t)(uintptr_t)addr;
-    int fixed = (flags & 1) != 0;
+    if (!anon) {
+        if (!fd_is_valid(fd)) return ERR_PTR(EBADF);
+        file_descriptor_t *file = fd_get(fd);
+        if (!file) return ERR_PTR(EBADF);
+    }
 
     if (fixed) {
         if (v == 0 || (v & 0xFFFULL)) return ERR_PTR(EINVAL);
         if (!is_user_range(v, sz)) return ERR_PTR(EACCES);
+        for (uint64_t cur = v; cur < v + sz; cur += PAGE_SIZE)
+            if (paging_virt_to_phys(cur) != 0) return ERR_PTR(EEXIST);
     } else {
         v = (p->user_mmap_end + 0xFFFULL) & ~0xFFFULL;
         if (v < p->user_mmap_base) v = p->user_mmap_base;
-
         if (!is_user_range(v, sz)) return ERR_PTR(ENOMEM);
         if (v + sz > p->user_mmap_limit) return ERR_PTR(ENOMEM);
     }
 
-    size_t pages = (size_t)(sz / 0x1000ULL);
+    size_t pages = (size_t)(sz / PAGE_SIZE);
     uint64_t phys = phys_alloc_contiguous(pages);
     if (!phys) return ERR_PTR(ENOMEM);
 
     uint64_t pflags = PFLAG_PRESENT | PFLAG_USER;
-    if (prot & 2) pflags |= PFLAG_WRITABLE;
+    if (prot & PROT_W) pflags |= PFLAG_WRITABLE;
+    /* PROT_X ignored -- paging.h has no NX bit; everything present executes */
 
     if (paging_map_range(v, phys, sz, pflags) != 0) {
-        for (size_t i = 0; i < pages; i++)
-            phys_free_frame(phys + i * 0x1000ULL);
+        for (size_t i = 0; i < pages; i++) phys_free_frame(phys + i * PAGE_SIZE);
         return ERR_PTR(ENOMEM);
     }
-
     memset((void*)(uintptr_t)v, 0, (size_t)sz);
 
-    if (!fixed) {
-        if (v + sz > p->user_mmap_end)
-            p->user_mmap_end = v + sz;
+    if (!anon) {
+        /* Map from the fd's *current* position, like a normal file-backed mmap
+         * call following an open()+lseek(). We don't own an offset arg in this
+         * 5-arg ABI, so the caller (ld-moduos) is expected to lseek() first. */
+        off_t saved_pos = fd_tell(fd);
+        ssize_t got = fd_read(fd, (void*)(uintptr_t)v, size);
+        if (saved_pos >= 0) fd_lseek(fd, saved_pos, SEEK_SET);
+        (void)got; /* short/zero reads leave the zero-fill from memset in place */
     }
 
+    if (!fixed && v + sz > p->user_mmap_end) p->user_mmap_end = v + sz;
     return (void*)(uintptr_t)v;
 }
 
-// SECURITY UPDATE: Protect kernel memory
 int sys_munmap(void *addr, size_t size) {
     process_t *p = process_get_current();
     if (!p || !p->is_user) return -EPERM;
@@ -801,21 +814,16 @@ int sys_munmap(void *addr, size_t size) {
 
     uint64_t v = (uint64_t)(uintptr_t)addr;
     if (v & 0xFFFULL) return -EINVAL;
-
     uint64_t sz = ((uint64_t)size + 0xFFFULL) & ~0xFFFULL;
-
     if (!is_user_range(v, sz)) return -EACCES;
 
-    uint64_t end = v + sz;
-
-    for (uint64_t cur = v; cur < end; cur += 0x1000ULL) {
+    for (uint64_t cur = v; cur < v + sz; cur += PAGE_SIZE) {
         uint64_t phys = paging_virt_to_phys(cur);
         if (phys != 0) {
             paging_unmap_page(cur);
-            phys_free_frame(phys & ~0xFFFULL);
+            phys_free_frame(phys);
         }
     }
-
     return 0;
 }
 
