@@ -22,6 +22,8 @@
 #include "moduos/kernel/spinlock.h"
 #include "moduos/drivers/input/input.h"
 
+#include "moduos/kernel/panic.h"
+
 extern sqrm_gpu_device_t *g_active_gpu;
 static char g_sqrm_current_module_name[64];
 const char *sqrm_get_current_module_name(void) { return g_sqrm_current_module_name; }
@@ -1444,6 +1446,9 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
     out_api->ms_to_ticks = ms_to_ticks;
     out_api->sleep_ms = sqrm_sleep_ms_impl;
 
+    /* Panic */
+    out_api->panic_system = panic;
+
     out_api->usercopy_from_user = usercopy_from_user;
     out_api->usercopy_to_user = usercopy_to_user;
     out_api->usercopy_string_from_user = usercopy_string_from_user;
@@ -2204,10 +2209,20 @@ static int sqrm_load_one(const char *path, const char *basename, const sqrm_kern
         }
 
         for (uint16_t i = 0; i < desc_v2->dep_count; i++) {
-            const char *dep = desc_v2->deps[i];
-            if (!dep || !dep[0]) continue;
+            const char *raw_dep = desc_v2->deps[i];
+            if (!raw_dep || !raw_dep[0]) continue;
 
-            com_write_string(COM1_PORT, "[SQRM] dep: ");
+            // Optional-dependency syntax: "? depname" (leading '?', optional whitespace).
+            int optional = 0;
+            const char *dep = raw_dep;
+            if (dep[0] == '?') {
+                optional = 1;
+                dep++;
+                while (*dep == ' ' || *dep == '\t') dep++;
+            }
+            if (!dep[0]) continue;
+
+            com_write_string(COM1_PORT, optional ? "[SQRM] optional dep: " : "[SQRM] dep: ");
             com_write_string(COM1_PORT, desc.name);
             com_write_string(COM1_PORT, " -> ");
             com_write_string(COM1_PORT, dep);
@@ -2215,11 +2230,18 @@ static int sqrm_load_one(const char *path, const char *basename, const sqrm_kern
 
             int ldr = sqrm_load_module_by_desc_name_recursive(dep, stack, depth);
             if (ldr != 0) {
-                com_write_string(COM1_PORT, "[SQRM] failed to load dependency: ");
+                com_write_string(COM1_PORT, optional
+                    ? "[SQRM] optional dependency unavailable (continuing): "
+                    : "[SQRM] failed to load dependency: ");
                 com_write_string(COM1_PORT, dep);
                 com_write_string(COM1_PORT, " for module ");
                 com_write_string(COM1_PORT, basename);
                 com_write_string(COM1_PORT, "\n");
+
+                if (optional) {
+                    continue;
+                }
+
                 kfree((void*)stack);
                 kfree(image);
                 kfree(buf);
