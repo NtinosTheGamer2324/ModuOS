@@ -545,6 +545,8 @@ typedef struct sqrm_kernel_api {
     int (*usercopy_from_user)(void *kernel_dst, const void *user_src, size_t n);
     int (*usercopy_to_user)(void *user_dst, const void *kernel_src, size_t n);
     int (*usercopy_string_from_user)(char *kernel_dst, const char *user_src, size_t max_len);
+
+    void (*panic_system)(const char* title, const char* message, const char* tips, const char* err_cat, const char* err_code, int reboot_delay);
 } sqrm_kernel_api_t;
 
 typedef int (*sqrm_module_init_fn)(const sqrm_kernel_api_t *api);

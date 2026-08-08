@@ -189,7 +189,8 @@ typedef struct sqrm_kernel_api {
     void *(*kmalloc)(size_t sz);
     void (*kfree)(void *p);
 
-    // DMA — AUDIO modules only; NULL for all other types.
+    // ~~DMA — AUDIO modules only; NULL for all other types.~~
+    // All modules have DMA caps.
     // HDA/AC97 use this for CORB/RIRB/BDL/PCM ring buffers.
     // Always NULL-check; fall back to kmalloc+virt_to_phys if NULL.
     int (*dma_alloc)(dma_buffer_t *out, size_t size, size_t align);
@@ -230,6 +231,7 @@ typedef struct sqrm_kernel_api {
     // Input injection — HID modules only.
     // Injects an input event into /dev/input/event0 and /dev/input/kbd0 (VT100 translation)
     // and also pushes it to the kernel event queue.
+    // **DEPRECATED** Do not use.
     void (*input_push_event)(const Event *e);
 
     // Graphics — GPU modules only.
@@ -306,6 +308,8 @@ typedef struct sqrm_kernel_api {
     int (*usercopy_from_user)(void *kernel_dst, const void *user_src, size_t n);
     int (*usercopy_to_user)(void *user_dst, const void *kernel_src, size_t n);
     int (*usercopy_string_from_user)(char *kernel_dst, const char *user_src, size_t max_len);
+
+    void (*panic_system)(const char* title, const char* message, const char* tips, const char* err_cat, const char* err_code, int reboot_delay);
 } sqrm_kernel_api_t;
 
 typedef int (*sqrm_module_init_fn)(const sqrm_kernel_api_t *api);
