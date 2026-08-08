@@ -556,6 +556,21 @@ static inline void* sbrk(intptr_t inc) {
     return (void*)syscall(SYS_SBRK, inc, 0, 0);
 }
 
+#define MAP_FIXED  0x1
+#define MAP_ANON   0x2
+
+#define PROT_R 0x1
+#define PROT_W 0x2
+#define PROT_X 0x4
+
+static inline void* mmap(void *addr, size_t length, int prot, int flags, int fd) {
+    return (void*)syscall5(SYS_MMAP, (long)addr, (long)length, (long)prot, (long)flags, (long)fd);
+}
+
+static inline int munmap(void *addr, size_t length) {
+    return (int)syscall(SYS_MUNMAP, (long)addr, (long)length, 0);
+}
+
 /*
  * Userland heap allocator (simple free-list malloc).
  *
