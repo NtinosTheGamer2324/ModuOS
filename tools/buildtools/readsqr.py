@@ -5,6 +5,8 @@ import struct
 import argparse
 
 MAGIC = b"SQR\0"
+HEADER_FMT = "<4sHHIIQIIIIQIIQIIQIIQQQQQQQII"
+HEADER_SIZE = 0x98
 ARCH_NAMES = {1: "X86_64", 2: "AARCH64", 3: "RISCV64"}
 FLAG_BITS = [
     (0x1, "EXEC"), (0x2, "LIB"), (0x4, "HAS_TLS"), (0x8, "SORTED_EXPORTS"),
@@ -36,18 +38,19 @@ def parse(path):
 
     (magic, version, arch, flags, _res0, entry_off, mod_hint, _res1,
      seg_count, _res2, seg_off, imp_count, _res3, imp_off,
-     exp_count, _res4, exp_off, iat_count, _res5, iat_off,
-     str_off, str_size, tls_off, tls_size, init_off, fini_off) = struct.unpack_from(
-        "<4sHHIIQIIIIQIIQIIQIIQQQQQQQ", buf, 0)
+     exp_count, _res4, exp_off, iat_count, _res5, iat_base,
+     str_off, str_size, tls_off, tls_size, init_off, fini_off,
+     interp_off, _res6) = struct.unpack_from(HEADER_FMT, buf, 0)
 
     strtab = buf[str_off:str_off + str_size]
 
     hdr = dict(version=version, arch=arch, flags=flags, entry_off=entry_off,
                mod_hint=mod_hint, seg_count=seg_count, seg_off=seg_off,
                imp_count=imp_count, imp_off=imp_off, exp_count=exp_count,
-               exp_off=exp_off, iat_count=iat_count, iat_off=iat_off,
+               exp_off=exp_off, iat_count=iat_count, iat_base=iat_base,
                str_off=str_off, str_size=str_size, tls_off=tls_off,
-               tls_size=tls_size, init_off=init_off, fini_off=fini_off)
+               tls_size=tls_size, init_off=init_off, fini_off=fini_off,
+               interp_off=interp_off)
 
     segs = []
     for i in range(seg_count):
@@ -68,14 +71,15 @@ def parse(path):
         sym_o, kind, value, ver, _r = struct.unpack_from("<IIQII", buf, o)
         exports.append(dict(symbol=cstr(strtab, sym_o), kind=kind, value=value, version=ver))
 
-    return buf, hdr, segs, imports, exports
+    return buf, hdr, segs, imports, exports, strtab
 
 
 def perms_str(p):
     return ("R" if p & 1 else "-") + ("W" if p & 2 else "-") + ("X" if p & 4 else "-")
 
 
-def print_header(path, hdr, buf):
+def print_header(path, hdr, buf, strtab):
+    interp = cstr(strtab, hdr["interp_off"]) if hdr["interp_off"] else "(none - static)"
     print(f"SQR Header: {path}")
     print(f"  Magic:              SQR\\0")
     print(f"  Version:            {hdr['version']}")
@@ -86,10 +90,12 @@ def print_header(path, hdr, buf):
     print(f"  Segments:           {hdr['seg_count']} @ 0x{hdr['seg_off']:x}")
     print(f"  Imports:            {hdr['imp_count']} @ 0x{hdr['imp_off']:x}")
     print(f"  Exports:            {hdr['exp_count']} @ 0x{hdr['exp_off']:x}")
-    print(f"  IAT slots:          {hdr['iat_count']} @ 0x{hdr['iat_off']:x}")
+    print(f"  IAT slots:          {hdr['iat_count']} @ vaddr 0x{hdr['iat_base']:x} (base-relative, "
+          f"lives inside a segment -- not a file offset)")
     print(f"  String table:       0x{hdr['str_off']:x}, {hdr['str_size']} bytes")
     print(f"  TLS template:       off=0x{hdr['tls_off']:x} size={hdr['tls_size']}")
     print(f"  Init/Fini offset:   0x{hdr['init_off']:x} / 0x{hdr['fini_off']:x}")
+    print(f"  Interpreter:        {interp}")
     print(f"  File size:          {len(buf)} bytes")
 
 
@@ -101,12 +107,13 @@ def print_segments(segs):
               f"{perms_str(s['perms'])}  {s['align']}")
 
 
-def print_imports(imports):
+def print_imports(imports, hdr):
     print(f"\nImports ({len(imports)}):")
     if imports:
-        print(f"  {'Slot':>4}  {'Kind':4}  {'Module':<16} {'Symbol':<24} MinVer")
+        print(f"  {'Slot':>4}  {'GOT VAddr':>18}  {'Kind':4}  {'Module':<16} {'Symbol':<24} MinVer")
     for i in imports:
-        print(f"  {i['slot']:4d}  {KIND_NAMES.get(i['kind'], i['kind']):4}  "
+        got_vaddr = hdr["iat_base"] + i["slot"] * 8
+        print(f"  {i['slot']:4d}  0x{got_vaddr:016x}  {KIND_NAMES.get(i['kind'], i['kind']):4}  "
               f"{i['module']:<16} {i['symbol']:<24} {ver_str(i['min_version'])}")
 
 
@@ -129,18 +136,18 @@ def main():
     ap.add_argument("-a", "--all", action="store_true", help="show everything (default)")
     args = ap.parse_args()
 
-    buf, hdr, segs, imports, exports = parse(args.file)
+    buf, hdr, segs, imports, exports, strtab = parse(args.file)
 
     show_any = args.header or args.segments or args.imports or args.exports
     if args.all or not show_any:
         args.header = args.segments = args.imports = args.exports = True
 
     if args.header:
-        print_header(args.file, hdr, buf)
+        print_header(args.file, hdr, buf, strtab)
     if args.segments:
         print_segments(segs)
     if args.imports:
-        print_imports(imports)
+        print_imports(imports, hdr)
     if args.exports:
         print_exports(exports)
 
