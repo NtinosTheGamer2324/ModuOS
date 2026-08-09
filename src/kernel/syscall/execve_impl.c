@@ -630,6 +630,24 @@ int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *
         p->name[PROCESS_NAME_MAX - 1] = 0;
     }
 
+    /* ── 10b. Reset FPU state for the new image ────────────────────────── *
+     * execve() reuses the existing process_t rather than allocating a     *
+     * fresh one, so p->fpu_state still holds whatever fork() copied from  *
+     * the parent. That value is only guaranteed correct if the parent     *
+     * itself never drifted from the safe default — reset explicitly here  *
+     * so every newly exec'd image starts from known-good FCW/MXCSR        *
+     * regardless of what the parent process did to its own FPU state.     *
+     * If this process was the live FPU owner, force a re-fault into       *
+     * fpu_lazy_handle_nm on its next FP instruction so it doesn't keep    *
+     * running with stale hardware register contents belonging to the      *
+     * previous image.                                                     */
+    {
+        extern void fpu_lazy_on_process_exit(process_t *p);
+        fpu_lazy_on_process_exit(p);
+        memset(p->fpu_state, 0, 512);
+        fpu_state_init_default(p->fpu_state);
+    }
+
     /* ── 10. Update process env ───────────────────────────────────────── */
     if (p->envp) {
         for (int i = 0; i < p->envc; i++) if (p->envp[i]) kfree(p->envp[i]);

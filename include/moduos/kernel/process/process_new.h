@@ -213,6 +213,14 @@ process_t *process_alloc(void);
 void       process_free(process_t *p);
 process_t *process_find(uint32_t pid);
 
+/* Resets a 512-byte FXSAVE-format buffer to the hardware POST default
+ * (FCW = 0x037F, MXCSR = 0x1F80, all FP exceptions masked). A zeroed
+ * buffer instead unmasks every SSE exception and will #XM on the
+ * first ordinary inexact result. Call whenever a process_t's
+ * fpu_state must be reset without a fresh process_alloc() — notably
+ * in execve(), which reuses the existing process_t. */
+void fpu_state_init_default(uint8_t *state);
+
 // ---------------------------------------------------------------------------
 // Fork and exec
 // ---------------------------------------------------------------------------

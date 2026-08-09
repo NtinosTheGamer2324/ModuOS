@@ -17,6 +17,22 @@ volatile process_t *current = NULL;
 static spinlock_t ptable_lock __attribute__((aligned(64)));
 uint32_t next_pid = 1;   // PID 0 reserved for idle; extern-declared in process_new.h
 
+/* A zeroed FXSAVE area has MXCSR = 0, which unmasks every SSE FP
+ * exception (mask bits are active-low). Ordinary FP results that are
+ * merely inexact then raise #XM instead of just setting a status
+ * flag. Real hardware enforces this; QEMU TCG's FPU emulation does
+ * not, which is why this only surfaced under VMWare. Every new
+ * process's saved state must start at the hardware POST default
+ * (FCW = 0x037F, MXCSR = 0x1F80, all exceptions masked) rather than
+ * all zero. */
+/* Exported so execve() can reset FPU state to the same hardware
+ * default when it reuses a process_t for a new image — see
+ * process_new.h. */
+void fpu_state_init_default(uint8_t *state) {
+    *(uint16_t *)(state + 0)  = 0x037F; /* FCW */
+    *(uint32_t *)(state + 24) = 0x1F80; /* MXCSR */
+}
+
 // ---------------------------------------------------------------------------
 // Initialisation
 // ---------------------------------------------------------------------------
@@ -85,6 +101,7 @@ process_t *process_alloc(void) {
     memset(p, 0, sizeof(process_t));
 
     memset(p->fpu_state, 0, 512);
+    fpu_state_init_default(p->fpu_state);
 
     p->pid      = pid;
     p->refcount = 1;
@@ -105,7 +122,10 @@ void process_free(process_t *p) {
         process_table[p->pid] = NULL;
     spinlock_unlock(&ptable_lock);
 
-    if (p->fpu_state)   kfree(p->fpu_state);
+    /* fpu_state is an embedded array inside process_t, not a separate
+     * heap allocation — it's reclaimed by the kfree(p) below. Freeing
+     * it here would hand the allocator an interior pointer instead of
+     * a real block start. */
     if (p->kernel_stack) kfree(p->kernel_stack);
 
     if (p->argv) {
