@@ -205,9 +205,9 @@ static void storage_early_init(void) {
 static void devices_late_init(void) {
     // DEVFS / $/dev devices
     //  - input:    $/dev/input/kbd0, $/dev/input/event0
-    //  - graphics: ~~$/dev/graphics/video0~~ !!!!DEPREACTED!!!! - USE $/dev/mvc3/mvi0 FOR GRAPHICS. MAKE SURE MVC3.SQRM LOADED
+    //  - graphics: ~~$/dev/graphics/video0~~ !!!!DEPRECATED!!!! - USE $/dev/mvc3/mvi0 FOR GRAPHICS. MAKE SURE MVC3.SQRM LOADED
     devfs_input_init();
-    devfs_gui_init(); // DEPREACTED BUT KEPT FOR BACKWARDS COMPATIBILITY -- USE USERFS
+    devfs_gui_init(); // DEPRECATED BUT KEPT FOR BACKWARDS COMPATIBILITY -- USE USERFS
 
     COM_LOG_INFO(COM1_PORT, "Initializing input subsystem");
     input_init();
@@ -487,7 +487,7 @@ static void init(uint64_t mb2_ptr_init) {
 
     COM_LOG(COM1_PORT, "Initializing FPU");
     fpu_init();
-    COM_LOG_OK(COM1_PORT, "Successfuly Initialized FPU");
+    COM_LOG_OK(COM1_PORT, "Successfully Initialized FPU");
 
     
     COM_LOG(COM1_PORT, "Enabling CPU features");
@@ -499,7 +499,7 @@ static void init(uint64_t mb2_ptr_init) {
 
     switch (cfrc) {
     case CPU_ENABLE_OK:
-        COM_LOG_OK(COM1_PORT, "CPU Features successfuly enabled!");
+        COM_LOG_OK(COM1_PORT, "CPU Features Successfully enabled!");
         break;
     case CPU_ENABLE_ERR_CR4_FXSR:
         COM_LOG_ERROR(COM1_PORT, "CPU Features ERROR: CR4 FXSR");
