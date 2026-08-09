@@ -28,10 +28,6 @@ void memory_smoke_test(void);
 #include "moduos/arch/AMD64/interrupts/pic.h"
 #include "moduos/arch/AMD64/interrupts/timer.h"
 
-// Optional USB HID debug polling (compile-time gated)
-void hid_debug_poll_early(void);
-
-
 #include "moduos/drivers/input/input.h"
 #include "moduos/drivers/input/ps2/ps2.h"
 #include "moduos/drivers/PCI/pci.h"
@@ -51,7 +47,9 @@ void hid_debug_poll_early(void);
 // needed by the new POSIX-compliant process system (process_management_init etc.)
 #include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/syscall/syscall.h"
-/* Kernel shell removed - boot messages go to serial/VGA */
+/* Kernel shell removed - boot messages go to serial */
+
+#include "moduos/arch/AMD64/cpu_features.h"
 
 // ------------------ DEVICE INIT (split) ------------------
 
@@ -207,16 +205,17 @@ static void storage_early_init(void) {
 static void devices_late_init(void) {
     // DEVFS / $/dev devices
     //  - input:    $/dev/input/kbd0, $/dev/input/event0
-    //  - graphics: $/dev/graphics/video0
+    //  - graphics: ~~$/dev/graphics/video0~~ !!!!DEPREACTED!!!! - USE $/dev/mvc3/mvi0 FOR GRAPHICS. MAKE SURE MVC3.SQRM LOADED
     devfs_input_init();
-    devfs_gui_init();
+    devfs_gui_init(); // DEPREACTED BUT KEPT FOR BACKWARDS COMPATIBILITY -- USE USERFS
 
     COM_LOG_INFO(COM1_PORT, "Initializing input subsystem");
     input_init();
     irq_install_handler(1, keyboard_irq_handler);
 
     // USB Initialization
-    COM_LOG_INFO(COM1_PORT, "Initializing USB subsystem (USB Disabled)");
+    // ANCIENT USB SUBSYSTEM HAS BEEN DEPRECATED FOR THE PAST 6 MONTHS, USE UUHCI + USBMASTER SQRMs
+    COM_LOG_INFO(COM1_PORT, "~~Initializing USB subsystem~~ (In-Kernel USB has been disabled forever.)");
     //usb_init();
 
     //if (usb_has_controllers()) {
@@ -490,6 +489,33 @@ static void init(uint64_t mb2_ptr_init) {
     fpu_init();
     COM_LOG_OK(COM1_PORT, "Successfuly Initialized FPU");
 
+    
+    COM_LOG(COM1_PORT, "Enabling CPU features");
+
+    cpu_features_t cpu_features;
+    cpu_detect_features(&cpu_features);
+
+    int cfrc = cpu_enable_features(&cpu_features);
+
+    switch (cfrc) {
+    case CPU_ENABLE_OK:
+        COM_LOG_OK(COM1_PORT, "CPU Features successfuly enabled!");
+        break;
+    case CPU_ENABLE_ERR_CR4_FXSR:
+        COM_LOG_ERROR(COM1_PORT, "CPU Features ERROR: CR4 FXSR");
+        break;
+    case CPU_ENABLE_ERR_CR4_XSAVE:
+        COM_LOG_ERROR(COM1_PORT, "CPU Features ERROR: CR4 XSAVE");
+        break;
+    case CPU_ENABLE_ERR_XCR0:
+        COM_LOG_ERROR(COM1_PORT, "CPU Features ERROR: XCR0");
+        break;
+    default:
+        COM_LOG_ERROR(COM1_PORT, "CPU Features UNKNOWN ERROR");
+        break;
+    }
+
+
     // Debug: show multiboot pointer
     com_write_string(COM1_PORT, "\n=== MEMORY INITIALIZATION ===\n");
     com_write_string(COM1_PORT, "[MEM] Multiboot2 pointer: ");
@@ -574,9 +600,6 @@ static void init(uint64_t mb2_ptr_init) {
     // Load the rest of SQRM modules (USB/NET/AUDIO/etc).
     sqrm_load_late_drivers();
 
-    // Optional: poll HID reports for a short time during boot to validate USB HID.
-    hid_debug_poll_early();
-
     // Initialize ACPI
     if (acpi_init() == 0) {
         acpi_initialized = 1;
@@ -585,7 +608,7 @@ static void init(uint64_t mb2_ptr_init) {
         COM_LOG_WARN(COM1_PORT, "ACPI initialization failed");
     }
 
-    // Late device init (PS/2/input/USB, etc)
+    // Late device init (PS/2/input/etc.)
     devices_late_init();
 
     // Initialize process management system
