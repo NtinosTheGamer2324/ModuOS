@@ -25,7 +25,7 @@ static void panic_header(const char* title)
  * @param err_code     Specific error code string (e.g., "ATA_DEV_NONE")
  * @param reboot_delay Seconds to wait before reboot
  */
-/* ---------------- Windows-11-style framebuffer panic UI ---------------- */
+/* ---------------- Framebuffer Panic Screen `BLUESCREEN` ---------------- */
 
 #include "moduos/drivers/graphics/framebuffer.h"
 #include "moduos/drivers/graphics/bitmap_font.h"
