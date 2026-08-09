@@ -672,7 +672,6 @@ int vdrive_init(void) {
     vdrive_register_devfs_nodes();
     
     vdrive_system.initialized = 1;
-    COM_LOG_OK(COM1_PORT, "vDrive subsystem initialized");
     
     return VDRIVE_SUCCESS;
 }
