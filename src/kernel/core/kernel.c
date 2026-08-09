@@ -610,8 +610,8 @@ void kernel_main(uint64_t mb2_ptr)
     g_kernel_mb2_ptr = mb2_ptr;
     mdinit_run(mb2_ptr);
 
-    /* Past this point, it is dead code. mdinit will never ever EVER return */
-
+    /* There was a comment here, that my dumbass wrote, for no reason, that was the most untrue thing. please do not roast me*/
+    
     // For gfx-test, try to (re)enable framebuffer after full init in case something reset VGA state.
     if (want_gfx_test) {
         com_write_string(COM1_PORT, "[BOOT] Enabling framebuffer for gfx-test...\n");
