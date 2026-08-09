@@ -1,440 +1,629 @@
-#include "libc.h"
-#include "NodGL.h"
-#include "string.h"
-#include "../include/moduos/kernel/events/events.h"
-
 /*
- * gfxclock.sqr
+ * gfxclock.c — ModuOS graphical clock
  *
- * Analog + digital clock rendered in framebuffer graphics mode.
+ * Analog clock face (smooth-sweeping hands, glowing rim, comet trail on the
+ * second hand) plus a digital date/time readout pill, driven by the RTC
+ * devfs node exposed by the RTC kernel module.
  *
  * Controls:
- *   ESC: quit
+ *   ESC / Q     — quit
+ *   T           — toggle 12h / 24h digital display
+ *
+ * Copyright © 2026 New Technologies Software — GPL v2.0
  */
 
+#include "libc.h"
+#include "NodGL.h"
+#include "lib_fnt.h"
+#include "../include/moduos/kernel/events/events.h"
+
+/* ============================================================
+   RTC device
+   ============================================================
+   Must byte-for-byte match the rtc_time_t layout defined in the RTC
+   kernel module. No shared header between kernel module and userland
+   exists yet, so this is kept in sync manually — see rtc.c / rtc_client.c.
+*/
 typedef struct {
-    md64api_grp_video_info_t vi;
-    uint8_t *bb;
-    uint32_t bb_pitch;
-    uint32_t fmt;
-    uint32_t bpp_bytes;
-} Gfx;
+    uint8_t  second;
+    uint8_t  minute;
+    uint8_t  hour;
+    uint8_t  day;
+    uint8_t  month;
+    uint32_t year;
+} rtc_time_t;
 
-static uint32_t pack_xrgb8888(uint8_t r, uint8_t g, uint8_t b) {
-    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-}
+#define RTC_DEV_PATH "$/dev/rtc"
 
-static uint16_t pack_rgb565(uint8_t r, uint8_t g, uint8_t b) {
-    uint16_t rr = (uint16_t)((r * 31u) / 255u);
-    uint16_t gg = (uint16_t)((g * 63u) / 255u);
-    uint16_t bb = (uint16_t)((b * 31u) / 255u);
-    return (uint16_t)((rr << 11) | (gg << 5) | (bb));
-}
+/* ============================================================
+   Fonts — Terminus is the preferred UI font; Unicode.fnt (older, but
+   covers Greek and other non-ASCII ranges) is the fallback.
+   ============================================================ */
+#define FONT_PRIMARY  "/ModuOS/shared/assets/fonts/Terminus.fnt"
+#define FONT_FALLBACK "/ModuOS/shared/assets/fonts/Unicode.fnt"
 
-static void put_px(Gfx *g, int x, int y, uint32_t c) {
-    if (!g || !g->bb) return;
-    if ((unsigned)x >= g->vi.width || (unsigned)y >= g->vi.height) return;
-    uint8_t *row = g->bb + (uint64_t)y * g->bb_pitch;
-    if (g->bpp_bytes == 4) {
-        ((uint32_t*)row)[x] = c;
-    } else {
-        ((uint16_t*)row)[x] = (uint16_t)c;
-    }
-}
-
-static void clear(Gfx *g, uint32_t c) {
-    if (!g || !g->bb) return;
-    for (uint32_t y = 0; y < g->vi.height; y++) {
-        uint8_t *row = g->bb + (uint64_t)y * g->bb_pitch;
-        if (g->bpp_bytes == 4) {
-            uint32_t *p = (uint32_t*)row;
-            for (uint32_t x = 0; x < g->vi.width; x++) p[x] = c;
-        } else {
-            uint16_t *p = (uint16_t*)row;
-            for (uint32_t x = 0; x < g->vi.width; x++) p[x] = (uint16_t)c;
-        }
-    }
-}
-
-static int iabs(int v) { return (v < 0) ? -v : v; }
-
-/* Simple integer Bresenham line */
-static void draw_line(Gfx *g, int x0, int y0, int x1, int y1, uint32_t c) {
-    int dx = iabs(x1 - x0);
-    int sx = (x0 < x1) ? 1 : -1;
-    int dy = -iabs(y1 - y0);
-    int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
-
-    for (;;) {
-        put_px(g, x0, y0, c);
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
-    }
-}
-
-/* Midpoint circle (outline) */
-static void draw_circle(Gfx *g, int cx, int cy, int r, uint32_t c) {
-    int x = r;
-    int y = 0;
-    int err = 0;
-
-    while (x >= y) {
-        put_px(g, cx + x, cy + y, c);
-        put_px(g, cx + y, cy + x, c);
-        put_px(g, cx - y, cy + x, c);
-        put_px(g, cx - x, cy + y, c);
-        put_px(g, cx - x, cy - y, c);
-        put_px(g, cx - y, cy - x, c);
-        put_px(g, cx + y, cy - x, c);
-        put_px(g, cx + x, cy - y, c);
-
-        y++;
-        if (err <= 0) {
-            err += 2*y + 1;
-        }
-        if (err > 0) {
-            x--;
-            err -= 2*x + 1;
-        }
-    }
-}
-
-/* Tiny 3x5 font digits + ':' and '-' (enough for HH:MM:SS and YYYY-MM-DD) */
-static const uint8_t font_3x5_digits[12][5] = {
-    /* 0 */ {0b111,0b101,0b101,0b101,0b111},
-    /* 1 */ {0b010,0b110,0b010,0b010,0b111},
-    /* 2 */ {0b111,0b001,0b111,0b100,0b111},
-    /* 3 */ {0b111,0b001,0b111,0b001,0b111},
-    /* 4 */ {0b101,0b101,0b111,0b001,0b001},
-    /* 5 */ {0b111,0b100,0b111,0b001,0b111},
-    /* 6 */ {0b111,0b100,0b111,0b101,0b111},
-    /* 7 */ {0b111,0b001,0b001,0b001,0b001},
-    /* 8 */ {0b111,0b101,0b111,0b101,0b111},
-    /* 9 */ {0b111,0b101,0b111,0b001,0b111},
-    /* : */ {0b000,0b010,0b000,0b010,0b000},
-    /* - */ {0b000,0b000,0b111,0b000,0b000},
+/* ============================================================
+   Fixed-point sine table (0..255 -> 0..360deg), matches the one used
+   throughout the rest of the userland demo/effect code so hand angles
+   behave identically to everything else that draws circles on ModuOS.
+   ============================================================ */
+static const int8_t sin_tbl[256] = {
+     0,  3,  6,  9, 12, 15, 18, 21, 24,27, 30, 33, 36, 39, 42, 45,
+    48, 51, 54, 57, 59, 62, 65, 67, 70, 73, 75, 78, 80, 82, 85, 87,
+    89, 91, 94, 96, 98,100,102,103,105,107,108,110,112,113,114,116,
+   117,118,119,120,121,122,123,123,124,125,125,126,126,126,127,127,
+   127,127,127,126,126,126,125,125,124,123,123,122,121,120,119,118,
+   117,116,114,113,112,110,108,107,105,103,102,100, 98, 96, 94, 91,
+    89, 87, 85, 82, 80, 78, 75, 73, 70, 67, 65, 62, 59, 57, 54, 51,
+    48, 45, 42, 39, 36, 33, 30, 27, 24, 21, 18, 15, 12,  9,  6,  3,
+     0, -3, -6, -9,-12,-15,-18,-21,-24,-27,-30,-33,-36,-39,-42,-45,
+   -48,-51,-54,-57,-59,-62,-65,-67,-70,-73,-75,-78,-80,-82,-85,-87,
+   -89,-91,-94,-96,-98,-100,-102,-103,-105,-107,-108,-110,-112,-113,
+  -114,-116,-117,-118,-119,-120,-121,-122,-123,-123,-124,-125,-125,
+  -126,-126,-126,-127,-127,-127,-127,-127,-126,-126,-126,-125,-125,
+  -124,-123,-123,-122,-121,-120,-119,-118,-117,-116,-114,-113,-112,
+  -110,-108,-107,-105,-103,-102,-100,-98,-96,-94,-91,-89,-87,-85,
+   -82,-80,-78,-75,-73,-70,-67,-65,-62,-59,-57,-54,-51,-48,-45,-42,
+   -39,-36,-33,-30,-27,-24,-21,-18,-15,-12, -9, -6, -3
 };
 
-static void draw_glyph_3x5(Gfx *g, int x, int y, char ch, int scale, uint32_t c) {
-    int idx = -1;
-    if (ch >= '0' && ch <= '9') idx = (int)(ch - '0');
-    else if (ch == ':') idx = 10;
-    else if (ch == '-') idx = 11;
-    if (idx < 0) return;
+static inline int isin(uint8_t angle) { return sin_tbl[angle]; }
+static inline int icos(uint8_t angle) { return sin_tbl[(uint8_t)(angle + 64)]; }
 
-    for (int yy = 0; yy < 5; yy++) {
-        uint8_t row = font_3x5_digits[idx][yy];
-        for (int xx = 0; xx < 3; xx++) {
-            if (row & (1u << (2-xx))) {
-                for (int sy = 0; sy < scale; sy++)
-                    for (int sx = 0; sx < scale; sx++)
-                        put_px(g, x + xx*scale + sx, y + yy*scale + sy, c);
-            }
-        }
+static inline float sqrtf3_fast(float v) {
+    if (v <= 0.0f) return 0.0f;
+    float x = v, g = v * 0.5f + 0.5f;
+    for (int i = 0; i < 4; i++) g = 0.5f * (g + x / g);
+    return g;
+}
+
+static inline float clampf(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* ============================================================
+   App globals
+   ============================================================ */
+
+static struct {
+    NodGL_Device  device;
+    NodGL_Context ctx;
+    NodGL_Texture tex;
+    uint8_t      *bb;
+    uint32_t      bb_pitch;
+    uint32_t      sw, sh;
+    fnt_font_t   *font;
+
+    int      rtc_fd;
+    int      quit;
+    int      fmt24;          /* 1 = 24h, 0 = 12h */
+
+    /* Latest RTC snapshot + smoothing state for the sweeping second hand */
+    rtc_time_t now;
+    int        last_raw_sec;
+    uint64_t   sec_baseline_ms;
+
+    /* Comet trail behind the second hand tip, in rim-angle bytes */
+    uint8_t  trail[24];
+    int      trail_len;
+} g;
+
+/* ============================================================
+   Pixel helpers (same conventions as the rest of ModuOS userland demos)
+   ============================================================ */
+
+static void fill(int x, int y, int w, int h, uint32_t col) {
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w; if (x1 > (int)g.sw) x1 = (int)g.sw;
+    int y1 = y + h; if (y1 > (int)g.sh) y1 = (int)g.sh;
+    for (int yy = y0; yy < y1; yy++) {
+        uint32_t *row = (uint32_t *)(g.bb + (uint64_t)yy * g.bb_pitch);
+        for (int xx = x0; xx < x1; xx++) row[xx] = col;
     }
 }
 
-static void draw_text_3x5(Gfx *g, int x, int y, const char *s, int scale, uint32_t c) {
+static void clear(uint32_t col) { fill(0, 0, (int)g.sw, (int)g.sh, col); }
+
+static inline uint32_t div255(uint32_t x) { return (x + 1 + (x >> 8)) >> 8; }
+
+static inline void blend(int x, int y, uint8_t r, uint8_t gv, uint8_t b, uint8_t a) {
+    if ((uint32_t)x >= g.sw || (uint32_t)y >= g.sh || !g.bb || a == 0) return;
+    uint32_t *d = (uint32_t *)(g.bb + (uint64_t)y * g.bb_pitch) + x;
+    if (a == 255) { *d = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)gv << 8) | b; return; }
+    uint32_t bg = *d; uint32_t ia = 255 - a;
+    *d = 0xFF000000u
+       | (div255(r * a + ((bg >> 16) & 0xFF) * ia) << 16)
+       | (div255(gv * a + ((bg >> 8) & 0xFF) * ia) << 8)
+       | (div255(b * a + (bg & 0xFF) * ia));
+}
+
+/* ============================================================
+   Text
+   ============================================================ */
+
+static int text_width(const char *s) {
+    if (!g.font || !s) return 0;
+    return fnt_string_width(g.font, s);
+}
+
+static void draw_text(int x, int y, const char *s, uint32_t col) {
+    if (!g.font || !s) return;
     int cx = x;
-    for (size_t i = 0; s && s[i]; i++) {
-        draw_glyph_3x5(g, cx, y, s[i], scale, c);
-        cx += (3*scale) + scale; // glyph + spacing
+    uint8_t r = (col >> 16) & 0xFF, gv = (col >> 8) & 0xFF, b = col & 0xFF;
+    while (*s) {
+        fnt_glyph_t *gl = fnt_get_glyph(g.font, (uint32_t)(unsigned char)*s);
+        if (gl) {
+            for (int dy = 0; dy < gl->bitmap_height; dy++)
+                for (int dx = 0; dx < gl->bitmap_width; dx++)
+                    if (fnt_get_pixel(gl, dx, dy))
+                        blend(cx + dx, y + dy, r, gv, b, 255);
+            cx += gl->width;
+        }
+        s++;
     }
 }
 
-/* Very small float-free sin/cos approximation via lookup table (0..59) */
-static const int16_t sin60[60] = {
-      0,  107,  214,  319,  420,  515,  604,  684,  756,  818,
-    870,  912,  943,  963,  972,  970,  957,  933,  898,  852,
-    796,  729,  652,  566,  471,  369,  260,  146,   30,  -86,
-   -201, -312, -417, -515, -604, -684, -756, -818, -870, -912,
-   -943, -963, -972, -970, -957, -933, -898, -852, -796, -729,
-   -652, -566, -471, -369, -260, -146,  -30,   86,  201,  312,
-};
-static const int16_t cos60[60] = {
-    1000,  994,  977,  948,  908,  857,  796,  725,  647,  561,
-     471,  375,  276,  174,   70,  -37, -144, -250, -353, -453,
-    -548, -637, -719, -793, -857, -911, -953, -983, -999, -1000,
-    -987, -959, -918, -864, -798, -721, -634, -540, -440, -336,
-    -230, -123,  -16,   91,  197,  300,  399,  493,  581,  662,
-     734,  797,  850,  892,  923,  942,  951,  948,  934,  909,
-};
-
-/* Map "tick" (0..59) to an angle where 0 is at 12 o'clock */
-static void hand_endpoint(int cx, int cy, int len, int tick0_59, int *out_x, int *out_y) {
-    int t = tick0_59 % 60;
-    // rotate so 0 is at top: cos->x, sin->y, but y grows down => use -sin
-    int x = (cos60[t] * len) / 1000;
-    int y = -(sin60[t] * len) / 1000;
-    if (out_x) *out_x = cx + x;
-    if (out_y) *out_y = cy + y;
+static void draw_text_centered(int cx, int y, const char *s, uint32_t col) {
+    draw_text(cx - text_width(s) / 2, y, s, col);
 }
 
-// Interpolate between tick t and t+1 using ms_in_sec (0..999) for smoother second hand.
-static void hand_endpoint_smooth(int cx, int cy, int len, int tick0_59, uint16_t ms_in_sec,
-                                int *out_x, int *out_y) {
-    int t0 = tick0_59 % 60;
-    int t1 = (t0 + 1) % 60;
+/* ============================================================
+   Geometry primitives
+   ============================================================ */
 
-    int w1 = (int)ms_in_sec;          // 0..999
-    int w0 = 1000 - w1;
-
-    int sinv = (sin60[t0] * w0 + sin60[t1] * w1) / 1000;
-    int cosv = (cos60[t0] * w0 + cos60[t1] * w1) / 1000;
-
-    int x = (cosv * len) / 1000;
-    int y = -(sinv * len) / 1000;
-    if (out_x) *out_x = cx + x;
-    if (out_y) *out_y = cy + y;
-}
-
-static NodGL_Device g_device = NULL;
-static NodGL_Context g_ctx = NULL;
-static NodGL_Texture g_backbuffer_tex = 0;
-
-static int gfx_init(Gfx *g) {
-    memset(g, 0, sizeof(*g));
-
-    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &g_device, &g_ctx, NULL) != NodGL_OK) {
-        return -1;
+/* Anti-aliased filled disc (used for the rim glow, hub, and tick dots). */
+static void draw_disc(float cx, float cy, float radius, uint8_t r, uint8_t gv, uint8_t b, uint8_t a) {
+    int x0 = (int)(cx - radius - 1), x1 = (int)(cx + radius + 1);
+    int y0 = (int)(cy - radius - 1), y1 = (int)(cy + radius + 1);
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            float dx = (x + 0.5f) - cx, dy = (y + 0.5f) - cy;
+            float d = sqrtf3_fast(dx * dx + dy * dy);
+            if (d > radius + 1.0f) continue;
+            float edge = clampf(radius + 0.5f - d, 0.0f, 1.0f);
+            uint8_t aa = (uint8_t)((float)a * edge);
+            if (aa) blend(x, y, r, gv, b, aa);
+        }
     }
+}
 
-    uint32_t screen_w, screen_h;
-    NodGL_GetScreenResolution(g_device, &screen_w, &screen_h);
+/* Anti-aliased ring outline. */
+static void draw_ring(float cx, float cy, float radius, float thickness, uint8_t r, uint8_t gv, uint8_t b, uint8_t a) {
+    int x0 = (int)(cx - radius - thickness - 1), x1 = (int)(cx + radius + thickness + 1);
+    int y0 = (int)(cy - radius - thickness - 1), y1 = (int)(cy + radius + thickness + 1);
+    float inner = radius - thickness * 0.5f, outer = radius + thickness * 0.5f;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            float dx = (x + 0.5f) - cx, dy = (y + 0.5f) - cy;
+            float d = sqrtf3_fast(dx * dx + dy * dy);
+            if (d < inner - 1.0f || d > outer + 1.0f) continue;
+            float edge_out = clampf(outer - d + 0.5f, 0.0f, 1.0f);
+            float edge_in  = clampf(d - inner + 0.5f, 0.0f, 1.0f);
+            float k = edge_out < edge_in ? edge_out : edge_in;
+            uint8_t aa = (uint8_t)((float)a * k);
+            if (aa) blend(x, y, r, gv, b, aa);
+        }
+    }
+}
 
-    g->vi.width = screen_w;
-    g->vi.height = screen_h;
-    g->vi.bpp = 32;
-    g->fmt = MD64API_GRP_FMT_XRGB8888;
-    g->bpp_bytes = 4;
+/* Tapered, anti-aliased hand: wide at the base, narrow at the tip. */
+static void draw_hand(float cx, float cy, uint8_t angle_byte, float length, float back_len,
+                       float base_half_w, float tip_half_w,
+                       uint8_t r, uint8_t gv, uint8_t b, uint8_t a) {
+    float dx = (float)isin(angle_byte);
+    float dy = -(float)icos(angle_byte);
+    float norm = sqrtf3_fast(dx * dx + dy * dy);
+    if (norm < 0.001f) return;
+    dx /= norm; dy /= norm;
 
-    NodGL_TextureDesc tex_desc = {
-        .width = screen_w,
-        .height = screen_h,
-        .format = NodGL_FORMAT_R8G8B8A8_UNORM,
-        .mip_levels = 1,
-        .initial_data = NULL,
-        .initial_data_size = 0
+    float ex = cx + dx * length, ey = cy + dy * length;
+    float bx = cx - dx * back_len, by = cy - dy * back_len;
+
+    int x0 = (int)(cx - length - back_len - 4), x1 = (int)(cx + length + back_len + 4);
+    int y0 = (int)(cy - length - back_len - 4), y1 = (int)(cy + length + back_len + 4);
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > (int)g.sw) x1 = (int)g.sw; if (y1 > (int)g.sh) y1 = (int)g.sh;
+
+    float sdx = ex - bx, sdy = ey - by;
+    float seg_len2 = sdx * sdx + sdy * sdy;
+    if (seg_len2 < 0.001f) return;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            float px = (x + 0.5f) - bx, py = (y + 0.5f) - by;
+            float t = (px * sdx + py * sdy) / seg_len2;
+            t = clampf(t, 0.0f, 1.0f);
+            float projx = bx + t * sdx, projy = by + t * sdy;
+            float ddx = (x + 0.5f) - projx, ddy = (y + 0.5f) - projy;
+            float dist = sqrtf3_fast(ddx * ddx + ddy * ddy);
+
+            /* Width tapers only across the forward (tip) portion of the hand. */
+            float back_frac = back_len / (back_len + length);
+            float taper_t = t <= back_frac ? 0.0f : (t - back_frac) / (1.0f - back_frac);
+            float half_w = base_half_w + (tip_half_w - base_half_w) * taper_t;
+
+            if (dist > half_w + 1.0f) continue;
+            float edge = clampf(half_w + 0.5f - dist, 0.0f, 1.0f);
+            uint8_t aa = (uint8_t)((float)a * edge);
+            if (aa) blend(x, y, r, gv, b, aa);
+        }
+    }
+}
+
+/* ============================================================
+   RTC read + weekday computation
+   ============================================================ */
+
+static void rtc_poll(void) {
+    if (g.rtc_fd < 0) return;
+    rtc_time_t t;
+    ssize_t n = read(g.rtc_fd, &t, sizeof(t));
+    if (n != (ssize_t)sizeof(t)) return;
+
+    if (t.second != g.last_raw_sec) {
+        g.last_raw_sec = t.second;
+        g.sec_baseline_ms = time_ms();
+
+        /* Push the previous second-hand angle into the comet trail. */
+        float prev_sec_f = (float)g.now.second;
+        uint8_t prev_angle = (uint8_t)(int)(prev_sec_f / 60.0f * 256.0f);
+        if (g.trail_len < (int)(sizeof(g.trail) / sizeof(g.trail[0]))) {
+            g.trail[g.trail_len++] = prev_angle;
+        } else {
+            for (int i = 1; i < g.trail_len; i++) g.trail[i - 1] = g.trail[i];
+            g.trail[g.trail_len - 1] = prev_angle;
+        }
+    }
+    g.now = t;
+}
+
+/* Zeller's congruence (Gregorian), 5*J form to avoid negative mod on
+ * integer division. Returns 0=Saturday .. 6=Friday. */
+static int day_of_week(int y, int m, int d) {
+    if (m < 3) { m += 12; y -= 1; }
+    int K = y % 100, J = y / 100;
+    int h = (d + (13 * (m + 1)) / 5 + K + K / 4 + J / 4 + 5 * J) % 7;
+    return h;
+}
+
+static const char *weekday_name(int h) {
+    static const char *names[7] = {
+        "Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"
     };
+    return names[h % 7];
+}
 
-    if (NodGL_CreateTexture(g_device, &tex_desc, &g_backbuffer_tex) != NodGL_OK) {
-        NodGL_ReleaseDevice(g_device);
-        return -2;
+static const char *month_name(uint8_t m) {
+    static const char *names[] = {
+        "???", "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    };
+    if (m < 1 || m > 12) return names[0];
+    return names[m];
+}
+
+/* ============================================================
+   Background
+   ============================================================ */
+
+static void draw_background(float cx, float cy, float max_r) {
+    /* Deep radial gradient, navy center fading to near-black edges. */
+    uint32_t row_cache_y = 0xFFFFFFFF;
+    for (int y = 0; y < (int)g.sh; y++) {
+        for (int x = 0; x < (int)g.sw; x++) {
+            float dx = x - cx, dy = y - cy;
+            float d = sqrtf3_fast(dx * dx + dy * dy);
+            float t = clampf(d / (max_r * 2.4f), 0.0f, 1.0f);
+            /* lerp between two navy tones */
+            uint8_t r  = (uint8_t)(16  + (6  - 16)  * t + 16 * t * t);
+            uint8_t gv = (uint8_t)(22  + (8  - 22)  * t + 10 * t * t);
+            uint8_t b  = (uint8_t)(46  + (18 - 46)  * t + 4  * t * t);
+            ((uint32_t *)(g.bb + (uint64_t)y * g.bb_pitch))[x] =
+                0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)gv << 8) | b;
+        }
+    }
+    (void)row_cache_y;
+}
+
+/* ============================================================
+   Clock face
+   ============================================================ */
+
+static void draw_clock(void) {
+    float cx = g.sw * 0.5f;
+    float cy = g.sh * 0.5f - 20.0f; /* leave room for the digital pill below */
+    float radius = ((g.sw < g.sh) ? (float)g.sw : (float)g.sh) * 0.34f;
+
+    draw_background(cx, cy, radius);
+
+    /* Outer soft glow (a few translucent rings, largest/faintest first). */
+    draw_ring(cx, cy, radius + 10, 18, 60, 200, 255, 18);
+    draw_ring(cx, cy, radius + 4,  8,  80, 220, 255, 30);
+
+    /* Face + rim */
+    draw_disc(cx, cy, radius, 14, 18, 30, 235);
+    draw_ring(cx, cy, radius, 3, 120, 235, 255, 220);
+
+    /* Ticks: 60 minor, 12 major, cardinal points accented gold. */
+    for (int i = 0; i < 60; i++) {
+        uint8_t ang = (uint8_t)(i * 256 / 60);
+        float dx = isin(ang) / 127.0f, dy = -icos(ang) / 127.0f;
+        int major = (i % 5 == 0);
+        int cardinal = (i % 15 == 0);
+        float r0 = radius - (major ? 16.0f : 8.0f);
+        float r1 = radius - 4.0f;
+        float half_w = major ? 2.0f : 1.0f;
+        uint8_t cr, cg, cb, ca;
+        if (cardinal)      { cr = 255; cg = 205; cb = 90;  ca = 255; }
+        else if (major)    { cr = 230; cg = 235; cb = 245; ca = 220; }
+        else               { cr = 140; cg = 150; cb = 165; ca = 140; }
+
+        int steps = (int)(r1 - r0);
+        if (steps < 1) steps = 1;
+        for (int s = 0; s <= steps; s++) {
+            float rr = r0 + (r1 - r0) * ((float)s / (float)steps);
+            float px = cx + dx * rr, py = cy + dy * rr;
+            draw_disc(px, py, half_w, cr, cg, cb, ca);
+        }
     }
 
-    if (NodGL_MapResource(g_ctx, g_backbuffer_tex, (void**)&g->bb, &g->bb_pitch) != NodGL_OK) {
-        NodGL_ReleaseResource(g_device, g_backbuffer_tex);
-        NodGL_ReleaseDevice(g_device);
-        return -4;
+    /* Hour numerals (skipped gracefully if no font could be loaded). */
+    if (g.font) {
+        for (int h = 1; h <= 12; h++) {
+            uint8_t ang = (uint8_t)(h * 256 / 12);
+            float dx = isin(ang) / 127.0f, dy = -icos(ang) / 127.0f;
+            float rr = radius - 34.0f;
+            float px = cx + dx * rr, py = cy + dy * rr;
+            char buf[4];
+            int n = 0;
+            if (h >= 10) buf[n++] = '0' + (h / 10);
+            buf[n++] = '0' + (h % 10);
+            buf[n] = 0;
+            int tw = text_width(buf);
+            draw_text((int)px - tw / 2, (int)py - 6, buf, 0xFFE8ECF5);
+        }
     }
 
-    return 0;
+    /* Comet trail behind the second hand — faint, fading dots along the rim. */
+    for (int i = 0; i < g.trail_len; i++) {
+        uint8_t ang = g.trail[g.trail_len - 1 - i];
+        float dx = isin(ang) / 127.0f, dy = -icos(ang) / 127.0f;
+        float rr = radius - 20.0f;
+        float px = cx + dx * rr, py = cy + dy * rr;
+        uint8_t a = (uint8_t)(90 - i * (90 / (int)(sizeof(g.trail) / sizeof(g.trail[0]))));
+        draw_disc(px, py, 3.0f, 255, 90, 90, a);
+    }
+
+    /* Smooth fractional time for sweeping hands. */
+    float frac = clampf((float)(time_ms() - g.sec_baseline_ms) / 1000.0f, 0.0f, 1.0f);
+    float sec_f  = (float)g.now.second + frac;
+    float min_f  = (float)g.now.minute + sec_f / 60.0f;
+    float hour_f = (float)(g.now.hour % 12) + min_f / 60.0f;
+
+    uint8_t a_hour = (uint8_t)(int)(hour_f / 12.0f * 256.0f);
+    uint8_t a_min  = (uint8_t)(int)(min_f  / 60.0f * 256.0f);
+    uint8_t a_sec  = (uint8_t)(int)(sec_f  / 60.0f * 256.0f);
+
+    /* Hour hand */
+    draw_hand(cx, cy, a_hour, radius * 0.50f, radius * 0.12f, 5.5f, 2.0f, 235, 235, 245, 255);
+    /* Minute hand */
+    draw_hand(cx, cy, a_min,  radius * 0.74f, radius * 0.14f, 4.0f, 1.5f, 235, 235, 245, 255);
+    /* Second hand: soft glow pass, then sharp accent-coloured pass */
+    draw_hand(cx, cy, a_sec, radius * 0.82f, radius * 0.18f, 4.0f, 2.5f, 255, 90, 90, 40);
+    draw_hand(cx, cy, a_sec, radius * 0.82f, radius * 0.18f, 1.6f, 0.8f, 255, 110, 110, 255);
+
+    /* Hub */
+    draw_disc(cx, cy, 7.0f, 20, 24, 34, 255);
+    draw_ring(cx, cy, 7.0f, 2.0f, 255, 110, 110, 255);
+    draw_disc(cx, cy, 2.5f, 255, 230, 230, 255);
 }
 
-static void gfx_present(Gfx *g) {
-    NodGL_DrawTexture(g_ctx, g_backbuffer_tex, 0, 0, 0, 0, g->vi.width, g->vi.height);
-    NodGL_PresentContext(g_ctx, 0);
-}
+/* ============================================================
+   Digital readout pill + hint
+   ============================================================ */
 
-static void format_time(char out[16], uint8_t hh, uint8_t mm, uint8_t ss) {
-    out[0] = (char)('0' + (hh / 10));
-    out[1] = (char)('0' + (hh % 10));
-    out[2] = ':';
-    out[3] = (char)('0' + (mm / 10));
-    out[4] = (char)('0' + (mm % 10));
-    out[5] = ':';
-    out[6] = (char)('0' + (ss / 10));
-    out[7] = (char)('0' + (ss % 10));
-    out[8] = 0;
-}
+static void draw_digital_pill(void) {
+    if (!g.font) return;
 
-static void format_date(char out[16], uint16_t yyyy, uint8_t mo, uint8_t dd) {
-    // YYYY-MM-DD
-    out[0] = (char)('0' + (yyyy / 1000) % 10);
-    out[1] = (char)('0' + (yyyy / 100) % 10);
-    out[2] = (char)('0' + (yyyy / 10) % 10);
-    out[3] = (char)('0' + (yyyy / 1) % 10);
-    out[4] = '-';
-    out[5] = (char)('0' + (mo / 10));
-    out[6] = (char)('0' + (mo % 10));
-    out[7] = '-';
-    out[8] = (char)('0' + (dd / 10));
-    out[9] = (char)('0' + (dd % 10));
-    out[10] = 0;
-}
+    char timebuf[16];
+    int hh = g.now.hour;
+    const char *suffix = "";
+    if (!g.fmt24) {
+        suffix = (hh >= 12) ? " PM" : " AM";
+        hh = hh % 12; if (hh == 0) hh = 12;
+    }
+    /* HH:MM:SS (+AM/PM) */
+    int n = 0;
+    timebuf[n++] = '0' + (hh / 10);
+    timebuf[n++] = '0' + (hh % 10);
+    timebuf[n++] = ':';
+    timebuf[n++] = '0' + (g.now.minute / 10);
+    timebuf[n++] = '0' + (g.now.minute % 10);
+    timebuf[n++] = ':';
+    timebuf[n++] = '0' + (g.now.second / 10);
+    timebuf[n++] = '0' + (g.now.second % 10);
+    timebuf[n] = 0;
 
-static void render(Gfx *g, uint8_t hh, uint8_t mm, uint8_t ss,
-                   uint16_t yyyy, uint8_t mo, uint8_t dd,
-                   uint16_t ms_in_sec) {
-
-    uint32_t bg = (g->fmt == MD64API_GRP_FMT_RGB565) ? pack_rgb565(10, 12, 18) : pack_xrgb8888(10, 12, 18);
-    uint32_t fg = (g->fmt == MD64API_GRP_FMT_RGB565) ? pack_rgb565(230, 230, 240) : pack_xrgb8888(230, 230, 240);
-    uint32_t accent = (g->fmt == MD64API_GRP_FMT_RGB565) ? pack_rgb565(255, 80, 80) : pack_xrgb8888(255, 80, 80);
-    uint32_t dim = (g->fmt == MD64API_GRP_FMT_RGB565) ? pack_rgb565(90, 100, 120) : pack_xrgb8888(90, 100, 120);
-
-    clear(g, bg);
-
-    int cx = (int)g->vi.width / 2;
-    int cy = (int)g->vi.height / 2 - 40;
-    int r = (int)((g->vi.height < g->vi.width ? g->vi.height : g->vi.width) / 3);
-    if (r < 60) r = 60;
-
-    // Face
-    draw_circle(g, cx, cy, r, fg);
-    draw_circle(g, cx, cy, r-1, dim);
-
-    // Numerals 12/3/6/9
+    char linebuf[24];
     {
-        int nscale = 4;
-        // "12" at top
-        draw_text_3x5(g, cx - (2 * ((3*nscale)+nscale))/2, cy - r + 14, "12", nscale, fg);
-        // "3" right
-        draw_text_3x5(g, cx + r - 16, cy - (5*nscale)/2, "3", nscale, fg);
-        // "6" bottom
-        draw_text_3x5(g, cx - ((3*nscale)+nscale)/2, cy + r - 16, "6", nscale, fg);
-        // "9" left
-        draw_text_3x5(g, cx - r + 10, cy - (5*nscale)/2, "9", nscale, fg);
+        int i = 0;
+        while (timebuf[i]) { linebuf[i] = timebuf[i]; i++; }
+        const char *s = suffix;
+        while (*s) linebuf[i++] = *s++;
+        linebuf[i] = 0;
     }
 
-    // Minute dots (subtle)
-    for (int t = 0; t < 60; t++) {
-        int x0,y0;
-        hand_endpoint(cx, cy, r-3, t, &x0, &y0);
-        put_px(g, x0, y0, (t % 5 == 0) ? fg : dim);
-    }
-
-    // Tick marks every 5 minutes (longer)
-    for (int t = 0; t < 60; t += 5) {
-        int x0,y0,x1,y1;
-        hand_endpoint(cx, cy, r-2, t, &x0, &y0);
-        hand_endpoint(cx, cy, r-10, t, &x1, &y1);
-        draw_line(g, x0, y0, x1, y1, fg);
-    }
-
-    // Hands
-    int sx,sy,mx,my,hx,hy;
-
-    // Smooth second hand (interpolated)
-    hand_endpoint_smooth(cx, cy, r-12, (int)ss, ms_in_sec, &sx, &sy);
-    hand_endpoint(cx, cy, r-22, (int)mm, &mx, &my);
-
-    // hour: map to 0..59 with minute influence
-    int hour12 = (int)(hh % 12);
-    int hour_tick = (hour12 * 5) + ((int)mm / 12);
-    hand_endpoint(cx, cy, r-38, hour_tick, &hx, &hy);
-
-    draw_line(g, cx, cy, hx, hy, fg);
-    draw_line(g, cx, cy, mx, my, fg);
-    // Second hand: draw base position, plus a small "tail" (also smooth)
-    draw_line(g, cx, cy, sx, sy, accent);
+    char datebuf[64];
     {
-        int tx, ty;
-        hand_endpoint_smooth(cx, cy, -12, (int)ss, ms_in_sec, &tx, &ty);
-        draw_line(g, cx, cy, tx, ty, dim);
+        const char *wd = weekday_name(day_of_week((int)g.now.year, g.now.month, g.now.day));
+        const char *mo = month_name(g.now.month);
+        int i = 0;
+        const char *s = wd; while (*s) datebuf[i++] = *s++;
+        datebuf[i++] = ','; datebuf[i++] = ' ';
+        s = mo; while (*s) datebuf[i++] = *s++;
+        datebuf[i++] = ' ';
+        datebuf[i++] = '0' + (g.now.day / 10);
+        datebuf[i++] = '0' + (g.now.day % 10);
+        datebuf[i++] = ',';
+        datebuf[i++] = ' ';
+        uint32_t y = g.now.year;
+        char ybuf[6]; int yn = 0;
+        if (y == 0) { ybuf[yn++] = '0'; }
+        while (y) { ybuf[yn++] = '0' + (y % 10); y /= 10; }
+        while (yn > 0) datebuf[i++] = ybuf[--yn];
+        datebuf[i] = 0;
     }
 
-    // Center cap
-    draw_circle(g, cx, cy, 3, fg);
+    int tw1 = text_width(linebuf) * 2; /* time drawn at 2x scale below */
+    int tw2 = text_width(datebuf);
+    int pill_w = (tw1 > tw2 ? tw1 : tw2) + 48;
+    int pill_h = 62;
+    int px = (int)g.sw / 2 - pill_w / 2;
+    int py = (int)g.sh - pill_h - 24;
 
-    // Digital time below
-    char tbuf[16];
-    format_time(tbuf, hh, mm, ss);
+    /* Rounded-ish translucent pill via a rect + disc caps */
+    fill(px + 10, py, pill_w - 20, pill_h, 0x00000000);
+    for (int y = py; y < py + pill_h; y++)
+        for (int x = px; x < px + pill_w; x++)
+            blend(x, y, 8, 10, 18, 165);
+    draw_disc(px + 10,           py + pill_h / 2, pill_h / 2.0f, 8, 10, 18, 165);
+    draw_disc(px + pill_w - 10,  py + pill_h / 2, pill_h / 2.0f, 8, 10, 18, 165);
 
-    char dbuf[16];
-    format_date(dbuf, yyyy, mo, dd);
+    /* Time, drawn scaled up for emphasis */
+    {
+        int cx = (int)g.sw / 2;
+        int cxx = cx - tw1 / 2;
+        int cy = py + 8;
+        uint8_t r = 235, gv = 240, b = 255;
+        const char *s = linebuf;
+        int cxp = cxx;
+        while (*s) {
+            fnt_glyph_t *gl = fnt_get_glyph(g.font, (uint32_t)(unsigned char)*s);
+            if (gl) {
+                for (int dy = 0; dy < gl->bitmap_height; dy++)
+                    for (int dx = 0; dx < gl->bitmap_width; dx++)
+                        if (fnt_get_pixel(gl, dx, dy))
+                            fill(cxp + dx * 2, cy + dy * 2, 2, 2,
+                                 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)gv << 8) | b);
+                cxp += gl->width * 2;
+            }
+            s++;
+        }
+    }
 
-    int scale = 6;
-    int text_w = (int)strlen(tbuf) * ((3*scale)+scale);
-    int tx = (int)g->vi.width/2 - text_w/2;
-    int ty = cy + r + 20;
-    draw_text_3x5(g, tx, ty, tbuf, scale, fg);
+    draw_text_centered((int)g.sw / 2, py + 40, datebuf, 0xFFAAB3C8);
 
-    // Date line
-    scale = 4;
-    text_w = (int)strlen(dbuf) * ((3*scale)+scale);
-    tx = (int)g->vi.width/2 - text_w/2;
-    ty += 5*6 + 10;
-    draw_text_3x5(g, tx, ty, dbuf, scale, dim);
-
-    // Hint
-    const char *hint = "ESC to quit";
-    scale = 3;
-    text_w = (int)strlen(hint) * ((3*scale)+scale);
-    tx = (int)g->vi.width/2 - text_w/2;
-    ty += 5*4 + 14;
-    draw_text_3x5(g, tx, ty, hint, scale, dim);
+    draw_text(16, (int)g.sh - 20, "ESC/Q: quit   T: toggle 12h/24h", 0xFF3A4256);
 }
+
+/* ============================================================
+   Font loading (Terminus preferred, Unicode.fnt fallback)
+   ============================================================ */
+
+static fnt_font_t *try_load_font(const char *path) {
+    int fd = open(path, O_RDONLY, 0);
+    if (fd < 0) return NULL;
+    long fsz = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    fnt_font_t *out = NULL;
+    if (fsz > 0 && fsz < 4 * 1024 * 1024) {
+        void *data = malloc((size_t)fsz);
+        if (data) {
+            size_t got = 0;
+            while (got < (size_t)fsz) {
+                ssize_t r = read(fd, (uint8_t *)data + got, (size_t)fsz - got);
+                if (r <= 0) break;
+                got += (size_t)r;
+            }
+            if (got == (size_t)fsz) out = fnt_load_font(data, got);
+            free(data);
+        }
+    }
+    close(fd);
+    return out;
+}
+
+/* ============================================================
+   Entry point
+   ============================================================ */
 
 int md_main(long argc, char **argv) {
     (void)argc; (void)argv;
+    memset(&g, 0, sizeof(g));
+    g.fmt24 = 1;
+    g.last_raw_sec = -1;
 
-    Gfx g;
-    int gr = gfx_init(&g);
-    if (gr != 0) {
-        printf("gfxclock: graphics init failed (%d). Need framebuffer graphics mode.\n", gr);
+    int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
+    if (efd < 0) { printf("gfxclock: no event device\n"); sleep(2); return 2; }
+
+    g.rtc_fd = open(RTC_DEV_PATH, O_RDONLY, 0);
+    if (g.rtc_fd < 0) {
+        printf("gfxclock: failed to open " RTC_DEV_PATH "\n");
+        close(efd);
         return 1;
     }
 
-    int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
-    if (efd < 0) {
-        puts_raw("gfxclock: cannot open $/dev/input/event0\n");
-        NodGL_ReleaseResource(g_device, g_backbuffer_tex);
-        NodGL_ReleaseDevice(g_device);
-        return 2;
+    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &g.device, &g.ctx, NULL) != NodGL_OK) {
+        printf("gfxclock: NodGL failed\n");
+        close(g.rtc_fd); close(efd);
+        return 1;
+    }
+    NodGL_GetScreenResolution(g.device, &g.sw, &g.sh);
+
+    NodGL_TextureDesc td; memset(&td, 0, sizeof(td));
+    td.width = g.sw; td.height = g.sh;
+    td.format = NodGL_FORMAT_R8G8B8A8_UNORM; td.mip_levels = 1;
+    if (NodGL_CreateTexture(g.device, &td, &g.tex) != NodGL_OK) {
+        NodGL_ReleaseDevice(g.device); close(g.rtc_fd); close(efd);
+        return 1;
+    }
+    if (NodGL_MapResource(g.ctx, g.tex, (void **)&g.bb, &g.bb_pitch) != NodGL_OK) {
+        NodGL_ReleaseResource(g.device, g.tex);
+        NodGL_ReleaseDevice(g.device); close(g.rtc_fd); close(efd);
+        return 1;
     }
 
-    md64api_sysinfo_data_u info;
-    memset(&info, 0, sizeof(info));
-    int sysinfo_fd = open("$/dev/md64api/sysinfo", 0, 0);
+    /* Font: Terminus first, Unicode.fnt fallback. HUD/numerals degrade
+     * gracefully (hands + ticks still render) if neither is available. */
+    g.font = try_load_font(FONT_PRIMARY);
+    if (!g.font) g.font = try_load_font(FONT_FALLBACK);
 
-    uint8_t last_s = 255;
-    uint16_t last_ms_bucket = 0;
-    uint64_t sec_epoch_ms = 0;
+    /* Prime the first RTC reading before the first frame draws. */
+    rtc_poll();
+    g.sec_baseline_ms = time_ms();
 
-    while (1) {
-        // input
+    g.quit = 0;
+    while (!g.quit) {
         Event ev;
-        while (read(efd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
-            if (ev.type == EVENT_KEY_PRESSED && ev.data.keyboard.keycode == KEY_ESCAPE) {
-                close(efd);
-                if (g.bb) free(g.bb);
-                return 0;
-            }
-        }
-
-        // Use SYS_TIME for smooth animation pacing.
-        uint64_t ms = time_ms();
-
-        // Render at ~60 FPS for a smooth sweeping second hand.
-        uint16_t bucket = (uint16_t)(ms / 16u);
-        if (bucket != last_ms_bucket) {
-            last_ms_bucket = bucket;
-
-            if (sysinfo_fd >= 0 && (lseek(sysinfo_fd, 0, 0), read(sysinfo_fd, &info, sizeof(info))) > 0) {
-                // Re-sync the sub-second phase when the RTC second changes.
-                // This avoids jitter caused by SYS_TIME not being aligned to RTC seconds.
-                if (info.rtc_second != last_s) {
-                    last_s = info.rtc_second;
-                    sec_epoch_ms = ms;
+        while (read(efd, &ev, sizeof(ev)) > 0) {
+            if (ev.type == EVENT_KEY_PRESSED) {
+                char ch = ev.data.keyboard.ascii;
+                if (ch == 'q' || ch == 'Q' || ch == 0x1B) {
+                    g.quit = 1; break;
+                } else if (ch == 't' || ch == 'T') {
+                    g.fmt24 = !g.fmt24;
                 }
-
-                uint16_t ms_in_sec = (uint16_t)(ms - sec_epoch_ms);
-                if (ms_in_sec >= 1000) ms_in_sec %= 1000;
-
-                render(&g,
-                       info.rtc_hour, info.rtc_minute, info.rtc_second,
-                       info.rtc_year, info.rtc_month, info.rtc_day,
-                       ms_in_sec);
-                gfx_present(&g);
             }
         }
+        if (g.quit) break;
 
+        rtc_poll();
+        draw_clock();
+        draw_digital_pill();
+
+        NodGL_DrawTexture(g.ctx, g.tex, 0, 0, 0, 0, g.sw, g.sh);
+        NodGL_PresentContext(g.ctx, 1); /* vsync */
         yield();
     }
 
-    NodGL_ReleaseResource(g_device, g_backbuffer_tex);
-    NodGL_ReleaseDevice(g_device);
+    if (g.font) fnt_free_font(g.font);
+    if (g.bb)   NodGL_UnmapResource(g.ctx, g.tex);
+    NodGL_ReleaseResource(g.device, g.tex);
+    NodGL_ReleaseDevice(g.device);
+    close(g.rtc_fd);
+    close(efd);
+    input_flush();
+    return 0;
 }
