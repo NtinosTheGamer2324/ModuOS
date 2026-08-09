@@ -36,6 +36,7 @@
 #include "moduos/kernel/audio.h"
 #include "moduos/kernel/mdinit.h"
 #include <stdint.h>
+#include "moduos/kernel/debug.h"
 
 int acpi_initialized;
 int boot_drive_index = -1;  // Global to store boot drive
@@ -564,7 +565,7 @@ void kernel_main(uint64_t mb2_ptr)
 {
     // Boot arg selection:
     //  - "gfx-test" => force graphics test path
-    //  - otherwise  => normal text-mode boot
+    //  - otherwise  => ancient text-mode boot
     const char *cmdline = NULL;
     struct multiboot_tag *t = multiboot2_find_tag((void*)(uintptr_t)mb2_ptr, MULTIBOOT_TAG_TYPE_CMDLINE);
     if (t) {
@@ -579,9 +580,26 @@ void kernel_main(uint64_t mb2_ptr)
             char c[2] = { cmdline[i], 0 };
             com_write_string(COM1_PORT, c);
         }
+
+        com_write_string(COM1_PORT, "\n");
+
+        /* Add Debug level arg support */
+        if (strstr(cmdline, "--debug=on") != NULL) {
+            kernel_debug_set_level(KDBG_ON);
+            COM_LOG_INFO(COM1_PORT, "KDBG: ON");
+        } else if (strstr(cmdline, "--debug=med") != NULL) {
+            kernel_debug_set_level(KDBG_MED);
+            COM_LOG_INFO(COM1_PORT, "KDBG: MEDIUM");
+        } else {
+            kernel_debug_set_level(KDBG_OFF);
+            COM_LOG_INFO(COM1_PORT, "KDBG: OFF");
+        }
+
     } else {
         com_write_string(COM1_PORT, "<none>");
+        kernel_debug_set_level(KDBG_OFF);
     }
+
     com_write_string(COM1_PORT, "\n");
 
     int want_gfx_test = (cmdline && cmdline_has_token(cmdline, "gfx-test")) ? 1 : 0;
@@ -591,6 +609,8 @@ void kernel_main(uint64_t mb2_ptr)
     // Run full init ONCE (running it twice corrupts the multiboot info area)
     g_kernel_mb2_ptr = mb2_ptr;
     mdinit_run(mb2_ptr);
+
+    /* Past this point, it is dead code. mdinit will never ever EVER return */
 
     // For gfx-test, try to (re)enable framebuffer after full init in case something reset VGA state.
     if (want_gfx_test) {
