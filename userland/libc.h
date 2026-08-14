@@ -571,6 +571,43 @@ static inline int munmap(void *addr, size_t length) {
     return (int)syscall(SYS_MUNMAP, (long)addr, (long)length, 0);
 }
 
+/* ------------------------------------------------------------
+   Shared memory: shm_open() + mmap(MAP_SHARED)
+   ------------------------------------------------------------ */
+
+#define MAP_SHARED 0x4   /* fd below must be a shm_open() handle, not a real fd */
+
+/* SHM_O_CREAT/SHM_O_EXCL are deliberately separate from the O_CREAT defined
+ * above. That O_CREAT (0x0100) does NOT match what the kernel's fd.h
+ * actually checks for regular open() (0x0040) -- a pre-existing mismatch in
+ * this codebase, unrelated to shm. shm_open() is a raw syscall that checks
+ * the kernel's real bit values directly, so it needs its own correctly-
+ * matched constants rather than inheriting that bug. O_RDONLY/O_WRONLY/
+ * O_RDWR above (0x0000/0x0001/0x0002) DO match the kernel and are reused
+ * as-is for oflags. */
+#define SHM_O_CREAT 0x0040
+#define SHM_O_EXCL  0x1000
+
+/* shm_open(name, oflags, mode, size)
+ *   oflags: O_RDONLY or O_RDWR, optionally | SHM_O_CREAT (and | SHM_O_EXCL).
+ *   mode:   stored but not enforced yet.
+ *   size:   required (>0) when creating a new segment, rounded up to a
+ *           page; pass 0 when opening an existing segment (or the exact
+ *           existing size -- any other non-zero size is an error).
+ * Returns a handle (>=0) that is valid for exactly ONE mmap(MAP_SHARED,
+ * handle) call, or a negative -errno. There is no shm_close() -- the
+ * handle is consumed the moment mmap() maps it. */
+static inline int shm_open(const char *name, int oflags, uint32_t mode, uint64_t size) {
+    return (int)syscall4(SYS_SHM_OPEN, (long)name, (long)oflags, (long)mode, (long)size);
+}
+
+/* Removes `name` from the namespace. Any mapping already made from it keeps
+ * working until every mapper munmap()s (or exits); the memory itself is
+ * only actually freed once the last one does. Returns 0 or -errno. */
+static inline int shm_unlink(const char *name) {
+    return (int)syscall(SYS_SHM_UNLINK, (long)name, 0, 0);
+}
+
 /*
  * Userland heap allocator (simple free-list malloc).
  *

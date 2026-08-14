@@ -34,6 +34,7 @@
 #include "moduos/kernel/memory/usercopy.h"
 #include "moduos/kernel/errno.h"
 #include "moduos/arch/AMD64/syscall/syscall64.h"
+#include "moduos/kernel/ipc/shm.h"
 
 /* Forward declarations */
 uint64_t sys_signal(int sig, uint64_t handler);
@@ -201,6 +202,11 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             return (uint64_t)sys_mmap((void*)arg1, (size_t)arg2, (int)arg3, (int)arg4, (int)arg5);
         case SYS_MUNMAP:
             return (uint64_t)sys_munmap((void*)arg1, (size_t)arg2);
+        case SYS_SHM_OPEN:
+            return (uint64_t)(int64_t)sys_shm_open((const char*)arg1, (int)arg2,
+                                                    (uint32_t)arg3, (uint64_t)arg4);
+        case SYS_SHM_UNLINK:
+            return (uint64_t)(int64_t)sys_shm_unlink((const char*)arg1);
         case SYS_VFS_MKFS:
             return (uint64_t)sys_vfs_mkfs((const vfs_mkfs_req_t*)arg1);
         case SYS_VFS_GETPART:
@@ -747,14 +753,68 @@ void* sys_sbrk(intptr_t increment) {
 
 #define MAP_FIXED  0x1
 #define MAP_ANON   0x2
+#define MAP_SHARED 0x4   /* fd is a shm_open() handle, not a real fd */
 #define PROT_R 0x1
 #define PROT_W 0x2
 #define PROT_X 0x4
+
+/* Shared-memory path: map every page of a shm_open()'d object into the
+ * caller, ref-counting each physical frame. Split out of sys_mmap() so the
+ * existing anon/file logic below is untouched. */
+static void* sys_mmap_shared(process_t *p, void *addr, size_t size, int prot,
+                             int flags, int fd) {
+    if (size == 0) return ERR_PTR(EINVAL);
+
+    uint64_t *frames;
+    size_t    frame_count;
+    int       can_write;
+    int rc = shm_handle_take(fd, &frames, &frame_count, &can_write);
+    if (rc != 0) return ERR_PTR(-rc);
+
+    uint64_t sz = ((uint64_t)size + 0xFFFULL) & ~0xFFFULL;
+    if (sz != frame_count * 0x1000ULL) return ERR_PTR(EINVAL); /* whole-object only */
+    if ((prot & PROT_W) && !can_write) return ERR_PTR(EACCES);
+
+    uint64_t v = (uint64_t)(uintptr_t)addr;
+    int fixed = (flags & MAP_FIXED) != 0;
+
+    if (fixed) {
+        if (v == 0 || (v & 0xFFFULL)) return ERR_PTR(EINVAL);
+        if (!is_user_range(v, sz)) return ERR_PTR(EACCES);
+        for (uint64_t cur = v; cur < v + sz; cur += PAGE_SIZE)
+            if (paging_virt_to_phys(cur) != 0) return ERR_PTR(EEXIST);
+    } else {
+        v = (p->user_mmap_end + 0xFFFULL) & ~0xFFFULL;
+        if (v < p->user_mmap_base) v = p->user_mmap_base;
+        if (!is_user_range(v, sz)) return ERR_PTR(ENOMEM);
+        if (v + sz > p->user_mmap_limit) return ERR_PTR(ENOMEM);
+    }
+
+    uint64_t pflags = PFLAG_PRESENT | PFLAG_USER | PFLAG_SHARED;
+    if (prot & PROT_W) pflags |= PFLAG_WRITABLE;
+
+    for (size_t i = 0; i < frame_count; i++) {
+        phys_ref_inc(frames[i]);
+        if (paging_map_page(v + i * PAGE_SIZE, frames[i], pflags) != 0) {
+            /* Roll back what we already mapped/ref'd. */
+            for (size_t j = 0; j <= i; j++) {
+                paging_unmap_page(v + j * PAGE_SIZE);
+                phys_free_frame(frames[j]);
+            }
+            return ERR_PTR(ENOMEM);
+        }
+    }
+
+    if (!fixed && v + sz > p->user_mmap_end) p->user_mmap_end = v + sz;
+    return (void*)(uintptr_t)v;
+}
 
 void* sys_mmap(void *addr, size_t size, int prot, int flags, int fd) {
     process_t *p = process_get_current();
     if (!p || !p->is_user) return ERR_PTR(EPERM);
     if (size == 0) return ERR_PTR(EINVAL);
+
+    if (flags & MAP_SHARED) return sys_mmap_shared(p, addr, size, prot, flags, fd);
 
     uint64_t sz = ((uint64_t)size + 0xFFFULL) & ~0xFFFULL;
     uint64_t v  = (uint64_t)(uintptr_t)addr;
@@ -825,6 +885,18 @@ int sys_munmap(void *addr, size_t size) {
         }
     }
     return 0;
+}
+
+int sys_shm_open(const char *name, int oflags, uint32_t mode, uint64_t size) {
+    process_t *p = process_get_current();
+    if (!p || !p->is_user) return -EPERM;
+    return shm_open(name, oflags, mode, size);
+}
+
+int sys_shm_unlink(const char *name) {
+    process_t *p = process_get_current();
+    if (!p || !p->is_user) return -EPERM;
+    return shm_unlink(name);
 }
 
 int sys_kill(int pid, int sig) {

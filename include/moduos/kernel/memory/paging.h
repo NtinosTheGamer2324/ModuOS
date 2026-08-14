@@ -13,6 +13,13 @@
 /* Software-only flag stored in available PTE bits (bit 9). */
 #define PFLAG_COW 0x200
 
+/* Software-only flag stored in available PTE bits (bit 10).
+ * Marks a page as belonging to a shared-memory mapping (MAP_SHARED via
+ * shm_open()+mmap()). Consulted by fork()'s address-space clone so shared
+ * pages are ref-counted and re-mapped into the child instead of being
+ * physically copied like a normal private page would be. See shm.h. */
+#define PFLAG_SHARED 0x400
+
 /* amd64 PTE NX bit is handled elsewhere; for now we only need the USER bit */
 
 

@@ -104,24 +104,38 @@ static int clone_user_address_space(process_t *parent, process_t *child) {
             uint64_t pte = paging_get_pte(v);
             if (!(pte & PFLAG_USER)) continue;
 
-            /* Allocate a fresh physical page for the child. */
-            uint64_t child_phys = phys_alloc_frame();
-            if (!child_phys) return -ENOMEM;
+            uint64_t child_phys;
 
-            /*
-             * Copy the parent page directly via identity mapping.
-             * phys_to_virt_kernel(phys) == (void*)phys when phys_offset == 0,
-             * so no scratch VA or TLB shenanigans are needed.
-             */
-            void *src = phys_to_virt_kernel(parent_phys & ~0xFFFULL);
-            void *dst = phys_to_virt_kernel(child_phys);
-            if (!src || !dst) {
-                phys_free_frame(child_phys);
-                return -ENOMEM;
+            if (pte & PFLAG_SHARED) {
+                /* Shared mapping (shm_open()+mmap(MAP_SHARED)): don't copy —
+                 * point the child at the same physical frame and bump its
+                 * refcount. phys_free_frame() (called by munmap/process exit)
+                 * already only actually frees a frame once its refcount hits
+                 * zero, so this composes with existing cleanup unmodified. */
+                child_phys = parent_phys & ~0xFFFULL;
+                phys_ref_inc(child_phys);
+            } else {
+                /* Allocate a fresh physical page for the child. */
+                child_phys = phys_alloc_frame();
+                if (!child_phys) return -ENOMEM;
+
+                /*
+                 * Copy the parent page directly via identity mapping.
+                 * phys_to_virt_kernel(phys) == (void*)phys when phys_offset == 0,
+                 * so no scratch VA or TLB shenanigans are needed.
+                 */
+                void *src = phys_to_virt_kernel(parent_phys & ~0xFFFULL);
+                void *dst = phys_to_virt_kernel(child_phys);
+                if (!src || !dst) {
+                    phys_free_frame(child_phys);
+                    return -ENOMEM;
+                }
+                memcpy(dst, src, 4096);
             }
-            memcpy(dst, src, 4096);
 
-            /* Map child_phys into the child's address space with the same flags. */
+            /* Map child_phys into the child's address space with the same
+             * flags (this preserves PFLAG_SHARED on shared pages too, so a
+             * grandchild fork()ing from this child shares correctly as well). */
             uint64_t flags = (pte & 0xFFFULL) | PFLAG_PRESENT | PFLAG_USER | PFLAG_WRITABLE;
             if (paging_map_range_to_pml4(child_pml4, v, child_phys, 4096, flags) != 0) {
                 phys_free_frame(child_phys);
