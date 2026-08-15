@@ -335,10 +335,10 @@ int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
         __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
     }
 
-    if (flags & PFLAG_USER) pd[i2] |= PFLAG_USER;
-
     uint64_t *pt = get_or_create(pd, i2);
     if (!pt) return -1;
+
+    if (flags & PFLAG_USER) pd[i2] |= PFLAG_USER;
 
     uint64_t entry = (phys & PAGE_MASK) | (flags & 0xFFFULL) | PFLAG_PRESENT;
     pt[i1] = entry;
