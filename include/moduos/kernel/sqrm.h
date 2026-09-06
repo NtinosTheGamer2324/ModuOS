@@ -94,6 +94,16 @@ typedef struct Event Event;
 
 #include "moduos/kernel/gfx.h" /* gfx_src_sg_t */
 
+/* Programmable shader stage — UMCS (ModuOS's shader ISA). */
+typedef enum {
+    SQRM_SHADER_STAGE_VERTEX   = 1,
+    SQRM_SHADER_STAGE_FRAGMENT = 2,
+    SQRM_SHADER_STAGE_COMPUTE  = 3,
+} sqrm_shader_stage_t;
+
+typedef uint32_t sqrm_shader_handle_t;
+#define SQRM_SHADER_INVALID_HANDLE 0u
+
 typedef struct sqrm_gpu_device {
     framebuffer_t fb;
     // Optional: called after drawing into fb.addr to push updates to hardware.
@@ -139,6 +149,31 @@ typedef struct sqrm_gpu_device {
                                  int32_t x2, int32_t y2, float u2, float v2,
                                  uint32_t texture_id);
 
+    /* ------------------------------------------------------------
+     * Optional programmable shader hook (thread-context only).
+     * Present iff caps & SQRM_GPU_CAP_PROGRAMMABLE.
+     *
+     * Executes a UMCS shader binary that has ALREADY been validated
+     * by the kernel-side loader before this is called — this hook
+     * trusts umcs_binary/umcs_size and does not re-check module
+     * header or instruction structure itself.
+     *
+     * buffers[]/buffer_count are raw I/O pointers; which index is
+     * input vs output is a convention agreed between the caller and
+     * the shader, not interpreted here. invocation_count is how many
+     * times to run the shader (once per pixel/vertex/compute item);
+     * the interpreter exposes the invocation index to the shader via
+     * a reserved register.
+     *
+     * Returns 0 on success, negative on failure (unsupported stage,
+     * invocation_count too large, opcode this backend can't execute).
+     * A software interpreter is an acceptable first implementation.
+     * ------------------------------------------------------------ */
+    int (*shader_run)(const uint8_t *umcs_binary, size_t umcs_size,
+                      sqrm_shader_stage_t stage,
+                      void *buffers[], uint32_t buffer_count,
+                      uint32_t invocation_count);
+
     /* Future: vertex buffer submission, transform matrices, etc */
 
     int (*blit_buffer)(const framebuffer_t *fb, uint32_t dst_x, uint32_t dst_y,
@@ -161,6 +196,7 @@ typedef struct sqrm_gpu_device {
     #define SQRM_GPU_CAP_HW_CURSOR     (1u << 3)  // Has cursor hooks
     #define SQRM_GPU_CAP_VSYNC         (1u << 4)  // Supports vsync
     #define SQRM_GPU_CAP_BLIT_BUF      (1u << 5)  // Has blit_buffer (mandatory for all GPU LKMs)
+    #define SQRM_GPU_CAP_PROGRAMMABLE  (1u << 6)  // Has shader_run (UMCS)
 
     // Optional: called on shutdown/unload (not implemented yet)
     void (*shutdown)(void);
@@ -301,6 +337,16 @@ typedef struct sqrm_kernel_api {
     int (*gfx_set_mode)(uint32_t width, uint32_t height, uint32_t bpp);
     int (*gfx_blit_buffer)(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h, 
                            const void *src_buf, uint32_t src_stride);
+
+    // Programmable shaders — GENERIC modules only; NULL if no GPU
+    // registered or the active GPU lacks SQRM_GPU_CAP_PROGRAMMABLE.
+    // Kernel wrapper for the active GPU's shader_run hook. The caller
+    // (MVC3 or similar) is responsible for the umcs_binary having
+    // already passed validation before this is called.
+    int (*gfx_shader_dispatch)(const uint8_t *umcs_binary, size_t umcs_size,
+                               sqrm_shader_stage_t stage,
+                               void *buffers[], uint32_t buffer_count,
+                               uint32_t invocation_count);
                            
     void *(*devfs_mmap_region)(uint64_t phys_or_virt, size_t size,
                                int prot, int is_phys);
@@ -316,9 +362,15 @@ typedef int (*sqrm_module_init_fn)(const sqrm_kernel_api_t *api);
 
 // Load selected *.sqrm modules from SQRM_MODULE_DIR on the boot filesystem.
 // Safe to call multiple times; already-loaded modules will be skipped.
-int sqrm_load_early_drivers(void); // GPU, then FS
+int sqrm_load_early_drivers(void); // initmod.tpk, then GPU, then FS
 int sqrm_load_late_drivers(void);  // USB/NET/AUDIO/etc
 int sqrm_load_all(void);           // backwards compatible: early + late
+
+// Load *.sqrm entries directly out of the multiboot2 "initmod.tpk" module, if
+// the bootloader supplied one. Does not require a mounted boot drive. Called
+// automatically as the first step of sqrm_load_early_drivers(); exposed here
+// in case it needs to run standalone (e.g. before boot-drive detection).
+int sqrm_load_initmod(void);
 
 // Kernel-side service lookup for syscalls/subsystems.
 // Returns NULL if not found.

@@ -41,6 +41,7 @@ void memory_smoke_test(void);
 
 #include "moduos/fs/fs.h"
 #include "moduos/fs/fd.h"
+#include "moduos/kernel/ipc/shm.h"
 #include "moduos/fs/devfs.h"
 
 // process_new.h supersedes the old process.h — it includes all declarations
@@ -194,7 +195,10 @@ static void storage_early_init(void) {
         if (vdrive_get_count() == 0) {
             COM_LOG_WARN(COM1_PORT, "No storage drives available!");
             if (sata_status != SATA_SUCCESS && ata_status != 0) {
-                trigger_panic_doata();  // No drives at all - panic!
+                // No drives at all -- continue booting instead of panicking.
+                // SQRM can still bring up modules bundled in initmod.tpk, and
+                // detect_boot_drive() below handles a missing boot drive gracefully.
+                COM_LOG_WARN(COM1_PORT, "No ATA/SATA controller responded; continuing without storage.");
             }
         }
     } else {
@@ -442,15 +446,11 @@ static int detect_boot_drive(void) {
         fs_unmount_slot(slot);
     }
 
-    COM_LOG_PANIC(COM1_PORT, "No boot drive detected!");
-    panic(
-        "No boot drive detected",
-        "No drive contains /ModuOS/System64/mdsys.sqr",
-        "Ensure ISO/HDD is attached and readable",
-        "Boot",
-        "BOOT_DRIVE",
-        3
-    );
+    // No boot drive found -- continue booting instead of panicking.
+    // kernel_get_boot_mount() returns NULL with boot_drive_slot < 0, and every
+    // caller (SQRM's disk-backed loader, fs lookups, etc.) already handles
+    // that gracefully. SQRM can still bring up modules bundled in initmod.tpk.
+    COM_LOG_WARN(COM1_PORT, "No boot drive detected; continuing without a mounted boot drive.");
 
     return -1;
 }
@@ -548,6 +548,17 @@ static void init(uint64_t mb2_ptr_init) {
     com_write_string(COM1_PORT, "=== MEMORY INITIALIZATION COMPLETE ===\n\n");
 
     // Early storage stack so boot drive can be found ASAP.
+    //
+    // Temporarily lift the splash lock so AHCI/SATA probe diagnostics are
+    // visible on the physical screen (VGA_Write*), not just on COM1. This
+    // matters on real hardware where a serial cable/adapter often isn't
+    // available - the screen becomes the only debug output.
+    bool storage_splash_was_locked = (VGA_GetFrameBufferMode() == FB_MODE_GRAPHICS);
+    if (storage_splash_was_locked) {
+        VGA_SetSplashLock(false);
+        VGA_Writef("\n[BOOT] Probing storage (AHCI/SATA)...\n");
+    }
+
     storage_early_init();
 
     // Register vDrives as block devices (first-party)
@@ -557,6 +568,7 @@ static void init(uint64_t mb2_ptr_init) {
     COM_LOG_INFO(COM1_PORT, "Initializing filesystem layer");
     fs_init();
     fd_init();
+    shm_init();
     COM_LOG_OK(COM1_PORT, "Filesystem layer initialized");
 
     // Detect boot drive as soon as VFS is ready.
@@ -590,11 +602,15 @@ static void init(uint64_t mb2_ptr_init) {
         /* Do NOT re-enable splash lock here; let normal console output work. */
     }
 
-    // Load SQRM early drivers: Graphics first, then FS drivers.
+    // Load SQRM early drivers: Graphics, then DRIVE (storage controllers),
+    // then FS drivers. DRIVE modules attach new vdrives via block_register;
+    // FS modules then see those vdrives when they probe/mount below.
     sqrm_load_early_drivers();
 
-    // External filesystem drivers may have registered during SQRM early loading.
-    // Rescan so additional drives/partitions (e.g., ext2 HDD) become available automatically.
+    // External filesystem/drive drivers may have registered during SQRM
+    // early loading. Rescan so additional drives/partitions (e.g., ext2 HDD,
+    // or a drive brought up by a third-party DRIVE .sqrm module) become
+    // available automatically.
     fs_rescan_all();
 
     // Load the rest of SQRM modules (USB/NET/AUDIO/etc).

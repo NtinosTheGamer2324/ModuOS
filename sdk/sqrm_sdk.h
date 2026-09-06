@@ -22,9 +22,9 @@
  *   sqrm_service_*            Y    Y     Y     Y     Y    Y    Y     Y
  *   devfs_register_path       Y    Y     Y     Y     Y    Y    Y     Y
  *   multiboot2_header         Y    Y     Y     Y     Y    Y    Y     Y
- *   dma_alloc/free            -    -     -     Y     -    -    -     -
- *   inb/inw/inl/out*          -    -     -     Y     -    -    -     -
- *   irq_install_handler       -    -     -     Y     -    -    -     -
+ *   dma_alloc/free            -    Y     Y     Y     Y    Y    Y     Y
+ *   inb/inw/inl/out*          -    -     -     Y     -    -    -     Y
+ *   irq_install_handler       -    -     -     Y     -    -    -     Y
  *   ioremap / _guarded        -    -     -     Y     Y    Y    Y     -
  *   virt_to_phys              -    -     Y     Y     Y    Y    Y     -
  *   pci_*                     -    -     Y     Y     Y    Y    Y     -
@@ -262,6 +262,17 @@ typedef struct {
 #define SQRM_GPU_CAP_HW_CURSOR     (1u << 3)  /* Has cursor hooks                 */
 #define SQRM_GPU_CAP_VSYNC         (1u << 4)  /* Supports vsync                   */
 #define SQRM_GPU_CAP_BLIT_BUF      (1u << 5)  /* Has blit_buffer (MANDATORY)      */
+#define SQRM_GPU_CAP_PROGRAMMABLE  (1u << 6)  /* Has shader_run (UMCS)            */
+
+/* Programmable shader stage — UMCS (ModuOS's shader ISA). */
+typedef enum {
+    SQRM_SHADER_STAGE_VERTEX   = 1,
+    SQRM_SHADER_STAGE_FRAGMENT = 2,
+    SQRM_SHADER_STAGE_COMPUTE  = 3,
+} sqrm_shader_stage_t;
+
+typedef uint32_t sqrm_shader_handle_t;
+#define SQRM_SHADER_INVALID_HANDLE 0u
 
 typedef struct sqrm_gpu_device {
     framebuffer_t fb;
@@ -293,6 +304,27 @@ typedef struct sqrm_gpu_device {
                                   int32_t x1, int32_t y1, float u1, float v1,
                                   int32_t x2, int32_t y2, float u2, float v2,
                                   uint32_t texture_id);
+
+    /* Optional programmable-shader hook (present iff
+     * caps & SQRM_GPU_CAP_PROGRAMMABLE). Executes a UMCS shader binary
+     * that has ALREADY been validated by the kernel-side loader before
+     * this is called — this hook trusts umcs_binary/umcs_size and does
+     * not re-check module header or instruction structure itself.
+     *
+     * buffers[]/buffer_count are raw I/O pointers; index meaning (which
+     * slot is input vs output) is a convention agreed between the
+     * caller and the shader, not interpreted here. invocation_count is
+     * how many times to run the shader (once per pixel/vertex/compute
+     * item); the interpreter exposes the invocation index to the
+     * shader via a reserved register.
+     *
+     * Returns 0 on success, negative on failure (unsupported stage,
+     * invocation_count too large, opcode this backend can't execute).
+     * A software interpreter is an acceptable first implementation. */
+    int (*shader_run)(const uint8_t *umcs_binary, size_t umcs_size,
+                      sqrm_shader_stage_t stage,
+                      void *buffers[], uint32_t buffer_count,
+                      uint32_t invocation_count);
 
     /* MANDATORY: copy an external pixel buffer into the framebuffer at
      * (dst_x, dst_y) for a region of (w x h) pixels, then push the dirty
@@ -540,6 +572,16 @@ typedef struct sqrm_kernel_api {
      * Kernel wrapper for the active GPU's blit_buffer hook. */
     int (*gfx_blit_buffer)(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
                            const void *src_buf, uint32_t src_stride);
+
+    /* Programmable shaders — GENERIC modules only; NULL if no GPU
+     * registered or the active GPU lacks SQRM_GPU_CAP_PROGRAMMABLE.
+     * Kernel wrapper for the active GPU's shader_run hook. The caller
+     * (MVC3 or similar) is responsible for the umcs_binary having
+     * already passed validation before this is called. */
+    int (*gfx_shader_dispatch)(const uint8_t *umcs_binary, size_t umcs_size,
+                               sqrm_shader_stage_t stage,
+                               void *buffers[], uint32_t buffer_count,
+                               uint32_t invocation_count);
 
     void *(*devfs_mmap_region)(uint64_t phys_or_virt, size_t size,
                                int prot, int is_phys);

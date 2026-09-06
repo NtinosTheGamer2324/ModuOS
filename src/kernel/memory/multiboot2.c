@@ -231,6 +231,36 @@ struct mb2_mmap_entry {
 extern uint8_t _kernel_start;
 extern uint8_t _kernel_end;
 
+/* Location of the "initmod.tpk" bootstrap module, if the bootloader supplied
+ * one via a Multiboot2 MODULE tag. Populated by memory_init(). */
+static uint64_t g_initmod_phys = 0;
+static uint64_t g_initmod_len  = 0;
+
+int multiboot2_get_initmod(uint64_t *out_phys, uint64_t *out_len) {
+    if (!g_initmod_len) return -1;
+    if (out_phys) *out_phys = g_initmod_phys;
+    if (out_len) *out_len = g_initmod_len;
+    return 0;
+}
+
+/* True if cmdline names the given module file, either exactly or as the
+ * trailing path component (e.g. "/boot/initmod.tpk" matches "initmod.tpk"). */
+static int mb2_module_cmdline_matches(const char *cmdline, const char *want) {
+    if (!cmdline || !want) return 0;
+    size_t wl = strlen(want);
+    size_t cl = strlen(cmdline);
+    if (cl < wl) return 0;
+
+    const char *tail = cmdline + (cl - wl);
+    if (strcmp(tail, want) != 0) return 0;
+
+    if (cl > wl) {
+        char sep = cmdline[cl - wl - 1];
+        if (sep != '/' && sep != '\\' && sep != ' ') return 0;
+    }
+    return 1;
+}
+
 void memory_init(void *mb2_ptr) {
     
     /*Validate pointer first */
@@ -291,6 +321,10 @@ void memory_init(void *mb2_ptr) {
     // ACPI RSDP from Multiboot2 tags (type 14/15)
     uint64_t rsdp_phys = 0;
 
+    // "initmod.tpk" module tag (type 3), if the bootloader supplied one.
+    uint64_t initmod_phys = 0;
+    uint64_t initmod_len  = 0;
+
     while (tagp + sizeof(struct mb2_tag) <= end) {
         /*  Safe tag read */
         memory_barrier();
@@ -314,6 +348,36 @@ void memory_init(void *mb2_ptr) {
             log_msg("[MEM] Found MB2 ACPI tag, RSDP at ");
             print_hex64(rsdp_phys);
             log_msg("\n");
+        }
+
+        if (tag->type == MULTIBOOT_TAG_TYPE_MODULE && tag->size >= 16) {
+            const struct multiboot_tag_module *mod = (const struct multiboot_tag_module *)tagp;
+            const char *cmdline = (const char *)(tagp + 16);
+            const char *cmdline_end = (const char *)(tagp + tag->size); /* one past the tag's bytes */
+
+            /* Bounds-check the cmdline's NUL terminator before treating it as a C string. */
+            int cmdline_terminated = 0;
+            for (const char *p = cmdline; p < cmdline_end; p++) {
+                if (*p == '\0') { cmdline_terminated = 1; break; }
+            }
+
+            if (cmdline_terminated) {
+                log_msg("[MEM] Found MB2 module tag: ");
+                log_msg(cmdline);
+                log_msg("\n");
+
+                if (mb2_module_cmdline_matches(cmdline, "initmod.tpk")) {
+                    initmod_phys = (uint64_t)mod->mod_start;
+                    initmod_len  = (uint64_t)mod->mod_end - (uint64_t)mod->mod_start;
+                    log_msg("[MEM]   -> initmod.tpk at ");
+                    print_hex64(initmod_phys);
+                    log_msg(" len=");
+                    print_dec64(initmod_len);
+                    log_msg("\n");
+                }
+            } else {
+                log_msg("[MEM] WARNING: MB2 module tag has unterminated cmdline, skipping\n");
+            }
         }
 
         if (tag->type == 6) { /* Memory map tag */
@@ -440,6 +504,20 @@ void memory_init(void *mb2_ptr) {
     log_msg(" len=");
     print_dec64(mb2_len);
     log_msg("\n");
+
+    // Reserve the initmod.tpk module (if any) so the physical allocator never
+    // hands its pages out before SQRM has a chance to load it.
+    if (initmod_len) {
+        uint64_t mod_len_aligned = (initmod_len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        phys_reserve_range(initmod_phys, mod_len_aligned);
+        log_msg("[MEM] Reserved initmod.tpk at ");
+        print_hex64(initmod_phys);
+        log_msg(" len=");
+        print_dec64(mod_len_aligned);
+        log_msg("\n");
+    }
+    g_initmod_phys = initmod_phys;
+    g_initmod_len  = initmod_len;
 
     log_msg("[MEM] Physical allocator ready!\n");
 

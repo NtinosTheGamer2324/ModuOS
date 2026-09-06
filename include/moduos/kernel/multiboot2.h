@@ -112,6 +112,11 @@ struct __attribute__((packed)) multiboot_tag_framebuffer {
 #define MULTIBOOT_FRAMEBUFFER_TYPE_RGB      1
 #define MULTIBOOT_FRAMEBUFFER_TYPE_EGA_TEXT 2
 
+/* Returns 0 and fills out_phys/out_len if the bootloader supplied a module
+ * named "initmod.tpk" (matched against the tag's cmdline). Only valid after
+ * memory_init() has parsed the Multiboot2 tags. Returns -1 if none was found. */
+int multiboot2_get_initmod(uint64_t *out_phys, uint64_t *out_len);
+
 /* Helper function to find tags */
 static inline struct multiboot_tag *multiboot2_find_tag(void *mboot_ptr, uint32_t tag_type) {
     if (!mboot_ptr) return NULL;

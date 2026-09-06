@@ -9,10 +9,21 @@
 #include "moduos/fs/fs.h"
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/drivers/graphics/VGA.h"
+#include "moduos/kernel/blockdev.h"
 #include <stddef.h>
 
 // freestanding: use kernel string/memory routines
 #include "moduos/kernel/memory/string.h"
+
+// Registers/refreshes the $/dev/vDriveN-<model> info nodes. Defined further
+// down in this file; forward-declared here so vdrive_register_sqrm_drive()
+// (which runs at SQRM module-load time, after the boot-time vdrive_init()
+// pass has already registered nodes for the native drives) can call it to
+// expose the drive it just attached. Safe to call repeatedly: devfs_register_path
+// no-ops (returns -9) for paths already owned by the kernel, so existing
+// native-drive nodes are left untouched -- only genuinely new slots get a
+// node created.
+void vdrive_register_devfs_nodes(void);
 
 // MBR partition entry structure
 typedef struct __attribute__((packed)) {
@@ -395,6 +406,58 @@ static int vdrive_register_sata_drive(int sata_port, const sata_device_t *sata_d
     return vdrive_id;
 }
 
+// Attach point for third-party SQRM DRIVE-type modules. Called by the SQRM
+// loader immediately after a module's block_register() succeeds, so the
+// blockdev is visible to vDrive/devfs/FS the same way native ATA/SATA
+// drives are. Unlike the native paths, capacity/model/flags come entirely
+// from the module's own get_info() rather than a probed identify structure.
+int vdrive_register_sqrm_drive(blockdev_handle_t handle, const blockdev_info_t *info) {
+    if (!vdrive_system.initialized) {
+        return VDRIVE_ERR_NOT_INIT;
+    }
+    if (!info) {
+        return VDRIVE_ERR_NULL_BUFFER;
+    }
+    if (vdrive_system.drive_count >= VDRIVE_MAX_DRIVES) {
+        COM_LOG_WARN(COM1_PORT, "vDrive: Maximum drives reached, skipping SQRM drive");
+        return VDRIVE_ERR_NO_DRIVES;
+    }
+
+    int vdrive_id = vdrive_system.drive_count;
+    vdrive_t *vdrive = &vdrive_system.drives[vdrive_id];
+    memset(vdrive, 0, sizeof(*vdrive));
+
+    vdrive->present = 1;
+    vdrive->vdrive_id = vdrive_id;
+    vdrive->backend = VDRIVE_BACKEND_SQRM;
+    vdrive->backend_id = (uint32_t)handle;
+    vdrive->status = VDRIVE_STATUS_READY;
+
+    vdrive->sector_size = info->sector_size ? info->sector_size : 512;
+    vdrive->total_sectors = info->sector_count;
+    vdrive->capacity_mb = (vdrive->total_sectors * vdrive->sector_size) / (1024 * 1024);
+    vdrive->capacity_gb = vdrive->capacity_mb / 1024;
+
+    vdrive->read_only = (info->flags & BLOCKDEV_F_READONLY) ? 1 : 0;
+    vdrive->type = (info->flags & BLOCKDEV_F_REMOVABLE) ? VDRIVE_TYPE_SATA_OPTICAL
+                                                          : VDRIVE_TYPE_UNKNOWN;
+
+    vdrive_copy_string(vdrive->model, info->model, 40);
+
+    vdrive->supports_lba48 = 1;
+    vdrive->supports_dma = 0;
+
+    vdrive_system.drive_count++;
+
+    // Expose $/dev/vDrive<id>-<model> now, with the fields above already
+    // populated -- vdrive_info_read() reads live from vdrive_system.drives[],
+    // so anything reading this node from this point on sees the real model/
+    // capacity, not whatever existed (or didn't) before this call.
+    vdrive_register_devfs_nodes();
+
+    return vdrive_id;
+}
+
 // Drive Info.
 typedef struct {
     uint8_t vdrive_id;
@@ -579,7 +642,19 @@ void vdrive_register_devfs_nodes(void) {
         ops->read  = vdrive_info_read;
         ops->close = vdrive_info_close;
 
-        devfs_register_path(node_path, ops, id_ctx, owner);
+        int rc = devfs_register_path(node_path, ops, id_ctx, owner);
+        if (rc != 0) {
+            // Already registered (this drive's node exists from an earlier
+            // call -- expected every time this runs after the first SQRM
+            // drive attaches) or some other failure. Either way the ops/
+            // ctx/name we just allocated aren't owned by devfs, so free them
+            // instead of leaking.
+            kfree(ops);
+            kfree(name_copy);
+            kfree(id_ctx);
+            continue;
+        }
+
         com_printf(COM1_PORT, "[vDrive] Registered $/dev/%s\n", node_path);
     }
 }
@@ -873,6 +948,12 @@ int vdrive_read(uint8_t vdrive_id, uint64_t lba, uint32_t count, void *buffer) {
         // ATA hard drive with 512-byte sectors
         result = ata_read_sectors(drive->backend_id, (uint32_t)lba, buffer, count);
     }
+    else if (drive->backend == VDRIVE_BACKEND_SQRM) {
+        // Third-party SQRM DRIVE module, dispatched via its registered blockdev handle
+        size_t need = (size_t)count * (size_t)drive->sector_size;
+        result = blockdev_read((blockdev_handle_t)drive->backend_id, lba, count, buffer, need);
+        result = (result == 0) ? 0 : -1;
+    }
     else {
         com_write_string(COM1_PORT, "[vDrive] ERROR: Unknown backend type!\n");
         drive->status = VDRIVE_STATUS_ERROR;
@@ -951,6 +1032,10 @@ int vdrive_write(uint8_t vdrive_id, uint64_t lba, uint32_t count, const void *bu
                 break;
             }
         }
+    } else if (drive->backend == VDRIVE_BACKEND_SQRM) {
+        size_t need = (size_t)count * (size_t)drive->sector_size;
+        result = blockdev_write((blockdev_handle_t)drive->backend_id, lba, count, buffer, need);
+        result = (result == 0) ? 0 : -1;
     } else {
         drive->status = VDRIVE_STATUS_ERROR;
         drive_last_error[vdrive_id] = VDRIVE_ERR_BACKEND;
@@ -998,6 +1083,7 @@ const char* vdrive_get_backend_string(vdrive_backend_t backend) {
     switch (backend) {
         case VDRIVE_BACKEND_ATA: return "ATA";
         case VDRIVE_BACKEND_SATA: return "SATA";
+        case VDRIVE_BACKEND_SQRM: return "SQRM";
         default: return "None";
     }
 }

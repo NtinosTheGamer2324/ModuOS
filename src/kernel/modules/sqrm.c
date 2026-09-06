@@ -6,6 +6,7 @@
 #include "moduos/kernel/memory/memory.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/blockdev.h"
+#include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/kernel/errno.h"
 #include "moduos/fs/fs.h"
 #include "moduos/fs/devfs.h"
@@ -18,9 +19,12 @@
 #include "moduos/arch/AMD64/interrupts/timer.h"
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/kernel/memory/usercopy.h"
+#include "moduos/kernel/multiboot2.h"
 #include "moduos/kernel/io/io.h"
 #include "moduos/kernel/spinlock.h"
 #include "moduos/drivers/input/input.h"
+#include "moduos/kernel/interrupts/hlt_wait.h"
+#include "moduos/fs/fd.h"
 
 #include "moduos/kernel/panic.h"
 
@@ -1249,6 +1253,27 @@ static int sqrm_block_get_handle_for_vdrive(int vdrive_id, blockdev_handle_t *ou
     return (*out_handle != BLOCKDEV_INVALID_HANDLE) ? 0 : -2;
 }
 
+// block_register for SQRM_TYPE_DRIVE modules: registers the module's
+// blockdev_ops_t in the blockdev registry, then immediately attaches it as
+// a vdrive so the rest of the storage stack (devfs nodes, FS mounts, cache)
+// sees it exactly like a native ATA/SATA drive. Modules only need to make
+// this one call per drive they discover.
+static int sqrm_drive_block_register(const void *ops, void *ctx, blockdev_handle_t *out_handle) {
+    if (!ops) return -1;
+
+    blockdev_handle_t h = blockdev_register((const blockdev_ops_t *)ops, ctx);
+    if (h == BLOCKDEV_INVALID_HANDLE) return -2;
+
+    blockdev_info_t info;
+    if (blockdev_get_info(h, &info) != 0) return -3;
+
+    int vdrive_id = vdrive_register_sqrm_drive(h, &info);
+    if (vdrive_id < 0) return -4;
+
+    if (out_handle) *out_handle = h;
+    return 0;
+}
+
 // Resolve the address of sqrm_module_desc inside the relocated image and optionally return v2 pointer.
 static const void *sqrm_find_desc_ptr_in_image(const uint8_t *buf, size_t rd, const elf64_ehdr_t *eh,
                                               uint64_t min_v, const uint8_t *image,
@@ -1407,6 +1432,24 @@ static int gfx_wrap_blit_buffer(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h
     return g_active_gpu->blit_buffer(&g_active_gpu->fb, dx, dy, src_buf, src_stride, w, h);
 }
 
+/* NOTE — trust boundary, currently incomplete:
+ * umcs_binary is expected to have ALREADY been validated (module header +
+ * every instruction, the same checks wumcs-validate.py performs) before it
+ * reaches here. This wrapper is the natural point to enforce that — every
+ * caller funnels through it — but that check is NOT YET IMPLEMENTED. Do
+ * not register a real (non-stub) GPU shader_run backend until a C port of
+ * the validator is added here; until then this only forwards to whatever
+ * the active GPU module does with unvalidated bytecode. */
+static int gfx_wrap_shader_dispatch(const uint8_t *umcs_binary, size_t umcs_size,
+                                    sqrm_shader_stage_t stage,
+                                    void *buffers[], uint32_t buffer_count,
+                                    uint32_t invocation_count) {
+    if (!g_active_gpu || !g_active_gpu->shader_run) return -1;
+    if (!(g_active_gpu->caps & SQRM_GPU_CAP_PROGRAMMABLE)) return -1;
+    return g_active_gpu->shader_run(umcs_binary, umcs_size, stage,
+                                    buffers, buffer_count, invocation_count);
+}
+
 static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *out_api) {
     memset(out_api, 0, sizeof(*out_api));
     out_api->abi_version = 1;
@@ -1464,6 +1507,37 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
     // VFS FS-driver registration: FS modules only
     if (desc->type == SQRM_TYPE_FS) {
         out_api->fs_register_driver = fs_register_driver;
+    }
+
+    // DRIVE modules: storage controller drivers (AHCI, NVMe, etc.) living
+    // entirely outside the kernel tree. They need PCI enumeration/config,
+    // MMIO for controller BARs, an IRQ line, DMA for command structures,
+    // and the ability to register the drives they find as vdrives.
+    if (desc->type == SQRM_TYPE_DRIVE) {
+        out_api->pci_get_device_count     = pci_get_device_count;
+        out_api->pci_get_device           = pci_get_device;
+        out_api->pci_find_device          = pci_find_device;
+        out_api->pci_enable_memory_space  = pci_enable_memory_space;
+        out_api->pci_enable_io_space      = pci_enable_io_space;
+        out_api->pci_enable_bus_mastering = pci_enable_bus_mastering;
+        out_api->pci_cfg_read32           = pci_config_read_dword;
+        out_api->pci_cfg_write32          = pci_config_write_dword;
+
+        out_api->ioremap         = ioremap;
+        out_api->ioremap_guarded = ioremap_guarded;
+        out_api->virt_to_phys    = paging_virt_to_phys;
+
+        out_api->irq_install_handler   = irq_install_handler;
+        out_api->irq_uninstall_handler = irq_uninstall_handler;
+        out_api->pic_send_eoi          = pic_send_eoi;
+
+        out_api->dma_alloc = dma_alloc;
+        out_api->dma_free  = dma_free;
+
+        out_api->block_get_info = blockdev_get_info;
+        out_api->block_read     = blockdev_read;
+        out_api->block_write    = blockdev_write;
+        out_api->block_register = sqrm_drive_block_register;
     }
 
     // DEVFS/input injection: available to HID modules.
@@ -1572,6 +1646,7 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
         out_api->gfx_fill_rect       = gfx_wrap_fill_rect;
         out_api->gfx_blit_rect       = gfx_wrap_blit_rect;
         out_api->gfx_blit_buffer     = gfx_wrap_blit_buffer;
+        out_api->gfx_shader_dispatch = gfx_wrap_shader_dispatch;
         out_api->gfx_cursor_move     = gfx_wrap_cursor_move;
         out_api->gfx_cursor_show     = gfx_wrap_cursor_show;
         out_api->gfx_flush           = gfx_wrap_flush;
@@ -1598,54 +1673,162 @@ static void sqrm_build_api(const sqrm_module_desc_t *desc, sqrm_kernel_api_t *ou
     out_api->devfs_mmap_region = devfs_mmap_region;
 }
 
+/*
+ * ── NET glue: DevFS node backing a registered "net" SQRM service ───────
+ *
+ * Previous design (removed): control AND data (TX/RX) were multiplexed
+ * through devfs write()+read() as a two-syscall command/reply RPC, with
+ * the reply staged in a per-open buffer between the two calls. That's
+ * fragile — a second write() before the matching read() clobbers the
+ * previous reply, two threads sharing a dup'd fd can interleave a write
+ * from one with a read from the other, and RX was strictly one frame
+ * per poll with no queue, so any frame that arrived between poll calls
+ * and got overwritten in the NIC's own ring was silently lost.
+ *
+ * New design:
+ *   - read()/write() are real byte-oriented frame I/O, matching what
+ *     DevFS's read/write contract already means everywhere else:
+ *       read()  -> pop one queued RX frame (or drain-and-block on the
+ *                  ~1kHz timer tick if the fd is blocking and the ring
+ *                  is empty; return 0 immediately if O_NONBLOCK).
+ *       write() -> transmit exactly one frame (buf/count is the raw
+ *                  Ethernet frame, no header/wrapper).
+ *   - invoke() is metadata/control only (GET_MODE / GET_LINK_UP /
+ *     GET_MTU / GET_MAC) — a single syscall, no shared staging buffer,
+ *     nothing to interleave.
+ *   - A real RX ring sits between the driver and devfs: sqrm_net_rx_drain()
+ *     pulls every frame currently sitting in the driver's descriptors in
+ *     one pass, so a burst of packets between two userland reads is
+ *     queued instead of dropped down to the last one. The ring is
+ *     IRQ-safe (spinlock + irq_save) so it's ready for the driver to
+ *     push into it directly from an interrupt handler later — today the
+ *     e1000 driver is poll-only (it masks all NIC interrupts at init),
+ *     so the drain is still pull-based, just pulled in bulk instead of
+ *     one frame at a time.
+ */
+
 #define NET_CMD_GET_MODE     1u
 #define NET_CMD_GET_LINK_UP  2u
 #define NET_CMD_GET_MTU      3u
 #define NET_CMD_GET_MAC      4u
-#define NET_CMD_TX_FRAME     5u
-#define NET_CMD_RX_POLL      6u
 
 #define NET_MODE_ETH         1u
 #define NET_MODE_WIFI        2u
 
-typedef struct {
-    uint32_t cmd;
-    uint32_t len;
-    uint8_t  data[1500];
-} sqrm_net_cmd_t;
+#define SQRM_NET_RX_RING_SLOTS 32
+#define SQRM_NET_RX_FRAME_MAX  1600  /* MTU 1500 + Ethernet header/VLAN slack */
 
 typedef struct {
-    uint32_t cmd;
-    int32_t  status;
+    uint8_t  data[SQRM_NET_RX_FRAME_MAX];
     uint32_t len;
-    uint8_t  data[1500];
-} sqrm_net_reply_t;
+} sqrm_net_rx_slot_t;
 
-/* Stored as node->ctx so open() can access the net api pointer */
+/* Shared per-device state — one instance per net0/net1/... node. */
 typedef struct {
     sqrm_net_api_v1_t *net;
+
+    spinlock_t          rx_lock;
+    sqrm_net_rx_slot_t  rx_ring[SQRM_NET_RX_RING_SLOTS];
+    uint32_t             rx_r, rx_w, rx_count;
+    uint32_t             rx_dropped; /* diagnostic: frames dropped, ring was full */
 } sqrm_net_node_ctx_t;
 
-/* Per-open context: one staged reply at a time */
+/* Per-open state. */
 typedef struct {
-    sqrm_net_api_v1_t *net;
-    sqrm_net_reply_t   reply;       /* kernel-side staging buffer          */
-    uint32_t           reply_off;   /* bytes already consumed by read()    */
-    int                reply_ready; /* 1 = reply waiting, 0 = empty        */
+    sqrm_net_node_ctx_t *nc;
+    int                   open_flags;
 } sqrm_net_open_ctx_t;
 
 static int g_net_index = 0;
+
+/* ── RX ring helpers (IRQ-safe; ready for future interrupt-time push) ── */
+
+static void sqrm_net_rx_push(sqrm_net_node_ctx_t *nc, const void *frame, uint32_t len)
+{
+    if (!nc || !frame || len == 0 || len > SQRM_NET_RX_FRAME_MAX) return;
+
+    uint64_t f = irq_save();
+    spinlock_lock(&nc->rx_lock);
+
+    if (nc->rx_count >= SQRM_NET_RX_RING_SLOTS) {
+        nc->rx_dropped++;
+    } else {
+        sqrm_net_rx_slot_t *slot = &nc->rx_ring[nc->rx_w];
+        memcpy(slot->data, frame, len);
+        slot->len = len;
+        nc->rx_w = (nc->rx_w + 1) % SQRM_NET_RX_RING_SLOTS;
+        nc->rx_count++;
+    }
+
+    spinlock_unlock(&nc->rx_lock);
+    irq_restore(f);
+}
+
+/* Pop the oldest queued frame. Returns 1 and fills out_buf/out_len, or 0 if empty. */
+static int sqrm_net_rx_pop(sqrm_net_node_ctx_t *nc, void *out_buf, size_t out_cap, uint32_t *out_len)
+{
+    if (!nc) return 0;
+
+    uint64_t f = irq_save();
+    spinlock_lock(&nc->rx_lock);
+
+    if (nc->rx_count == 0) {
+        spinlock_unlock(&nc->rx_lock);
+        irq_restore(f);
+        return 0;
+    }
+
+    sqrm_net_rx_slot_t *slot = &nc->rx_ring[nc->rx_r];
+    uint32_t len = slot->len;
+
+    if (len > out_cap) {
+        /* Caller's buffer is too small — leave the frame queued so a
+         * retry with a bigger buffer still works, rather than losing it. */
+        spinlock_unlock(&nc->rx_lock);
+        irq_restore(f);
+        return -1;
+    }
+
+    memcpy(out_buf, slot->data, len);
+    if (out_len) *out_len = len;
+
+    nc->rx_r = (nc->rx_r + 1) % SQRM_NET_RX_RING_SLOTS;
+    nc->rx_count--;
+
+    spinlock_unlock(&nc->rx_lock);
+    irq_restore(f);
+    return 1;
+}
+
+/*
+ * Drain every frame currently sitting in the driver's own RX descriptors
+ * into our ring. Bounded so a misbehaving driver (rx_poll never returning
+ * "empty") can't wedge the caller forever.
+ */
+static void sqrm_net_rx_drain(sqrm_net_node_ctx_t *nc)
+{
+    if (!nc || !nc->net || !nc->net->rx_poll) return;
+
+    uint8_t tmp[SQRM_NET_RX_FRAME_MAX];
+    for (int i = 0; i < SQRM_NET_RX_RING_SLOTS * 2; i++) {
+        size_t got = 0;
+        int rc = nc->net->rx_poll(tmp, sizeof(tmp), &got);
+        if (rc != 0 || got == 0) break;
+
+        sqrm_net_rx_push(nc, tmp, (uint32_t)got);
+        if (nc->net->rx_consume) nc->net->rx_consume();
+    }
+}
 
 /* ── open / close ─────────────────────────────────────────────────────── */
 
 static void *sqrm_net_devfs_open(void *ctx, int flags)
 {
-    (void)flags;
     sqrm_net_node_ctx_t *nc = (sqrm_net_node_ctx_t *)ctx;
     sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t *)kmalloc(sizeof(*oc));
     if (!oc) return NULL;
-    memset(oc, 0, sizeof(*oc));
-    oc->net = nc ? nc->net : NULL;
+    oc->nc          = nc;
+    oc->open_flags  = flags;
     return oc;
 }
 
@@ -1655,132 +1838,136 @@ static int sqrm_net_devfs_close(void *ctx)
     return 0;
 }
 
-/* ── read()  –  copy staged reply out to user buffer ─────────────────── */
+/* ── read()  –  pop one queued RX frame, blocking unless O_NONBLOCK ───── */
 
 static ssize_t sqrm_net_devfs_read(void *ctx, void *user_buf, size_t count)
 {
     sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t *)ctx;
-    if (!oc || !user_buf) return -1;
-    if (!oc->reply_ready)  return 0;
+    if (!oc || !oc->nc || !user_buf) return -1;
 
-    uint32_t total  = (uint32_t)sizeof(sqrm_net_reply_t);
-    uint32_t remain = total - oc->reply_off;
-    uint32_t n      = (remain < (uint32_t)count) ? remain : (uint32_t)count;
+    for (;;) {
+        sqrm_net_rx_drain(oc->nc);
 
-    /* The devfs read callback receives a kernel buffer (already allocated by
-     * sys_readfile).  Do NOT call usercopy_to_user here — the syscall layer
-     * owns the user↔kernel copy; we just fill the kernel buffer. */
-    memcpy(user_buf,
-           (const uint8_t *)&oc->reply + oc->reply_off,
-           n);
+        uint32_t got = 0;
+        int rc = sqrm_net_rx_pop(oc->nc, user_buf, count, &got);
+        if (rc > 0) return (ssize_t)got;
+        if (rc < 0) return -2; /* ENOSPC-ish: caller's buffer too small for the queued frame */
 
-    oc->reply_off += n;
-    if (oc->reply_off >= total) {
-        oc->reply_ready = 0;
-        oc->reply_off   = 0;
+        /* Nothing queued. */
+        if (oc->open_flags & O_NONBLOCK) return 0;
+
+        /* Block until the next interrupt (the ~1kHz timer tick included),
+         * then loop around and drain again. Once the driver gains real
+         * RX-interrupt support this same wait wakes immediately on a
+         * frame arriving instead of on the next tick. */
+        hlt_wait_preserve_if();
     }
-    return (ssize_t)n;
 }
 
-/* ── write()  –  copy cmd in from user, execute, stage reply ─────────── */
+/* ── write()  –  transmit exactly one raw frame ───────────────────────── */
+//
+// tx_frame() returns -11 (EAGAIN) when the driver's next TX descriptor
+// hasn't had its DD (Descriptor Done) bit set by hardware yet -- normally
+// a race that resolves itself in well under a millisecond. The old code
+// surfaced that instantly as a write() failure, and since the driver
+// never advances its tx_tail on that path, every future write() re-checked
+// the exact same descriptor: one transient EAGAIN turned into every
+// subsequent transmit failing forever (this is what was wedging netd
+// after one slow packet). Retry here, under a bounded real-time deadline,
+// so a normal short stall is absorbed instead of propagating as a
+// permanent failure. O_NONBLOCK callers still get EAGAIN back immediately,
+// same as a nonblocking socket would.
+#define SQRM_NET_TX_RETRY_MS 50
 
 static ssize_t sqrm_net_devfs_write(void *ctx, const void *user_buf, size_t count)
 {
     sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t *)ctx;
-    if (!oc || !user_buf || count < sizeof(uint32_t)) return -1;
+    if (!oc || !oc->nc || !oc->nc->net || !user_buf || count == 0) return -1;
+    if (!oc->nc->net->tx_frame) return -1;
 
-    sqrm_net_api_v1_t *net = oc->net;
-    if (!net) return -1;
+    const uint64_t start = get_system_ticks();
+    const uint64_t deadline_ticks = ms_to_ticks(SQRM_NET_TX_RETRY_MS);
 
-    /* ── Safe copy: user buffer → kernel cmd struct ────────────────── */
-    sqrm_net_cmd_t cmd;
-    memset(&cmd, 0, sizeof(cmd));
+    for (;;) {
+        int rc = oc->nc->net->tx_frame(user_buf, count);
+        if (rc == 0) return (ssize_t)count;
 
-    size_t copy_len = (count < sizeof(cmd)) ? count : sizeof(cmd);
-    /* The devfs write callback receives a kernel buffer (already copied from
-     * userspace by sys_writefile).  Do NOT call usercopy_from_user here —
-     * the syscall layer owns the user↔kernel copy; just memcpy it in. */
-    memcpy(&cmd, user_buf, copy_len);
+        if (rc != -11 /* EAGAIN */) return rc; /* real error -- don't retry */
 
-    /* ── Build reply entirely in kernel memory ──────────────────────── */
-    sqrm_net_reply_t *rep = &oc->reply;
-    memset(rep, 0, sizeof(*rep));
-    rep->cmd    = cmd.cmd;
-    rep->status = 0;
-    rep->len    = 0;
+        if (oc->open_flags & O_NONBLOCK) return rc;
 
-    switch (cmd.cmd) {
+        if ((get_system_ticks() - start) >= deadline_ticks) {
+            /* Genuinely stuck (not just a transient race) -- give up and
+             * report EAGAIN truthfully rather than spinning forever. */
+            return rc;
+        }
+        /* busy wait a beat and let the descriptor's in-flight completion catch up */
+    }
+}
+
+/* ── invoke()  –  metadata/control only; one syscall, no staging state ── */
+
+static ssize_t sqrm_net_devfs_invoke(void *ctx, const void *in_buf, size_t in_size,
+                                     void *out_buf, size_t out_size)
+{
+    sqrm_net_open_ctx_t *oc = (sqrm_net_open_ctx_t *)ctx;
+    if (!oc || !oc->nc || !oc->nc->net) return -1;
+    if (!in_buf || in_size < sizeof(uint32_t)) return -1;
+
+    sqrm_net_api_v1_t *net = oc->nc->net;
+
+    uint32_t cmd = 0;
+    memcpy(&cmd, in_buf, sizeof(cmd));
+
+    switch (cmd) {
 
         case NET_CMD_GET_MODE: {
+            if (!out_buf || out_size < sizeof(uint32_t)) return -1;
             uint32_t mode = NET_MODE_ETH;
-            memcpy(rep->data, &mode, sizeof(mode));
-            rep->len = sizeof(mode);
-            break;
+            memcpy(out_buf, &mode, sizeof(mode));
+            return (ssize_t)sizeof(mode);
         }
 
         case NET_CMD_GET_LINK_UP: {
-            if (!net->get_link_up) { rep->status = -1; break; }
+            if (!net->get_link_up) return -1;
+            if (!out_buf || out_size < sizeof(uint32_t)) return -1;
             uint32_t val = (uint32_t)(net->get_link_up() ? 1 : 0);
-            memcpy(rep->data, &val, sizeof(val));
-            rep->len = sizeof(val);
-            break;
+            memcpy(out_buf, &val, sizeof(val));
+            return (ssize_t)sizeof(val);
         }
 
         case NET_CMD_GET_MTU: {
-            if (!net->get_mtu) { rep->status = -1; break; }
+            if (!net->get_mtu) return -1;
+            if (!out_buf || out_size < sizeof(uint32_t)) return -1;
             uint32_t mtu = 0;
-            net->get_mtu(&mtu);
-            memcpy(rep->data, &mtu, sizeof(mtu));
-            rep->len = sizeof(mtu);
-            break;
+            if (net->get_mtu(&mtu) != 0) return -1;
+            memcpy(out_buf, &mtu, sizeof(mtu));
+            return (ssize_t)sizeof(mtu);
         }
 
         case NET_CMD_GET_MAC: {
-            if (!net->get_mac) { rep->status = -1; break; }
+            if (!net->get_mac) return -1;
+            if (!out_buf || out_size < 6) return -1;
             uint8_t mac[6] = {0};
-            net->get_mac(mac);
-            memcpy(rep->data, mac, 6);
-            rep->len = 6;
-            break;
-        }
-
-        case NET_CMD_TX_FRAME: {
-            if (!net->tx_frame) { rep->status = -1; break; }
-            if (cmd.len == 0 || cmd.len > 1500) { rep->status = -2; break; }
-            /* cmd.data is already in kernel memory (copied above) */
-            rep->status = net->tx_frame(cmd.data, cmd.len);
-            break;
-        }
-
-        case NET_CMD_RX_POLL: {
-            if (!net->rx_poll) { rep->status = -1; break; }
-            size_t got = 0;
-            /* rep->data is kernel memory — safe to pass directly */
-            int rc = net->rx_poll(rep->data, sizeof(rep->data), &got);
-            if (rc != 0) { rep->status = rc; break; }
-            rep->len = (uint32_t)got;
-            if (got > 0 && net->rx_consume) net->rx_consume();
-            break;
+            if (net->get_mac(mac) != 0) return -1;
+            memcpy(out_buf, mac, 6);
+            return 6;
         }
 
         default:
-            rep->status = -99;
-            break;
+            return -99;
     }
-
-    oc->reply_ready = 1;
-    oc->reply_off   = 0;
-    return (ssize_t)count;
 }
 
 /* ── devfs ops table ──────────────────────────────────────────────────── */
 
 static const devfs_device_ops_t g_sqrm_net_ops = {
-    .name  = "net",
-    .open  = sqrm_net_devfs_open,
-    .read  = sqrm_net_devfs_read,
-    .write = sqrm_net_devfs_write,
-    .close = sqrm_net_devfs_close,
+    .name   = "net",
+    .open   = sqrm_net_devfs_open,
+    .read   = sqrm_net_devfs_read,
+    .write  = sqrm_net_devfs_write,
+    .close  = sqrm_net_devfs_close,
+    .invoke = sqrm_net_devfs_invoke,
 };
 
 /* ── Auto-registration (called after a NIC SQRM module loads) ─────────── */
@@ -1802,7 +1989,9 @@ static void sqrm_net_autoregister_devfs(const sqrm_module_desc_t *desc)
         com_write_string(COM1_PORT, "[SQRM] NET node ctx alloc failed\n");
         return;
     }
+    memset(nc, 0, sizeof(*nc));
     nc->net = (sqrm_net_api_v1_t *)net;
+    spinlock_init(&nc->rx_lock);
 
     /* Build canonical name: net0, net1, net2 … */
     char name[16];
@@ -1835,24 +2024,19 @@ static void sqrm_net_autoregister_devfs(const sqrm_module_desc_t *desc)
     com_write_string(COM1_PORT, ")\n");
 }
 
-static int sqrm_load_one(const char *path, const char *basename, const sqrm_kernel_api_t *unused_api,
-                         const char **dep_stack, size_t dep_depth) {
-    if (already_loaded(basename)) return 0;
-
-    fs_mount_t *mnt = kernel_get_boot_mount();
-    if (!mnt || !mnt->valid) return -1;
-
-    fs_file_info_t st;
-    if (fs_stat(mnt, path, &st) != 0 || st.is_directory || st.size < sizeof(elf64_ehdr_t)) {
-        return -2;
+// Core ELF loader, shared by disk-backed (SQRM_MODULE_DIR) and in-memory
+// (multiboot2 initmod TPK) module sources. Takes ownership of buf on every
+// return path -- callers must not touch or free it after calling this.
+static int sqrm_load_one_from_memory(uint8_t *buf, size_t rd, const char *basename,
+                                     const char **dep_stack, size_t dep_depth) {
+    if (already_loaded(basename)) {
+        kfree(buf);
+        return 0;
     }
 
-    uint8_t *buf = (uint8_t*)kmalloc(st.size);
-    if (!buf) return -3;
-    size_t rd = 0;
-    if (fs_read_file(mnt, path, buf, st.size, &rd) != 0 || rd < sizeof(elf64_ehdr_t)) {
+    if (rd < sizeof(elf64_ehdr_t)) {
         kfree(buf);
-        return -4;
+        return -2;
     }
 
     const elf64_ehdr_t *eh = (const elf64_ehdr_t*)buf;
@@ -2375,6 +2559,32 @@ int rc = init(mod_api);
     return 0;
 }
 
+// Disk-backed entry point: reads the file from SQRM_MODULE_DIR on the boot
+// mount, then hands the raw bytes to the shared in-memory loader.
+static int sqrm_load_one(const char *path, const char *basename, const sqrm_kernel_api_t *unused_api,
+                         const char **dep_stack, size_t dep_depth) {
+    (void)unused_api;
+    if (already_loaded(basename)) return 0;
+
+    fs_mount_t *mnt = kernel_get_boot_mount();
+    if (!mnt || !mnt->valid) return -1;
+
+    fs_file_info_t st;
+    if (fs_stat(mnt, path, &st) != 0 || st.is_directory || st.size < sizeof(elf64_ehdr_t)) {
+        return -2;
+    }
+
+    uint8_t *buf = (uint8_t*)kmalloc(st.size);
+    if (!buf) return -3;
+    size_t rd = 0;
+    if (fs_read_file(mnt, path, buf, st.size, &rd) != 0 || rd < sizeof(elf64_ehdr_t)) {
+        kfree(buf);
+        return -4;
+    }
+
+    return sqrm_load_one_from_memory(buf, rd, basename, dep_stack, dep_depth);
+}
+
 static int sqrm_peek_desc(const char *path, const char *basename, sqrm_module_desc_t *out_desc) {
     if (!out_desc) return -1;
     memset(out_desc, 0, sizeof(*out_desc));
@@ -2540,16 +2750,143 @@ static int sqrm_load_filtered(int (*want_type)(sqrm_module_type_t type)) {
     return 0;
 }
 
+/* --- Multiboot2 "initmod.tpk" bootstrap module ---
+ *
+ * The bootloader may hand the kernel a small TPK (Tiny Package Archive; see
+ * LTF-Spec section 1.1) as a Multiboot2 module. Its .sqrm entries are loaded
+ * straight out of the module's memory, before anything is scanned from
+ * SQRM_MODULE_DIR on the boot drive -- and before any boot drive is even
+ * required to exist. Layout:
+ *   offset 0: uint32_t magic ('TPK!' = 0x214B5054)
+ *   offset 4: uint32_t file_count
+ *   then file_count entries of 264 bytes: char name[256], u32 offset, u32 size
+ *   followed by the raw file data.
+ */
+#define TPK_MAGIC      0x214B5054u
+#define TPK_NAME_LEN   256u
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t file_count;
+} tpk_header_t;
+
+typedef struct __attribute__((packed)) {
+    char name[TPK_NAME_LEN];
+    uint32_t offset;
+    uint32_t size;
+} tpk_entry_t;
+
+int sqrm_load_initmod(void) {
+    uint64_t mod_phys = 0, mod_len = 0;
+    if (multiboot2_get_initmod(&mod_phys, &mod_len) != 0 || mod_len < sizeof(tpk_header_t)) {
+        com_write_string(COM1_PORT, "[SQRM] No initmod.tpk multiboot module supplied\n");
+        return 0;
+    }
+
+    const uint8_t *base = (const uint8_t*)phys_to_virt_kernel(mod_phys);
+    if (!base) {
+        com_write_string(COM1_PORT, "[SQRM] initmod.tpk: could not map module memory\n");
+        return -1;
+    }
+
+    const tpk_header_t *hdr = (const tpk_header_t*)base;
+    if (hdr->magic != TPK_MAGIC) {
+        com_write_string(COM1_PORT, "[SQRM] initmod.tpk: bad magic, ignoring\n");
+        return -2;
+    }
+
+    uint64_t table_bytes = (uint64_t)hdr->file_count * (uint64_t)sizeof(tpk_entry_t);
+    if (sizeof(tpk_header_t) + table_bytes > mod_len) {
+        com_write_string(COM1_PORT, "[SQRM] initmod.tpk: truncated entry table, ignoring\n");
+        return -3;
+    }
+
+    com_write_string(COM1_PORT, "[SQRM] initmod.tpk: ");
+    char cbuf[16];
+    itoa((int)hdr->file_count, cbuf, 10);
+    com_write_string(COM1_PORT, cbuf);
+    com_write_string(COM1_PORT, " file(s)\n");
+
+    const tpk_entry_t *entries = (const tpk_entry_t*)(base + sizeof(tpk_header_t));
+    int loaded_any = 0;
+
+    for (uint32_t i = 0; i < hdr->file_count; i++) {
+        char name[TPK_NAME_LEN];
+        memcpy(name, entries[i].name, TPK_NAME_LEN);
+        name[TPK_NAME_LEN - 1] = 0;
+
+        if (!ends_with(name, ".sqrm")) continue;
+
+        uint64_t data_off = entries[i].offset;
+        uint64_t data_sz  = entries[i].size;
+        if (data_off > mod_len || data_sz > mod_len - data_off) {
+            com_write_string(COM1_PORT, "[SQRM] initmod.tpk: entry out of range: ");
+            com_write_string(COM1_PORT, name);
+            com_write_string(COM1_PORT, "\n");
+            continue;
+        }
+        if (data_sz < sizeof(elf64_ehdr_t)) continue;
+
+        uint8_t *buf = (uint8_t*)kmalloc((size_t)data_sz);
+        if (!buf) {
+            com_write_string(COM1_PORT, "[SQRM] initmod.tpk: OOM copying ");
+            com_write_string(COM1_PORT, name);
+            com_write_string(COM1_PORT, "\n");
+            continue;
+        }
+        memcpy(buf, base + data_off, (size_t)data_sz);
+
+        com_write_string(COM1_PORT, "[SQRM] initmod: loading ");
+        com_write_string(COM1_PORT, name);
+        com_write_string(COM1_PORT, "\n");
+
+        int rc = sqrm_load_one_from_memory(buf, (size_t)data_sz, name, NULL, 0);
+        if (rc == 0) {
+            loaded_any = 1;
+        } else {
+            com_write_string(COM1_PORT, "[SQRM] initmod: failed to load ");
+            com_write_string(COM1_PORT, name);
+            com_write_string(COM1_PORT, " rc=");
+            char rbuf[16];
+            itoa(rc, rbuf, 10);
+            com_write_string(COM1_PORT, rbuf);
+            com_write_string(COM1_PORT, "\n");
+        }
+    }
+
+    if (!loaded_any) {
+        com_write_string(COM1_PORT, "[SQRM] initmod.tpk: no modules loaded\n");
+    }
+
+    return 0;
+}
+
 static int want_gpu_only(sqrm_module_type_t t) { return t == SQRM_TYPE_GPU; }
 static int want_fs_only(sqrm_module_type_t t) { return t == SQRM_TYPE_FS; }
+static int want_drive_only(sqrm_module_type_t t) { return t == SQRM_TYPE_DRIVE; }
 static int want_late(sqrm_module_type_t t) {
-    // Late: everything except GPU and FS.
-    return !(t == SQRM_TYPE_GPU || t == SQRM_TYPE_FS);
+    // Late: everything except GPU, FS and DRIVE (those load early).
+    return !(t == SQRM_TYPE_GPU || t == SQRM_TYPE_FS || t == SQRM_TYPE_DRIVE);
 }
 
 int sqrm_load_early_drivers(void) {
+    // Bootstrap modules bundled in the multiboot2 initmod.tpk (if any) load
+    // first, ahead of anything scanned from the boot drive.
+    sqrm_load_initmod();
+
     com_write_string(COM1_PORT, "[SQRM] Early load: GPU\n");
     sqrm_load_filtered(want_gpu_only);
+
+    // DRIVE modules (third-party storage controller drivers) load here,
+    // scanned from the boot drive's SQRM_MODULE_DIR like every other .sqrm
+    // module. This means a DRIVE module cannot itself back the boot drive --
+    // something has to be readable before .sqrm files can be found on it --
+    // but it can bring up any additional/secondary controller (a second
+    // AHCI HBA, NVMe, etc.) whose drives are then picked up by the
+    // fs_rescan_all() the caller runs right after this returns.
+    com_write_string(COM1_PORT, "[SQRM] Early load: DRIVE\n");
+    sqrm_load_filtered(want_drive_only);
+
     com_write_string(COM1_PORT, "[SQRM] Early load: FS\n");
     sqrm_load_filtered(want_fs_only);
     return 0;

@@ -2,6 +2,7 @@
 #define VDRIVE_H
 
 #include <stdint.h>
+#include "moduos/kernel/blockdev.h"
 
 // vDrive: Virtual Drive abstraction layer
 // Provides a unified interface for both ATA (legacy IDE) and SATA drives
@@ -25,7 +26,8 @@ typedef enum {
 typedef enum {
     VDRIVE_BACKEND_NONE = 0,
     VDRIVE_BACKEND_ATA = 1,
-    VDRIVE_BACKEND_SATA = 2
+    VDRIVE_BACKEND_SATA = 2,
+    VDRIVE_BACKEND_SQRM = 3    // Third-party SQRM DRIVE-type module (block_register)
 } vdrive_backend_t;
 
 // Drive status
@@ -46,7 +48,8 @@ typedef struct {
     vdrive_status_t status;       // Current status
     
     // Backend-specific identifiers
-    uint8_t backend_id;           // ATA drive index or SATA port number
+    uint32_t backend_id;          // ATA drive index, SATA port number, or
+                                   // blockdev_handle_t for VDRIVE_BACKEND_SQRM
     
     // Drive information
     char model[41];               // Model string
@@ -93,6 +96,11 @@ int vdrive_rescan(void);
 
 // Get system information
 vdrive_system_t* vdrive_get_system_info(void);
+
+// Attach a blockdev-backed drive (registered by a SQRM DRIVE-type module via
+// block_register) as a new vdrive slot. Returns the new vdrive_id (>=0) or a
+// VDRIVE_ERR_* code on failure.
+int vdrive_register_sqrm_drive(blockdev_handle_t handle, const blockdev_info_t *info);
 
 // ===========================================================================
 // Drive Access
