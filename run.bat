@@ -52,13 +52,12 @@ start "cmdQEMU" qemu-system-x86_64 ^
     -smbios type=1,manufacturer="NTLLC",product="DevmanPC",version="1.0",serial="MDMDMDMDMDMD" ^
     -m 4096M ^
     -smp 2 ^
+    -display gtk ^
     -serial file:com1.log ^
     -serial file:com2.log ^
     -serial file:com3.log ^
     -audiodev dsound,id=snd0 ^
-    -device intel-hda -device hda-duplex,audiodev=snd0 ^
-    -device piix3-usb-uhci,id=usb0 ^
-    -device usb-mouse,bus=usb0.0 ^
+    -device ac97,audiodev=snd0 ^
     -netdev user,id=u1 -device e1000,netdev=u1,mac=52:54:00:12:34:56 ^
     -drive file=dist\AMD64\kernel.iso,format=raw,media=cdrom,if=none,id=cdrom0 ^
     -drive file=.\disk.img,format=raw,media=disk,if=none,id=disk0 ^
