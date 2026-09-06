@@ -242,14 +242,21 @@ int NodGL_GetScreenResolution(NodGL_Device device,
 /*  Present — the ONE place the command batch is flushed              */
 /* ------------------------------------------------------------------ */
 
+int NodGL_PresentContextRect(NodGL_Context ctx, uint32_t x, uint32_t y,
+                              uint32_t w, uint32_t h, uint32_t sync_interval) {
+    if (!ctx || !ctx->device) return NodGL_ERROR_INVALID_ARGS;
+    (void)sync_interval; /* no vsync wait in this backend yet — flush is fire-and-forget */
+    if (w == 0 || h == 0) return NodGL_OK;
+    int rc = gfx2d_flush(&ctx->device->gfx2d, x, y, w, h);
+    return (rc == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
+}
+
 int NodGL_PresentContext(NodGL_Context ctx, uint32_t sync_interval) {
     if (!ctx || !ctx->device) return NodGL_ERROR_INVALID_ARGS;
-    (void)sync_interval;
-    int rc = gfx2d_flush(&ctx->device->gfx2d,
-                         0, 0,
-                         (uint32_t)ctx->viewport.width,
-                         (uint32_t)ctx->viewport.height);
-    return (rc == 0) ? NodGL_OK : NodGL_ERROR_DEVICE_LOST;
+    return NodGL_PresentContextRect(ctx, 0, 0,
+                                     (uint32_t)ctx->viewport.width,
+                                     (uint32_t)ctx->viewport.height,
+                                     sync_interval);
 }
 
 /* ------------------------------------------------------------------ */

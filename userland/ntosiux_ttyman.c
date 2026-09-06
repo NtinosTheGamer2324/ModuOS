@@ -9,11 +9,11 @@
 #include "nodgl.h"
 #include "lib_FNT.h"
 
-// DEPRECATION NOTICE:
-// events.h and the $/dev/input/event0 subsystem are deprecated as of
-// ModuOS 0.6.2 and will be REMOVED in 0.6.3 (the input update).
-// This file must be updated to use the new input API when 0.6.3 lands.
-// All event_poll / KeyCode usage below is 0.6.2-only.
+// Input events (KeyCode, Event, KeyboardEventData, EVENT_* constants) come
+// from this shared header. It's just struct/enum definitions — userland
+// gets input by opening $/dev/input/event0 and read()-ing Event records
+// off it, same as any other file. There is no kernel function to call
+// for this; see handle_keyboard_input() below.
 #include "../include/moduos/kernel/events/events.h"
 
 // ================================================================
@@ -171,12 +171,6 @@ static size_t ring_pop(ring_t *rb, uint8_t *out, size_t maxlen) {
     return n;
 }
 
-int event_poll(int fd, Event *e) {
-    // This maps the file-based API to the function-based call 
-    // that your broken code is expecting.
-    return (read(fd, e, sizeof(Event)) == (ssize_t)sizeof(Event));
-}
-
 // ================================================================
 // Per-TTY slot
 // ================================================================
@@ -193,8 +187,10 @@ typedef struct {
 
 static vtty_t ttys[MAX_TTYS];
 static int    current_tty = 0;
-// NOTE (0.6.2): input comes via event_poll() from the global event queue.
-// kbd_fd raw read is gone. Remove all of this block in 0.6.3.
+
+// Input device fd — opened once in md_main(), read from every tick in
+// handle_keyboard_input(). -1 until init_input() succeeds.
+static int    g_input_fd = -1;
 
 // ================================================================
 // Screen buffer helpers
@@ -902,9 +898,6 @@ static int spawn_shell_on_tty(int idx) {
 
 // ================================================================
 // Keyboard input -> current TTY stdin ring
-//
-// DEPRECATED (0.6.2): uses event_poll() / events.h.
-// Replace with new input API in 0.6.3.
 // ================================================================
 
 // Translate a KeyCode + modifiers into the VT byte sequence the shell
@@ -979,16 +972,16 @@ static int keyevent_to_vt(const KeyboardEventData *k, uint8_t *out) {
     }
 }
 
-if (read(efd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) { 
-    // handle key
-}
-
 static void handle_keyboard_input(void) {
+    if (g_input_fd < 0) return; // input device never opened successfully
+
     Event ev;
-    // Drain all pending events this tick.
-    while (event_poll(&ev)) {
+    // Drain all pending events this tick. The fd is opened O_NONBLOCK, so
+    // read() returns <= 0 once the queue is empty (0 == no data, -1 == would
+    // block / error) — same pattern as teseraris.c's input loop.
+    while (read(g_input_fd, &ev, sizeof(ev)) > 0) {
         // We only care about key-press events; releases are ignored.
-        if (ev.type != EVENT_KEY_PRESSED && ev.type != EVENT_CHAR_INPUT)
+        if (ev.type != EVENT_KEY_PRESSED)
             continue;
 
         const KeyboardEventData *k = &ev.data.keyboard;
@@ -1072,6 +1065,14 @@ static int init_graphics(void) {
     return 0;
 }
 
+// Open the input device and stash the fd in g_input_fd. O_NONBLOCK so
+// handle_keyboard_input() can poll it every tick without stalling the
+// render loop. Returns 0 on success, -1 on failure.
+static int init_input(void) {
+    g_input_fd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
+    return (g_input_fd < 0) ? -1 : 0;
+}
+
 // ================================================================
 // Entry point
 // ================================================================
@@ -1084,6 +1085,7 @@ int md_main(long argc, char **argv) {
     // During development you can re-enable the printf calls below.
 
     if (init_graphics() < 0) return 1;
+    if (init_input() < 0) return 1;
 
     int cols = (int)(g_screen_w / (uint32_t)g_font_w);
     int rows = (int)(g_screen_h / (uint32_t)g_font_h);

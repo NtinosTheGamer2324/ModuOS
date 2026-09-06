@@ -208,7 +208,7 @@ for obj in "$BUILD_DIR"/*.o; do
             "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
-        minesgfx)
+        minesgfx|mdedit)
             bin="$DIST_DIR/${base}.sqr"
             echo "[BUILD] LD(app static NodGL+fnt) $obj + lib_NodGL.o + lib_gfx2d.o + lib_fnt.o -> $bin"
             "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
@@ -227,14 +227,14 @@ for obj in "$BUILD_DIR"/*.o; do
                 --hash-style=sysv
             ;;
             
-        calcgfx|snakegfx|raygfx|froggergfx|gfxclock|mousedemo|sysmon|miniwm|neontank|gfxtest)
+        calcgfx|snakegfx|raygfx|froggergfx|mousedemo|sysmon|miniwm|neontank|gfxtest)
             bin="$DIST_DIR/${base}.sqr"
             echo "[BUILD] LD(app static NodGL) $obj + lib_NodGL.o + lib_gfx2d.o -> $bin"
             "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
 
-        screensaver)
+        screensaver|gfxclock)
             bin="$DIST_DIR/${base}.sqr"
             echo "[BUILD] LD(app static NodGL) $obj + lib_NodGL.o + lib_gfx2d.o + lib_fnt.o -> $bin"
             "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
@@ -250,6 +250,18 @@ for obj in "$BUILD_DIR"/*.o; do
             bin="$DIST_DIR/${base}.sqr"
             echo "[BUILD] LD(app static NodGL) $obj + lib_NodGL.o + lib_gfx2d.o -> $bin"
             "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        mdw)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static NodGL+fnt) $obj + lib_NodGL.o + lib_gfx2d.o + lib_fnt.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_NodGL.o" "$BUILD_DIR/lib_gfx2d.o" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
+                --hash-style=sysv
+            ;;
+        demo_welcome|demo_notes|mdw_test)
+            bin="$DIST_DIR/${base}.sqr"
+            echo "[BUILD] LD(app static fnt) $obj + lib_fnt.o -> $bin"
+            "$LD" "$obj" "$BUILD_DIR/lib_fnt.o" -T "$LD_SCRIPT_APP" -o "$bin" \
                 --hash-style=sysv
             ;;
         shader_demo)

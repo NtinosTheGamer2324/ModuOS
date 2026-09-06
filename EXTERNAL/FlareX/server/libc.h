@@ -1043,7 +1043,7 @@ static inline void* realloc(void *ptr, size_t size) {
 
 __attribute__((noreturn)) static inline void exit(int status) {
     syscall(SYS_EXIT, status, 0, 0);
-    /* SYS_EXIT must not return; if it does, halt here. */
+    /* SYS_EXIT must not return; if it does, trigger #GPF. to force kill. */
     for (;;) { __asm__ volatile("hlt"); }
 }
 

@@ -146,6 +146,14 @@ int NodGL_GetScreenResolution(NodGL_Device device, uint32_t *out_width, uint32_t
 /* Present backbuffer to screen (context API) */
 int NodGL_PresentContext(NodGL_Context ctx, uint32_t sync_interval);
 
+/* Present only a sub-rectangle of the backbuffer. Use this instead of
+ * NodGL_PresentContext whenever you already know exactly what region
+ * changed (e.g. a dirty-rect compositor) — NodGL_PresentContext always
+ * flushes the full viewport regardless of what was drawn, which defeats
+ * any partial-update work upstream of it. */
+int NodGL_PresentContextRect(NodGL_Context ctx, uint32_t x, uint32_t y,
+                              uint32_t w, uint32_t h, uint32_t sync_interval);
+
 /* ============================================================
  * Simple Global API (for simple apps like ttyman)
  * ============================================================ */
