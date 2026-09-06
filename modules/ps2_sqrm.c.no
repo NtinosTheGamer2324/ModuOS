@@ -1,0 +1,544 @@
+#include "moduos/kernel/sqrm.h"
+#include "inputsqrm/contract.h"
+#include <stdbool.h>
+
+static const char *ps2_deps[] = { "inputmanager" };
+SQRM_DEFINE_MODULE_V2(SQRM_TYPE_GENERIC, "ps2", INPUT_CLASS, INPUT_CONTROLLER, 1, &ps2_deps);
+
+/* Ports */
+// PS/2 Controller Ports
+#define PS2_DATA_PORT       0x60
+#define PS2_COMMAND_PORT    0x64
+
+// PS/2 Controller Commands
+#define PS2_CMD_READ_CONFIG      0x20
+#define PS2_CMD_WRITE_CONFIG     0x60
+#define PS2_CMD_DISABLE_PORT1    0xAD
+#define PS2_CMD_ENABLE_PORT1     0xAE
+#define PS2_CMD_DISABLE_PORT2    0xA7
+#define PS2_CMD_ENABLE_PORT2     0xA8
+#define PS2_CMD_WRITE_TO_PORT2   0xD4
+
+// PS/2 Status Register Bits (read from 0x64)
+#define PS2_STATUS_OUTPUT_BUFFER 0x01
+#define PS2_STATUS_INPUT_BUFFER  0x02
+
+/* me */
+#define TIMEOUT_LIMIT 1000000
+#define PREFON true
+#define PREFOFF false
+
+/* PS2 TYPE 2 */
+typedef enum {
+    // --- Control & Special Keys ---
+    PS2_KEY_ERROR       = 0x00,
+    PS2_KEY_F9          = 0x01,
+    PS2_KEY_F5          = 0x03,
+    PS2_KEY_F3          = 0x04,
+    PS2_KEY_F1          = 0x05,
+    PS2_KEY_F2          = 0x06,
+    PS2_KEY_F12         = 0x07,
+    PS2_KEY_F10         = 0x09,
+    PS2_KEY_F8          = 0x0A,
+    PS2_KEY_F6          = 0x0B,
+    PS2_KEY_F4          = 0x0C,
+    PS2_KEY_TAB         = 0x0D,
+    PS2_KEY_BACKTICK    = 0x0E, // ` ~
+    
+    PS2_KEY_LALT        = 0x11,
+    PS2_KEY_LSHIFT      = 0x12,
+    PS2_KEY_LCTRL       = 0x14,
+    PS2_KEY_Q           = 0x15,
+    PS2_KEY_1           = 0x16, // 1 !
+    
+    PS2_KEY_Z           = 0x1A,
+    PS2_KEY_S           = 0x1B,
+    PS2_KEY_A           = 0x1C,
+    PS2_KEY_W           = 0x1D,
+    PS2_KEY_2           = 0x1E, // 2 @
+    
+    PS2_KEY_C           = 0x21,
+    PS2_KEY_X           = 0x22,
+    PS2_KEY_D           = 0x23,
+    PS2_KEY_E           = 0x24,
+    PS2_KEY_4           = 0x25, // 4 $
+    PS2_KEY_3           = 0x26, // 3 #
+    
+    PS2_KEY_SPACE       = 0x29,
+    PS2_KEY_V           = 0x2A,
+    PS2_KEY_F           = 0x2B,
+    PS2_KEY_T           = 0x2C,
+    PS2_KEY_R           = 0x2D,
+    PS2_KEY_5           = 0x2E, // 5 %
+    
+    PS2_KEY_N           = 0x31,
+    PS2_KEY_B           = 0x32,
+    PS2_KEY_H           = 0x33,
+    PS2_KEY_G           = 0x34,
+    PS2_KEY_Y           = 0x35,
+    PS2_KEY_6           = 0x36, // 6 ^
+    
+    PS2_KEY_M           = 0x3A,
+    PS2_KEY_J           = 0x3B,
+    PS2_KEY_U           = 0x3C,
+    PS2_KEY_7           = 0x3D, // 7 &
+    PS2_KEY_8           = 0x3E, // 8 *
+    
+    PS2_KEY_COMMA       = 0x41, // , <
+    PS2_KEY_K           = 0x42,
+    PS2_KEY_I           = 0x43,
+    PS2_KEY_O           = 0x44,
+    PS2_KEY_0           = 0x45, // 0 )
+    PS2_KEY_9           = 0x46, // 9 (
+    
+    PS2_KEY_DOT         = 0x49, // . >
+    PS2_KEY_SLASH       = 0x4A, // / ?
+    PS2_KEY_L           = 0x4B,
+    PS2_KEY_SEMICOLON   = 0x4C, // ; :
+    PS2_KEY_P           = 0x4D,
+    PS2_KEY_MINUS       = 0x4E, // - _
+    
+    PS2_KEY_LBRACKET    = 0x54, // [ {
+    PS2_KEY_EQUALS      = 0x55, // = +
+    
+    PS2_KEY_CAPSLOCK    = 0x58,
+    PS2_KEY_RSHIFT      = 0x59,
+    PS2_KEY_ENTER       = 0x5A,
+    PS2_KEY_RBRACKET    = 0x5B, // ] }
+    PS2_KEY_BACKSLASH   = 0x5D, // \ |
+    
+    PS2_KEY_BACKSPACE   = 0x66,
+    PS2_KEY_1_PAD       = 0x69,
+    PS2_KEY_4_PAD       = 0x6B,
+    PS2_KEY_7_PAD       = 0x6C,
+    
+    PS2_KEY_0_PAD       = 0x70,
+    PS2_KEY_DOT_PAD     = 0x71,
+    PS2_KEY_2_PAD       = 0x72,
+    PS2_KEY_5_PAD       = 0x73,
+    PS2_KEY_6_PAD       = 0x74,
+    PS2_KEY_8_PAD       = 0x75,
+    PS2_KEY_ESC         = 0x76,
+    PS2_KEY_NUMLOCK     = 0x77,
+    PS2_KEY_F11         = 0x78,
+    PS2_KEY_PLUS_PAD    = 0x79,
+    PS2_KEY_3_PAD       = 0x7A,
+    PS2_KEY_MINUS_PAD   = 0x7B,
+    PS2_KEY_ASTERISK_PAD= 0x7C,
+    PS2_KEY_9_PAD       = 0x7D,
+    PS2_KEY_SCROLLLOCK  = 0x7E,
+    
+    PS2_KEY_F7          = 0x83,
+
+    // --- Extended Keys (typically prefixed with 0xE0) ---
+    PS2_KEY_RALT        = 0xE011,
+    PS2_KEY_RCTRL       = 0xE014,
+    PS2_KEY_LWIN        = 0xE01F,
+    PS2_KEY_RWIN        = 0xE027,
+    PS2_KEY_APPS        = 0xE02F,
+    PS2_KEY_PRINTSCREEN = 0xE012, // (often part of a longer sequence: E0 12 E0 7C)
+    PS2_KEY_R_ARROW     = 0xE074,
+    PS2_KEY_UP_ARROW    = 0xE075,
+    PS2_KEY_DOWN_ARROW  = 0xE072,
+    PS2_KEY_L_ARROW     = 0xE06B,
+    PS2_KEY_INSERT      = 0xE070,
+    PS2_KEY_DELETE      = 0xE071,
+    PS2_KEY_HOME        = 0xE06C,
+    PS2_KEY_END         = 0xE069,
+    PS2_KEY_PAGEUP      = 0xE07D,
+    PS2_KEY_PAGEDOWN    = 0xE07A,
+    PS2_KEY_SLASH_PAD   = 0xE04A,
+    PS2_KEY_ENTER_PAD   = 0xE05A
+} PS2_ScancodeSet2;
+
+/* Globals */
+sqrm_kernel_api_t *g_api = NULL;
+input_api_t *g_inptapi = NULL;
+int g_kbd_id = 0;
+
+/* Memory */
+static void *memset(void *dest, int val, size_t len) {
+    unsigned char *ptr = dest;
+    while (len--) {
+        *ptr++ = (unsigned char)val;
+    }
+    return dest;
+}
+
+static void *memcpy(void *dest, const void *src, size_t len) {
+    const unsigned char *s = src;
+    unsigned char *d = dest;
+    while (len--) {
+        *d++ = *s++;
+    }
+    return dest;
+}
+
+static size_t strlen(const char *str) {
+    const char *s = str;
+    while (*s) {
+        ++s;
+    }
+    return s - str;
+}
+
+static int strcmp(const char *s1, const char *s2) {
+    while (*s1 && (*s1 == *s2)) {
+        ++s1;
+        ++s2;
+    }
+    return *(unsigned char *)s1 - *(unsigned char *)s2;
+}
+
+/* Helpers */
+static uint8_t sinb(uint16_t port) {
+    return g_api->inb(port);
+}
+static void soutb(uint16_t port, uint8_t val) {
+    g_api->outb(port, val);
+}
+
+
+static void kprint(const char *string, bool bprefix) {
+    if (bprefix == true) {
+        g_api->com_write_string(0x3F8, "[PS/2 SQRM] ");
+    }
+    g_api->com_write_string(0x3F8, string);
+}
+
+static void push_key(key_event_t key) {
+    g_inptapi->push_key_event(g_kbd_id, key);
+}
+
+static keys_t type2_to_kevent(PS2_ScancodeSet2 scancode, bool is_extended) {
+    if (is_extended) {
+        switch (scancode) {
+            case 0xE011: // Fallthrough if 16-bit code passed directly
+            case 0x11: return KEY_RALT;
+            case 0xE014: 
+            case 0x14: return KEY_RCTRL;
+            case 0xE01F: 
+            case 0x1F: return KEY_SUPER; // LWIN
+            case 0xE027: 
+            case 0x27: return KEY_SUPER; // RWIN
+            case 0xE02F: 
+            case 0x2F: return KEY_APPS; // APPS
+            case 0xE012: 
+            case 0x12: return KEY_PRINT_SCREEN;
+            case 0xE074: 
+            case 0x74: return KEY_ARROW_RIGHT;
+            case 0xE075: 
+            case 0x75: return KEY_ARROW_UP;
+            case 0xE072: 
+            case 0x72: return KEY_ARROW_DOWN;
+            case 0xE06B: 
+            case 0x6B: return KEY_ARROW_LEFT;
+            case 0xE070: 
+            case 0x70: return KEY_INSERT;
+            case 0xE071: 
+            case 0x71: return KEY_DEL;
+            case 0xE06C: 
+            case 0x6C: return KEY_HOME;
+            case 0xE069: 
+            case 0x69: return KEY_END;
+            case 0xE07D: 
+            case 0x7D: return KEY_PAGEUP;
+            case 0xE07A: 
+            case 0x7A: return KEY_PAGEDOWN;
+            case 0xE04A: 
+            case 0x4A: return KEY_FORWARDSLASH; // Pad Slash
+            case 0xE05A: 
+            case 0x5A: return KEY_ENTER;        // Pad Enter
+            default:   return KEY_UNKNOWN;
+        }
+    }
+
+    switch (scancode) {
+        case PS2_KEY_ERROR:         return KEY_UNKNOWN;
+        case PS2_KEY_BACKTICK:      return KEY_BACKTICK;
+        case PS2_KEY_0:             return KEY_0;
+        case PS2_KEY_1:             return KEY_1;
+        case PS2_KEY_2:             return KEY_2;
+        case PS2_KEY_3:             return KEY_3;
+        case PS2_KEY_4:             return KEY_4;
+        case PS2_KEY_5:             return KEY_5;
+        case PS2_KEY_6:             return KEY_6;
+        case PS2_KEY_7:             return KEY_7;
+        case PS2_KEY_8:             return KEY_8;
+        case PS2_KEY_9:             return KEY_9;
+        case PS2_KEY_A:             return KEY_A;
+        case PS2_KEY_B:             return KEY_B;
+        case PS2_KEY_C:             return KEY_C;
+        case PS2_KEY_D:             return KEY_D;
+        case PS2_KEY_E:             return KEY_E;
+        case PS2_KEY_F:             return KEY_F;
+        case PS2_KEY_G:             return KEY_G;
+        case PS2_KEY_H:             return KEY_H;
+        case PS2_KEY_I:             return KEY_I;
+        case PS2_KEY_J:             return KEY_J;
+        case PS2_KEY_K:             return KEY_K;
+        case PS2_KEY_L:             return KEY_L;
+        case PS2_KEY_M:             return KEY_M;
+        case PS2_KEY_N:             return KEY_N;
+        case PS2_KEY_O:             return KEY_O;
+        case PS2_KEY_P:             return KEY_P;
+        case PS2_KEY_Q:             return KEY_Q;
+        case PS2_KEY_R:             return KEY_R;
+        case PS2_KEY_S:             return KEY_S;
+        case PS2_KEY_T:             return KEY_T;
+        case PS2_KEY_U:             return KEY_U;
+        case PS2_KEY_V:             return KEY_V;
+        case PS2_KEY_W:             return KEY_W;
+        case PS2_KEY_X:             return KEY_X;
+        case PS2_KEY_Y:             return KEY_Y;
+        case PS2_KEY_Z:             return KEY_Z;
+        case PS2_KEY_F1:            return KEY_F1;
+        case PS2_KEY_F2:            return KEY_F2;
+        case PS2_KEY_F3:            return KEY_F3;
+        case PS2_KEY_F4:            return KEY_F4;
+        case PS2_KEY_F5:            return KEY_F5;
+        case PS2_KEY_F6:            return KEY_F6;
+        case PS2_KEY_F7:            return KEY_F7;
+        case PS2_KEY_F8:            return KEY_F8;
+        case PS2_KEY_F9:            return KEY_F9;
+        case PS2_KEY_F10:           return KEY_F10;
+        case PS2_KEY_F11:           return KEY_F11;
+        case PS2_KEY_F12:           return KEY_F12;
+        case PS2_KEY_TAB:           return KEY_TAB;
+        case PS2_KEY_LALT:          return KEY_LALT;
+        case PS2_KEY_LCTRL:         return KEY_LCTRL;
+        case PS2_KEY_LSHIFT:        return KEY_LSHIFT;
+        case PS2_KEY_RSHIFT:        return KEY_RSHIFT;
+        case PS2_KEY_ENTER:         return KEY_ENTER;
+        case PS2_KEY_SPACE:         return KEY_SPACE;
+        case PS2_KEY_BACKSPACE:     return KEY_BACKSPACE;
+        case PS2_KEY_ESC:           return KEY_ESCAPE;
+        case PS2_KEY_CAPSLOCK:      return KEY_CAPSLOCK;
+        case PS2_KEY_SCROLLLOCK:    return KEY_SCROLL_LOCK;
+        case PS2_KEY_NUMLOCK:       return KEY_NUMLOCK;
+        case PS2_KEY_MINUS:         return KEY_DASH_MINUS;
+        case PS2_KEY_EQUALS:        return KEY_EQUAL;
+        case PS2_KEY_LBRACKET:      return KEY_LBRACKET;
+        case PS2_KEY_RBRACKET:      return KEY_RBRACKET;
+        case PS2_KEY_BACKSLASH:     return KEY_BACKSLASH;
+        case PS2_KEY_SEMICOLON:     return KEY_SEMICOLON;
+        case PS2_KEY_COMMA:         return KEY_COMMA;
+        case PS2_KEY_DOT:           return KEY_DOT;
+        case PS2_KEY_SLASH:         return KEY_FORWARDSLASH;
+        case PS2_KEY_0_PAD:         return KEY_NUM0;
+        case PS2_KEY_1_PAD:         return KEY_NUM1;
+        case PS2_KEY_2_PAD:         return KEY_NUM2;
+        case PS2_KEY_3_PAD:         return KEY_NUM3;
+        case PS2_KEY_4_PAD:         return KEY_NUM4;
+        case PS2_KEY_5_PAD:         return KEY_NUM5;
+        case PS2_KEY_6_PAD:         return KEY_NUM6;
+        case PS2_KEY_7_PAD:         return KEY_NUM7;
+        case PS2_KEY_8_PAD:         return KEY_NUM8;
+        case PS2_KEY_9_PAD:         return KEY_NUM9;
+        case PS2_KEY_DOT_PAD:       return KEY_DOT;
+        case PS2_KEY_PLUS_PAD:      return KEY_PLUS;
+        case PS2_KEY_MINUS_PAD:     return KEY_DASH_MINUS;
+        case PS2_KEY_ASTERISK_PAD:  return KEY_ASTERISC;
+        default:                    return KEY_UNKNOWN;
+    }
+}
+
+/* PS2 Helpers */
+static int ps2_wait_output(uint8_t *data) {
+    int timeout = 0;
+    while (!(sinb(PS2_COMMAND_PORT) & PS2_STATUS_OUTPUT_BUFFER) && timeout < TIMEOUT_LIMIT)
+        timeout++;
+    if (timeout == TIMEOUT_LIMIT) return -1;
+    *data =sinb(PS2_DATA_PORT);
+    return 0;
+}
+
+static int ps2_wait_input(void) {
+    int timeout = 0;
+    while ((sinb(PS2_COMMAND_PORT) & PS2_STATUS_INPUT_BUFFER) && timeout < TIMEOUT_LIMIT)
+        timeout++;
+    return (timeout == TIMEOUT_LIMIT) ? -1 : 0;
+}
+
+static bool is_running_in_vm() {
+    uint32_t eax, ebx, ecx, edx;
+    char hv_vendor[13] = {0};
+
+    // Check if hypervisor present (bit 31 of ECX in CPUID leaf 1)
+    eax = 1;
+    __asm__ volatile("cpuid"
+                     : "=c"(ecx)
+                     : "a"(eax)
+                     : "ebx", "edx");
+
+    if (!((ecx >> 31) & 1)) {
+        return false; // Not running in a VM
+    }
+
+    // Get hypervisor vendor string (CPUID leaf 0x40000000)
+    eax = 0x40000000;
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(eax));
+
+    memcpy(&hv_vendor[0], &ebx, 4);
+    memcpy(&hv_vendor[4], &ecx, 4);
+    memcpy(&hv_vendor[8], &edx, 4);
+    hv_vendor[12] = '\0';
+
+    // Known VM vendors
+    if (strcmp(hv_vendor, "KVMKVMKVM") == 0 ||    // KVM/QEMU
+        strcmp(hv_vendor, "VBoxVBoxVBox") == 0 || // VirtualBox
+        strcmp(hv_vendor, "QEMU") == 0 ||         // plain QEMU
+        strcmp(hv_vendor, "VMwareVMware") == 0) { // VMware
+        return true;
+    }
+
+    return false;
+}
+/* PS2 Stuff */
+static int ps2_init() {
+    uint8_t config;
+    uint8_t response;
+    bool vm = is_running_in_vm(); // detect VM
+
+    /* === Controller Init === */
+
+    if (ps2_wait_input() < 0 && !vm) return -1;
+    soutb(PS2_COMMAND_PORT, PS2_CMD_DISABLE_PORT1);
+
+    if (ps2_wait_input() < 0 && !vm) return -1;
+    soutb(PS2_COMMAND_PORT, PS2_CMD_READ_CONFIG);
+
+    if (ps2_wait_output(&config) < 0 && !vm) config = 0;
+
+    config |= (1 << 0);
+    config &= ~(1 << 1);
+    config &= ~(1 << 6);
+
+    if (ps2_wait_input() < 0 && !vm) return -1;
+    soutb(PS2_COMMAND_PORT, PS2_CMD_WRITE_CONFIG);
+
+    if (ps2_wait_input() < 0 && !vm) return -1;
+    soutb(PS2_DATA_PORT, config);
+
+    while (sinb(PS2_COMMAND_PORT) & PS2_STATUS_OUTPUT_BUFFER) {
+       sinb(PS2_DATA_PORT);
+    }
+
+    if (ps2_wait_input() < 0 && !vm) return -1;
+    soutb(PS2_COMMAND_PORT, PS2_CMD_ENABLE_PORT1);
+
+    while (sinb(PS2_COMMAND_PORT) & PS2_STATUS_OUTPUT_BUFFER) {
+       sinb(PS2_DATA_PORT);
+    }
+
+    if (ps2_wait_input() >= 0 || vm) {
+        soutb(PS2_DATA_PORT, 0xFF); // Reset keyboard
+
+        if (ps2_wait_output(&response) == 0) {
+            if (response == 0xFA) {
+                if (ps2_wait_output(&response) == 0 && response == 0xAA) {
+                    /* ok */
+                }
+
+                if (ps2_wait_input() >= 0 || vm) {
+                    soutb(PS2_DATA_PORT, 0xF4); // Enable scanning
+                    if (ps2_wait_output(&response) == 0) {
+                        if (response != 0xFA && !vm) return -1;
+                    } else if (!vm) {
+                        return -1;
+                    }
+                }
+                return 0;
+            } else if (response == 0xAA) {
+                return 0; // self-test only
+            } else if (vm) {
+                return 0; // unexpected byte in VM → tolerate
+            }
+            return -1; // unexpected byte on real hardware
+        }
+
+        // No response → tolerate in VM
+        if (vm) return 0;
+    }
+
+    return 0; // success by default
+}
+
+/* IRQ */
+/* NOTE: is_extended/is_pressed must persist ACROSS interrupts, since a full
+ * scancode sequence (e.g. E0 F0 4B) can be split over multiple IRQ1 firings. */
+static void ps2_irq() {
+    static bool is_extended = false;
+    static bool is_pressed = true;
+
+    /* Only read the data port if the controller actually has a byte for us. */
+    if (!(sinb(PS2_COMMAND_PORT) & PS2_STATUS_OUTPUT_BUFFER)) {
+        g_api->pic_send_eoi(1);
+        return;
+    }
+
+    uint8_t byte = sinb(PS2_DATA_PORT);
+
+    if (byte == 0xE0) {
+        is_extended = true;
+        g_api->pic_send_eoi(1);
+        return;
+    }
+
+    /* Scan code set 2 break (key-up) prefix is 0xF0, not 0x0F. */
+    if (byte == 0xF0) {
+        is_pressed = false;
+        g_api->pic_send_eoi(1);
+        return;
+    }
+
+    uint16_t final_code = byte;
+    if (is_extended) {
+        final_code |= 0xE000;
+    }
+
+    key_event_t event;
+    event.key = type2_to_kevent((PS2_ScancodeSet2)final_code, is_extended);
+    event.state = is_pressed ? STATE_PRESS : STATE_RELEASE;
+    push_key(event);
+
+    /* Reset state for the next scancode sequence. is_pressed defaults back
+     * to true (press) rather than false, since a break was only signalled
+     * by the 0xF0 prefix we may or may not have seen. */
+    is_extended = false;
+    is_pressed = true;
+
+    g_api->pic_send_eoi(1);
+}
+
+/* ENTRY */
+int sqrm_module_init(const sqrm_kernel_api_t *api) {
+    g_api = api;
+
+    size_t inputsqrm_size = 0;
+    const input_api_t *inputapi = (const input_api_t *)api->sqrm_service_get("inputmanager", &inputsqrm_size);
+    g_inptapi = inputapi;
+    if (!inputapi) {
+        kprint("INPUTSQRM NOT FOUND", PREFON);
+        return -1;
+    }
+
+    g_kbd_id = inputapi->register_controller(CONTROLLER_TYPE_KEYBOARD, "ps2keyboard1");
+    if (g_kbd_id < 0) {
+        kprint("Failed to register PS/2 keyboard controller\n", PREFON);
+        return -1;
+    }
+
+
+    int rc = ps2_init();
+    if (rc != 0) {
+        kprint("Failed to initialize PS/2\n", PREFON);
+        kprint("Is keyboard plugged in?\n", PREFOFF);
+        return -1;
+    }
+
+    api->irq_install_handler(1, ps2_irq);
+    return 0;
+}
