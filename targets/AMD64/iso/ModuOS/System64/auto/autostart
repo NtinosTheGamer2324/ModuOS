@@ -4,13 +4,22 @@
 
 // Core system services
 // critical /Apps/ntosiux_ttyman.sqr
-// service /ModuOS/System64/Apps/netd.sqr
+// bg /ModuOS/System64/Apps/netd.sqr
 // User services
 // service /Apps/userman.sqr
 service /Apps/calc_service.sqr
-bg /Apps/userctl.sqr
+//bg /Apps/userctl.sqr
+//bg /Apps/shm_demo_writer.sqr
+bg /Apps/netd.sqr
 bg /Apps/zenith5.1.sqr
 
 //bg /Apps/nodds.sqr
 //bg /Apps/nodds_demo.sqr
 //bg /Apps/ninput_test.sqr
+
+// wm-test
+//bg /Apps/mdw.sqr
+//bg /Apps/mdw_test.sqr
+//bg /Apps/demo_welcome.sqr
+//bg /Apps/demo_notes.sqr
+
