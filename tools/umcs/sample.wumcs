@@ -1,0 +1,14 @@
+; sample.wumcs — exercises R, I, B, M formats + a label/branch loop
+.cap DOUBLE_PRECISION
+
+main:
+    MOVI    r1, 3.14159265        ; load pi as a float immediate
+    MOVI    r2, 10                ; loop counter
+    LDG     r9, [r10 + 0], tex=0, sz=2
+loop:
+    FFMA    r5, r6, r7, r8, mod=0, pred=0
+    IADDI   r2, -1
+    ICMP    r0, r2, r0, r0, mod=1
+    BRAP    loop, pred=1
+    STG     r9, [r10 + 16], tex=0, sz=2
+    EXIT
