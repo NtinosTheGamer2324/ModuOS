@@ -190,8 +190,8 @@ static void collect_sysinfo(void) {
     g_api->com_write_string(0x3F8, "[md64api] Memory info collected\n");
     g_api->com_write_string(0x3F8, "[md64api] Safe Copy Static Strings\n");
     /* Static strings */
-    safe_copy(o->SystemVersion, sizeof(o->SystemVersion), "0.6.4");
-    safe_copy(o->KernelVersion, sizeof(o->KernelVersion), "0.6.4");
+    safe_copy(o->SystemVersion, sizeof(o->SystemVersion), "0.6.5");
+    safe_copy(o->KernelVersion, sizeof(o->KernelVersion), "0.6.5");
     safe_copy(o->KernelVendor,  sizeof(o->KernelVendor),  "NTSoftware");
     safe_copy(o->os_name,       sizeof(o->os_name),       "ModuOS");
     safe_copy(o->os_arch,       sizeof(o->os_arch),       "AMD64");
