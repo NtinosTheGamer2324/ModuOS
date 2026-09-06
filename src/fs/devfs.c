@@ -452,6 +452,13 @@ int devfs_close(void *handle) {
     return 0;
 }
 
+ssize_t devfs_invoke(void *handle, const void *in_buf, size_t in_size,
+                     void *out_buf, size_t out_size) {
+    devfs_handle_t *h = (devfs_handle_t *)handle;
+    if (!h || !h->ops || !h->ops->invoke) return -1;
+    return h->ops->invoke(h->opened_ctx, in_buf, in_size, out_buf, out_size);
+}
+
 /* ── Public: mmap ────────────────────────────────────────────────────── */
 
 /*

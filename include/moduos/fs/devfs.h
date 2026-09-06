@@ -44,6 +44,18 @@ typedef int (*devfs_close_fn)(void *ctx);
 typedef void* (*devfs_mmap_fn)(void *ctx, void *hint, size_t length,
                                int prot, int flags, uint64_t offset);
 
+/*
+ * devfs_invoke_fn — ioctl-style RPC on a device.
+ *
+ * Mirrors userfs_user_invoke_fn: takes an input buffer, produces an
+ * output buffer, returns bytes written to out_buf (or a negative
+ * error code). Optional; NULL means the device does not support
+ * invoke and SYS_INVOKE on it returns -ENOSYS, exactly like a UserFS
+ * node with ops.invoke == NULL.
+ */
+typedef ssize_t (*devfs_invoke_fn)(void *ctx, const void *in_buf, size_t in_size,
+                                   void *out_buf, size_t out_size);
+
 typedef enum {
     DEVFS_OWNER_KERNEL = 0,
     DEVFS_OWNER_SQRM   = 1,
@@ -68,6 +80,7 @@ typedef struct {
     devfs_write_fn       write;
     devfs_close_fn       close;
     devfs_mmap_fn        mmap;  /* optional; NULL → device does not support mmap  */
+    devfs_invoke_fn       invoke;      /* optional; NULL → device does not support invoke */
     devfs_can_replace_fn can_replace; /* optional; consulted for 3rd-party overwrite */
 } devfs_device_ops_t;
 
@@ -109,6 +122,17 @@ int devfs_list_dir_next(const char *dir_path, int *cookie,
 ssize_t devfs_read(void *handle, void *buf, size_t count);
 ssize_t devfs_write(void *handle, const void *buf, size_t count);
 int     devfs_close(void *handle);
+
+/*
+ * devfs_invoke — ioctl-style RPC on an opened device handle.
+ *
+ * Delegates to the device's ops->invoke hook. Returns -1 if the handle
+ * is invalid or the device has no invoke hook (mirrors userfs_invoke's
+ * "unsupported" contract), otherwise whatever the device's invoke
+ * callback returns.
+ */
+ssize_t devfs_invoke(void *handle, const void *in_buf, size_t in_size,
+                     void *out_buf, size_t out_size);
 
 /*
  * devfs_mmap — map a device region into the calling process's address space.

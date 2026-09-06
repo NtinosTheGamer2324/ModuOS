@@ -367,7 +367,8 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
 
 
     if (vdrive_read_sector(vdrive_id, partition_lba, sector) != VDRIVE_SUCCESS) {
-        VGA_Write("FAT32: failed to read boot sector\n");
+        VGA_Writef("FAT32 MOUNT FAIL -2: read boot sector failed (vdrive=%d lba=%u)\n",
+                   vdrive_id, partition_lba);
         kfree(sector);
         return -2;
     }
@@ -392,6 +393,8 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
         com_printf(COM1_PORT,
                    "FAT32: invalid boot signature (got 0x%x 0x%x at off=%u, bps=%u)\n",
                    sector[sig_off], sector[sig_off + 1], sig_off, bps);
+        VGA_Writef("FAT32 MOUNT FAIL -3: bad boot sig 0x%x 0x%x at off=%u bps=%u\n",
+                   sector[sig_off], sector[sig_off + 1], sig_off, bps);
         kfree(sector);
         return -3;
     }
@@ -403,6 +406,8 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
     /* Validate before calculations */
     if (fs->bytes_per_sector == 0 || fs->sectors_per_cluster == 0 || fs->num_fats == 0) {
         VGA_Write("FAT32: invalid BPB values (zero)\n");
+        VGA_Writef("FAT32 MOUNT FAIL -4: bps=%u spc=%u nfats=%u\n",
+                   fs->bytes_per_sector, fs->sectors_per_cluster, fs->num_fats);
         kfree(sector);
         return -4;
     }
@@ -410,12 +415,15 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
     if (fs->bytes_per_sector != 512 && fs->bytes_per_sector != 1024 && 
         fs->bytes_per_sector != 2048 && fs->bytes_per_sector != 4096) {
         com_printf(COM1_PORT, "FAT32: unusual bytes_per_sector=%u\n", fs->bytes_per_sector);
+        VGA_Writef("FAT32 MOUNT FAIL -5: unusual bytes_per_sector=%u\n", fs->bytes_per_sector);
         kfree(sector);
         return -5;
     }
 
     if (fs->sectors_per_cluster > 128) {
         com_printf(COM1_PORT, "FAT32: suspiciously large sectors_per_cluster=%u\n", fs->sectors_per_cluster);
+        VGA_Writef("FAT32 MOUNT FAIL -6: sectors_per_cluster=%u (bps=%u)\n",
+                   fs->sectors_per_cluster, fs->bytes_per_sector);
         kfree(sector);
         return -6;
     }
@@ -434,6 +442,7 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
 
     if (fs->sectors_per_fat == 0) {
         VGA_Write("FAT32: sectors_per_fat is 0!\n");
+        VGA_Writef("FAT32 MOUNT FAIL -7: spf16=%u spf32=%u\n", spf16, spf32);
         kfree(sector);
         return -7;
     }
@@ -444,6 +453,7 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
 
     if (fs->root_cluster < 2) {
         com_printf(COM1_PORT, "FAT32: invalid root_cluster=%u (must be >= 2)\n", fs->root_cluster);
+        VGA_Writef("FAT32 MOUNT FAIL -8: root_cluster=%u\n", fs->root_cluster);
         kfree(sector);
         return -8;
     }
@@ -456,13 +466,18 @@ int fat32_mount(int vdrive_id, uint32_t partition_lba) {
     uint32_t clus_size = (uint32_t)fs->bytes_per_sector * (uint32_t)fs->sectors_per_cluster;
     if (clus_size > FAT32_MAX_CLUSTER_SIZE) {
         com_printf(COM1_PORT, "FAT32: cluster size %u > max %u\n", clus_size, FAT32_MAX_CLUSTER_SIZE);
+        VGA_Writef("FAT32 MOUNT FAIL -9: cluster_size=%u > max=%u (bps=%u spc=%u)\n",
+                   clus_size, FAT32_MAX_CLUSTER_SIZE, fs->bytes_per_sector, fs->sectors_per_cluster);
         kfree(sector);
         return -9;
     }
 
     /* Mark as active */
     fs->active = 1;
-    
+
+    VGA_Writef("FAT32 mount OK: bps=%u spc=%u nfats=%u spf=%u root_clus=%u total_sec=%u\n",
+               fs->bytes_per_sector, fs->sectors_per_cluster, fs->num_fats,
+               fs->sectors_per_fat, fs->root_cluster, fs->total_sectors);
     com_printf(COM1_PORT, "FAT32: mount successful! handle=%d, root_cluster=%u\n", handle, fs->root_cluster);
     kfree(sector);
     return handle;

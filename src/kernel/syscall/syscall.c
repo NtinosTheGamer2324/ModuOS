@@ -1160,7 +1160,12 @@ int sys_chdir(const char *path) {
         if (!fs_directory_exists(mount, r.rel_path)) return -1;
         strncpy(proc->cwd, p, sizeof(proc->cwd) - 1);
         proc->cwd[sizeof(proc->cwd) - 1] = 0;
-        proc->current_slot = r.mount_slot;
+        // current_slot is NOT updated here. It stays pinned to the boot
+        // drive for the lifetime of the process -- it's what bare "/" and
+        // relative paths resolve against in fs_resolve_path(). cwd already
+        // encodes which drive we're in (the "$/mnt/vDriveN-Px/" prefix), so
+        // relative lookups re-derive the right mount slot from cwd on every
+        // call instead of relying on a cached slot number here.
         return 0;
     }
 

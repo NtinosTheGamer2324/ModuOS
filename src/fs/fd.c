@@ -708,7 +708,7 @@ ssize_t fd_invoke(int fd,
     }
 
     /* Only devices (UserFS / DevFS) support invoke for now */
-    if (!fd_table[fd].is_userfs /* && !fd_table[fd].is_devfs */) {
+    if (!fd_table[fd].is_userfs && !fd_table[fd].is_devfs) {
         return -2;      /* ENOTTY or ENOSYS */
     }
 
@@ -724,10 +724,12 @@ ssize_t fd_invoke(int fd,
                              out_buf, out_size);
     }
 
-    /* Future DevFS support would go here */
-    /* if (fd_table[fd].is_devfs) {
-        return devfs_invoke(fd_table[fd].cached_data, in_buf, in_size, out_buf, out_size);
-    } */
+    if (fd_table[fd].is_devfs) {
+        if (!fd_table[fd].cached_data) return -4;
+        return devfs_invoke(fd_table[fd].cached_data,
+                            in_buf, in_size,
+                            out_buf, out_size);
+    }
 
     return -2;  /* Not supported */
 }
@@ -1117,25 +1119,6 @@ typedef struct {
     char user_path[128]; /* for kind=3: subpath under $/user ("" for root) */
 } devvfs_dir_t;
 
-static void devvfs_sanitize(const char *in, char *out, size_t out_sz) {
-    if (!out || out_sz == 0) return;
-    size_t j = 0;
-    for (size_t i = 0; in && in[i] && j + 1 < out_sz; i++) {
-        char c = in[i];
-        if (c == ' ' || c == '\t') {
-            if (j == 0 || out[j - 1] == '-') continue;
-            out[j++] = '-';
-        } else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
-            out[j++] = c;
-        } else {
-            if (j == 0 || out[j - 1] == '-') continue;
-            out[j++] = '-';
-        }
-    }
-    while (j > 0 && out[j - 1] == '-') j--;
-    out[j] = 0;
-}
-
 int fd_devvfs_opendir_dev(const char *dev_subdir) {
     fd_init();
 
@@ -1306,7 +1289,12 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
         }
 
         if (h->kind == 2) {
-            // $/dev or $/dev/<subdir>: list DEVFS tree
+            // $/dev or $/dev/<subdir>: list DEVFS tree.
+            // Every present vdrive (native or SQRM-backed) has a real node
+            // registered here by vdrive_register_devfs_nodes(), so this walk
+            // alone is authoritative -- do not also synthesize vDriveN-Model
+            // names from vdrive_system directly, or every drive shows up
+            // twice (once from the tree, once synthesized).
             int d_is_dir = 0;
             int rc = devfs_list_dir_next(h->dev_path, &h->cookie, name_buf, buf_size, &d_is_dir);
             if (rc == 1) {
@@ -1314,34 +1302,7 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
                 if (size) *size = 0;
                 return 1;
             }
-
-            // After DEVFS entries, append vDrive devices only at $/dev root.
-            if (h->dev_path[0] != 0) return 0;
-
-            int count = vdrive_get_count();
-            if (h->index >= count) return 0;
-            int vdrive_id = h->index;
-            vdrive_t *d = vdrive_get((uint8_t)vdrive_id);
-            char name[96];
-            strcpy(name, "vDrive");
-            char nbuf[8];
-            itoa(vdrive_id, nbuf, 10);
-            strncat(name, nbuf, sizeof(name) - strlen(name) - 1);
-            if (d) {
-                char san[64];
-                devvfs_sanitize(d->model, san, sizeof(san));
-                if (san[0]) {
-                    strncat(name, "-", sizeof(name) - strlen(name) - 1);
-                    strncat(name, san, sizeof(name) - strlen(name) - 1);
-                }
-            }
-
-            strncpy(name_buf, name, buf_size - 1);
-            name_buf[buf_size - 1] = 0;
-            if (is_dir) *is_dir = 0;
-            if (size) *size = 0;
-            h->index++;
-            return 1;
+            return 0;
         }
 
         if (h->kind == 3) {

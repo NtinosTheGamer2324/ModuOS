@@ -145,12 +145,26 @@ int fs_resolve_path(struct process *proc, const char *path, fs_path_resolved_t *
     }
 
     if (!is_absolute) {
-        out->route = FS_ROUTE_CURRENT;
-        out->mount_slot = proc->current_slot;
-        out->mount = fs_get_mount(proc->current_slot);
-        strncpy(out->rel_path, path, sizeof(out->rel_path) - 1);
-        out->rel_path[sizeof(out->rel_path) - 1] = 0;
-        return (out->mount && out->mount->valid) ? 0 : -1;
+        const char *cwd = (proc->cwd[0] ? proc->cwd : "/");
+
+        // cwd is itself a full virtual path (e.g. "$/mnt/vDrive1-P1/sub" or
+        // "/some/dir" on the boot drive). Build the effective absolute path
+        // and recurse through the normal absolute resolver so a cwd sitting
+        // inside a $/mnt/ mount re-derives the correct mount slot from the
+        // path string itself, rather than reading a slot number cached
+        // anywhere -- current_slot is never touched by cd, so it can't be
+        // used here to find "which drive cwd is on".
+        char full[256];
+        size_t clen = strlen(cwd);
+        if (clen >= sizeof(full)) return -1;
+        strcpy(full, cwd);
+        if (clen == 0 || full[clen - 1] != '/') {
+            if (clen + 1 < sizeof(full)) { full[clen] = '/'; full[clen + 1] = 0; clen++; }
+        }
+        if (clen + strlen(path) >= sizeof(full)) return -1;
+        strcat(full, path);
+
+        return fs_resolve_path(proc, full, out);
     }
 
     // System-absolute resolution

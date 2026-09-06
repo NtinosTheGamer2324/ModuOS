@@ -4,7 +4,7 @@
 #define SYS_EXIT        0
 #define SYS_FORK        1
 #define SYS_READ        2
-#define SYS_WRITE       3
+#define SYS_WRITE       3 
 #define SYS_OPEN        4
 #define SYS_CLOSE       5
 #define SYS_WAIT        6
@@ -63,6 +63,12 @@
 
 /* Custom IPC / Device control operations (non-POSIX) */
 #define SYS_INVOKE      71  /* invoke(fd, in_buf, in_size, out_buf, out_size) */
+
+/* POSIX-ish shared memory. Not routed through fd.c/devfs: shm_open() hands
+ * back a small kernel-local handle that is only meaningful as the `fd` arg
+ * to mmap(..., MAP_SHARED, handle). See ipc/shm.h. */
+#define SYS_SHM_OPEN    76  /* shm_open(name, oflags, mode, size) -> handle or -errno */
+#define SYS_SHM_UNLINK  77  /* shm_unlink(name) -> 0 or -errno */
 
 /* Filesystem mount/unmount */
 #define SYS_MOUNT       65  /* mount(vdrive_id, partition_lba, fs_type) -> slot or -errno */

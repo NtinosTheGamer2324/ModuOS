@@ -56,6 +56,11 @@ int sys_userfs_register(const userfs_user_node_t *user_node);
 void* sys_mmap(void *addr, size_t size, int prot, int flags, int fd);
 int   sys_munmap(void *addr, size_t size);
 
+/* Shared memory (see ipc/shm.h). fd for sys_mmap() with MAP_SHARED set is a
+ * handle from sys_shm_open(), not a real file descriptor. */
+int sys_shm_open(const char *name, int oflags, uint32_t mode, uint64_t size);
+int sys_shm_unlink(const char *name);
+
 md64api_sysinfo_data* sys_get_sysinfo(void);
 int sys_get_sysinfo2(md64api_sysinfo_data_u *out, size_t out_size);  // Changed to return pointer
 
