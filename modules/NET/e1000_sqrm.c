@@ -60,7 +60,8 @@ SQRM_DEFINE_MODULE(SQRM_TYPE_NET, "e1000");
 #define E1000_RCTL_UPE      (1 << 3)   // Unicast Promiscuous Enable
 #define E1000_RCTL_MPE      (1 << 4)   // Multicast Promiscuous Enable
 #define E1000_RCTL_BAM      (1 << 15)  // Broadcast Accept Mode
-#define E1000_RCTL_BSIZE_8K (3 << 16)  // Buffer Size 8K
+#define E1000_RCTL_BSEX      (1 << 25)  // Buffer Size Extension
+#define E1000_RCTL_BSIZE_8K  ((1 << 16) | E1000_RCTL_BSEX)  // BSIZE=01b + BSEX = 8192B
 #define E1000_RCTL_SECRC    (1 << 26)  // Strip Ethernet CRC
 
 // Transmit Control Bits
@@ -428,6 +429,19 @@ static int net_get_mac(uint8_t out_mac[6]) {
     return 0;
 }
 
+// How many consecutive EAGAINs on the *same* tx_tail index we tolerate
+// before assuming that descriptor's completion was lost (rather than just
+// slow) and forcing it back into rotation. Without this, a single
+// descriptor whose DD bit never gets set -- for whatever reason -- wedges
+// tx_tail forever: every future net_tx_frame() call re-checks that exact
+// descriptor and returns EAGAIN, permanently, since tail never advances
+// past it. That previously surfaced as "netd works for a couple of
+// requests, then every send silently fails from then on".
+#define E1000_TX_STUCK_RETRY_LIMIT 20000
+
+static uint32_t g_tx_stall_index = 0;
+static uint32_t g_tx_stall_count = 0;
+
 static int net_tx_frame(const void *frame, size_t len) {
     if (!frame || len == 0 || len > E1000_BUFFER_SIZE) {
         return -22; // -EINVAL
@@ -438,7 +452,30 @@ static int net_tx_frame(const void *frame, size_t len) {
     
     // Wait if descriptor is not available
     if (!(desc->status & E1000_DESC_STATUS_DD)) {
-        return -11; // -EAGAIN
+        if (g_tx_stall_index == tail) {
+            g_tx_stall_count++;
+        } else {
+            g_tx_stall_index = tail;
+            g_tx_stall_count = 1;
+        }
+
+        if (g_tx_stall_count < E1000_TX_STUCK_RETRY_LIMIT) {
+            return -11; // -EAGAIN -- caller should retry shortly
+        }
+
+        // We've been handed EAGAIN on this exact descriptor this many
+        // times in a row with no completion ever landing -- treat it as
+        // lost, not just slow, and reclaim the slot so the ring doesn't
+        // stay wedged for the rest of the session. This drops whatever
+        // frame was in flight on that descriptor, but a dropped frame is
+        // recoverable (retransmit/timeout at the protocol layer); a
+        // permanently dead TX ring is not.
+        if (g_api->com_write_string) {
+            g_api->com_write_string(COM1_PORT,
+                "[e1000] tx descriptor stuck, forcing reclaim\n");
+        }
+        desc->status = E1000_DESC_STATUS_DD;
+        g_tx_stall_count = 0;
     }
     
     // Copy frame to TX buffer
