@@ -2,6 +2,7 @@
 #include <stdint.h>
 
 #include "usbmaster/usbmaster_hc_api.h"
+#include "usbmaster/usb_types.h"
 
 /* Globals */
 const sqrm_kernel_api_t *g_api;
@@ -30,17 +31,6 @@ typedef struct __attribute__((packed)) {
     uint32_t bufAddress;
     uint32_t sysuse[4];
 } uhci_td_t;
-
-/* Enums */
-    /* Driver errors, not controller */
-typedef enum {
-    esuccess = 0,
-    egeneral,
-    eallocfail,
-    etimeout,
-    enotfound,
-    ebarnotio,
-} err;
 
 /* I/O Registers */
 #define USBCMD   0x00
@@ -301,8 +291,13 @@ static int uhci_send_setup_packet(uint8_t device_address, usb_setup_packet_t pac
 
     uint32_t status_max_len = (0 - 1) & 0x7FF; /* zero-length quirk = 0x7FF */
 
+    /* Status stage direction is the OPPOSITE of the data stage direction.
+     * If there is no data stage at all (data_td_count == 0, e.g. SET_ADDRESS),
+     * the status stage is always IN. */
+    uint32_t status_pid = (data_td_count > 0) ? 0xE1 /* OUT */ : 0x69 /* IN */;
+
     uint32_t status_packet_header =
-        (0xE1) |                          /* Packet Type = OUT */
+        (status_pid) |                    /* Packet Type = OUT or IN, see above */
         (device_address << 8) |           /* Device */
         (0 << 15) |                       /* Endpoint 0 */
         (1 << 19) |                       /* Data Toggle = 1, always for STATUS */
@@ -313,8 +308,13 @@ static int uhci_send_setup_packet(uint8_t device_address, usb_setup_packet_t pac
     uint32_t status_status = (1 << 23) | (1 << 26) | (1 << 24) | (3 << 27);
     status_td_ptr->Status = status_status;
 
-    /* Chain: setup -> data[0] */
-    setup_td_ptr->nextDescriptor = data_td[0].phys | (1 << 2);
+    /* Chain: setup -> data[0], or setup -> status directly if there's no data stage
+     * (e.g. SET_ADDRESS, which has response_len == 0 / data_td_count == 0). */
+    if (data_td_count > 0) {
+        setup_td_ptr->nextDescriptor = data_td[0].phys | (1 << 2);
+    } else {
+        setup_td_ptr->nextDescriptor = status_td.phys | (1 << 2);
+    }
 
     /* Chain: data[i] -> data[i+1], last data -> status */
     for (int i = 0; i < data_td_count; i++) {
@@ -508,83 +508,6 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
 
     }
 
-    for (int n = 0; n < g_uhci_ports; n++) {
-        uint16_t portsc1 = uhci_read16(PORTSC1 + (n * 2));
-
-        if ((portsc1 & 0x01) == 1) {
-            kprint("[UHCI]:  Device Attached! n=");
-
-            char buf[32];
-            itoa(n, buf, 10);
-            kprint(buf);
-            kprint("\n");
-
-            int r = uhci_enable_port(n);
-            if (r == esuccess) {
-                kprint("[UHCI]: Device Enabled! n=");
-                kprint(buf);
-                kprint("\n");
-
-                usb_setup_packet_t get_desc = {
-                    .RequestType = 0x80,
-                    .Request = 6,
-                    .Value = (1 << 8) | 0,
-                    .Index = 0,
-                    .Length = 18
-                };
-            
-                uint8_t device_descriptor[18];
-            
-                int td_result = uhci_send_setup_packet(0, get_desc, device_descriptor, 18);
-            
-                if (td_result == esuccess) {
-                    kprint("[UHCI]: Got device descriptor!\n");
-                    /* print raw bytes for now */
-                    for (int b = 0; b < 18; b++) {
-                        char hexbuf[8];
-                        itoa(device_descriptor[b], hexbuf, 16);
-                        kprint(hexbuf);
-                        kprint(" ");
-                    }
-                    kprint("\n");
-
-                    uint16_t vendor_id = device_descriptor[8] | (device_descriptor[9] << 8);
-                    uint16_t product_id = device_descriptor[10] | (device_descriptor[11] << 8);
-                    uint16_t device_class = device_descriptor[4];
-
-                    /* Device Info */
-                    kprint("[UHCI]: Product ID:");
-                    char productbuf[32];
-                    itoa(product_id, productbuf, 10);
-                    kprint(productbuf);
-
-                    kprint(" Vendor ID: ");
-                    char vendorbuf[32];
-                    itoa(vendor_id, vendorbuf, 10);
-                    kprint(vendorbuf);
-                    
-                    kprint(" Device Class: ");
-                    char classbuf[32];
-                    itoa(device_class, classbuf, 10);
-                    kprint(classbuf);
-                    kprint("\n");
-                } else {
-                    kprint("[UHCI]: GET_DESCRIPTOR failed.\n");
-                }
-            } else {
-                kprint("[UHCI]: Device Enable FAILED! n=");
-                kprint(buf);
-                kprint("\n");
-                kprint("err=");
-
-                char errbuf[32];
-                itoa(r, errbuf, 10);
-                kprint(errbuf);
-                kprint("\n");
-            }
-        }
-    }
-
     static uhci_hc_api_t uhci_api;
 
     /* Providing UHCI functions to the API struct */
@@ -595,6 +518,8 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
 
     /* Register the UHCI Hardware Controller API */
     api->sqrm_service_register("uhci_hc", &uhci_api, sizeof(uhci_api));
+
+    /* From now on, UHCI driver is done, the USBMASTER will handle all USB specific stuff */
 
     return esuccess;
 }

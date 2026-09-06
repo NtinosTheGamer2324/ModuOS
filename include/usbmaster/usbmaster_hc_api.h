@@ -27,4 +27,14 @@ typedef enum {
     pdisconnected = false
 } port_state;
 
+/* Error status NonUSB, Driver ones */
+typedef enum {
+    esuccess = 0,
+    egeneral,
+    eallocfail,
+    etimeout,
+    enotfound,
+    ebarnotio,
+} err;
+
 #endif
