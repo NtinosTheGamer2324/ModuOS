@@ -4,6 +4,7 @@
 *.img
 dump.txt
 file_dump.bat
+.h.*.*
 
 #############################################
 # WSLK Stuff
