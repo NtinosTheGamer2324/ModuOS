@@ -1,25 +1,17 @@
 // ModuOS System Services
-// This file is read by automan (PID 1) on boot
-
+// This file is read by automan (PID 1 OR 2 (based on the kernel mood)) on boot
 
 // Core system services
-// critical /Apps/ntosiux_ttyman.sqr
-// bg /ModuOS/System64/Apps/netd.sqr
+// critical /Apps/ntosiux_ttyman.sqr // BS -- deprecated -- delete -- TTY Will eventualy exist, but in-kernel for serveral issues -- also not as a SQRM but baked into the kernel.
+
 // User services
-// service /Apps/userman.sqr
-service /Apps/calc_service.sqr
-//bg /Apps/userctl.sqr
-//bg /Apps/shm_demo_writer.sqr
+//service /Apps/calc_service.sqr // UserFS demo
+//bg /Apps/userctl.sqr // Do not use, no work currently.
+//bg /Apps/shm_demo_writer.sqr // SHARED MEMORY demo
 bg /Apps/netd.sqr
-bg /Apps/zenith5.1.sqr
+//bg /Apps/timed.sqr // This will FREEZE the system, i have no clue why, do not ask why. If someone can fix it, FIX IT. (I spent 5 hours debugging this piece of shit)
+bg /Apps/zenith5.1.sqr // the best shell on earth.
 
-//bg /Apps/nodds.sqr
-//bg /Apps/nodds_demo.sqr
-//bg /Apps/ninput_test.sqr
-
-// wm-test
-//bg /Apps/mdw.sqr
-//bg /Apps/mdw_test.sqr
-//bg /Apps/demo_welcome.sqr
-//bg /Apps/demo_notes.sqr
-
+// MDW
+//bg /Apps/mdw.sqr // This is GUI, Very cool, see it, if you can. just uncomment them and comment zenith5.1.sqr
+//bg /Apps/shellmgr.sqr // same as MDW, this one launches all the needed apps for the desktop (taskbar, desktop, bindkeys)
