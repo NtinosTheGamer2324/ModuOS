@@ -5,6 +5,7 @@
 #include "moduos/kernel/COM/com.h"
 // #include "moduos/kernel/process/process.h"  /* process_exit, schedule */  // OLD
 #include "moduos/kernel/process/process.h"
+#include "moduos/kernel/process/signals.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/macros.h"
 #include "moduos/kernel/panic.h"
@@ -13,7 +14,7 @@
 
 // Debug: last syscall info (from syscall.c)
 extern volatile uint64_t g_last_syscall_num;
-extern volatile uint64_t g_last_syscall_args[5];
+extern volatile uint64_t g_last_syscall_args[6];
 
 // Assembly stubs (defined in fault.asm)
 extern void fault_stub_0(void);
@@ -36,6 +37,20 @@ extern void fault_stub_18(void);
 extern void fault_stub_19(void);
 
 static void format_hex64(uint64_t value, char* buffer);
+
+static void fault_terminate_user(interrupt_frame_t *frame, int signal_number) {
+    if (!frame || (frame->cs & 3) != 3) return;
+    process_t *p = process_get_current();
+    if (p) {
+        com_write_string(COM1_PORT, "[FAULT] Unhandled user exception in PID ");
+        char buf[12];
+        itoa((int)p->pid, buf, 10);
+        com_write_string(COM1_PORT, buf);
+        com_write_string(COM1_PORT, "\n");
+    }
+    process_exit(128 + signal_number);
+    for (;;) __asm__ volatile("hlt");
+}
 
 // Store last user-mode page fault details for debugging (COM1 only)
 typedef struct {
@@ -345,8 +360,6 @@ static void fault_dump_rip_bytes(uint64_t rip) {
 }
 
 void fault_handler_invalid_opcode(interrupt_frame_t *frame) {
-    fault_dump_rip_bytes(frame->rip);
-
     /* If CPL=3, treat as user process crash and terminate instead of panicking kernel. */
     if ((frame->cs & 3) == 3) {
         process_t *p = process_get_current();
@@ -362,6 +375,7 @@ void fault_handler_invalid_opcode(interrupt_frame_t *frame) {
         for (;;) { __asm__ volatile("hlt"); }
     }
 
+    fault_dump_rip_bytes(frame->rip);
     fault_panic("Invalid Opcode", 
                 "CPU encountered an invalid or unsupported instruction.", 
                 frame, "INVALID_OPCODE");
@@ -391,12 +405,14 @@ void fault_handler_double_fault(uint64_t error_code, interrupt_frame_t *frame) {
 }
 
 void fault_handler_invalid_tss(uint64_t error_code, interrupt_frame_t *frame) {
+    fault_terminate_user(frame, SIGFAULT_GENERAL);
     fault_panic("Invalid TSS", 
                 "Task State Segment reference is invalid.", 
                 frame, "INVALID_TSS");
 }
 
 void fault_handler_segment_not_present(uint64_t error_code, interrupt_frame_t *frame) {
+    fault_terminate_user(frame, SIGFAULT_SEG_NOT_PRESENT);
     char message[256];
     char selector[19];
     format_hex64(error_code & 0xFFFF, selector);
@@ -415,6 +431,7 @@ void fault_handler_segment_not_present(uint64_t error_code, interrupt_frame_t *f
 }
 
 void fault_handler_stack_fault(uint64_t error_code, interrupt_frame_t *frame) {
+    fault_terminate_user(frame, SIGFAULT_STACK_SEGMENT);
     fault_panic("Stack Segment Fault", 
                 "Stack segment limit exceeded or stack segment not present.", 
                 frame, "STACK_FAULT");
@@ -471,22 +488,6 @@ void fault_handler_general_protection(uint64_t error_code, interrupt_frame_t *fr
             com_write_string(COM1_PORT, " RFLAGS=0x");
             format_hex64(frame->rflags, hexbuf);
             com_write_string(COM1_PORT, hexbuf);
-            com_write_string(COM1_PORT, "\n");
-
-            /* Best-effort instruction bytes */
-            uint8_t bytes[16];
-            memset(bytes, 0, sizeof(bytes));
-            memcpy(bytes, (const void*)(uintptr_t)frame->rip, sizeof(bytes));
-            com_write_string(COM1_PORT, "[FAULT]  bytes:");
-            for (int i = 0; i < 16; i++) {
-                static const char *hx = "0123456789abcdef";
-                char b[4];
-                b[0] = ' ';
-                b[1] = hx[(bytes[i] >> 4) & 0xF];
-                b[2] = hx[bytes[i] & 0xF];
-                b[3] = 0;
-                com_write_string(COM1_PORT, b);
-            }
             com_write_string(COM1_PORT, "\n");
 
             process_exit(128 + 13);
@@ -551,7 +552,9 @@ void fault_handler_general_protection(uint64_t error_code, interrupt_frame_t *fr
     fault_panic("General Protection Fault", message, frame, "GPF");
 }
 
-void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame) {
+void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame,
+                              fault_user_iret_frame_t *user_frame,
+                              fault_saved_regs_t *saved_regs) {
     /* Reentrancy guard: if we fault while handling a page fault, stop immediately.
      * For user-mode faults we can still recover by killing the process.
      */
@@ -767,6 +770,11 @@ after_heap_demand: ;
 
                 /* If it's a user-range fault and not handled as stack growth, kill the process. */
                 if (addr >= p->user_stack_limit && addr < user_hi) {
+                    if (fault_try_deliver_user_signal(14, error_code,
+                                                      user_frame, saved_regs)) {
+                        in_pf = 0;
+                        return;
+                    }
                     com_write_string(COM1_PORT, "\n[FAULT] User-range #PF not stack-growth; killing PID ");
                     char buf[12]; itoa((int)p->pid, buf, 10); com_write_string(COM1_PORT, buf);
                     com_write_string(COM1_PORT, "\n");
@@ -957,6 +965,11 @@ after_ptw:
      * IMPORTANT: do not call schedule() here; process_exit() will context-switch away.
      */
     if ((frame->cs & 3) == 3) {
+        if (fault_try_deliver_user_signal(14, error_code, user_frame,
+                                          saved_regs)) {
+            in_pf = 0;
+            return;
+        }
         process_t *p = process_get_current();
         if (p) {
             com_write_string(COM1_PORT, "[FAULT] User-mode #PF in PID ");

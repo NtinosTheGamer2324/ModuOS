@@ -36,22 +36,22 @@
 #define SYS_WRITEFILE   24
 #define SYS_INPUT       28 // DO NOT USE - Deprecated
 #define SYS_SSTATS      29 /* SYS_SSTATS (29) removed — use $/dev/md64api/sysinfo via DevFS instead. */
-#define SYS_SSTATS2     38 /* fill user buffer with md64api_sysinfo_data_u  This literrly does not live anywhere, useless shit. - Deprecated*/
+#define SYS_SSTATS2     38 /* fill user buffer with md64api_sysinfo_data_u  This literrly does not live anywhere, useless shit. - Deprecated - Use MD64API aka $/dev/md64api/sysinfo */
 // VFS formatting / mkfs
 #define SYS_VFS_MKFS    36
-#define SYS_VFS_GETPART 37
-#define SYS_VFS_MBRINIT 41
+#define SYS_VFS_GETPART 37 /* Deprecated - do not use - vDrive userland IO exists for a reason. */
+#define SYS_VFS_MBRINIT 41 /* Deprecated - do not use - vDrive userland IO exists for a reason. */
 /* User identity */
 #define SYS_GETUID_OF_OTHER_PROCESS 32
 #define SYS_GETUID      33
 #define SYS_SETUID      34
 #define SYS_SETUID_OF_OTHER_PROCESS 35
-/* Graphics/VGA - REMOVED: ~~Use $/dev/graphics/video0 instead~~ use $/dev/mvc/mvi0*/
+/* Graphics/VGA - REMOVED: ~~Use $/dev/graphics/video0 instead~~ use $/dev/mvc/mvi0 */
 /* Virtual memory mapping (userland dynamic linker support) */
 #define SYS_MMAP        39
 #define SYS_MUNMAP      40
 #define SYS_DEV_MMAP    51
-/* Networking - REMOVED: Use $/user/network/* (NetMan service) instead */
+/* Networking - REMOVED: ~~Use $/user/network/* (NetMan service) instead~~ - use the NETD (SHM) mailbox!!!!!! */
 /* FS tracing (timing) */
 #define SYS_FS_TRACE        55 /* arg1=0/1 set, returns previous state */
 #define SYS_OPENDIR         56 /* opendir(path) -> dirfd */
@@ -81,6 +81,10 @@
 #define SYS_VDRIVE_WRITE_SECTOR 98
 #define SYS_VDRIVE_READ_SECTOR 99
 
+/* Dynamic-linker hand-off: dlinfo(dlinfo_t *out) -> 0 or -errno. Only valid
+ * for images started through PT_INTERP. See loader/dlinfo.h. */
+#define SYS_DLINFO      100
+
 
 /* POSIX fd operations */
 #define SYS_DUP         68  /* dup(oldfd) -> newfd or -errno */
@@ -93,7 +97,7 @@
 #define SYS_GETEUID     74  /* geteuid() -> euid */
 #define SYS_GETEGID     75  /* getegid() -> egid */
 
-/* GPU Core - REMOVED: Use $/dev/graphics/video0 (DevFS) instead */
+/* GPU Core - REMOVED: ~~Use $/dev/graphics/video0 (DevFS) instead~~ USE MVC3 ($/mvc3/mvi0) aka JUST NodGL, If you are planning to make a window than owning the frame buffer use MDW */
 
 /* POSIX Signals */
 #define SYS_SIGNAL             87  /* signal(signum, handler) -> old_handler or -errno */

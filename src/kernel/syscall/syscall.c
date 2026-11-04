@@ -39,7 +39,11 @@
 /* Forward declarations */
 uint64_t sys_signal(int sig, uint64_t handler);
 int sys_raise(int sig);
+int sys_sigaction(int sig, const signal_action_t *user_action,
+                  signal_action_t *user_old_action);
+uint64_t sys_rt_sigreturn(void);
 int sys_fd_inject(uint32_t pid, int fd, void *arg);
+int sys_getenv(const char *user_key, char *user_buf, size_t buflen);
 
 /* Helper: Copy string from userspace to kernel buffer */
 static int copy_string_from_user(const char *user_str, char *kernel_buf, size_t max_len) {
@@ -64,7 +68,7 @@ static int copy_string_from_user(const char *user_str, char *kernel_buf, size_t 
 extern void syscall_entry(void);
 
 volatile uint64_t g_last_syscall_num = 0;
-volatile uint64_t g_last_syscall_args[5] = {0,0,0,0,0};
+volatile uint64_t g_last_syscall_args[6] = {0,0,0,0,0,0};
 volatile uint64_t g_syscall_entry_rbp = 0;
 
 static int sys_vfs_mkfs(const vfs_mkfs_req_t *user_req);
@@ -91,13 +95,15 @@ void syscall_init(void) {
 extern void check_signals(void);
 
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
-                         uint64_t arg3, uint64_t arg4, uint64_t arg5) {
+                         uint64_t arg3, uint64_t arg4, uint64_t arg5,
+                         uint64_t arg6) {
     g_last_syscall_num = syscall_num;
     g_last_syscall_args[0] = arg1;
     g_last_syscall_args[1] = arg2;
     g_last_syscall_args[2] = arg3;
     g_last_syscall_args[3] = arg4;
     g_last_syscall_args[4] = arg5;
+    g_last_syscall_args[5] = arg6;
     
     // DEBUG: Check PID 2 before each syscall from PID 4
     extern process_t *process_get_by_pid(uint32_t);
@@ -177,6 +183,11 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_SBRK:    return (uint64_t)sys_sbrk((intptr_t)arg1);
         case SYS_KILL:    return sys_kill((int)arg1, (int)arg2);
         case SYS_SIGNAL:  return sys_signal((int)arg1, (uint64_t)arg2);
+        case SYS_SIGACTION:
+            return (uint64_t)sys_sigaction((int)arg1,
+                (const signal_action_t *)(uintptr_t)arg2,
+                (signal_action_t *)(uintptr_t)arg3);
+        case SYS_RT_SIGRETURN: return sys_rt_sigreturn();
         case SYS_RAISE:   return sys_raise((int)arg1);
         case SYS_FD_INJECT: return sys_fd_inject((uint32_t)arg1, (int)arg2, (void*)arg3);
         case SYS_TIME:    return sys_time();
@@ -202,6 +213,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             return (uint64_t)sys_mmap((void*)arg1, (size_t)arg2, (int)arg3, (int)arg4, (int)arg5);
         case SYS_MUNMAP:
             return (uint64_t)sys_munmap((void*)arg1, (size_t)arg2);
+        case SYS_DLINFO:
+            return (uint64_t)(int64_t)sys_dlinfo((void*)arg1);
         case SYS_SHM_OPEN:
             return (uint64_t)(int64_t)sys_shm_open((const char*)arg1, (int)arg2,
                                                     (uint32_t)arg3, (uint64_t)arg4);
@@ -212,7 +225,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_VFS_GETPART:
             return (uint64_t)sys_vfs_getpart((const vfs_part_req_t*)arg1, (vfs_part_info_t*)arg2);
         case SYS_VFS_MBRINIT:
-            return (uint64_t)sys_vfs_mbrinit((const vfs_mbrinit_req_t*)arg1);
+            /* DEPRECATED MAN. */
+            return -1;
         case SYS_USERFS_REGISTER:
             return (uint64_t)sys_userfs_register((const userfs_user_node_t*)arg1);
         case SYS_INVOKE:
@@ -302,23 +316,24 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             // For now, just return success so the init process doesn't abort
             return 0;
         }
+        case SYS_GETENV:
+            return (uint64_t)(int64_t)sys_getenv((const char*)arg1,
+                                                  (char*)arg2,
+                                                  (size_t)arg3);
 
         case SYS_DEV_MMAP: {
             /*
-             * The userland dev_mmap() puts `offset` in r9 (6th SysV arg register).
-             * Our dispatcher only receives 5 args, so we read r9 directly here.
-             * This is safe: r9 is caller-saved and the syscall entry stub has not
-             * clobbered it before reaching this point.
+             * offset is now a real 6th syscall argument (arg6), passed by
+             * both entry stubs on the stack and forwarded through
+             * syscall_handler like arg1..arg5. See syscall64_entry.asm /
+             * syscall_entry.asm for how it is loaded.
              */
-            uint64_t s_offset;
-            __asm__ volatile ("mov %%r9, %0" : "=r"(s_offset));
-        
             void *va = fd_mmap((int)arg1,       /* fd     */
                                (void*)arg2,     /* hint   */
                                (size_t)arg3,    /* length */
                                (int)arg4,       /* prot   */
                                (int)arg5,       /* flags  */
-                               s_offset);       /* offset */
+                               arg6);           /* offset */
             return (uint64_t)(uintptr_t)va;
         }
 
@@ -418,7 +433,6 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
                 return -EPERM;
             }
         }
-
 
         default:
             if (kernel_debug_is_med()) {
@@ -887,6 +901,15 @@ int sys_munmap(void *addr, size_t size) {
     return 0;
 }
 
+int sys_dlinfo(void *out_user) {
+    process_t *p = process_get_current();
+    if (!p || !p->is_user) return -EPERM;
+    if (!out_user) return -EFAULT;
+    if (p->dl_info.version != DLINFO_VERSION) return -ENOENT;
+    if (usercopy_to_user(out_user, &p->dl_info, sizeof(p->dl_info)) != 0) return -EFAULT;
+    return 0;
+}
+
 int sys_shm_open(const char *name, int oflags, uint32_t mode, uint64_t size) {
     process_t *p = process_get_current();
     if (!p || !p->is_user) return -EPERM;
@@ -900,6 +923,8 @@ int sys_shm_unlink(const char *name) {
 }
 
 int sys_kill(int pid, int sig) {
+    if (pid <= 0) return -EINVAL;
+    if (sig < 0 || sig >= 64) return -EINVAL;
     return send_signal((uint32_t)pid, sig);
 }
 
@@ -908,8 +933,9 @@ int sys_kill(int pid, int sig) {
 // Time API: milliseconds since boot (PIT ticks). PIT runs at 100Hz by default.
 uint64_t sys_time(void) {
     const uint64_t ticks = get_system_ticks();
-    return ticks * 10ULL; // 100Hz => 10ms per tick
+    return ticks_to_ms(ticks);
 }
+
 int sys_stat(const char *path, void *out_info, size_t out_size) {
     if (!path || !out_info || out_size < sizeof(fs_file_info_t)) return -1;
 
@@ -1537,6 +1563,10 @@ static int sys_pidinfo(uint32_t pid, md64api_pid_info_u *out, size_t out_size) {
 
     if (p->user_image_end > p->user_image_base) {
         info.mem_image_bytes = p->user_image_end - p->user_image_base;
+    }
+    if (p->dl_info.version == DLINFO_VERSION &&
+        p->user_interp_end > p->dl_info.interp_base) {
+        info.mem_image_bytes += p->user_interp_end - p->dl_info.interp_base;
     }
     if (p->user_heap_end > p->user_heap_base) {
         info.mem_heap_bytes = p->user_heap_end - p->user_heap_base;

@@ -11,7 +11,7 @@
 
 static volatile uint64_t system_ticks = 0;
 static volatile int in_timer_handler = 0;
-static volatile uint32_t pit_hz = 100;
+volatile uint32_t pit_hz = 100;
 static volatile int apic_tick_enabled = 0;
 
 uint32_t get_pit_frequency(void) {

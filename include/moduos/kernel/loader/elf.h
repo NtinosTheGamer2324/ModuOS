@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "moduos/kernel/loader/dlinfo.h"
 
 // ELF identification
 #define EI_MAG0       0
@@ -115,6 +116,16 @@ int elf_load_with_args(const void *elf_data, size_t size, uint64_t *entry_point,
  * If no PT_INTERP, returns 0. On error, returns -1.
  */
 int elf_get_interp_path(const void *elf_data, size_t size, char *out, size_t out_size);
+
+/* Maps a PT_INTERP executable and its interpreter into the current build PML4
+ * and returns the interpreter's entry as the process entry point. The
+ * executable is mapped at its linked addresses (no bias); the interpreter must
+ * not overlap it. *out_info is filled for SYS_DLINFO. Returns 0 on success. */
+int elf_load_dynamic(const void *exe, size_t exe_size,
+                     const void *interp, size_t interp_size,
+                     uint64_t *entry_point,
+                     uint64_t *out_image_base, uint64_t *out_image_end,
+                     uint64_t *out_interp_end, dlinfo_t *out_info);
 
 int elf_load_process(const char *path, char *const argv[]);
 

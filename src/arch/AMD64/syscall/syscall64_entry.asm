@@ -10,7 +10,7 @@
 ;   CS  = STAR.kernel_cs, SS = STAR.kernel_cs + 8
 ;   IF  = 0 (cleared by FMASK)
 ;   RAX = syscall number
-;   RDI, RSI, RDX = args 1–3
+;   RDI, RSI, RDX = args 1-3
 ;   R10 = arg 4   (RCX is clobbered by hardware)
 ;   R8  = arg 5
 
@@ -68,27 +68,41 @@ syscall64_entry:
     mov rbp, rsp
     mov [rel g_syscall_entry_rbp], rbp
 
-    ; SysV ABI 16-byte stack alignment before the C call.
-    test rsp, 0xF
-    jz .aligned
-    sub rsp, 8
-.aligned:
-
     ; Map saved registers to C arguments.
     ; Frame at rbp: [0]=rax(num) [8]=rbx [16]=rcx [24]=rdx
     ;               [32]=rsi     [40]=rdi [48]=rbp [56]=r8
     ;               [64]=r9      [72]=r10 [80]=r11 [88]=r12
     ;               [96]=r13     [104]=r14 [112]=r15
     ; iretq frame:  RIP CS RFLAGS RSP SS
-    mov rdi, [rbp]          ; syscall_num  ← saved rax
-    mov rsi, [rbp + 40]     ; arg1         ← saved rdi
-    mov rdx, [rbp + 32]     ; arg2         ← saved rsi
-    mov rcx, [rbp + 24]     ; arg3         ← saved rdx
-    mov r8,  [rbp + 72]     ; arg4         ← saved r10
-    mov r9,  [rbp + 56]     ; arg5         ← saved r8
+    ;
+    ; arg6 (7th C parameter) is passed on the stack per SysV ABI (only
+    ; the first 6 integer/pointer args go in registers: rdi, rsi, rdx,
+    ; rcx, r8, r9). The user's real 6th syscall argument was saved at
+    ; entry as the original r9 -- read it from the frame and push it
+    ; before the call, not from the live r9 register, which we reuse
+    ; below to carry arg5 into the call per the register convention.
+    mov rax, [rbp + 64]     ; arg6 (offset) <- saved r9
+
+    mov rdi, [rbp]          ; syscall_num  <- saved rax
+    mov rsi, [rbp + 40]     ; arg1         <- saved rdi
+    mov rdx, [rbp + 32]     ; arg2         <- saved rsi
+    mov rcx, [rbp + 24]     ; arg3         <- saved rdx
+    mov r8,  [rbp + 72]     ; arg4         <- saved r10
+    mov r9,  [rbp + 56]     ; arg5         <- saved r8
+
+    ; SysV ABI: rsp must be 16-aligned at the call instruction, i.e.
+    ; 16n+8 right before it (call then pushes an 8-byte return address).
+    ; We are about to push exactly one stack argument (arg6), so align
+    ; for that push here.
+    test rsp, 0xF
+    jz .push_arg6
+    sub rsp, 8
+.push_arg6:
+    push rax                ; arg6 (offset), 7th C parameter, on-stack
 
     cld
     call syscall_handler
+    add rsp, 8               ; pop the on-stack arg6
 
     mov rsp, rbp
     mov [rsp], rax          ; return value into saved-rax slot
@@ -98,7 +112,7 @@ syscall64_entry:
     ; we honour it here so the process doesn't get an extra unearned time slice
     ; just because it happened to be in a syscall.
     ; Interrupts are still off (FMASK cleared IF on entry); schedule() is safe
-    ; to call here on the kernel stack — it will re-enable interrupts via
+    ; to call here on the kernel stack -- it will re-enable interrupts via
     ; popfq inside context_switch_asm when it switches to the next process.
 extern should_reschedule
 extern schedule

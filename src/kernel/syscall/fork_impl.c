@@ -72,11 +72,16 @@ static int clone_user_address_space(process_t *parent, process_t *child) {
     uint64_t *child_pml4 = (uint64_t *)phys_to_virt_kernel(child_cr3 & ~0xFFFULL);
     if (!child_pml4) return -ENOMEM;
 
-    struct range { uint64_t a, b; } ranges[4];
+    struct range { uint64_t a, b; } ranges[5];
     int rn = 0;
 
     if (parent->user_image_base && parent->user_image_end > parent->user_image_base)
         ranges[rn++] = (struct range){ parent->user_image_base, parent->user_image_end };
+    if (parent->dl_info.version == DLINFO_VERSION &&
+        parent->dl_info.interp_base &&
+        parent->user_interp_end > parent->dl_info.interp_base)
+        ranges[rn++] = (struct range){ parent->dl_info.interp_base,
+                                       parent->user_interp_end };
     if (parent->user_heap_base && parent->user_heap_end > parent->user_heap_base)
         ranges[rn++] = (struct range){ parent->user_heap_base, parent->user_heap_end };
     if (parent->user_mmap_base && parent->user_mmap_end > parent->user_mmap_base)
@@ -95,12 +100,7 @@ static int clone_user_address_space(process_t *parent, process_t *child) {
         uint64_t end   = (ranges[i].b + 0xFFFULL) & ~0xFFFULL;
         for (uint64_t v = start; v < end; v += 0x1000ULL) {
             uint64_t parent_phys = paging_virt_to_phys(v);
-            if (!parent_phys) {
-                com_write_string(COM1_PORT, "[FORK] Skipping unmapped page at 0x");
-                com_write_hex64(COM1_PORT, v);
-                com_write_string(COM1_PORT, "\n");
-                continue;
-            }
+            if (!parent_phys) continue;
             uint64_t pte = paging_get_pte(v);
             if (!(pte & PFLAG_USER)) continue;
 
@@ -155,12 +155,14 @@ static int clone_user_address_space(process_t *parent, process_t *child) {
 
     child->user_image_base  = parent->user_image_base;
     child->user_image_end   = parent->user_image_end;
+    child->user_interp_end  = parent->user_interp_end;
     child->user_heap_base   = parent->user_heap_base;
     child->user_heap_end    = parent->user_heap_end;
     child->user_heap_limit  = parent->user_heap_limit;
     child->user_mmap_base   = parent->user_mmap_base;
     child->user_mmap_end    = parent->user_mmap_end;
     child->user_mmap_limit  = parent->user_mmap_limit;
+    child->dl_info          = parent->dl_info;
     child->user_stack       = parent->user_stack;
     child->user_stack_top   = parent->user_stack_top;
     child->user_stack_low   = parent->user_stack_low;
@@ -192,6 +194,15 @@ int sys_fork_impl(void) {
     child->suid       = parent->suid;
     child->sgid       = parent->sgid;
     child->is_user    = 1;
+    memcpy(child->signal_actions, parent->signal_actions,
+           sizeof(child->signal_actions));
+    child->signal_in_handler = parent->signal_in_handler;
+    child->signal_fault_active = parent->signal_fault_active;
+    child->signal_fault_reject_repeat = parent->signal_fault_reject_repeat;
+    child->signal_fault_vector = parent->signal_fault_vector;
+    child->signal_fault_address = parent->signal_fault_address;
+    child->signal_fault_error = parent->signal_fault_error;
+    child->signal_fault_context = parent->signal_fault_context;
     child->priority   = parent->priority;
     child->nice       = parent->nice;
     child->weight     = parent->weight;

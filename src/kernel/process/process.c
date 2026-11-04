@@ -150,6 +150,7 @@ void process_destroy(process_t *proc) {
     (void)process_unregister(proc->pid);
 
     proc->user_image_base = 0; proc->user_image_end  = 0;
+    proc->user_interp_end = 0;
     proc->user_heap_end   = proc->user_heap_base;
     proc->user_mmap_end   = proc->user_mmap_base;
     proc->user_stack_top  = 0; proc->user_stack_low  = 0;
@@ -218,6 +219,9 @@ void process_free_user_memory(process_t *p) {
 
     if (p->user_image_base && p->user_image_end > p->user_image_base)
         free_user_range(p->user_image_base, p->user_image_end);
+    if (p->dl_info.version == DLINFO_VERSION && p->dl_info.interp_base &&
+        p->user_interp_end > p->dl_info.interp_base)
+        free_user_range(p->dl_info.interp_base, p->user_interp_end);
 
     free_user_range(p->user_heap_base, p->user_heap_end);
     free_user_range(p->user_mmap_base, p->user_mmap_end);
@@ -237,16 +241,26 @@ void process_free_user_memory(process_t *p) {
 // process_exit
 // ---------------------------------------------------------------------------
 
+/* process_exit -- termination entry point used by the fault handlers (and
+ * kernel.c's own shutdown path) for processes that die without going
+ * through the exit()/kill() syscalls, e.g. an unhandled #GP, #PF or #DE.
+ *
+ * This used to duplicate a slimmed-down copy of do_exit()'s logic that
+ * skipped fd cleanup, userfs cleanup, children reparenting, and (most
+ * importantly) freeing the address space and page tables: a process
+ * killed by a fault leaked all of it forever, since nothing but a normal
+ * exit() or signal-kill ever ran do_exit(). Routing through do_exit()
+ * gives fault-killed processes the exact same teardown as any other exit.
+ */
 void process_exit(int exit_code) {
-    fpu_lazy_on_process_exit((process_t *)current);
     process_t *cp = (process_t *)current;
     if (!cp) {
         com_write_string(COM1_PORT, "[PROC] process_exit: no current process!\n");
         for (;;) { __asm__ volatile("hlt"); }
     }
 
-    char pidbuf[12];
     if (kernel_debug_is_on()) {
+        char pidbuf[12];
         com_write_string(COM1_PORT, "[PROC] process_exit: PID=");
         itoa((int)cp->pid, pidbuf, 10);
         com_write_string(COM1_PORT, pidbuf);
@@ -256,19 +270,11 @@ void process_exit(int exit_code) {
         com_write_string(COM1_PORT, "\n");
     }
 
-    cp->state     = PROCESS_STATE_ZOMBIE;
-    cp->exit_code = exit_code;
-
-    scheduler_remove_process(cp);
-
-    process_t *parent = process_get_by_pid(cp->ppid);
-    if (parent) wakeup(parent);
-
-    if (kernel_debug_is_on())
-        com_write_string(COM1_PORT, "[PROC] process_exit: calling schedule()\n");
     __asm__ volatile("sti" ::: "memory");
-    schedule();
+    do_exit(exit_code);
 
+    /* do_exit() never returns (it schedule()s away for good). This is
+     * only reached if that invariant is ever broken. */
     for (;;) { __asm__ volatile("hlt"); }
 }
 

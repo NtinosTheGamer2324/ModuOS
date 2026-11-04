@@ -27,6 +27,7 @@ extern fault_handler_x87_fpu
 extern fault_handler_alignment_check
 extern fault_handler_machine_check
 extern fault_handler_simd_exception
+extern fault_try_deliver_user_signal
 
 ; Save/restore all general purpose registers.
 ; (We intentionally do not touch segment registers here.)
@@ -77,6 +78,14 @@ fault_stub_%1:
 
     PUSH_GPRS
 
+    lea rdx, [rsp + 120]
+    xor esi, esi
+    mov edi, %1
+    mov rcx, rsp
+    call fault_try_deliver_user_signal
+    test eax, eax
+    jnz %%signal_delivered
+
     ; After PUSH_GPRS, the CPU frame is above our saved registers.
     ; 15 pushes => 120 bytes.
     mov rax, [rsp + 120 + 0]   ; rip
@@ -94,6 +103,9 @@ fault_stub_%1:
     call %2
 
     add rsp, 32
+    jmp %%restore
+%%signal_delivered:
+%%restore:
     POP_GPRS
     iretq
 %endmacro
@@ -109,6 +121,14 @@ fault_stub_%1:
     ;   [rsp+24] RFLAGS
 
     PUSH_GPRS
+
+    mov rsi, [rsp + 120]
+    lea rdx, [rsp + 128]
+    mov edi, %1
+    mov rcx, rsp
+    call fault_try_deliver_user_signal
+    test eax, eax
+    jnz %%signal_delivered
 
     ; After PUSH_GPRS, error code + CPU frame are above saved registers.
     ; 15 pushes => 120 bytes.
@@ -128,9 +148,37 @@ fault_stub_%1:
     call %2
 
     add rsp, 32
+    jmp %%restore
+%%signal_delivered:
+%%restore:
     POP_GPRS
 
     ; Drop the CPU-pushed error code before returning.
+    add rsp, 8
+    iretq
+%endmacro
+
+%macro FAULT_STUB_PAGE_FAULT 0
+global fault_stub_14
+fault_stub_14:
+    PUSH_GPRS
+
+    mov rdi, [rsp + 120]
+    lea rdx, [rsp + 128]
+    mov rcx, rsp
+
+    mov rax, [rsp + 128]
+    mov rbx, [rsp + 136]
+    mov rsi, [rsp + 144]
+    sub rsp, 32
+    mov [rsp + 0], rax
+    mov [rsp + 8], rbx
+    mov [rsp + 16], rsi
+    mov qword [rsp + 24], 0
+    mov rsi, rsp
+    call fault_handler_page_fault
+    add rsp, 32
+    POP_GPRS
     add rsp, 8
     iretq
 %endmacro
@@ -149,7 +197,7 @@ FAULT_STUB_WITH_ERROR  10, fault_handler_invalid_tss
 FAULT_STUB_WITH_ERROR  11, fault_handler_segment_not_present
 FAULT_STUB_WITH_ERROR  12, fault_handler_stack_fault
 FAULT_STUB_WITH_ERROR  13, fault_handler_general_protection
-FAULT_STUB_WITH_ERROR  14, fault_handler_page_fault
+FAULT_STUB_PAGE_FAULT
 FAULT_STUB_NO_ERROR    16, fault_handler_x87_fpu
 FAULT_STUB_WITH_ERROR  17, fault_handler_alignment_check
 FAULT_STUB_NO_ERROR    18, fault_handler_machine_check

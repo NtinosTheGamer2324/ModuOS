@@ -490,6 +490,40 @@ int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *
         return -ENOENT;
     }
 
+    /* ── 4b. PT_INTERP: read ld-moduos so both images load together ──── */
+    void  *interp_buf = NULL;
+    size_t interp_rd  = 0;
+    {
+        char ipath[256];
+        int has_interp = elf_get_interp_path(elf_buf, rd, ipath, sizeof(ipath));
+        if (has_interp < 0) rc = -ENOEXEC;
+        else rc = 0;
+
+        if (rc == 0 && has_interp == 1) {
+            char ifull[256], irel[256];
+            int  islot = -1;
+            fs_file_info_t ist;
+            rc = resolve_execve_path(p, ipath, ifull, sizeof(ifull), &islot, irel, sizeof(irel));
+            fs_mount_t *imnt = (rc == 0) ? fs_get_mount(islot) : NULL;
+            if (rc == 0 && (!imnt || !imnt->valid)) rc = -ENOENT;
+            if (rc == 0 && (fs_stat(imnt, irel, &ist) != 0 || ist.is_directory ||
+                            ist.size < sizeof(elf64_ehdr_t))) rc = -ENOENT;
+            if (rc == 0) {
+                interp_buf = kmalloc(ist.size);
+                if (!interp_buf) rc = -ENOMEM;
+            }
+            if (rc == 0 && (fs_read_file(imnt, irel, interp_buf, ist.size, &interp_rd) != 0 ||
+                            interp_rd < sizeof(elf64_ehdr_t))) rc = -ENOENT;
+        }
+        if (rc != 0) {
+            if (interp_buf) kfree(interp_buf);
+            kfree(elf_buf);
+            free_strv(kargv, argc);
+            free_strv(kenvp, envc);
+            return rc;
+        }
+    }
+
     /* ── 5. Create new PML4 WHILE STILL ON KERNEL / PARENT CR3 ───────── *
      *                                                                      *
      *  INVARIANT: paging_create_process_pml4() copies kernel mappings     *
@@ -501,6 +535,7 @@ int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *
     extern void process_set_build_pml4(uint64_t *virt, uint64_t phys);
     uint64_t new_cr3 = paging_create_process_pml4();
     if (!new_cr3) {
+        if (interp_buf) kfree(interp_buf);
         kfree(elf_buf);
         free_strv(kargv, argc);
         free_strv(kenvp, envc);
@@ -520,9 +555,16 @@ int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *
     uint64_t *new_pml4_virt = (uint64_t*)phys_to_virt_kernel(new_cr3 & ~0xFFFULL);
     process_set_build_pml4(new_pml4_virt, new_cr3);
 
-    uint64_t entry = 0, img_base = 0, img_end = 0;
-    rc = elf_load_with_args(elf_buf, rd, &entry, 0, NULL, &img_base, &img_end);
+    uint64_t entry = 0, img_base = 0, img_end = 0, interp_end = 0;
+    dlinfo_t new_dl;
+    memset(&new_dl, 0, sizeof(new_dl));
+    if (interp_buf)
+        rc = elf_load_dynamic(elf_buf, rd, interp_buf, interp_rd, &entry,
+                              &img_base, &img_end, &interp_end, &new_dl);
+    else
+        rc = elf_load_with_args(elf_buf, rd, &entry, 0, NULL, &img_base, &img_end);
     kfree(elf_buf);
+    if (interp_buf) kfree(interp_buf);
     process_set_build_pml4(NULL, 0);
 
     if (rc != 0) {
@@ -565,6 +607,7 @@ int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *
     process_free_user_memory(p);
     p->user_image_base = 0;
     p->user_image_end  = 0;
+    p->user_interp_end = 0;
     p->user_heap_end   = p->user_heap_base;
     p->user_mmap_end   = p->user_mmap_base;
 
@@ -588,6 +631,8 @@ int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *
 
     p->user_image_base = img_base;
     p->user_image_end  = img_end;
+    p->user_interp_end = interp_end;
+    p->dl_info         = new_dl;
 
     /* ── 9. Build user stack in new address space ─────────────────────── *
      *                                                                      *
@@ -655,6 +700,14 @@ int sys_execve_impl(const char *path_user, char *const *argv_user, char *const *
     }
     p->envp = kenvp;
     p->envc = envc;
+    for (int sig = 1; sig < 64; sig++) {
+        if (p->signal_actions[sig].handler > SIGNAL_IGNORE)
+            memset(&p->signal_actions[sig], 0,
+                   sizeof(p->signal_actions[sig]));
+    }
+    p->signal_in_handler = false;
+    p->signal_fault_active = false;
+    p->signal_fault_reject_repeat = false;
 
     free_strv(kargv, argc);
 

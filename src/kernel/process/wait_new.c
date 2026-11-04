@@ -7,6 +7,7 @@
 #include "moduos/kernel/debug.h"
 #include "moduos/kernel/memory/usercopy.h"
 #include "moduos/kernel/memory/phys.h"
+#include "moduos/kernel/memory/paging.h"
 
 extern char *itoa(int value, char *str, int base);
 extern spinlock_t children_lock;
@@ -118,29 +119,43 @@ int do_waitpid_full(int32_t pid, int *kernel_status, int options,
             }
 
             /*
-             * Step 2 — free the child's user-space page mappings.
+             * Step 2/3 -- free the child's user-space mappings and PML4,
+             * if that has not already happened.
              *
-             * process_free_user_memory() saves CR3, switches to the child's
-             * page table, unmaps all user ranges, then restores CR3.
-             * It does NOT touch p->page_table or p->cr3 — that is our job.
-             */
-            extern void process_free_user_memory(process_t *p);
-            process_free_user_memory(found);
-
-            /*
-             * Step 3 — free the child's PML4 frame.
+             * do_exit() now frees a process's own address space and page
+             * tables at exit time (see exit_new.c:process_teardown_resources),
+             * switching to the kernel master CR3 once done. That covers
+             * every normal termination path (exit(), signal-kill,
+             * fault-kill), so by the time a child shows up here as a
+             * zombie, found->page_table already just points at the kernel
+             * master mapping (switch_to() records whatever CR3 was live
+             * when a process was last scheduled away from, which by then
+             * is the master one, not the process's own freed PML4) and
+             * there is nothing left to free.
              *
-             * Do this after process_free_user_memory() has unmapped all leaf
-             * pages and restored CR3.  Never free if it matches PID 1's CR3
-             * (kernel processes share the boot PML4).
+             * We still check rather than assuming: if we called
+             * process_free_user_memory() unconditionally here on an
+             * already-freed process, and it somehow still recorded its
+             * *own* old PML4 (found->is_user is untouched by do_exit(), so
+             * the function would not simply no-op), it would walk the
+             * *parent's* live page tables instead whenever dying_cr3 reads
+             * as 0. Comparing against the master CR3 (rather than just
+             * checking for non-zero) avoids both that and a duplicate call
+             * into paging_free_process_pml4(), and keeps this path as a
+             * defensive fallback for any future caller that reaps a child
+             * without going through do_exit() first.
              */
-            if (found->page_table) {
+            {
+                uint64_t kernel_cr3 = paging_get_master_cr3() & ~0xFFFULL;
                 uint64_t pml4_phys  = found->page_table & ~0xFFFULL;
-                uint64_t kernel_cr3 = 0;
-                process_t *init = process_get_by_pid(1);
-                if (init) kernel_cr3 = init->page_table & ~0xFFFULL;
-                if (pml4_phys && pml4_phys != kernel_cr3)
-                    phys_free_frame(pml4_phys);
+
+                if (pml4_phys && pml4_phys != kernel_cr3) {
+                    extern void process_free_user_memory(process_t *p);
+                    process_free_user_memory(found);
+
+                    paging_switch_cr3(kernel_cr3);
+                    paging_free_process_pml4(pml4_phys);
+                }
                 found->page_table = 0;
                 found->cr3        = 0;
             }

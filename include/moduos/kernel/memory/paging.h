@@ -54,6 +54,10 @@ uint64_t paging_create_process_pml4(void);
  */
 int paging_map_range_to_pml4(uint64_t *pml4_virt, uint64_t virt_base, uint64_t phys_base, uint64_t size, uint64_t flags);
 uint64_t paging_virt_to_phys(uint64_t virt);
+/* Walk an explicit PML4 (physical address) instead of the live CR3 — use
+ * paging_get_master_cr3() for kernel-heap VAs so the translation doesn't
+ * depend on what the calling process's page tables happen to have mapped. */
+uint64_t paging_virt_to_phys_in(uint64_t pml4_phys, uint64_t virt);
 
 /* Return the low 12 bits of the PTE for virt in the currently active address space.
  * Returns 0 if unmapped/not present.

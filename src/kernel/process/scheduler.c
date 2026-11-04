@@ -33,6 +33,7 @@
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/memory/kheap.h"
 #include "moduos/kernel/debug.h"
+#include "moduos/arch/AMD64/interrupts/timer.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -49,7 +50,7 @@ extern void switch_to(process_t *prev, process_t *next);
 #define NICE_0_WEIGHT         1024
 #define MIN_GRANULARITY_NS    750000ULL
 #define SCHED_WAKEUP_BONUS_NS 1000000ULL
-#define TICK_NS               1000000ULL
+#define TICK_NS               pit_hz
 
 // Linux prio_to_weight[], indexed by (nice + 20).
 static const uint32_t sched_weight_table[40] = {
@@ -460,11 +461,12 @@ static void sched_update_curr(process_t *p, uint64_t delta_ns) {
 // ---------------------------------------------------------------------------
 
 static void enqueue_process(process_t *p, bool is_wakeup) {
-    spinlock_lock(&sched_lock);
+    uint64_t flags;
+    spinlock_lock_irqsave(&sched_lock, &flags);
 
     if (p->state == PROCESS_STATE_ZOMBIE ||
         p->state == PROCESS_STATE_TERMINATED) {
-        spinlock_unlock(&sched_lock);
+        spinlock_unlock_irqrestore(&sched_lock, flags);
         return;
     }
 
@@ -480,13 +482,14 @@ static void enqueue_process(process_t *p, bool is_wakeup) {
     rbtree_insert(p);
     p->state = PROCESS_STATE_READY;
 
-    spinlock_unlock(&sched_lock);
+    spinlock_unlock_irqrestore(&sched_lock, flags);
 }
 
 static void dequeue_process(process_t *p) {
-    spinlock_lock(&sched_lock);
+    uint64_t flags;
+    spinlock_lock_irqsave(&sched_lock, &flags);
     rbtree_remove(p);
-    spinlock_unlock(&sched_lock);
+    spinlock_unlock_irqrestore(&sched_lock, flags);
 }
 
 // ---------------------------------------------------------------------------
@@ -557,10 +560,11 @@ static void rbtree_print_inorder(const rbtree_node_t *n) {
 }
 
 void debug_print_ready_queue(void) {
+    uint64_t flags;
     com_write_string(COM1_PORT, "[SCHED] Queue (vruntime order):\n");
-    spinlock_lock(&sched_lock);
+    spinlock_lock_irqsave(&sched_lock, &flags);
     rbtree_print_inorder(sched_state.root);
-    spinlock_unlock(&sched_lock);
+    spinlock_unlock_irqrestore(&sched_lock, flags);
     com_write_string(COM1_PORT, "[SCHED] ---\n");
 }
 
@@ -585,11 +589,32 @@ void schedule(void) {
     if (prev)
         prev->need_resched = 0;
 
-    spinlock_lock(&sched_lock);
+    uint64_t sched_flags;
+    spinlock_lock_irqsave(&sched_lock, &sched_flags);
 
     if (prev && prev->pid != 0 && prev->state == PROCESS_STATE_RUNNING) {
         if (prev->vruntime < sched_state.min_vruntime)
             prev->vruntime = sched_state.min_vruntime;
+
+        /*
+         * A voluntary yield (as opposed to a tick-driven preemption) has
+         * earned no measurable vruntime since prev was last selected --
+         * sched_update_curr() only runs on the 1 kHz tick, so two
+         * processes that both yield faster than that tick sit at exactly
+         * equal vruntime forever. rbtree_insert()'s tie-break sends an
+         * equal-key newcomer to the right of whatever's already resident,
+         * so prev would never win leftmost again: every yield() from
+         * either side becomes a guaranteed switch_to(), even though
+         * neither side did any real work. Charge a minimum granularity's
+         * worth of vruntime on voluntary yield so prev can't be
+         * immediately re-preempted by the process it just gave way to --
+         * it still cooperates (moves behind anyone with real waiting
+         * time), it just can't thrash at unbounded frequency against a
+         * peer at the same vruntime.
+         */
+        prev->vruntime += (MIN_GRANULARITY_NS * NICE_0_WEIGHT) /
+                           sched_process_weight(prev);
+
         rbtree_insert(prev);
         prev->state = PROCESS_STATE_READY;
     }
@@ -617,7 +642,7 @@ void schedule(void) {
         rbtree_remove(next);
     }
 
-    spinlock_unlock(&sched_lock);
+    spinlock_unlock_irqrestore(&sched_lock, sched_flags);
 
     if (!next)
         next = process_find(0);
@@ -694,6 +719,7 @@ void scheduler_tick(void) {
      */
     if (woke_someone && p->pid == 0) {
         p->need_resched = 0;
+        com_write_string(COM1_PORT, "if (woke_someone && p->pid == 0) { in scheduler tick stuff fired! \n");
         schedule();
     }
 }

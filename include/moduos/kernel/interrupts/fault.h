@@ -43,6 +43,32 @@ typedef struct {
     interrupt_frame_t frame;
 } __attribute__((packed)) fault_context_t;
 
+typedef struct {
+    uint64_t rip;
+    uint64_t cs;
+    uint64_t rflags;
+    uint64_t rsp;
+    uint64_t ss;
+} fault_user_iret_frame_t;
+
+typedef struct {
+    uint64_t r15;
+    uint64_t r14;
+    uint64_t r13;
+    uint64_t r12;
+    uint64_t r11;
+    uint64_t r10;
+    uint64_t r9;
+    uint64_t r8;
+    uint64_t rbp;
+    uint64_t rdi;
+    uint64_t rsi;
+    uint64_t rdx;
+    uint64_t rcx;
+    uint64_t rbx;
+    uint64_t rax;
+} fault_saved_regs_t;
+
 // Page fault error code flags
 #define PF_PRESENT      (1 << 0)  // Page not present
 #define PF_WRITE        (1 << 1)  // Write access
@@ -67,10 +93,15 @@ void fault_handler_invalid_tss(uint64_t error_code, interrupt_frame_t *frame);
 void fault_handler_segment_not_present(uint64_t error_code, interrupt_frame_t *frame);
 void fault_handler_stack_fault(uint64_t error_code, interrupt_frame_t *frame);
 void fault_handler_general_protection(uint64_t error_code, interrupt_frame_t *frame);
-void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame);
+void fault_handler_page_fault(uint64_t error_code, interrupt_frame_t *frame,
+                              fault_user_iret_frame_t *user_frame,
+                              fault_saved_regs_t *saved_regs);
 void fault_handler_x87_fpu(interrupt_frame_t *frame);
 void fault_handler_alignment_check(uint64_t error_code, interrupt_frame_t *frame);
 void fault_handler_machine_check(interrupt_frame_t *frame);
 void fault_handler_simd_exception(interrupt_frame_t *frame);
+int fault_try_deliver_user_signal(uint64_t vector, uint64_t error_code,
+                                  fault_user_iret_frame_t *user_frame,
+                                  fault_saved_regs_t *saved_regs);
 
 #endif // FAULT_H

@@ -501,21 +501,42 @@ void *devfs_mmap(void *handle, void *hint, size_t length,
 void *devfs_mmap_region(uint64_t phys_or_virt, size_t size, int prot, int is_phys) {
     if (size == 0) return (void*)-1;
 
-    uint64_t sz = ((uint64_t)size + 0xFFFULL) & ~0xFFFULL;
+    uint64_t page_offset = phys_or_virt & 0xFFFULL;
+    uint64_t span = page_offset + (uint64_t)size;
+    if (span < (uint64_t)size || span > UINT64_MAX - 0xFFFULL)
+        return (void*)-1;
+    uint64_t sz = (span + 0xFFFULL) & ~0xFFFULL;
+    uint64_t source_base = phys_or_virt & ~0xFFFULL;
+    if (source_base > UINT64_MAX - sz) return (void*)-1;
 
+    uint64_t master_cr3 = is_phys ? 0 : paging_get_master_cr3();
     uint64_t phys;
     if (is_phys) {
         phys = phys_or_virt & ~0xFFFULL;
     } else {
-        /* Kernel heap VA -> physical via physmap offset.
-         * Do NOT use paging_virt_to_phys() here — it walks the live CR3
-         * which during a syscall is the process CR3, and the process page
-         * tables may not have the kernel heap mapped correctly (or may map
-         * it to a wrong physical page due to shared PML4 entries).
-         * The physmap is a direct offset: phys = kva - phys_offset.
+        /* Kernel heap VA -> physical.
+         *
+         * NOTE: this is NOT a physmap address, so "phys = kva - phys_offset"
+         * is wrong here — phys_offset only describes the direct physmap
+         * region (paging_set_phys_offset), and kmalloc() hands out addresses
+         * in the separate KHEAP_START range, where each page is mapped to
+         * whatever physical frame the heap allocator happened to grab
+         * (kheap.c's paging_map_range() per growth chunk). Subtracting
+         * phys_offset from a KHEAP_START-range address underflows/wraps
+         * and produces a bogus "physical" frame outside real RAM — the
+         * mapping silently "succeeds" but the PTE points nowhere, and the
+         * first access from userland page-faults.
+         *
+         * Also do NOT use paging_virt_to_phys() (which walks the live
+         * CR3) — during a syscall the live CR3 is the calling process's
+         * PML4, which may not have the kernel heap mapped/current.
+         * Instead walk kernel_master_cr3 explicitly: kheap growth mirrors
+         * every new mapping into kernel_master_cr3, so it is always
+         * authoritative for kernel-space VAs regardless of which process
+         * is currently active.
          */
-        uint64_t offset = paging_get_phys_offset();
-        phys = (phys_or_virt & ~0xFFFULL) - offset;
+        phys = paging_virt_to_phys_in(master_cr3, source_base);
+        if (phys == 0) return (void*)-1;
     }
 
     /* Get current process */
@@ -525,10 +546,11 @@ void *devfs_mmap_region(uint64_t phys_or_virt, size_t size, int prot, int is_phy
     /* Pick user VA from mmap bump pointer */
     uint64_t uva = (p->user_mmap_end + 0xFFFULL) & ~0xFFFULL;
     if (uva < p->user_mmap_base) uva = p->user_mmap_base;
-    if (uva + sz > p->user_mmap_limit) return (void*)-1;
+    if (uva > UINT64_MAX - sz || uva + sz > p->user_mmap_limit)
+        return (void*)-1;
 
     /* Build page flags */
-    uint64_t pflags = PFLAG_PRESENT | PFLAG_USER;
+    uint64_t pflags = PFLAG_PRESENT | PFLAG_USER | PFLAG_SHARED;
     if (prot & 2) pflags |= PFLAG_WRITABLE;
 
     /* Map into the process's own page table */
@@ -536,20 +558,32 @@ void *devfs_mmap_region(uint64_t phys_or_virt, size_t size, int prot, int is_phy
     uint64_t *proc_pml4 = (uint64_t*)phys_to_virt_kernel(proc_cr3 & ~0xFFFULL);
     if (!proc_pml4) return (void*)-1;
 
-    /* Map page by page using the correct physical address from physmap math */
+    uint64_t mapped = 0;
     for (uint64_t off = 0; off < sz; off += 0x1000ULL) {
-        if (paging_map_range_to_pml4(proc_pml4,
-                                     uva + off,
-                                     phys + off,
-                                     0x1000ULL,
-                                     pflags) != 0)
+        if (!is_phys && off != 0)
+            phys = paging_virt_to_phys_in(master_cr3, source_base + off);
+        else if (is_phys)
+            phys = source_base + off;
+        if (phys == 0 || paging_virt_to_phys_in(proc_cr3, uva + off) != 0 ||
+            paging_map_range_to_pml4(proc_pml4, uva + off,
+                                     phys & ~0xFFFULL, 0x1000ULL,
+                                     pflags) != 0) {
+            for (uint64_t undo = 0; undo < mapped; undo += 0x1000ULL) {
+                uint64_t mapped_phys = paging_virt_to_phys_in(proc_cr3,
+                                                              uva + undo);
+                paging_unmap_page(uva + undo);
+                phys_ref_dec(mapped_phys & ~0xFFFULL);
+            }
             return (void*)-1;
+        }
+        phys_ref_inc(phys & ~0xFFFULL);
+        mapped += 0x1000ULL;
     }
 
     /* Advance the bump pointer */
     p->user_mmap_end = uva + sz;
 
-    return (void*)(uintptr_t)uva;
+    return (void*)(uintptr_t)(uva + page_offset);
 }
 
 /* ── Public: legacy list ─────────────────────────────────────────────── */

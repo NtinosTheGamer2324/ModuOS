@@ -202,10 +202,11 @@ int exec_run(const char *args, int wait_for_exit) {
     com_write_string(COM1_PORT, size_str);
     com_write_string(COM1_PORT, " bytes\n");
 
-    /* PT_INTERP support: if the target ELF specifies an interpreter, launch it and pass
-     * the target path as argv[1].
-     */
+    /* PT_INTERP: the kernel maps the executable and ld-moduos together and
+     * enters the interpreter; argv stays exactly what the caller passed. */
     char interp_path[256];
+    void *ibuf = NULL;
+    size_t ibread = 0;
     int has_interp = elf_get_interp_path(buffer, bytes_read, interp_path, sizeof(interp_path));
     if (has_interp < 0) {
         com_write_string(COM1_PORT, "[EXEC] Failed to parse ELF interpreter\n");
@@ -215,132 +216,21 @@ int exec_run(const char *args, int wait_for_exit) {
     }
 
     if (has_interp == 1) {
-        com_write_string(COM1_PORT, "[EXEC] PT_INTERP detected: ");
+        com_write_string(COM1_PORT, "[EXEC] PT_INTERP: ");
         com_write_string(COM1_PORT, interp_path);
         com_write_string(COM1_PORT, "\n");
 
-        /* Build argv for interpreter: [interp, target, target_arg1, ...] */
-        int new_argc = argc + 1;
-        if (new_argc > MAX_ARGS - 1) new_argc = MAX_ARGS - 1;
-
-        char **new_argv = (char **)kmalloc((new_argc + 1) * sizeof(char *));
-        if (!new_argv) {
-            com_write_string(COM1_PORT, "[EXEC] Failed to allocate interpreter argv\n");
+        fs_file_info_t iinfo;
+        if (!fs_file_exists(mount, interp_path) ||
+            fs_stat(mount, interp_path, &iinfo) != 0 || iinfo.is_directory ||
+            hvfs_read(boot_drive_slot, interp_path, &ibuf, &ibread) != 0 ||
+            !ibuf || ibread < (size_t)iinfo.size) {
+            com_write_string(COM1_PORT, "[EXEC] Interpreter unavailable\n");
+            if (ibuf) hvfs_free(boot_drive_slot, interp_path, ibuf);
             hvfs_free(boot_drive_slot, exec_path, buffer);
             free_argv(argv, argc);
             return -1;
         }
-        memset(new_argv, 0, (new_argc + 1) * sizeof(char *));
-
-        size_t ilen = strlen(interp_path);
-        new_argv[0] = (char *)kmalloc(ilen + 1);
-        memcpy(new_argv[0], interp_path, ilen + 1);
-
-        size_t tlen = strlen(exec_path);
-        new_argv[1] = (char *)kmalloc(tlen + 1);
-        memcpy(new_argv[1], exec_path, tlen + 1);
-
-        int out_i = 2;
-        for (int i = 1; i < argc && out_i < new_argc; i++, out_i++) {
-            size_t alen = strlen(argv[i]);
-            new_argv[out_i] = (char *)kmalloc(alen + 1);
-            memcpy(new_argv[out_i], argv[i], alen + 1);
-        }
-        new_argv[out_i] = NULL;
-
-        hvfs_free(boot_drive_slot, exec_path, buffer);
-        free_argv(argv, argc);
-
-        if (!fs_file_exists(mount, interp_path)) {
-            com_write_string(COM1_PORT, "[EXEC] Interpreter not found\n");
-            free_argv(new_argv, new_argc);
-            return -1;
-        }
-
-        fs_file_info_t iinfo;
-        if (fs_stat(mount, interp_path, &iinfo) != 0 || iinfo.is_directory) {
-            com_write_string(COM1_PORT, "[EXEC] Interpreter stat failed\n");
-            free_argv(new_argv, new_argc);
-            return -1;
-        }
-
-        void *ibuf = NULL;
-        size_t ibread = 0;
-        int ihrc = hvfs_read(boot_drive_slot, interp_path, &ibuf, &ibread);
-        if (ihrc != 0 || !ibuf || ibread < (size_t)iinfo.size) {
-            com_write_string(COM1_PORT, "[EXEC] Interpreter read failed\n");
-            hvfs_free(boot_drive_slot, interp_path, ibuf);
-            free_argv(new_argv, new_argc);
-            return -1;
-        }
-
-        uint64_t kernel_cr3;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(kernel_cr3));
-
-        uint64_t saved_rflags;
-        __asm__ volatile("pushfq; pop %0; cli" : "=r"(saved_rflags) :: "memory");
-
-        uint64_t proc_cr3 = paging_create_process_pml4();
-        if (!proc_cr3) {
-            if (saved_rflags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
-            hvfs_free(boot_drive_slot, interp_path, ibuf);
-            free_argv(new_argv, new_argc);
-            com_write_string(COM1_PORT, "[EXEC] Failed to create interpreter address space\n");
-            return -1;
-        }
-        paging_switch_cr3(proc_cr3);
-
-        uint64_t entry_point;
-        uint64_t img_base = 0, img_end = 0;
-        int elf_result = elf_load_with_args(ibuf, ibread, &entry_point, new_argc, new_argv, &img_base, &img_end);
-
-        paging_switch_cr3(kernel_cr3);
-        if (saved_rflags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
-        hvfs_free(boot_drive_slot, interp_path, ibuf);
-
-        if (elf_result != 0) {
-            com_write_string(COM1_PORT, "[EXEC] Failed to load interpreter ELF\n");
-            free_argv(new_argv, new_argc);
-            return -1;
-        }
-
-        const char *ifn = interp_path;
-        for (const char *p = interp_path; *p; p++) if (*p == '/') ifn = p + 1;
-
-        process_t *proc = NULL;
-        paging_switch_cr3(proc_cr3);
-        process_set_build_pml4((uint64_t*)phys_to_virt_kernel(proc_cr3), proc_cr3);
-        proc = process_create_with_args(ifn, (void (*)(void))entry_point, 1, new_argc, new_argv);
-        process_set_build_pml4(NULL, 0);
-        if (proc) {
-            proc->user_image_base = img_base;
-            proc->user_image_end = img_end;
-            proc->page_table = proc_cr3;
-            proc->cr3        = proc_cr3;
-        }
-        paging_switch_cr3(kernel_cr3);
-
-        /* process_create_with_args deep-copies argv, so we can free our temporary now. */
-        free_argv(new_argv, new_argc);
-
-        if (!proc) {
-            com_write_string(COM1_PORT, "[EXEC] Failed to create interpreter process\n");
-            return -1;
-        }
-
-        int pid = proc->pid;
-
-        if (wait_for_exit) {
-            while (1) {
-                process_yield();
-                proc = process_get_by_pid(pid);
-                if (!proc) break;
-                if (proc->state == PROCESS_STATE_ZOMBIE || proc->state == PROCESS_STATE_TERMINATED) break;
-            }
-        }
-
-        com_write_string(COM1_PORT, "[EXEC] ===== END EXEC COMMAND =====\n\n");
-        return pid;
     }
 
     com_write_string(COM1_PORT, "[EXEC] About to call elf_load_with_args...\n");
@@ -368,6 +258,7 @@ int exec_run(const char *args, int wait_for_exit) {
         if (saved_rflags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
         com_write_string(COM1_PORT, "[EXEC] Failed to create process address space\n");
         hvfs_free(boot_drive_slot, exec_path, buffer);
+        if (ibuf) hvfs_free(boot_drive_slot, interp_path, ibuf);
         free_argv(argv, argc);
         return -1;
     }
@@ -376,7 +267,16 @@ int exec_run(const char *args, int wait_for_exit) {
     // Load ELF with arguments (maps into current CR3)
     uint64_t entry_point;
     uint64_t img_base = 0, img_end = 0;
-    int elf_result = elf_load_with_args(buffer, bytes_read, &entry_point, argc, argv, &img_base, &img_end);
+    uint64_t interp_end = 0;
+    dlinfo_t dl_info;
+    memset(&dl_info, 0, sizeof(dl_info));
+    int elf_result;
+    if (ibuf) {
+        elf_result = elf_load_dynamic(buffer, bytes_read, ibuf, ibread, &entry_point,
+                                      &img_base, &img_end, &interp_end, &dl_info);
+    } else {
+        elf_result = elf_load_with_args(buffer, bytes_read, &entry_point, argc, argv, &img_base, &img_end);
+    }
 
     /* Restore kernel CR3 before we continue running kernel code that may rely on
      * existing kernel mappings/state.
@@ -391,6 +291,8 @@ int exec_run(const char *args, int wait_for_exit) {
     com_write_string(COM1_PORT, size_str);
     com_write_string(COM1_PORT, "\n");
     
+    if (ibuf) hvfs_free(boot_drive_slot, interp_path, ibuf);
+
     if (elf_result != 0) {
         com_write_string(COM1_PORT, "[EXEC] ELF load failed!\n");
         hvfs_free(boot_drive_slot, exec_path, buffer);
@@ -427,10 +329,15 @@ int exec_run(const char *args, int wait_for_exit) {
 
     if (argc > 0) {
         proc = process_create_with_args(filename, (void(*)(void))entry_point, 1, argc, argv);
-        if (proc) { proc->user_image_base = img_base; proc->user_image_end = img_end; }
     } else {
         proc = process_create(filename, (void(*)(void))entry_point, 1);
         free_argv(argv, argc);
+    }
+    if (proc) {
+        proc->user_image_base = img_base;
+        proc->user_image_end = img_end;
+        proc->user_interp_end = interp_end;
+        proc->dl_info = dl_info;
     }
 
     process_set_build_pml4(NULL, 0);
