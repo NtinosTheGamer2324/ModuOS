@@ -7,16 +7,18 @@ echo ==============================================
 echo             Modu-OS Launch Menu
 echo ==============================================
 echo.
-echo  [1] Build and Run (Full Pipeline)
+echo  [1] Rebuild and Run (Full Pipeline)
 echo  [2] Just Run (Skip Docker Build)
-echo  [3] Exit
+echo  [3] Only Build and Run (Skip Full Rebuild)
+echo  [4] Exit
 echo.
 echo ==============================================
-set /p choice="Select an option (1-3): "
+set /p choice="Select an option (1-4): "
 
 if "%choice%"=="1" goto option1
 if "%choice%"=="2" goto option2
 if "%choice%"=="3" goto option3
+if "%choice%"=="4" goto option4
 
 :: If invalid input, loop back
 echo.
@@ -39,6 +41,13 @@ call run.bat --run-only
 goto end
 
 :option3
+echo.
+echo Launching build.
+timeout /t 1 >nul
+call run.bat --no-rebuild
+goto end
+
+:option4
 echo.
 echo Exiting...
 timeout /t 1 >nul

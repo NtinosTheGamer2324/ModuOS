@@ -4,12 +4,19 @@ cls
 
 echo made in the hellenic republic :)
 
+set IsNoRebuild=0
+
 REM -----------------------------
 REM Check for arguments
 REM -----------------------------
 if "%~1"=="--run-only" (
     echo [Run-Only Mode] Skipping Docker check and Kernel build.
     goto start_qemu
+)
+
+if "%~1"=="--no-rebuild" (
+    echo [NoRebuild Mode] Skipping Make Clean.
+    set IsNoRebuild=1
 )
 
 REM -----------------------------
@@ -34,7 +41,13 @@ if errorlevel 1 (
 REM -----------------------------
 REM Build the kernel in Docker
 REM -----------------------------
-docker run --rm -it --privileged -v /dev:/dev -v "%cd%":/root/env modu-os /bin/bash -c "cd /root/env && make -j12 clean && make -j12 build-AMD64"
+
+if "%IsNoRebuild%"=="0" (
+    docker run --rm -it --privileged -v /dev:/dev -v "%cd%":/root/env modu-os /bin/bash -c "cd /root/env && make -j12 clean && make -j12 build-AMD64"
+) else if "%IsNoRebuild%"=="1" (
+    docker run --rm -it --privileged -v /dev:/dev -v "%cd%":/root/env modu-os /bin/bash -c "cd /root/env && make -j12 build-AMD64"
+)
+
 
 
 :start_qemu
@@ -49,6 +62,7 @@ timeout /t 1 /nobreak >nul
 REM Start QEMU
 start "cmdQEMU" qemu-system-x86_64 ^
     -machine pc ^
+    -cpu max ^
     -smbios type=1,manufacturer="NTLLC",product="DevmanPC",version="1.0",serial="MDMDMDMDMDMD" ^
     -m 4096M ^
     -smp 2 ^
@@ -58,7 +72,7 @@ start "cmdQEMU" qemu-system-x86_64 ^
     -serial file:com3.log ^
     -audiodev dsound,id=snd0 ^
     -device ac97,audiodev=snd0 ^
-    -netdev user,id=u1 -device e1000,netdev=u1,mac=52:54:00:12:34:56 ^
+    -netdev user,id=u1,hostfwd=tcp:127.0.0.1:8080-10.0.2.15:8080 -device e1000,netdev=u1,mac=52:54:00:12:34:56 ^
     -drive file=dist\AMD64\kernel.iso,format=raw,media=cdrom,if=none,id=cdrom0 ^
     -drive file=.\disk.img,format=raw,media=disk,if=none,id=disk0 ^
     -drive file=.\ext2.img,format=raw,media=disk,if=none,id=disk1 ^

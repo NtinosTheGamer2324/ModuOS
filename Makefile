@@ -18,6 +18,9 @@ kernel_asm_object_files := $(patsubst src/kernel/%.asm, build/kernel/%.o, $(kern
 # All kernel object files
 kernel_object_files := $(kernel_c_object_files) $(kernel_asm_object_files)
 
+# It is time to stop memorising build numbers.
+BUILD_COUNT_FILE := build.txt
+
 # Driver C files
 # NOTE: USB stack is provided via SQRM modules; do not compile the in-kernel USB drivers.
 drivers_c_source_files := $(shell find src/drivers -name '*.c' ! -path 'src/drivers/USB/*')
@@ -135,10 +138,6 @@ build-$(ARCH): $(kernel_object_files) $(drivers_object_files) $(fs_object_files)
 	mkdir -p targets/$(ARCH)/iso/ModuOS/shared/lib
 	cp -f userland/dist/*.sqrl targets/$(ARCH)/iso/ModuOS/shared/lib/ 2>/dev/null || true
 	cp -f userland/dist/ld-moduos.sqr targets/$(ARCH)/iso/ModuOS/shared/lib/ 2>/dev/null || true
-	@echo Building FlareX display server and applications
-	$(MAKE) -C EXTERNAL/FlareX ARCH=$(ARCH)
-	mkdir -p targets/$(ARCH)/iso/Apps
-	cp -f EXTERNAL/FlareX/build/*.sqr targets/$(ARCH)/iso/Apps/ 2>/dev/null || true
 	@echo Building BIOS ISO
 	mkdir -p dist/$(ARCH)/iso_grub/boot/grub/i386-pc
 	grub-mkimage \
@@ -161,6 +160,11 @@ build-$(ARCH): $(kernel_object_files) $(drivers_object_files) $(fs_object_files)
 		-graft-points \
 		dist/$(ARCH)/iso_grub \
 		targets/$(ARCH)/iso
+
+	@count=$$(cat $(BUILD_COUNT_FILE) 2>/dev/null || echo 0); \
+	count=$$((count + 1)); \
+	echo $$count > $(BUILD_COUNT_FILE); \
+	echo "ModuOS successful build count: $$count"
 
 .PHONY: iso-$(ARCH)-uefi
 iso-$(ARCH)-uefi: build-$(ARCH)
@@ -196,7 +200,6 @@ build-$(ARCH)-uefi: iso-$(ARCH)-uefi
 .PHONY: clean
 clean:
 	rm -rf build dist
-	$(MAKE) -C EXTERNAL/FlareX clean
 
 .PHONY: check
 check:
