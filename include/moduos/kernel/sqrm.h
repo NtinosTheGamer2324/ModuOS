@@ -284,7 +284,7 @@ typedef struct sqrm_kernel_api {
     void (*pci_enable_io_space)(pci_device_t *dev);
     void (*pci_enable_bus_mastering)(pci_device_t *dev);
 
-    // PCI config space — AUDIO, NET, USB, HID only; NULL for GPU.
+    // PCI config space
     uint32_t (*pci_cfg_read32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
     void (*pci_cfg_write32)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
 
