@@ -61,7 +61,7 @@
  *   }
  */
 
-#include "libc.h"
+#include "libc/libc.h"
 #include <stdint.h>
 #include "../include/moduos/kernel/events/events.h"
 

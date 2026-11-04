@@ -10,7 +10,7 @@
  * narrow the panels instead of leaving dead space or clipping content.
  */
 
-#include "libc.h"
+#include "libc/libc.h"
 #include "lib_fnt.h"
 #include "wm_protocol.h"
 #include "wm_client_resize.h"
@@ -212,12 +212,10 @@ static void render(void) {
         int i = 0;
         int j = 0; while ("Operating System"[j] && j+1 < (int)sizeof(p.title)) { p.title[j] = "Operating System"[j]; j++; } p.title[j]=0;
         p.chip = C_ACCENT;
-        char ver[32]; snprintf(ver, sizeof(ver), "%u", (unsigned)g_info->SystemVersion);
         row_set(&p.rows[i++], "OS Name", g_info->os_name);
-        row_set(&p.rows[i++], "Version", ver);
+        row_set(&p.rows[i++], "Version", g_info->SystemVersion);
         row_set(&p.rows[i++], "Architecture", g_info->os_arch);
-        char kver[32]; snprintf(kver, sizeof(kver), "%u", (unsigned)g_info->KernelVersion);
-        row_set(&p.rows[i++], "Kernel Version", kver);
+        row_set(&p.rows[i++], "Kernel Version", g_info->KernelVersion);
         row_set(&p.rows[i++], "Kernel Vendor", g_info->KernelVendor);
         p.nrows = i;
         int h; draw_panel(PAD, y, panel_w, &p, &h);

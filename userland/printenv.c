@@ -1,5 +1,5 @@
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 
 static void write_zterm(const char *s, int nul_term) {
     if (!s) return;

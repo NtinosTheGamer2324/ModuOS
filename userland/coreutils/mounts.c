@@ -1,6 +1,5 @@
-#include "libc.h"
-#include "string.h"
-#include "../include/moduos/kernel/syscall/syscall_numbers.h"
+#include "../libc/libc.h"
+#include "../libc/string.h"
 
 int md_main(long argc, char** argv) {
     (void)argc;

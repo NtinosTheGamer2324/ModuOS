@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "../libc/libc.h"
 
 int md_main(long argc, char** argv) {
     char buf[512];

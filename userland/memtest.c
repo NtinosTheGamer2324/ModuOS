@@ -14,7 +14,7 @@
  *  10. Heap integrity after mixed operations
  */
 
-#include "libc.h"
+#include "libc/libc.h"
 
 /* ── Result tracking ─────────────────────────────────────────────────── */
 

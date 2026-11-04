@@ -1,5 +1,5 @@
 // calc_service.c
-#include "libc.h"
+#include "libc/libc.h"
 
 // Simple request/response protocol
 typedef struct {

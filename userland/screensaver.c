@@ -21,7 +21,7 @@
  * Copyright © 2026 New Technologies Software — GPL v2.0
  */
 
-#include "libc.h"
+#include "libc/libc.h"
 #include "NodGL.h"
 #include "lib_fnt.h"
 #include "../include/moduos/kernel/events/events.h"

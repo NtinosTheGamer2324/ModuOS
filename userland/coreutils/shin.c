@@ -1,7 +1,7 @@
 // shin.c — SHell INterpreter for ModuOS (.sh scripts)
 // Usage: shin script.sh [args...]   OR   shin -c "command"
 
-#include "libc.h"
+#include "../libc/libc.h"
 
 #define SHIN_MAX_LINE    1024
 #define SHIN_MAX_VARS    128
@@ -327,10 +327,10 @@ static int shin_exec_words(char **w, int wc)
         int nl = 1, s = 1;
         if (wc > 1 && !strcmp(w[1], "-n")) { nl = 0; s = 2; }
         for (int i = s; i < wc; i++) {
-            if (i > s) putc(' ');
+            if (i > s) putchar(' ');
             puts_raw(w[i]);
         }
-        if (nl) putc('\n');
+        if (nl) putchar('\n');
         return 0;
     }
     if (!strcmp(cmd, "cd")) {

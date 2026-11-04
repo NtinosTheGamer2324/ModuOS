@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 /* Example userland shared library (.sqrl).
  * MVP: keep it trivial and avoid calling into other libs.

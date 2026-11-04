@@ -1,6 +1,6 @@
 // NodGL 3D Triangle Demo - Software 3D Rasterization
 #include "NodGL.h"
-#include "libc.h"
+#include "libc/libc.h"
 
 /* Freestanding math helpers */
 static inline float NodGL_sqrtf(float x) {

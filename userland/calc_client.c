@@ -1,5 +1,5 @@
 // calc_client.c
-#include "libc.h"
+#include "libc/libc.h"
 
 typedef struct {
     int cmd;

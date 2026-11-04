@@ -16,8 +16,8 @@
  *     [M]  data        file bytes (absent for directories)
  */
 
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 
 /* =========================================================================
  * §0  FORWARD DECLARATIONS & SHARED MACROS

@@ -16,8 +16,8 @@
  * NOTE: formatting (mkfs) is intentionally NOT here — use a separate mkfs tool.
  */
 
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 #include <stdint.h>
 
 /* ── ANSI colours ──────────────────────────────────────────────────────── */

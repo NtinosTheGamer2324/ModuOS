@@ -15,8 +15,8 @@
  *   biosdisk.mod fat.mod ext2.mod normal.mod part_msdos.mod
  */
 
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 #include <stdint.h>
 
 /* ── ANSI ──────────────────────────────────────────────────────────────── */

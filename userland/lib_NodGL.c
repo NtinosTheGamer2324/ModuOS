@@ -19,7 +19,7 @@
 
 #include "NodGL.h"
 #include "gfx2d.h"
-#include "libc.h"
+#include "libc/libc.h"
 
 /* MVC3 / gfx2d capability flags (SQRM_GPU_CAP_* from sqrm_sdk.h) */
 #define MVC3_CAP_2D_ACCEL    (1u << 0)   /* gfx_fill_rect / gfx_blit_rect  */

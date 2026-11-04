@@ -1,5 +1,5 @@
-#include "libc.h"
-#include "string.h"
+#include "../libc/libc.h"
+#include "../libc/string.h"
 
 int md_main(long argc, char** argv) {
     if (argc != 2) {

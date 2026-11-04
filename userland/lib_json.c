@@ -1,5 +1,5 @@
 #include "lib_json.h"
-#include "string.h"
+#include "libc/string.h"
 
 static void skip_ws(const char **p, const char *end) {
     while (*p < end) {

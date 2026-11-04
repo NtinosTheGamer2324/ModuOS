@@ -14,8 +14,8 @@
  * Lines starting with # or ; are comments. Malformed lines are skipped.
  */
 
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 #include "wm_protocol.h"
 #include <stdint.h>
 

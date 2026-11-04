@@ -5,8 +5,8 @@
  * special-cased mdw support, same as any other client.
  */
 
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 #include "lib_fnt.h"
 #include "wm_protocol.h"
 #include "wm_client_resize.h"

@@ -9,7 +9,7 @@
 //
 
 
-#include "libc.h"
+#include "libc/libc.h"
 #include "netd_ipc.h"
 
 // ── Ethernet / ARP / IPv4 / ICMP wire structs ──────────────────────────

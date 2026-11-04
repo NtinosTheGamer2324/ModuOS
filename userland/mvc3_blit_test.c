@@ -15,7 +15,7 @@
  * Copyright © 2025-2026 New Technologies Software — GPL v2.0
  */
 
-#include "libc.h"
+#include "libc/libc.h"
 #include "mvc3.h"
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
@@ -271,7 +271,6 @@ static void test_blit_buf_copybatch(int fd) {
  * Test 5: BLIT_BUF via zero-copy ring (MAP_RING + SUBMIT)
  * Maps the ring into userspace, writes a slot directly, then submits.
  * Falls back gracefully if mmap is unavailable.
- * DEV_MMAP STUFF IS **BROKEN** THIS WILL PRODUCE A PAGE FAULT
  */
 static void test_blit_buf_zerocopy(int fd) {
     /* --- Allocate & map an off-screen buffer --- */
@@ -573,7 +572,7 @@ int md_main(long argc, char **argv) {
     //test_blit_screen_to_screen(fd);
     test_nuke_screen(fd);
     //test_blit_buf_copybatch(fd);
-    /* test_blit_buf_zerocopy(fd); -- DEV_MMAP is broken, skip */
+    test_blit_buf_zerocopy(fd);
     //test_blit_buf_batch(fd);
     //test_cursor(fd);
 

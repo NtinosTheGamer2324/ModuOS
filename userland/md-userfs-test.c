@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 #define TestPath1 "$/user/test1"
 #define TestPath2 "$/user/test2"

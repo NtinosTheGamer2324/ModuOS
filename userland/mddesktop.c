@@ -21,8 +21,8 @@
  * desktop or in the file manager.
  */
 
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 #include "lib_fnt.h"
 #include "wm_protocol.h"
 #include "wm_client_resize.h"

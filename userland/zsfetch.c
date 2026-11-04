@@ -1,5 +1,5 @@
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 
 /*
  * zsfetch (ModuOS)
@@ -145,7 +145,7 @@ static int logo_max_width(const char **logo, int logo_lines) {
 }
 
 static void print_spaces(int n) {
-    for (int i = 0; i < n; i++) putc(' ');
+    for (int i = 0; i < n; i++) putchar(' ');
 }
 
 static void print_kv_color(int logo_on, const char **logo, int logo_lines, int logo_width, int line,
@@ -172,14 +172,14 @@ static void print_kv_color(int logo_on, const char **logo, int logo_lines, int l
             puts_raw(": ");
             puts_raw("\x1b[0m");
             puts_raw(val ? val : "");
-            putc('\n');
+            putchar('\n');
         } else {
             printf("%s: %s\n", key, val ? val : "");
         }
     } else {
         if (use_color) {
             puts_raw(val ? val : "");
-            putc('\n');
+            putchar('\n');
         } else {
             printf("%s\n", val ? val : "");
         }
@@ -292,7 +292,7 @@ int md_main(long argc, char** argv) {
     if (stacked && show_logo) {
         for (int i = 0; i < logo_lines; i++) {
             puts_raw(logo[i]);
-            putc('\n');
+            putchar('\n');
         }
         puts_raw("\n");
     }

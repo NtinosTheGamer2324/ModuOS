@@ -10,9 +10,9 @@
  * This implementation is completely original code written for ModuOS.
  */
 
-#include "libc.h"
+#include "libc/libc.h"
 #include "NodGL.h"
-#include "string.h"
+#include "libc/string.h"
 #include "lib_fnt.h"
 #include "../include/moduos/kernel/events/events.h"
 

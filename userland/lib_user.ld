@@ -1,17 +1,27 @@
 OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
 
-/* Shared libs are ET_DYN. VAs are relative to 0 (runtime loader chooses base). */
+/* .sqrl shared libraries are ET_DYN with VAs relative to 0; ld-moduos picks
+ * the base. Headers stay inside the first PT_LOAD. */
 SECTIONS
 {
-    . = 0;
+    . = SIZEOF_HEADERS;
+
+    .hash     : { *(.hash) }
+    .dynsym   : { *(.dynsym) }
+    .dynstr   : { *(.dynstr) }
+    .rela.plt : { *(.rela.plt) *(.rela.iplt) }
+    .rela.dyn : { *(.rela.*) }
+
+    .plt    : { *(.plt) *(.iplt) *(.plt.*) }
     .text   : { *(.text*) }
     .rodata : { *(.rodata*) }
-    
-    .got    : { *(.got*) }
-    .plt    : { *(.plt*) }
-    .dynamic : { *(.dynamic) }
 
-    .data   : { *(.data*) }
-    .bss    : { *(.bss*) *(COMMON) }
+    . = ALIGN(0x1000);
+    .init_array : { *(.init_array*) }
+    .dynamic    : { *(.dynamic) }
+    .got        : { *(.got) *(.igot) }
+    .got.plt    : { *(.got.plt) *(.igot.plt) }
+    .data       : { *(.data*) }
+    .bss        : { *(.bss*) *(COMMON) }
 }

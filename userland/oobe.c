@@ -1,5 +1,5 @@
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 
 /* --- SAFE STRING HELPERS --- */
 static void copy_str(char *dst, size_t dst_sz, const char *src) {

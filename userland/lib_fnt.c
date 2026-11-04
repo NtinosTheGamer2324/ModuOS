@@ -1,6 +1,6 @@
 #include "lib_fnt.h"
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 
 /* -----------------------------------------------------------------------
  * Fast glyph lookup

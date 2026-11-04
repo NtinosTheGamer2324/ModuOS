@@ -1,6 +1,6 @@
 // NodGL Stress Test - Push GPU to limits
 #include "NodGL.h"
-#include "libc.h"
+#include "libc/libc.h"
 
 #define MAX_PARTICLES 5000
 #define MAX_OBJECTS 100

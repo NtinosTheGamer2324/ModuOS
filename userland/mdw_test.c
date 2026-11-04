@@ -3,7 +3,7 @@
 // small window, paints a solid color + status text, damages it once, done.
 // Meant as a quick smoke test — if this window shows up, the connect race
 // with mdw's startup is actually fixed, not just theoretically fixed.
-#include "libc.h"
+#include "libc/libc.h"
 #include "lib_fnt.h"
 #include "wm_protocol.h"
 

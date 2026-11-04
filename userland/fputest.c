@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 /* FPU/SSE multitasking test.
  * Run two copies in background:

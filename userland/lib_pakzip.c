@@ -4,8 +4,8 @@
 #include "thirdparty/miniz/miniz.c"
 
 #include "lib_pakzip.h"
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 
 static int ensure_dir_recursive(const char *path) {
     // naive: try mkdir on every prefix

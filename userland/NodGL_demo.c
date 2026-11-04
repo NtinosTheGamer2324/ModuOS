@@ -4,7 +4,7 @@
 // Licensed under GPL v2.0 - See LICENSE.md
 
 #include "NodGL.h"
-#include "libc.h"
+#include "libc/libc.h"
 
 static void draw_gradient_background(NodGL_Context ctx, uint32_t width, uint32_t height) {
     for (uint32_t y = 0; y < height; y += 4) {

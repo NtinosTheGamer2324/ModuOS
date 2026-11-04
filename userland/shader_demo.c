@@ -2,7 +2,7 @@
 // Shows GPU-accelerated text rendering and effects
 
 #define LIBC_NO_START
-#include "libc.h"
+#include "libc/libc.h"
 #include "NodGL.h"
 #include "NodGL_shader.h"
 

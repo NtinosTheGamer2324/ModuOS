@@ -1,7 +1,7 @@
 // userctl_service.c
-#include "libc.h"
+#include "libc/libc.h"
 #include "errno.h"
-#include "string.h"
+#include "libc/string.h"
 #include <stdint.h>
 #include "sha256.h"
 

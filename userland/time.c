@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 /* Must byte-for-byte match the rtc_time_t layout defined in the RTC kernel
  * module (moduos/modules/rtc.c). If that struct changes, this must change

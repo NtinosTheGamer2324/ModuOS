@@ -2,9 +2,11 @@
 // Simple shader execution on CPU for drivers that don't have GPU shader support
 // This allows shader API to work on any GPU, with fallback to CPU execution
 
+#ifndef LIBC_NO_START
 #define LIBC_NO_START
-#include "libc.h"
-#include "string.h"
+#endif
+#include "libc/libc.h"
+#include "libc/string.h"
 
 #define MAX_SHADERS 64
 #define MAX_PROGRAMS 32

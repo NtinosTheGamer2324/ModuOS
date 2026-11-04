@@ -5,7 +5,7 @@
 //           = != < > <= >= (string/integer comparison, returns 0/1)
 //           : (basic regex match length — NYI, reserved)
 
-#include "libc.h"
+#include "../libc/libc.h"
 
 static void usage(void)
 {

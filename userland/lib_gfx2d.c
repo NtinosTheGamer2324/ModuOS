@@ -29,7 +29,7 @@
  * Copyright © 2025-2026 ModuOS Project Contributors — GPL v2.0
  */
 
-#include "libc.h"
+#include "libc/libc.h"
 #include "gfx2d.h"
 #include "mvc3.h"
 
@@ -66,8 +66,26 @@ static void hdr_init(mvc3_hdr_t *h, mvc3_cmd_t cmd, uint32_t total_bytes) {
 /* ── Zero-copy ring path setup ─────────────────────────────────────── */
 
 static int try_map_ring(gfx2d_t *g) {
-    (void)g;
-    return -1; /* disabled — use copy-batch */
+    mvc3_map_ring_req_t req;
+    memset(&req, 0, sizeof(req));
+    hdr_init(&req.hdr, MVC3_CMD_MAP_RING, sizeof(req));
+    req.requested_size = GFX2D_RING_SIZE;
+
+    if (write_full(g->fd, &req, sizeof(req)) != 0) return -1;
+
+    mvc3_map_ring_resp_t resp;
+    memset(&resp, 0, sizeof(resp));
+    if (read_full(g->fd, &resp, sizeof(resp)) != 0) return -1;
+    if (resp.hdr.magic != MVC3_MAGIC || resp.user_addr == 0) return -1;
+
+    void *va = dev_mmap(g->fd, NULL, resp.actual_size, 3, 0, MVC3_OFF_RING);
+    if (va == MAP_FAILED) return -1;
+
+    g->mapped_cmdbuf      = va;
+    g->mapped_cmdbuf_size = resp.actual_size;
+    g->mapped_cmdbuf_used = 0;
+    g->mapped_cmd_count   = 0;
+    return 0;
 }
 
 /* ── Open / Close ──────────────────────────────────────────────────── */
@@ -312,29 +330,43 @@ int gfx2d_alloc_buf(gfx2d_t *g, uint32_t size_bytes, uint32_t fmt,
     if (read_full(g->fd, &resp, sizeof(resp)) != 0) return -EIO;
     if (resp.handle == 0) return -ENOMEM;
 
-    /*
-     * Skip MAP_BUF entirely — devfs_mmap_region is broken.
-     * Allocate locally; kernel reads these pages via usercopy
-     * during write() syscall, so BLIT_BUF works fine.
-     */
     gfx2d_buf_t *b = &g->bufs[g->n_bufs];
     b->kva        = resp.handle;
     b->size_bytes = size_bytes;
     b->fmt        = fmt;
-    b->kva_mapped = 0;
     b->pitch      = resp.pitch ? resp.pitch : size_bytes / 4u;
 
-    b->user_va = malloc(size_bytes);
-    if (!b->user_va) return -ENOMEM;
-    memset(b->user_va, 0, size_bytes);
+    /* Attempt zero-copy: map the kernel buffer into this process via dev_mmap. */
+    mvc3_map_buf_req_t mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    hdr_init(&mreq.hdr, MVC3_CMD_MAP_BUF, sizeof(mreq));
+    mreq.handle = resp.handle;
+
+    mvc3_map_buf_resp_t mresp;
+    memset(&mresp, 0, sizeof(mresp));
+
+    int mapped = 0;
+    if (write_full(g->fd, &mreq, sizeof(mreq)) == 0 &&
+        read_full(g->fd, &mresp, sizeof(mresp)) == 0 &&
+        mresp.hdr.magic == MVC3_MAGIC && mresp.user_addr != 0) {
+        void *va = dev_mmap(g->fd, NULL, size_bytes, 3, 0,
+                            MVC3_OFF_BUF_BASE + resp.handle);
+        if (va != MAP_FAILED) {
+            b->user_va    = va;
+            b->kva_mapped = 1;
+            mapped = 1;
+        }
+    }
+
+    if (!mapped) {
+        b->user_va    = malloc(size_bytes);
+        b->kva_mapped = 0;
+        if (!b->user_va) return -ENOMEM;
+        memset(b->user_va, 0, size_bytes);
+    }
 
     g->n_bufs++;
 
-    /*
-     * Return the full 64-bit user VA as the handle.
-     * Callers must store it as uint64_t and pass it back unchanged to
-     * gfx2d_blit_buf / gfx2d_map_buf.  Never truncate to 32 bits.
-     */
     *out_handle = (uint64_t)(uintptr_t)b->user_va;
     *out_pitch  = b->pitch;
     return 0;

@@ -1,7 +1,9 @@
 // NodGL Shader API Implementation
 // GPU-accelerated programmable rendering
 
+#ifndef LIBC_NO_START
 #define LIBC_NO_START
+#endif
 #include "NodGL_shader.h"
 #include "gfx2d.h"
 #include "lib_sw_shader.h"

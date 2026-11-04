@@ -35,7 +35,8 @@ CC=${CC:-x86_64-elf-gcc}
 LD=${LD:-x86_64-elf-ld}
 
 # Common flags
-GCC_FLAGS_COMMON="-ffreestanding -c -mno-red-zone -O2 -fomit-frame-pointer -nostdlib -I."
+# -Ilibc: the ISO headers (stdio.h, string.h, ...) live in libc/.
+GCC_FLAGS_COMMON="-ffreestanding -c -mno-red-zone -O2 -fomit-frame-pointer -nostdlib -I. -Ilibc"
 
 # Linker scripts
 LD_SCRIPT_APP="user.ld"      # fixed 0x400000 (ET_EXEC)
@@ -46,7 +47,10 @@ LD_SCRIPT_LIB="lib_user.ld"  # shared libs (ET_DYN)
 # Libraries shipped as .sqrl (lib_<name>.c, compiled -fPIC). Anything not
 # listed here is still linked statically into the apps that use it.
 # Order matters: a library must come after the libraries it depends on.
-SHARED_LIBS="demo_gfx fnt crypto tls"
+#
+# libc (libc/libc.c -> dist/libc.sqrl) is built from libc/, not from lib_libc.c,
+# and every other library and every app is linked against it, so it comes first.
+SHARED_LIBS="libc demo_gfx fnt crypto tls"
 
 # Libraries that need other .sqrl libraries, as lib:dep1,dep2. The deps become
 # DT_NEEDED entries so ld-moduos loads them when the library is loaded.
@@ -82,26 +86,25 @@ list_has() {
     return 1
 }
 
+# Every app links libc.sqrl; DYNAMIC_APPS only lists the *extra* libraries.
 dyn_app_libs() {
+    extra=""
     for entry in $DYNAMIC_APPS; do
         if [ "${entry%%:*}" = "$1" ]; then
-            echo "${entry#*:}" | tr ',' ' '
-            return 0
+            extra=$(echo "${entry#*:}" | tr ',' ' ')
+            break
         fi
     done
-    return 1
+    echo "libc $extra"
 }
 
-# Links an app. Apps listed in DYNAMIC_APPS drop the static objects of their
-# shared libraries, use the dynamic-app script, and get DT_NEEDED entries
-# plus PT_INTERP instead. Everything else goes straight to $LD.
+# Links an app. Every app is dynamic: it drops the static objects of its shared
+# libraries (always including libc), uses the dynamic-app script, gets crt0
+# (the _start that calls md_main) and DT_NEEDED entries plus PT_INTERP.
 ld_app() {
     app="$1"
     shift
-    if ! app_libs=$(dyn_app_libs "$app"); then
-        "$LD" "$@"
-        return
-    fi
+    app_libs=$(dyn_app_libs "$app")
 
     count=$#
     while [ "$count" -gt 0 ]; do
@@ -115,6 +118,7 @@ ld_app() {
         [ "$arg" = "$LD_SCRIPT_APP" ] && arg="$LD_SCRIPT_DYN"
         [ "$keep" -eq 1 ] && set -- "$@" "$arg"
     done
+    set -- "$@" "$BUILD_DIR/lib_crt0.o"
 
     link_libs=""
     for dl in $app_libs; do
@@ -132,6 +136,29 @@ DIST_DIR="dist"
 
 rm -rf "$BUILD_DIR" "$DIST_DIR"
 mkdir -p "$BUILD_DIR" "$DIST_DIR"
+
+# --- Phase -1: stale pre-libc/ headers ---
+# A quoted #include finds a header next to the source file before it looks at
+# -Ilibc, so the old copies would silently shadow the new ones. Delete them.
+stale=0
+for h in assert.h errno.h libc.h stdlib.h string.h time.h coreutils/libc.h coreutils/string.h; do
+    if [ -f "$h" ]; then
+        echo "[BUILD] ERROR: stale $h shadows libc/$(basename "$h"); delete it" >&2
+        stale=1
+    fi
+done
+[ "$stale" -eq 0 ] || exit 1
+
+# --- Phase 0a: libc ---
+# lib_libc.o       -> libc.sqrl (PIC; functions only, no exported data)
+# lib_crt0.o       -> _start, linked into every program
+# (lib_ prefix keeps Phase 2 from treating them as apps)
+echo "[BUILD] CC libc/libc.c -> $BUILD_DIR/lib_libc.o (shared)"
+"$CC" $GCC_FLAGS_COMMON -fPIC -fno-semantic-interposition -fno-stack-protector \
+    libc/libc.c -o "$BUILD_DIR/lib_libc.o" &
+echo "[BUILD] CC libc/crt0.c -> $BUILD_DIR/lib_crt0.o"
+"$CC" $GCC_FLAGS_COMMON libc/crt0.c -o "$BUILD_DIR/lib_crt0.o" &
+wait
 
 # --- Phase 0: Compile userland objects (Parallelized) ---
 echo "[BUILD] Compiling source files using $JOBS thread(s)..."
@@ -220,6 +247,13 @@ for lib in $SHARED_LIBS; do
     bin="$DIST_DIR/${lib}.sqrl"
 
     dep_flags=""
+    extra_ld=""
+    if [ "$lib" = "libc" ]; then
+        # libc binds its own symbols locally and depends on nothing.
+        extra_ld="-Bsymbolic"
+    else
+        dep_flags="-l:libc.sqrl"
+    fi
     for entry in $LIB_DEPS; do
         if [ "${entry%%:*}" = "$lib" ]; then
             for dep in $(echo "${entry#*:}" | tr ',' ' '); do
@@ -230,7 +264,7 @@ for lib in $SHARED_LIBS; do
 
     echo "[BUILD] LD(shared) $obj -> $bin"
     "$LD" "$obj" -shared -T "$LD_SCRIPT_LIB" -o "$bin" --hash-style=sysv \
-        --no-as-needed -L"$DIST_DIR" $dep_flags
+        --no-as-needed -L"$DIST_DIR" $extra_ld $dep_flags
 done
 
 # --- Phase 2: interpreter + apps ---
@@ -393,7 +427,7 @@ for obj in "$BUILD_DIR"/coreutils_*.o; do
     toolname="${base#coreutils_}"
     bin="$DIST_DIR/${toolname}.sqr"
     echo "[BUILD] LD(coreutil) $obj -> $bin"
-    "$LD" "$obj" -T "$LD_SCRIPT_APP" -o "$bin" --hash-style=sysv
+    ld_app "coreutils/$toolname" "$obj" -T "$LD_SCRIPT_APP" -o "$bin" --hash-style=sysv
 done
 
 echo "[BUILD] Done. Outputs in $DIST_DIR"

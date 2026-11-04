@@ -1,6 +1,6 @@
 // mkbigfile.c - write a large file to stress-test MDFS indirect blocks
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 
 static void usage(void) {
     printf("Usage: mkbigfile <size_mb>\n");
