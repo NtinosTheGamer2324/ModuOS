@@ -106,7 +106,6 @@ static struct multiboot_tag *find_tag(uint32_t type) {
 /* ---- DevFS stubs ---- */
 
 static void *devfs_open_stub(void *ctx, int flags) {
-    g_api->com_write_string(0x3F8, "[md64api] OPEN Triggered\n");
     (void)flags;
     return ctx; /* return ctx as the handle */
 }
@@ -119,6 +118,186 @@ static int devfs_close_stub(void *ctx) {
 static ssize_t devfs_write_stub(void *ctx, const void *buf, size_t count) {
     (void)ctx; (void)buf; (void)count;
     return -1; /* read-only nodes */
+}
+
+/* ---- urandom: ChaCha20 DRBG with fast key erasure ---- */
+
+#define URANDOM_RESEED_BYTES (1ULL << 20)
+
+static uint32_t g_rng_key[8];
+static uint64_t g_rng_ctr;
+static uint64_t g_rng_since_seed;
+static int      g_rng_seeded;
+static int      g_rng_weak_logged;
+
+static uint64_t rng_irq_save(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; cli; popq %0" : "=r"(f) :: "memory");
+    return f;
+}
+
+static void rng_irq_restore(uint64_t f) {
+    __asm__ volatile("pushq %0; popfq" :: "r"(f) : "memory", "cc");
+}
+
+static void rng_wipe(void *p, size_t n) {
+    volatile unsigned char *v = (volatile unsigned char *)p;
+    while (n--) *v++ = 0;
+}
+
+static uint64_t rng_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static uint64_t rng_mix64(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+/* Last resort when no hardware RNG exists: not suitable as a sole entropy
+ * source for long-lived keys. */
+static uint64_t rng_jitter64(void) {
+    uint64_t acc = rng_rdtsc();
+    for (int i = 0; i < 512; i++) {
+        uint64_t t = rng_rdtsc();
+        for (volatile unsigned k = 0; k < (unsigned)(acc & 0x3F); k++) { }
+        acc = rng_mix64(acc ^ (rng_rdtsc() - t) ^ (acc << 7));
+    }
+    return acc;
+}
+
+static int rng_hw_caps(void) {
+    uint32_t a, b, c, d;
+    int caps = 0;
+
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0u));
+    uint32_t max_leaf = a;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u));
+    if (c & (1u << 30)) caps |= 1;                 /* RDRAND */
+    if (max_leaf >= 7) {
+        __asm__ volatile("cpuid"
+                         : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                         : "a"(7u), "c"(0u));
+        if (b & (1u << 18)) caps |= 2;             /* RDSEED */
+    }
+    return caps;
+}
+
+static int rng_hw64(int caps, uint64_t *out) {
+    unsigned char ok;
+    uint64_t v;
+
+    if (caps & 2) {
+        for (int i = 0; i < 64; i++) {
+            __asm__ volatile("rdseed %0; setc %1" : "=r"(v), "=qm"(ok) :: "cc");
+            if (ok) { *out = v; return 0; }
+            __asm__ volatile("pause");
+        }
+    }
+    if (caps & 1) {
+        for (int i = 0; i < 10; i++) {
+            __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok) :: "cc");
+            if (ok) { *out = v; return 0; }
+        }
+    }
+    return -1;
+}
+
+#define ROTL32(v, n) (((v) << (n)) | ((v) >> (32 - (n))))
+#define CHACHA_QR(a, b, c, d) do {                       \
+    a += b; d ^= a; d = ROTL32(d, 16);                   \
+    c += d; b ^= c; b = ROTL32(b, 12);                   \
+    a += b; d ^= a; d = ROTL32(d, 8);                    \
+    c += d; b ^= c; b = ROTL32(b, 7);                    \
+} while (0)
+
+static void chacha20_block(const uint32_t key[8], uint64_t ctr,
+                           uint32_t out[16]) {
+    uint32_t s[16] = {
+        0x61707865u, 0x3320646Eu, 0x79622D32u, 0x6B206574u,
+        key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+        (uint32_t)ctr, (uint32_t)(ctr >> 32), 0, 0
+    };
+    uint32_t x[16];
+
+    for (int i = 0; i < 16; i++) x[i] = s[i];
+    for (int i = 0; i < 10; i++) {
+        CHACHA_QR(x[0], x[4], x[8],  x[12]);
+        CHACHA_QR(x[1], x[5], x[9],  x[13]);
+        CHACHA_QR(x[2], x[6], x[10], x[14]);
+        CHACHA_QR(x[3], x[7], x[11], x[15]);
+        CHACHA_QR(x[0], x[5], x[10], x[15]);
+        CHACHA_QR(x[1], x[6], x[11], x[12]);
+        CHACHA_QR(x[2], x[7], x[8],  x[13]);
+        CHACHA_QR(x[3], x[4], x[9],  x[14]);
+    }
+    for (int i = 0; i < 16; i++) out[i] = x[i] + s[i];
+    rng_wipe(x, sizeof(x));
+    rng_wipe(s, sizeof(s));
+}
+
+static void rng_reseed(void) {
+    uint32_t blk[16];
+    uint64_t ent[4];
+    int caps = rng_hw_caps();
+    int weak = 0;
+
+    for (int i = 0; i < 4; i++) {
+        if (rng_hw64(caps, &ent[i]) != 0) {
+            ent[i] = rng_jitter64();
+            weak = 1;
+        }
+        ent[i] ^= rng_rdtsc();
+    }
+    if (weak && !g_rng_weak_logged) {
+        g_api->com_write_string(0x3F8,
+            "[md64api] urandom: no usable RDSEED/RDRAND, using TSC jitter\n");
+        g_rng_weak_logged = 1;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        g_rng_key[2 * i]     ^= (uint32_t)ent[i];
+        g_rng_key[2 * i + 1] ^= (uint32_t)(ent[i] >> 32);
+    }
+
+    chacha20_block(g_rng_key, g_rng_ctr++, blk);
+    for (int i = 0; i < 8; i++) g_rng_key[i] = blk[i];
+
+    rng_wipe(blk, sizeof(blk));
+    rng_wipe(ent, sizeof(ent));
+    g_rng_since_seed = 0;
+    g_rng_seeded = 1;
+}
+
+static ssize_t rd_urandom(void *ctx, void *buf, size_t n) {
+    (void)ctx;
+    unsigned char *dst = (unsigned char *)buf;
+    size_t left = n;
+
+    if (!buf) return -1;
+
+    while (left) {
+        uint32_t blk[16];
+        size_t take = left < 32 ? left : 32;
+        uint64_t f = rng_irq_save();
+
+        if (!g_rng_seeded || g_rng_since_seed >= URANDOM_RESEED_BYTES)
+            rng_reseed();
+
+        chacha20_block(g_rng_key, g_rng_ctr++, blk);
+        for (int i = 0; i < 8; i++) g_rng_key[i] = blk[i];
+        memcpy(dst, &blk[8], take);
+        g_rng_since_seed += take;
+        rng_irq_restore(f);
+
+        rng_wipe(blk, sizeof(blk));
+        dst += take;
+        left -= take;
+    }
+    return (ssize_t)n;
 }
 
 /* ---- Read handlers ---- */
@@ -149,13 +328,9 @@ static ssize_t rd_ram_upper(void *ctx, void *buf, size_t n) {
 
 static ssize_t rd_sysinfo(void *ctx, void *buf, size_t count) {
     (void)ctx;
-    g_api->com_write_string(0x3F8, "[md64api] sysinfo read triggered\n");
     collect_sysinfo();
-    g_api->com_write_string(0x3F8, "[md64api] collect_sysinfo done\n");
     size_t n = count < sizeof(g_sysinfo) ? count : sizeof(g_sysinfo);
-    g_api->com_write_string(0x3F8, "[md64api] count done\n");
     memcpy(buf, &g_sysinfo, n);
-    g_api->com_write_string(0x3F8, "[md64api] memcpy(buf, &g_sysinfo, n); done\n ABOUT TO RETURN\n");
     return (ssize_t)n;
 }
 
@@ -172,8 +347,6 @@ static ssize_t rd_sysinfo(void *ctx, void *buf, size_t count) {
 static void collect_sysinfo(void) {
     md64api_sysinfo_data_u *o = &g_sysinfo;
 
-    g_api->com_write_string(0x3F8, "[md64api] Starting sysinfo collection\n");
-    g_api->com_write_string(0x3F8, "[md64api] Collecting Memory Info\n");
     /* Memory */
     if (g_api->phys_total_frames && g_api->phys_count_free_frames) {
         uint64_t tot = g_api->phys_total_frames();
@@ -187,8 +360,6 @@ static void collect_sysinfo(void) {
             (uint64_t)(mt->mem_upper + mt->mem_lower) / 1024ULL;
     }
     
-    g_api->com_write_string(0x3F8, "[md64api] Memory info collected\n");
-    g_api->com_write_string(0x3F8, "[md64api] Safe Copy Static Strings\n");
     /* Static strings */
     safe_copy(o->SystemVersion, sizeof(o->SystemVersion), "0.6.5");
     safe_copy(o->KernelVersion, sizeof(o->KernelVersion), "0.6.5");
@@ -199,7 +370,6 @@ static void collect_sysinfo(void) {
     safe_copy(o->kconsole,      sizeof(o->kconsole),      "TTYMAN.CTL");
 
 
-    g_api->com_write_string(0x3F8, "[md64api] Start SMBIOS Checks\n");
     /* SMBIOS */
     if (g_api->get_smbios_field) {
         const char *mfr  = g_api->get_smbios_field(0);
@@ -211,8 +381,7 @@ static void collect_sysinfo(void) {
         if (bv)   safe_copy(o->bios_vendor,       sizeof(o->bios_vendor),       bv);
         if (bver) safe_copy(o->bios_version,      sizeof(o->bios_version),      bver);
     }
-    g_api->com_write_string(0x3F8, "[md64api] DONE SMBIOS Checks\n");
-    g_api->com_write_string(0x3F8, "[md64api] Start GPU Checks\n");
+
     /* GPU */
     if (g_api->get_gpu_driver_name) {
         const char *gpu = g_api->get_gpu_driver_name();
@@ -222,9 +391,7 @@ static void collect_sysinfo(void) {
         }
     }
     o->gpu_vram_mb = 64;
-    g_api->com_write_string(0x3F8, "[md64api] DONE GPU Checks\n");
 
-g_api->com_write_string(0x3F8, "[md64api] Start Blockdev Checks\n");
     /* Primary disk model */
     if (g_api->block_get_info) {
         g_api->com_write_string(0x3F8, "[md64api] block_get_info is valid\n");
@@ -264,19 +431,15 @@ g_api->com_write_string(0x3F8, "[md64api] Start Blockdev Checks\n");
 
             g_api->com_write_string(0x3F8, "[md64api] model empty, continuing\n");
         }
-        g_api->com_write_string(0x3F8, "[md64api] loop done\n");
     } else {
         g_api->com_write_string(0x3F8, "[md64api] block_get_info is NULL, skipping\n");
     }
-    g_api->com_write_string(0x3F8, "[md64api] DONE Blockdev Checks\n");
-    g_api->com_write_string(0x3F8, "[md64api] Start Uptime Checks\n");
     /* Uptime */
     if (g_api->get_system_ticks && g_api->ticks_to_ms) {
         uint64_t ms = g_api->ticks_to_ms(g_api->get_system_ticks());
         o->uptime_seconds = ms / 1000ULL;
     }
 
-    g_api->com_write_string(0x3F8, "[md64api] Start CPUID Checks\n");
     /* CPUID: vendor (leaf 0) */
     {
         uint32_t ebx = 0, ecx = 0, edx = 0;
@@ -357,7 +520,6 @@ g_api->com_write_string(0x3F8, "[md64api] Start Blockdev Checks\n");
         else if (memcmp(hs, "Microsoft Hv", 12)  == 0) safe_copy(o->virtualization_vendor, sizeof(o->virtualization_vendor), "Hyper-V");
         else safe_copy(o->virtualization_vendor, sizeof(o->virtualization_vendor), hs);
     }
-    g_api->com_write_string(0x3F8, "[md64api] DONE CPUID Checks AND Litterly DONE\n");
 }
 
 /* ---- Service ---- */
@@ -426,6 +588,15 @@ static devfs_device_ops_t g_ops_sysinfo = {
     .can_replace = NULL,
 };
 
+static devfs_device_ops_t g_ops_urandom = {
+    .name        = "urandom",
+    .open        = devfs_open_stub,
+    .read        = rd_urandom,
+    .write       = devfs_write_stub,
+    .close       = devfs_close_stub,
+    .can_replace = NULL,
+};
+
 /* ---- Module init ---- */
 
 int sqrm_init(const sqrm_kernel_api_t *api) {
@@ -433,12 +604,14 @@ int sqrm_init(const sqrm_kernel_api_t *api) {
 
     g_api = api;
     g_mb2 = api->multiboot2_header;
+    rng_reseed();
 
     api->devfs_register_path("md64api/cmdline",    &g_ops_cmdline,    NULL);
     api->devfs_register_path("md64api/bootloader", &g_ops_bootloader, NULL);
     api->devfs_register_path("md64api/ram/lower",  &g_ops_ram_lower,  NULL);
     api->devfs_register_path("md64api/ram/upper",  &g_ops_ram_upper,  NULL);
     api->devfs_register_path("md64api/sysinfo",    &g_ops_sysinfo,    NULL);
+    api->devfs_register_path("md64api/urandom",    &g_ops_urandom,    NULL);
 
     if (api->sqrm_service_register)
         api->sqrm_service_register("md64api", &g_svc, sizeof(g_svc));
