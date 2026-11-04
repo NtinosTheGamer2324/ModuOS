@@ -18,7 +18,7 @@ typedef cpu_context_t cpu_state_t;
 
 // Use the new context_switch_asm which matches cpu_context_t offsets exactly.
 extern void context_switch_asm(cpu_context_t *old_ctx, cpu_context_t *new_ctx,
-                                void *old_fpu, void *new_fpu, uint64_t new_cr3);
+                               void *old_fpu, void *new_fpu, uint64_t new_cr3);
 
 // CR3 register access.
 // read_cr3 is non-static so process_init_new.c can link against it.
@@ -36,6 +36,9 @@ static void write_cr3(uint64_t val) {
 // External functions from arch-specific code
 extern void amd64_syscall_set_kernel_stack(uint64_t stack_top);
 extern void fpu_lazy_on_context_switch(process_t *next);
+extern process_t *process_get_by_pid(uint32_t pid);
+extern int com_write_hex64(uint16_t port, uint64_t value);
+extern char *itoa(int value, char *str, int base);
 
 // Use the same stack size as process.h (8192). The local #define previously
 // conflicted with process.h's definition; since we no longer include process.h,
@@ -46,73 +49,78 @@ static inline uint64_t stack_top(void *stack_base) {
     return (uint64_t)stack_base + KERNEL_STACK_SIZE;
 }
 
+/* Diagnostic trace for switches involving PIDs 2/4 and for changes to PID 2's
+ * page_table. The process_get_by_pid() lookup takes ptable_lock, so this must
+ * only be called when debug is on; keep it out of the default switch path. */
+static void context_switch_trace(process_t *prev, process_t *next,
+                                 uint64_t old_cr3) {
+    static uint64_t last_pid2_page_table = 0;
+    static int pid2_addr_logged = 0;
+    char buf[16];
+
+    process_t *pid2 = process_get_by_pid(2);
+
+    if (pid2 && !pid2_addr_logged) {
+        com_write_string(COM1_PORT, "[DEBUG] PID 2 process struct is at 0x");
+        com_write_hex64(COM1_PORT, (uint64_t)pid2);
+        com_write_string(COM1_PORT, "\n");
+        pid2_addr_logged = 1;
+    }
+
+    int involved = (prev && (prev->pid == 2 || prev->pid == 4)) ||
+                   next->pid == 2 || next->pid == 4;
+    int pid2_changed = pid2 && pid2->page_table != last_pid2_page_table;
+
+    if (!involved && !pid2_changed)
+        return;
+
+    com_write_string(COM1_PORT, "[SWITCH] ");
+    if (prev) {
+        itoa((int)prev->pid, buf, 10);
+        com_write_string(COM1_PORT, buf);
+    } else {
+        com_write_string(COM1_PORT, "NULL");
+    }
+    com_write_string(COM1_PORT, " -> ");
+    itoa((int)next->pid, buf, 10);
+    com_write_string(COM1_PORT, buf);
+    com_write_string(COM1_PORT, " | old_cr3=0x");
+    com_write_hex64(COM1_PORT, old_cr3);
+    if (prev) {
+        com_write_string(COM1_PORT, " prev->page_table=0x");
+        com_write_hex64(COM1_PORT, prev->page_table);
+    }
+    com_write_string(COM1_PORT, " next->page_table=0x");
+    com_write_hex64(COM1_PORT, next->page_table);
+
+    if (pid2) {
+        com_write_string(COM1_PORT, " | PID2.page_table=0x");
+        com_write_hex64(COM1_PORT, pid2->page_table);
+        if (pid2_changed) {
+            com_write_string(COM1_PORT, " **CHANGED**");
+            last_pid2_page_table = pid2->page_table;
+        }
+    }
+    com_write_string(COM1_PORT, "\n");
+}
+
 // High-level context switch
 void switch_to(process_t *prev, process_t *next) {
     if (!next) {
         return;
     }
-    
+
     // Note: Interrupts must remain ENABLED so timer can preempt user processes
     // The scheduler lock protects the critical sections
-    
+
     // Save current CR3 into the outgoing process's page_table field.
     uint64_t old_cr3 = read_cr3();
     if (prev) {
         prev->page_table = old_cr3;
     }
-    
-    // DEBUG: Log switches involving PID 2, and check if we're corrupting it.
-    // All of this is spammy diagnostic tracing — only emit it at max debug
-    // level (KDBG_ON); med/off stay silent.
-    extern process_t *process_get_by_pid(uint32_t);
-    process_t *pid2 = process_get_by_pid(2);
-    static uint64_t last_pid2_page_table = 0;
-    static uint64_t pid2_addr_logged = 0;
-    if (kernel_debug_is_on() && pid2 && !pid2_addr_logged) {
-        extern int com_write_string(uint16_t, const char*);
-        extern int com_write_hex64(uint16_t, uint64_t);
-        com_write_string(0x3F8, "[DEBUG] PID 2 process struct is at 0x");
-        com_write_hex64(0x3F8, (uint64_t)pid2);
-        com_write_string(0x3F8, "\n");
-        pid2_addr_logged = 1;
-    }
 
-    if (kernel_debug_is_on() &&
-        ((prev && (prev->pid == 2 || prev->pid == 4)) || (next->pid == 2 || next->pid == 4) ||
-         (pid2 && pid2->page_table != last_pid2_page_table))) {
-        extern int com_write_string(uint16_t, const char*);
-        extern int com_write_hex64(uint16_t, uint64_t);
-        extern char *itoa(int, char*, int);
-        char buf[16];
-        com_write_string(0x3F8, "[SWITCH] ");
-        if (prev) {
-            itoa((int)prev->pid, buf, 10);
-            com_write_string(0x3F8, buf);
-        } else {
-            com_write_string(0x3F8, "NULL");
-        }
-        com_write_string(0x3F8, " -> ");
-        itoa((int)next->pid, buf, 10);
-        com_write_string(0x3F8, buf);
-        com_write_string(0x3F8, " | old_cr3=0x");
-        com_write_hex64(0x3F8, old_cr3);
-        if (prev) {
-            com_write_string(0x3F8, " prev->page_table=0x");
-            com_write_hex64(0x3F8, prev->page_table);
-        }
-        com_write_string(0x3F8, " next->page_table=0x");
-        com_write_hex64(0x3F8, next->page_table);
-        
-        if (pid2) {
-            com_write_string(0x3F8, " | PID2.page_table=0x");
-            com_write_hex64(0x3F8, pid2->page_table);
-            if (pid2->page_table != last_pid2_page_table) {
-                com_write_string(0x3F8, " **CHANGED**");
-                last_pid2_page_table = pid2->page_table;
-            }
-        }
-        com_write_string(0x3F8, "\n");
-    }
+    if (kernel_debug_is_on())
+        context_switch_trace(prev, next, old_cr3);
 
     // Update TSS kernel stack pointer for the incoming process.
     if (next->kernel_stack) {

@@ -240,6 +240,102 @@ int elf_get_interp_path(const void *elf_data, size_t size, char *out, size_t out
     return 0;
 }
 
+/* Page-aligned [lo, hi) spanned by PT_LOAD segments. Needed before mapping so
+ * an overlapping interpreter is rejected instead of silently clobbering the
+ * executable's pages. */
+static int elf_load_range(const void *elf_data, size_t size,
+                          uint64_t *lo, uint64_t *hi) {
+    if (size < sizeof(elf64_ehdr_t) || elf_validate(elf_data) != 0) return -1;
+
+    const elf64_ehdr_t *ehdr = (const elf64_ehdr_t *)elf_data;
+    if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) return -1;
+
+    uint64_t phentsz = ehdr->e_phentsize ? ehdr->e_phentsize
+                                         : (uint64_t)sizeof(elf64_phdr_t);
+    if (ehdr->e_phoff + (uint64_t)ehdr->e_phnum * phentsz > size) return -1;
+
+    uint64_t min = ~0ULL, max = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        const elf64_phdr_t *ph =
+            (const elf64_phdr_t *)((const uint8_t *)elf_data + ehdr->e_phoff +
+                                   (uint64_t)i * phentsz);
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+        uint64_t s = ph->p_vaddr & ~0xFFFULL;
+        uint64_t e = (ph->p_vaddr + ph->p_memsz + 0xFFFULL) & ~0xFFFULL;
+        if (s < min) min = s;
+        if (e > max) max = e;
+    }
+    if (min == ~0ULL || min < 0x1000ULL) return -1;
+
+    *lo = min;
+    *hi = max;
+    return 0;
+}
+
+/* The loader has no bias support, so the program header table's VA is only
+ * known when the table lies inside a PT_LOAD (the default ld layout). */
+static uint64_t elf_phdr_user_va(const elf64_ehdr_t *ehdr) {
+    uint64_t phentsz = ehdr->e_phentsize ? ehdr->e_phentsize
+                                         : (uint64_t)sizeof(elf64_phdr_t);
+    const elf64_phdr_t *ph =
+        (const elf64_phdr_t *)((const uint8_t *)ehdr + ehdr->e_phoff);
+
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        const elf64_phdr_t *p =
+            (const elf64_phdr_t *)((const uint8_t *)ph + (uint64_t)i * phentsz);
+        if (p->p_type == PT_PHDR) return p->p_vaddr;
+    }
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        const elf64_phdr_t *p =
+            (const elf64_phdr_t *)((const uint8_t *)ph + (uint64_t)i * phentsz);
+        if (p->p_type != PT_LOAD) continue;
+        if (ehdr->e_phoff >= p->p_offset &&
+            ehdr->e_phoff + (uint64_t)ehdr->e_phnum * phentsz <=
+                p->p_offset + p->p_filesz)
+            return p->p_vaddr + (ehdr->e_phoff - p->p_offset);
+    }
+    return 0;
+}
+
+int elf_load_dynamic(const void *exe, size_t exe_size,
+                     const void *interp, size_t interp_size,
+                     uint64_t *entry_point,
+                     uint64_t *out_image_base, uint64_t *out_image_end,
+                     uint64_t *out_interp_end, dlinfo_t *out_info) {
+    uint64_t elo, ehi, ilo, ihi;
+    if (elf_load_range(exe, exe_size, &elo, &ehi) != 0 ||
+        elf_load_range(interp, interp_size, &ilo, &ihi) != 0) {
+        COM_LOG_ERROR(COM1_PORT, "Dynamic load: bad ELF load range");
+        return -1;
+    }
+    if (elo < ihi && ilo < ehi) {
+        COM_LOG_ERROR(COM1_PORT, "Interpreter overlaps executable image");
+        return -1;
+    }
+
+    uint64_t exe_entry = 0, interp_entry = 0, b0, e0;
+    if (elf_load_with_args(exe, exe_size, &exe_entry, 0, NULL, &b0, &e0) != 0)
+        return -1;
+    if (elf_load_with_args(interp, interp_size, &interp_entry, 0, NULL, &b0, &e0) != 0)
+        return -1;
+
+    const elf64_ehdr_t *eh = (const elf64_ehdr_t *)exe;
+    memset(out_info, 0, sizeof(*out_info));
+    out_info->version     = DLINFO_VERSION;
+    out_info->exe_phdr    = elf_phdr_user_va(eh);
+    out_info->exe_phnum   = eh->e_phnum;
+    out_info->exe_phent   = eh->e_phentsize ? eh->e_phentsize
+                                            : (uint64_t)sizeof(elf64_phdr_t);
+    out_info->exe_entry   = exe_entry;
+    out_info->interp_base = ilo;
+
+    *entry_point = interp_entry;
+    if (out_image_base) *out_image_base = elo;
+    if (out_image_end)  *out_image_end  = ehi;
+    if (out_interp_end) *out_interp_end = ihi;
+    return 0;
+}
+
 int elf_load_process(const char *path, char *const argv[]) {
     COM_LOG_INFO(COM1_PORT, "Loading ELF from file");
     COM_LOG_ERROR(COM1_PORT, "File loading not yet implemented");

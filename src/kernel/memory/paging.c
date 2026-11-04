@@ -711,11 +711,26 @@ uint64_t paging_get_flags(uint64_t virt) {
     return pt_entry & 0xFFFULL;
 }
 
-uint64_t paging_virt_to_phys(uint64_t virt) {
-    uint64_t cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-
-    uint64_t cur_pml4_phys = cr3 & 0xFFFFFFFFFFFFF000ULL;
+/*
+ * paging_virt_to_phys_in — walk an EXPLICIT PML4 (by its physical address)
+ * rather than the live/current CR3.
+ *
+ * This exists so callers translating a kernel-heap VA (KHEAP_START range)
+ * can walk kernel_master_cr3 specifically. The kernel heap is grown with
+ * paging_map_range()/paging_map_kernel_page(), which mirror each mapping
+ * into kernel_master_cr3 (see paging_sync_kernel_mappings and the mirror
+ * logic near line 278/411), so kernel_master_cr3 is always authoritative
+ * for kernel-space VAs — unlike the live CR3 during a syscall, which is
+ * the calling process's PML4 and may not have the heap mapped/current.
+ *
+ * Do NOT use this with a process PML4 for user addresses unless you know
+ * that PML4 is the live one — this does not switch CR3, it only reads
+ * page tables via phys_to_virt, so the target PML4's tables must already
+ * be reachable through the physmap (true for kernel_master_cr3 and any
+ * process PML4 created via paging_create_process_pml4/paging_map_range_to_pml4).
+ */
+uint64_t paging_virt_to_phys_in(uint64_t pml4_phys, uint64_t virt) {
+    uint64_t cur_pml4_phys = pml4_phys & 0xFFFFFFFFFFFFF000ULL;
     uint64_t *current_pml4 = (uint64_t*)phys_to_virt(cur_pml4_phys);
     if (!current_pml4) return 0;
 
@@ -760,6 +775,12 @@ uint64_t paging_virt_to_phys(uint64_t virt) {
     if (!(pt_entry & PFLAG_PRESENT)) return 0;
 
     return (pt_entry & 0xFFFFFFFFFFFFF000ULL) | offset;
+}
+
+uint64_t paging_virt_to_phys(uint64_t virt) {
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    return paging_virt_to_phys_in(cr3 & 0xFFFFFFFFFFFFF000ULL, virt);
 }
 
 static int is_canonical_high(uint64_t v) {

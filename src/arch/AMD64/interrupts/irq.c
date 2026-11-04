@@ -4,6 +4,7 @@
 #include "moduos/kernel/memory/string.h" // itoa
 #include "moduos/arch/AMD64/interrupts/pic.h"
 #include "moduos/kernel/COM/com.h"
+#include "moduos/kernel/debug.h"
 
 extern void (*irq_stubs[16])(); // from isr.asm
 
@@ -22,9 +23,7 @@ static void irq_dbg_hex64(uint64_t v, char out[17]) {
 
 void irq_install_handler(int irq, irq_handler_t handler) {
     if (irq >= 0 && irq < 16) {
-        irq_handlers[irq] = handler;
-
-        // Debug: log handler address so we can catch truncated/unrelocated module pointers.
+        irq_handlers[irq] = handler;        // Debug: log handler address so we can catch truncated/unrelocated module pointers.
         char h[17];
         irq_dbg_hex64((uint64_t)(uintptr_t)handler, h);
         com_write_string(COM1_PORT, "[IRQ] install irq=");
@@ -34,6 +33,19 @@ void irq_install_handler(int irq, irq_handler_t handler) {
         com_write_string(COM1_PORT, " handler=0x");
         com_write_string(COM1_PORT, h);
         com_write_string(COM1_PORT, "\n");
+
+        if (kernel_debug_is_med() == 1) {
+            // Debug: log handler address so we can catch truncated/unrelocated module pointers.
+            char h[17];
+            irq_dbg_hex64((uint64_t)(uintptr_t)handler, h);
+            com_write_string(COM1_PORT, "[IRQ] install irq=");
+            char ibuf[4];
+            itoa(irq, ibuf, 10);
+            com_write_string(COM1_PORT, ibuf);
+            com_write_string(COM1_PORT, " handler=0x");
+            com_write_string(COM1_PORT, h);
+            com_write_string(COM1_PORT, "\n");
+        }
     }
 }
 

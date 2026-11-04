@@ -17,7 +17,8 @@
 // System call handler
 void syscall_init(void);
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, 
-                         uint64_t arg3, uint64_t arg4, uint64_t arg5);
+                         uint64_t arg3, uint64_t arg4, uint64_t arg5,
+                         uint64_t arg6);
 
 // Individual system call implementations
 int sys_exit(int status);
@@ -55,6 +56,7 @@ int sys_userfs_register(const userfs_user_node_t *user_node);
 /* VM mapping (for userland ld.so) */
 void* sys_mmap(void *addr, size_t size, int prot, int flags, int fd);
 int   sys_munmap(void *addr, size_t size);
+int   sys_dlinfo(void *out_user);
 
 /* Shared memory (see ipc/shm.h). fd for sys_mmap() with MAP_SHARED set is a
  * handle from sys_shm_open(), not a real file descriptor. */

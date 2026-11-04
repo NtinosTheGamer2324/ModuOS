@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "moduos/kernel/loader/dlinfo.h"
+#include "moduos/kernel/process/signals.h"
 
 // ---------------------------------------------------------------------------
 // container_of — recover the enclosing struct from a member pointer.
@@ -143,12 +145,16 @@ typedef struct process {
     // Memory regions
     uint64_t user_image_base;
     uint64_t user_image_end;
+    uint64_t user_interp_end; // PT_LOAD span end; base is dl_info.interp_base
     uint64_t user_heap_base;
     uint64_t user_heap_end;
     uint64_t user_heap_limit;
     uint64_t user_mmap_base;
     uint64_t user_mmap_end;
     uint64_t user_mmap_limit;
+
+    /* Filled by the kernel when the image has a PT_INTERP; see SYS_DLINFO. */
+    dlinfo_t dl_info;
 
     // Flags
     int is_user;
@@ -191,8 +197,14 @@ typedef struct process {
     uint32_t suid;
     uint32_t sgid;
 
-    // Per-signal disposition (0=SIG_DFL, 1=SIG_IGN, else=user handler VA)
-    uint64_t signal_handlers[64];
+    signal_action_t signal_actions[64];
+    bool signal_in_handler;
+    bool signal_fault_active;
+    bool signal_fault_reject_repeat;
+    uint64_t signal_fault_vector;
+    uint64_t signal_fault_address;
+    uint64_t signal_fault_error;
+    ucontext_t signal_fault_context;
 
 } process_t;
 
@@ -332,7 +344,7 @@ int   process_close_fd(uint32_t pid, int fd);
 
 void check_signals(void);
 void process_management_init(void);
-void create_init_process(const char *path);
+process_t *create_init_process(const char *path);
 void process_wake(uint32_t pid);
 void set_curproc(process_t *p);
 
