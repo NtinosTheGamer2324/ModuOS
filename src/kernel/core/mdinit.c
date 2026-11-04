@@ -123,8 +123,9 @@ static void Interrupts_Init(void) {
     irq_init();
     COM_LOG_OK(COM1_PORT, "Initialized IRQs");
 
-    COM_LOG_INFO(COM1_PORT, "Initializing PIT (1000Hz)");
-    pit_init(1000);
+    COM_LOG_INFO(COM1_PORT, "Initializing PIT");
+    com_printf(COM1_PORT, "[INFO] Selected PIT Hz: %d\n", pit_hz);
+    pit_init(pit_hz);
     COM_LOG_OK(COM1_PORT, "PIT initialized");
 
     COM_LOG_INFO(COM1_PORT, "Loading IDT");

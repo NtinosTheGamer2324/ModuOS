@@ -573,6 +573,8 @@ void kernel_main(uint64_t mb2_ptr)
         cmdline = s->string;
     }
 
+    // var to change: pit_hz
+
     com_write_string(COM1_PORT, "[BOOT] cmdline: ");
     if (cmdline) {
         // Print cmdline (bounded)
@@ -593,6 +595,13 @@ void kernel_main(uint64_t mb2_ptr)
         } else {
             kernel_debug_set_level(KDBG_OFF);
             COM_LOG_INFO(COM1_PORT, "KDBG: OFF");
+        }
+
+        const char *pithz_arg = strstr(cmdline, "--pithz=");
+        if (pithz_arg) {
+            pithz_arg += 8; 
+            pit_hz = (uint32_t)atoi(pithz_arg);
+            if (pit_hz == 0) pit_hz = 100; // safety fallback if parse fails
         }
 
     } else {
@@ -640,7 +649,16 @@ void kernel_main(uint64_t mb2_ptr)
 
     // Create init process (PID 1) - AutoMan (like systemd)
     com_write_string(COM1_PORT, "[KERNEL] Creating init process (AutoMan)...\n");
-    create_init_process("/ModuOS/System64/automan.sqr");
+    process_t *initp = create_init_process("/ModuOS/System64/automan.sqr");
+    if (initp == NULL) {
+        panic("FAILED TO CREATE INIT PROCESS",
+              "The Initial process (automan) could not be started.\n",
+              "", "INIT", "PROC_START_FAIL", 6);
+    } else if (initp->pid != 1) {
+        panic("INIT PROCESS NOT PID1",
+              "The Initial process (automan) was not assigned PID1\n",
+              "", "INIT", "PID_ASSIGN_FAIL", 6);
+    }
 
     /* Enable interrupts and enter the idle loop.
      * create_init_process() has already enqueued PID 1; the first schedule()
