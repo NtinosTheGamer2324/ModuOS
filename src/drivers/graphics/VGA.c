@@ -560,6 +560,15 @@ static int vga_try_parse_ansi_sgr(const char *s, size_t max_len, size_t *consume
             return 1;
         }
 
+        if (c == 'J') {
+            if (!have_param || param == 2) {
+                VGA_Clear();
+            }
+            i++;
+            *consumed = i;
+            return 1;
+        }
+
         return 0;
     }
 
@@ -603,6 +612,15 @@ static int vga_try_parse_ansi_sgr_z(const char *s, size_t *consumed) {
 
         if (c == 'm') {
             vga_apply_sgr_param(have_param ? param : 0);
+            i++;
+            *consumed = i;
+            return 1;
+        }
+
+        if (c == 'J') {
+            if (!have_param || param == 2) {
+                VGA_Clear();
+            }
             i++;
             *consumed = i;
             return 1;

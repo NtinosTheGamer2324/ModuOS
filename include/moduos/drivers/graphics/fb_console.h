@@ -58,6 +58,10 @@ typedef struct {
     bool dirty_any;
     uint32_t dirty_x0, dirty_y0;
     uint32_t dirty_x1, dirty_y1; /* exclusive */
+
+    /* Scrolling i guess */
+    uint32_t scroll_x0, scroll_y0;   /* top-left of the console's owned region */
+    uint32_t scroll_w,  scroll_h;    /* size of that region (0,0 = full screen, for back-compat) */
 } fb_console_t;
 
 /* Initialize console for a given framebuffer using built-in bitmap font. */

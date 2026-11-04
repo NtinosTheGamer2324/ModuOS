@@ -56,9 +56,11 @@ typedef struct {
 typedef struct {
     fnt_header_t header;
     fnt_glyph_t *glyphs;
-    
-    /* Quick lookup cache for ASCII (0-127) */
     fnt_glyph_t *ascii_cache[128];
+    
+    void *_bitmap_pool;
+    fnt_glyph_t **hash_buckets;
+    uint32_t hash_size;
 } fnt_font_t;
 
 /*

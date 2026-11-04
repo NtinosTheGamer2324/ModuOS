@@ -130,91 +130,52 @@ static void fb_fill_rect(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32
     }
 }
 
+void fbcon_set_region(fb_console_t *c, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!c) return;
+    c->scroll_x0 = x; c->scroll_y0 = y;
+    c->scroll_w  = w; c->scroll_h  = h;
+}
+
 static void fb_scroll_up(fb_console_t *c) {
-    /* Scroll by one text row (cell_h pixels) */
     uint32_t dy = c->cell_h;
     if (!c || !c->fb.addr || c->fb.pitch == 0) return;
 
-    /* Heuristic: warn if framebuffer lives in heap range (should usually be ioremap/MMIO). */
-    if (((uint64_t)(uintptr_t)c->fb.addr) >= 0xFFFF800000000000ULL &&
-        ((uint64_t)(uintptr_t)c->fb.addr) <  0xFFFF900000000000ULL) {
-        com_write_string(COM1_PORT, "[FBCON] WARNING: fb.addr is inside KHEAP high-half range\n");
-    }
-
-    /* Ensure cursor isn't baked into the scrolled pixels */
     fbcon_cursor_hide(c);
 
-    if (dy == 0 || dy >= c->fb.height) {
-        c->x = c->y = 0;
-        fbcon_clear(c);
+    uint32_t rx = c->scroll_w ? c->scroll_x0 : 0;
+    uint32_t ry = c->scroll_h ? c->scroll_y0 : 0;
+    uint32_t rw = c->scroll_w ? c->scroll_w  : c->fb.width;
+    uint32_t rh = c->scroll_h ? c->scroll_h  : c->fb.height;
+
+    if (dy == 0 || dy >= rh) {
+        c->x = c->margin_left + rx;
+        c->y = c->margin_top  + ry;
+        uint8_t r,g,b; vga16_to_rgb(c->bg, &r,&g,&b);
+        uint32_t px = fb_pack_rgb888(&c->fb, r,g,b);
+        fb_fill_rect(&c->fb, rx, ry, rw, rh, px);   // only OUR rect
+        fbcon_flush_rect(c, rx, ry, rw, rh);
+        fbcon_flush_commit(c);
         return;
     }
 
-    uint8_t *p = (uint8_t*)c->fb.addr;
-    uint64_t row_bytes = c->fb.pitch;
+    uint32_t bypp = c->fb.bpp / 8;
+    uint64_t row_span = (uint64_t)rw * bypp;
 
-    /* Defensive: compute move size from the actually-mapped framebuffer byte size.
-     * This avoids any accidental overrun if height/pitch are inconsistent.
-     */
-    uint64_t fb_size = (uint64_t)c->fb.height * row_bytes;
-    uint64_t src_off = (uint64_t)dy * row_bytes;
-    if (src_off >= fb_size) {
-        fbcon_clear(c);
-        return;
-    }
-    uint64_t move_bytes = fb_size - src_off;
-
-    /* Extra mapping sanity: ensure framebuffer pages are mapped */
-    uint64_t p_phys0 = paging_virt_to_phys((uint64_t)(uintptr_t)p);
-    uint64_t p_phys1 = paging_virt_to_phys((uint64_t)(uintptr_t)(p + fb_size - 1));
-    if (p_phys0 == 0 || p_phys1 == 0) {
-        com_write_string(COM1_PORT, "[FBCON] FATAL: framebuffer not fully mapped\n");
-        com_printf(COM1_PORT, "[FBCON]   p=0x%08x%08x p_phys0=0x%08x%08x p_phys_last=0x%08x%08x\n",
-                   (uint32_t)(((uint64_t)(uintptr_t)p) >> 32), (uint32_t)(((uint64_t)(uintptr_t)p) & 0xFFFFFFFFu),
-                   (uint32_t)(p_phys0 >> 32), (uint32_t)(p_phys0 & 0xFFFFFFFFu),
-                   (uint32_t)(p_phys1 >> 32), (uint32_t)(p_phys1 & 0xFFFFFFFFu));
-        for (;;) { __asm__ volatile("cli; hlt"); }
+    /* Row-by-row, confined to [rx, rx+rw) — never touches pixels outside it */
+    for (uint32_t row = 0; row < rh - dy; row++) {
+        uint8_t *dst = (uint8_t*)c->fb.addr + (uint64_t)(ry + row)      * c->fb.pitch + (uint64_t)rx * bypp;
+        uint8_t *src = (uint8_t*)c->fb.addr + (uint64_t)(ry + row + dy) * c->fb.pitch + (uint64_t)rx * bypp;
+        memmove(dst, src, row_span);
     }
 
-    /* HARD BOUNDS CHECK (debug safety): ensure memmove stays within framebuffer */
-    uintptr_t fb_start = (uintptr_t)p;
-    uintptr_t fb_end   = fb_start + (uintptr_t)fb_size;
-
-    uint8_t *dst = p;
-    uint8_t *src = p + src_off;
-    uintptr_t src_end = (uintptr_t)src + (uintptr_t)move_bytes;
-    uintptr_t dst_end = (uintptr_t)dst + (uintptr_t)move_bytes;
-
-    if (src_end > fb_end || dst_end > fb_end) {
-        com_write_string(COM1_PORT, "[FBCON] FATAL: fb_scroll_up overflow prevented\n");
-        com_printf(COM1_PORT, "[FBCON]   fb_start=0x%08x%08x fb_end=0x%08x%08x\n",
-                   (uint32_t)(fb_start >> 32), (uint32_t)(fb_start & 0xFFFFFFFFu),
-                   (uint32_t)(fb_end >> 32),   (uint32_t)(fb_end & 0xFFFFFFFFu));
-        com_printf(COM1_PORT, "[FBCON]   src=0x%08x%08x dst=0x%08x%08x len=%u\n",
-                   (uint32_t)(((uint64_t)(uintptr_t)src) >> 32), (uint32_t)(((uint64_t)(uintptr_t)src) & 0xFFFFFFFFu),
-                   (uint32_t)(((uint64_t)(uintptr_t)dst) >> 32), (uint32_t)(((uint64_t)(uintptr_t)dst) & 0xFFFFFFFFu),
-                   (uint32_t)move_bytes);
-        com_printf(COM1_PORT, "[FBCON]   src_end=0x%08x%08x dst_end=0x%08x%08x\n",
-                   (uint32_t)(src_end >> 32), (uint32_t)(src_end & 0xFFFFFFFFu),
-                   (uint32_t)(dst_end >> 32), (uint32_t)(dst_end & 0xFFFFFFFFu));
-        for (;;) { __asm__ volatile("cli; hlt"); }
-    }
-
-    memmove(dst, src, move_bytes);
-
-    /* Clear bottom area */
-    uint8_t r,g,b;
-    vga16_to_rgb(c->bg, &r,&g,&b);
+    uint8_t r,g,b; vga16_to_rgb(c->bg, &r,&g,&b);
     uint32_t px = fb_pack_rgb888(&c->fb, r,g,b);
-    fb_fill_rect(&c->fb, 0, c->fb.height - dy, c->fb.width, dy, px);
+    fb_fill_rect(&c->fb, rx, ry + rh - dy, rw, dy, px);   // clear only the exposed strip, only our width
 
-    if (c->y >= dy) c->y -= dy;
-    else c->y = 0;
+    if (c->y >= dy) c->y -= dy; else c->y = ry;
 
-    fbcon_flush_rect(c, 0, 0, c->fb.width, c->fb.height);
+    fbcon_flush_rect(c, rx, ry, rw, rh);   // flush only our rect, not the whole display
     fbcon_flush_commit(c);
-
-    /* Scrolling invalidates the drawn cursor position */
     c->cursor_drawn = false;
 }
 

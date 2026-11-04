@@ -23,127 +23,96 @@ fnt_font_t *fnt_load_font(const void *data, size_t size) {
     const uint8_t *ptr = (const uint8_t *)data;
     const uint8_t *end = ptr + size;
     
-    /* Verify magic */
-    if (ptr[0] != FNT_MAGIC_0 || ptr[1] != FNT_MAGIC_1 ||
-        ptr[2] != FNT_MAGIC_2 || ptr[3] != FNT_MAGIC_3) {
-        com_write_string(COM1_PORT, "[FNT] Invalid magic number\n");
-        return NULL;
-    }
-    ptr += 4;
-    
-    /* Check version */
-    uint16_t version = read_le16(ptr);
-    ptr += 2;
-    
-    if (version != FNT_VERSION) {
-        com_printf(COM1_PORT, "[FNT] Unsupported version %u\n", version);
-        return NULL;
-    }
-    
-    /* Allocate font structure */
-    fnt_font_t *font = (fnt_font_t *)kmalloc(sizeof(fnt_font_t));
-    if (!font) {
-        com_write_string(COM1_PORT, "[FNT] Failed to allocate font structure\n");
-        return NULL;
-    }
-    
-    memset(font, 0, sizeof(fnt_font_t));
-    
-    /* Read font name */
-    if (ptr + 2 > end) goto error;
+    ptr += 6; 
+
+    /* Read font name length and name */
+    if (ptr + 2 > end) return NULL;
     uint16_t name_len = read_le16(ptr);
     ptr += 2;
-    
-    if (ptr + name_len > end) goto error;
-    
-    font->header.name = (char *)kmalloc(name_len + 1);
-    if (!font->header.name) goto error;
-    
-    memcpy(font->header.name, ptr, name_len);
-    font->header.name[name_len] = '\0';
+    if (ptr + name_len > end) return NULL;
+    const uint8_t *name_ptr = ptr;
     ptr += name_len;
-    
-    /* Read font metrics */
-    if (ptr + 6 > end) goto error;
-    font->header.glyph_width = read_le16(ptr);
-    ptr += 2;
-    font->header.glyph_height = read_le16(ptr);
-    ptr += 2;
-    font->header.baseline = read_le16(ptr);
-    ptr += 2;
-    
-    com_printf(COM1_PORT, "[FNT] Loading font '%s' (%ux%u, baseline %u)\n",
-              font->header.name, font->header.glyph_width,
-              font->header.glyph_height, font->header.baseline);
-    
-    /* Read glyph count */
-    if (ptr + 4 > end) goto error;
-    font->header.glyph_count = read_le32(ptr);
+
+    /* Read metrics */
+    if (ptr + 6 > end) return NULL;
+    uint16_t glyph_width = read_le16(ptr); ptr += 2;
+    uint16_t glyph_height = read_le16(ptr); ptr += 2u;
+    uint16_t baseline = read_le16(ptr); ptr += 2u;
+
+    if (ptr + 4 > end) return NULL;
+    uint32_t glyph_count = read_le32(ptr);
     ptr += 4;
+
+    if (glyph_count == 0) return NULL;
+
+    const uint8_t *temp_ptr = ptr;
+    size_t total_bitmap_bytes = 0;
     
-    com_printf(COM1_PORT, "[FNT] Font contains %u glyphs\n", font->header.glyph_count);
-    
-    if (font->header.glyph_count == 0) {
-        com_write_string(COM1_PORT, "[FNT] Warning - font has no glyphs\n");
-        return font;
-    }
-    
-    /* Allocate glyph array */
-    font->glyphs = (fnt_glyph_t *)kmalloc(sizeof(fnt_glyph_t) * font->header.glyph_count);
-    if (!font->glyphs) goto error;
-    
-    memset(font->glyphs, 0, sizeof(fnt_glyph_t) * font->header.glyph_count);
-    
-    /* Load each glyph */
-    for (uint32_t i = 0; i < font->header.glyph_count; i++) {
-        if (ptr + 12 > end) goto error;
+    for (uint32_t i = 0; i < glyph_count; i++) {
+        if (temp_ptr + 12 > end) return NULL;
+        temp_ptr += 4; // codepoint
+        uint16_t w = read_le16(temp_ptr); temp_ptr += 2;
+        uint16_t bw = read_le16(temp_ptr); temp_ptr += 2;
+        uint16_t bh = read_le16(temp_ptr); temp_ptr += 2;
         
+        uint32_t bytes_per_row = (bw + 7) / 8;
+        size_t bmap_size = bytes_per_row * bh;
+        total_bitmap_bytes += bmap_size;
+        
+        if (temp_ptr + bmap_size > end) return NULL;
+        temp_ptr += bmap_size;
+    }
+
+    /* Allocate font structure, name, glyph array, AND the massive bitmap blob in just a few clean allocations */
+    fnt_font_t *font = (fnt_font_t *)kmalloc(sizeof(fnt_font_t));
+    if (!font) return NULL;
+    memset(font, 0, sizeof(fnt_font_t));
+
+    font->header.glyph_width = glyph_width;
+    font->header.glyph_height = glyph_height;
+    font->header.baseline = baseline;
+    font->header.glyph_count = glyph_count;
+
+    font->header.name = (char *)kmalloc(name_len + 1);
+    if (!font->header.name) { fnt_free_font(font); return NULL; }
+    memcpy(font->header.name, name_ptr, name_len);
+    font->header.name[name_len] = '\0';
+
+    font->glyphs = (fnt_glyph_t *)kmalloc(sizeof(fnt_glyph_t) * glyph_count);
+    if (!font->glyphs) { fnt_free_font(font); return NULL; }
+    memset(font->glyphs, 0, sizeof(fnt_glyph_t) * glyph_count);
+
+    uint8_t *bitmap_pool = (uint8_t *)kmalloc(total_bitmap_bytes);
+    if (!bitmap_pool) { fnt_free_font(font); return NULL; }
+    uint8_t *pool_ptr = bitmap_pool;
+
+    for (uint32_t i = 0; i < glyph_count; i++) {
         fnt_glyph_t *glyph = &font->glyphs[i];
         
-        /* Read glyph metadata */
-        glyph->codepoint = read_le32(ptr);
-        ptr += 4;
-        glyph->width = read_le16(ptr);
-        ptr += 2;
-        glyph->bitmap_width = read_le16(ptr);
-        ptr += 2;
-        glyph->bitmap_height = read_le16(ptr);
-        ptr += 2;
+        glyph->codepoint = read_le32(ptr); ptr += 4;
+        glyph->width = read_le16(ptr); ptr += 2;
+        glyph->bitmap_width = read_le16(ptr); ptr += 2;
+        glyph->bitmap_height = read_le16(ptr); ptr += 2;
         
-        /* Calculate bitmap size in bytes */
         uint32_t bytes_per_row = (glyph->bitmap_width + 7) / 8;
         uint32_t bitmap_size = bytes_per_row * glyph->bitmap_height;
         
-        if (ptr + bitmap_size > end) goto error;
-        
-        /* Allocate and copy bitmap */
-        glyph->bitmap = (uint8_t *)kmalloc(bitmap_size);
-        if (!glyph->bitmap) goto error;
-        
+        /* Point directly into our pre-allocated pool instead of kmallocing */
+        glyph->bitmap = pool_ptr;
         memcpy(glyph->bitmap, ptr, bitmap_size);
+        pool_ptr += bitmap_size;
         ptr += bitmap_size;
         
-        /* Cache ASCII glyphs for fast lookup */
         if (glyph->codepoint < 128) {
             font->ascii_cache[glyph->codepoint] = glyph;
         }
     }
-    
-    com_printf(COM1_PORT, "[FNT] Successfully loaded %u glyphs\n", font->header.glyph_count);
-    
-    /* Store header info */
-    font->header.magic[0] = FNT_MAGIC_0;
-    font->header.magic[1] = FNT_MAGIC_1;
-    font->header.magic[2] = FNT_MAGIC_2;
-    font->header.magic[3] = FNT_MAGIC_3;
-    font->header.version = version;
-    
+
+    // Keep track of the pool pointer so fnt_free_font can free it safely
+    font->_bitmap_pool = bitmap_pool; 
+
+    com_printf(COM1_PORT, "[FNT] Successfully loaded %u glyphs instantly\n", glyph_count);
     return font;
-    
-error:
-    com_write_string(COM1_PORT, "[FNT] Error loading font\n");
-    fnt_free_font(font);
-    return NULL;
 }
 
 void fnt_free_font(fnt_font_t *font) {
@@ -154,15 +123,14 @@ void fnt_free_font(fnt_font_t *font) {
     }
     
     if (font->glyphs) {
-        for (uint32_t i = 0; i < font->header.glyph_count; i++) {
-            if (font->glyphs[i].bitmap) {
-                kfree(font->glyphs[i].bitmap);
-            }
-        }
-        kfree(font->glyphs);
+        kfree(font->glyphs); // The glyph array itself
     }
     
-    kfree(font);
+    if (font->_bitmap_pool) {
+        kfree(font->_bitmap_pool); // Frees all bitmaps in one go!
+    }
+    
+    kfree(font); // Frees the font structure
 }
 
 fnt_glyph_t *fnt_get_glyph(fnt_font_t *font, uint32_t codepoint) {
