@@ -1,11 +1,9 @@
 /*
- * mdedit.c — ModuOS graphical text editor
+ * mdedit.c — ModuOS graphical text editor (mdw window client)
  *
- * Standalone fullscreen app: owns its own NodGL device/context and draws
- * straight into the screen texture's mapped backbuffer.
- *  This is the "simple app" pattern NodGL.h describes (see its
- * "Simple Global API" comment) taken one level down to the Device/Context
- * API so we get direct pixel access + font rendering.
+ * mdw client application: communicates with mdw via shared-memory IPC,
+ * renders text and gutter line numbers into a mapped 32-bit ARGB SHM backbuffer,
+ * and receives keyboard and mouse input events over IPC ring buffers.
  *
  * Usage:  mdedit [path]
  *   No path -> starts an untitled empty buffer; Ctrl+S will prompt for
@@ -38,9 +36,12 @@
  */
 
 #include "libc.h"
-#include "NodGL.h"
+#include "wm_protocol.h"
+#include "wm_client_resize.h"
 #include "lib_fnt.h"
-#include "../include/moduos/kernel/events/events.h"
+
+#define WIN_W          760
+#define WIN_H          520
 
 /* ============================================================
    Assets / config
@@ -231,12 +232,12 @@ static int buffer_save_file(buffer_t *buf, const char *path) {
 typedef enum { MODE_EDIT, MODE_PROMPT_SAVE } editor_mode_t;
 
 static struct {
-    NodGL_Device  device;
-    NodGL_Context ctx;
-    NodGL_Texture screen_tex;
-    uint8_t      *bb;
-    uint32_t      bb_pitch;
-    uint32_t      sw, sh;
+    wm_shm_t        *mailbox;
+    int32_t          win_id;
+    uint32_t        *bb;
+    uint32_t         sw, sh;
+    wm_key_ring_t   *keys;
+    wm_mouse_ring_t *mice;
 
     fnt_font_t *font;
     int glyph_w, glyph_h;
@@ -263,11 +264,7 @@ static struct {
 
     /* Damage tracking: single bounding dirty rect (screen space),
      * union everything that changed this frame into
-     * one rect, then only clear/redraw/present *that*. Redrawing the
-     * full screen on every keystroke was the whole source of the lag:
-     * with no GPU, every pixel is a CPU store, so a full-screen repaint
-     * + full-screen present on every single character is enormously
-     * more work than touching the one or two rows that actually changed. */
+     * one rect, then only clear/redraw/present *that*. */
     int dirty_valid;
     int dirty_x0, dirty_y0, dirty_x1, dirty_y1;
 
@@ -278,11 +275,12 @@ static struct {
    Pixel / text drawing (backbuffer space)
    ============================================================ */
 static void fill(int x, int y, int w, int h, uint32_t col) {
+    if (!g.bb) return;
     int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
     int x1 = x + w; if (x1 > (int)g.sw) x1 = (int)g.sw;
     int y1 = y + h; if (y1 > (int)g.sh) y1 = (int)g.sh;
     for (int yy = y0; yy < y1; yy++) {
-        uint32_t *row = (uint32_t *)(g.bb + (uint64_t)yy * g.bb_pitch);
+        uint32_t *row = g.bb + (uint64_t)yy * g.sw;
         for (int xx = x0; xx < x1; xx++) row[xx] = col;
     }
 }
@@ -291,7 +289,7 @@ static inline uint32_t div255(uint32_t x) { return (x + 1 + (x >> 8)) >> 8; }
 
 static inline void blend(int x, int y, uint8_t r, uint8_t gv, uint8_t b, uint8_t a) {
     if ((uint32_t)x >= g.sw || (uint32_t)y >= g.sh || !g.bb || a == 0) return;
-    uint32_t *d = (uint32_t *)(g.bb + (uint64_t)y * g.bb_pitch) + x;
+    uint32_t *d = g.bb + (uint64_t)y * g.sw + x;
     if (a == 255) { *d = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)gv << 8) | b; return; }
     uint32_t bg = *d; uint32_t ia = 255 - a;
     *d = 0xFF000000u
@@ -475,14 +473,9 @@ static void render_region(int rx0, int ry0, int rx1, int ry1) {
         }
     }
 
-    /* Rect-scoped upload + present — NodGL_PresentContext would flush the
-     * full viewport regardless of what we drew here, undoing the point
-     * of only touching [rx0,ry0)-[rx1,ry1) above (see NodGL.h's own note
-     * on NodGL_PresentContextRect). */
-    NodGL_DrawTexture(g.ctx, g.screen_tex, rx0, ry0, rx0, ry0,
-                       (uint32_t)(rx1 - rx0), (uint32_t)(ry1 - ry0));
-    NodGL_PresentContextRect(g.ctx, (uint32_t)rx0, (uint32_t)ry0,
-                              (uint32_t)(rx1 - rx0), (uint32_t)(ry1 - ry0), 1);
+    if (g.mailbox) {
+        wm_damage(g.mailbox, g.win_id, rx0, ry0, rx1 - rx0, ry1 - ry0);
+    }
 }
 
 /* ============================================================
@@ -727,6 +720,29 @@ scroll:
     mark_status_dirty(); /* Ln/Col and the modified flag change most keystrokes */
 }
 
+static void editor_handle_mouse(const wm_mouse_event_t *m) {
+    if (m->type == WM_MOUSE_DOWN && (m->changed & WM_MBTN_LEFT)) {
+        if (m->x >= g.text_x0 && m->y >= g.text_y0) {
+            int row = (m->y - g.text_y0) / g.glyph_h;
+            int col = (m->x - g.text_x0) / g.glyph_w;
+            if (row >= 0 && row < g.rows_visible) {
+                size_t target_row = g.top_line + (size_t)row;
+                if (target_row < g.buf.count) {
+                    size_t old_cy = g.cy;
+                    g.cy = target_row;
+                    size_t len = g.buf.lines[g.cy].len;
+                    size_t target_col = g.left_col + (size_t)(col >= 0 ? col : 0);
+                    g.cx = target_col > len ? len : target_col;
+                    g.pref_col = (int)g.cx;
+                    mark_row_dirty(old_cy);
+                    mark_row_dirty(g.cy);
+                    mark_status_dirty();
+                }
+            }
+        }
+    }
+}
+
 /* ============================================================
    Entry point
    ============================================================ */
@@ -734,45 +750,8 @@ int md_main(long argc, char **argv) {
     memset(&g, 0, sizeof(g));
     g.mode = MODE_EDIT;
     g.pref_col = 0;
-
-    int efd = open("$/dev/input/event0", O_RDONLY | O_NONBLOCK, 0);
-    if (efd < 0) { printf("mdedit: no event device\n"); return 2; }
-
-    if (NodGL_CreateDevice(NodGL_FEATURE_LEVEL_1_0, &g.device, &g.ctx, NULL) != NodGL_OK) {
-        printf("mdedit: NodGL_CreateDevice failed\n");
-        close(efd);
-        return 1;
-    }
-    NodGL_GetScreenResolution(g.device, &g.sw, &g.sh);
-
-    NodGL_TextureDesc td; memset(&td, 0, sizeof(td));
-    td.width = g.sw; td.height = g.sh;
-    td.format = NodGL_FORMAT_R8G8B8A8_UNORM; td.mip_levels = 1;
-    if (NodGL_CreateTexture(g.device, &td, &g.screen_tex) != NodGL_OK) {
-        printf("mdedit: NodGL_CreateTexture failed\n");
-        NodGL_ReleaseDevice(g.device); close(efd);
-        return 1;
-    }
-    if (NodGL_MapResource(g.ctx, g.screen_tex, (void **)&g.bb, &g.bb_pitch) != NodGL_OK) {
-        printf("mdedit: NodGL_MapResource failed\n");
-        NodGL_ReleaseResource(g.device, g.screen_tex);
-        NodGL_ReleaseDevice(g.device); close(efd);
-        return 1;
-    }
-
-    g.font = try_load_font(FONT_PRIMARY);
-    if (!g.font) g.font = try_load_font(FONT_FALLBACK);
-    if (!g.font) {
-        printf("mdedit: no font available\n");
-        NodGL_UnmapResource(g.ctx, g.screen_tex);
-        NodGL_ReleaseResource(g.device, g.screen_tex);
-        NodGL_ReleaseDevice(g.device); close(efd);
-        return 1;
-    }
-    g.glyph_w = g.font->header.glyph_width;
-    g.glyph_h = g.font->header.glyph_height;
-    if (g.glyph_w <= 0) g.glyph_w = 8;
-    if (g.glyph_h <= 0) g.glyph_h = 16;
+    g.sw = WIN_W;
+    g.sh = WIN_H;
 
     if (argc > 1 && argv[1] && argv[1][0]) {
         safe_strcpy(g.filename, sizeof(g.filename), argv[1]);
@@ -782,33 +761,155 @@ int md_main(long argc, char **argv) {
         buffer_insert_line(&g.buf, 0);
     }
 
+    g.font = try_load_font(FONT_PRIMARY);
+    if (!g.font) g.font = try_load_font(FONT_FALLBACK);
+    if (!g.font) {
+        printf("mdedit: no font available\n");
+        buffer_free(&g.buf);
+        return 1;
+    }
+    g.glyph_w = g.font->header.glyph_width;
+    g.glyph_h = g.font->header.glyph_height;
+    if (g.glyph_w <= 0) g.glyph_w = 8;
+    if (g.glyph_h <= 0) g.glyph_h = 16;
+
     recompute_layout();
     scroll_to_cursor();
-    mark_full_dirty(); /* prime the display with one full paint */
 
+    g.mailbox = wm_ipc_connect(3000);
+    if (!g.mailbox) {
+        printf("mdedit: couldn't connect to mdw (is it running?)\n");
+        buffer_free(&g.buf);
+        fnt_free_font(g.font);
+        return 1;
+    }
+
+    wm_request_t req; memset(&req, 0, sizeof(req));
+    req.cmd = WM_CMD_CREATE;
+    req.w = g.sw;
+    req.h = g.sh;
+    req.flags = 0;
+    req.pid = (uint32_t)getpid();
+    char title[128];
+    if (g.has_filename) {
+        snprintf(title, sizeof(title), "Text Editor - %s", g.filename);
+    } else {
+        safe_strcpy(title, sizeof(title), "Text Editor - Untitled");
+    }
+    safe_strcpy(req.title, sizeof(req.title), title);
+
+    wm_response_t resp;
+    if (wm_ipc_call(g.mailbox, &req, &resp, 3000) != 0 || !resp.success) {
+        printf("mdedit: WM_CMD_CREATE failed: %s\n", resp.message[0] ? resp.message : "(no response)");
+        buffer_free(&g.buf);
+        fnt_free_font(g.font);
+        return 1;
+    }
+    g.win_id = resp.win_id;
+
+    int pixel_fd = shm_open(resp.shm_name, O_RDWR, 0, 0);
+    if (pixel_fd < 0) {
+        printf("mdedit: shm_open(pixels) failed\n");
+        buffer_free(&g.buf);
+        fnt_free_font(g.font);
+        return 1;
+    }
+    g.bb = (uint32_t *)mmap(NULL, (size_t)resp.shm_size, PROT_R | PROT_W, MAP_SHARED, pixel_fd);
+    if (g.bb == MAP_FAILED) {
+        printf("mdedit: mmap(pixels) failed\n");
+        close(pixel_fd);
+        buffer_free(&g.buf);
+        fnt_free_font(g.font);
+        return 1;
+    }
+
+    int key_fd = shm_open(resp.key_shm_name, O_RDWR, 0, 0);
+    if (key_fd >= 0) {
+        void *p = mmap(NULL, (size_t)resp.key_shm_size, PROT_R | PROT_W, MAP_SHARED, key_fd);
+        if (p != MAP_FAILED) g.keys = (wm_key_ring_t *)p;
+    }
+
+    int mouse_fd = shm_open(resp.mouse_shm_name, O_RDWR, 0, 0);
+    if (mouse_fd >= 0) {
+        void *p = mmap(NULL, (size_t)resp.mouse_shm_size, PROT_R | PROT_W, MAP_SHARED, mouse_fd);
+        if (p != MAP_FAILED) g.mice = (wm_mouse_ring_t *)p;
+    }
+
+    wm_set_cursor(g.mailbox, g.win_id, WM_CURSOR_TEXT);
+
+    wm_client_surface_t surf;
+    wm_client_surface_init(&surf, g.bb, resp.shm_name, resp.shm_size, (int)g.sw, (int)g.sh);
+
+    mark_full_dirty();
+    render_region(0, 0, (int)g.sw, (int)g.sh);
+    g.dirty_valid = 0;
+
+    uint64_t next_poll = time_ms();
+    uint64_t next_resize_poll = time_ms();
     while (!g.quit) {
-        Event ev;
-        while (read(efd, &ev, sizeof(ev)) > 0) {
-            if (ev.type == EVENT_KEY_PRESSED) editor_handle_key(&ev.data.keyboard);
+        if (g.mice) {
+            wm_mouse_event_t m;
+            while (wm_mouse_ring_pop(g.mice, &m)) editor_handle_mouse(&m);
         }
-        if (g.quit) break;
+
+        if (g.keys) {
+            KeyboardEventData k;
+            while (wm_key_ring_pop(g.keys, &k)) editor_handle_key(&k);
+        }
+
+        /* mdw draws this window's titlebar itself, so its own maximize/
+         * restore button never round-trips through our own wm_ipc_call --
+         * polling wm_list_windows() is the only way we find out the
+         * content buffer got reallocated. Unlike the fixed-layout apps,
+         * mdedit's layout is already driven by g.sw/g.sh at runtime, so
+         * this is a real reflow (more/fewer visible rows and columns),
+         * not a letterbox. */
+        if (time_ms() >= next_resize_poll) {
+            int rc = wm_client_surface_poll(g.mailbox, g.win_id, &surf);
+            if (rc < 0) break; /* window torn down some other way */
+            if (rc > 0) {
+                g.bb = surf.buf;
+                g.sw = (uint32_t)surf.w;
+                g.sh = (uint32_t)surf.h;
+                recompute_layout();
+                scroll_to_cursor();
+                mark_full_dirty();
+            }
+            next_resize_poll = time_ms() + 200;
+        }
+
+        if (surf.minimized) {
+            g.dirty_valid = 0; /* nothing to draw into while hidden */
+            next_poll = time_ms();
+            yield();
+            continue;
+        }
 
         if (g.dirty_valid) {
             render_region(g.dirty_x0, g.dirty_y0, g.dirty_x1, g.dirty_y1);
             g.dirty_valid = 0;
         }
-        /* No damage this iteration -> no clear, no blit, no present, just
-         * poll input again 
-         */
-        yield();
+
+        next_poll += 8;
+        while (time_ms() < next_poll) yield();
+        if (time_ms() > next_poll + 200) next_poll = time_ms();
     }
+
+    wm_request_t close_req; memset(&close_req, 0, sizeof(close_req));
+    close_req.cmd = WM_CMD_CLOSE;
+    close_req.win_id = g.win_id;
+    wm_response_t close_resp;
+    wm_ipc_call(g.mailbox, &close_req, &close_resp, 2000);
+
+    if (g.keys) munmap(g.keys, (size_t)resp.key_shm_size);
+    if (g.mice) munmap(g.mice, (size_t)resp.mouse_shm_size);
+    if (surf.buf) munmap(surf.buf, (size_t)surf.shm_size); /* NOT resp.shm_size -- may be stale after a resize */
+    if (pixel_fd >= 0) close(pixel_fd);
+    if (key_fd >= 0) close(key_fd);
+    if (mouse_fd >= 0) close(mouse_fd);
 
     buffer_free(&g.buf);
     fnt_free_font(g.font);
-    NodGL_UnmapResource(g.ctx, g.screen_tex);
-    NodGL_ReleaseResource(g.device, g.screen_tex);
-    NodGL_ReleaseDevice(g.device);
-    close(efd);
     input_flush();
     return 0;
 }
