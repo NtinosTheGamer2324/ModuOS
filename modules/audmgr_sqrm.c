@@ -12,6 +12,18 @@
  * Modeled on inputmanager (service registration pattern) and mvc3_sqrm.c
  * (devfs session/ring/packet-framing pattern). The wire format is its own
  * (see audmgr_wire.h) rather than a guess at mvc3.h's actual layout.
+ *
+ * NOTE — zero-copy mmap is DISABLED (2026): devfs_mmap_region() was
+ * observed to succeed intermittently, which put sessions into the
+ * ring_is_mapped=1 branch of handle_submit() even though every current
+ * userland client (wavplay, beep) only ever speaks the copy-batch
+ * SUBMIT path and never writes directly into the mapped ring. In that
+ * mismatched state, handle_submit() trusts sub->advance (always 0 from
+ * these clients) and completely discards the inline PCM data, so
+ * playback goes silent with no error anywhere. Making zero-copy actually
+ * safe needs kernel-side work we're not doing right now, so both places
+ * that could set ring_is_mapped are forced off below. Copy-batch SUBMIT
+ * is fully functional and is now the only path any session will take.
  */
 
 #include "moduos/kernel/sqrm.h"
@@ -31,6 +43,12 @@ SQRM_DEFINE_MODULE(SQRM_TYPE_AUDIO, "audiomanager");
 #define AUDMGR_MAX_SESSIONS      4
 #define AUDMGR_DEFAULT_RING_SLOTS 64u   /* * sizeof(audmgr_ring_slot_t) */
 #define AUDMGR_MAX_RING_SLOTS     512u
+
+/* Master switch: zero-copy mmap of the ring is disabled system-wide
+ * until the kernel-side issues are fixed. Both handle_map_ring() and
+ * aud0_mmap() honor this, so ring_is_mapped can never become 1 and
+ * every session unconditionally uses copy-batch SUBMIT. */
+#define AUDMGR_ZERO_COPY_ENABLED 0
 
 /* ── Globals ───────────────────────────────────────────────────────── */
 
@@ -271,6 +289,13 @@ static void handle_map_ring(audmgr_session_t *s, const aud_map_ring_req_t *req) 
     s->ring_head = 0;
     s->ring_write_pos = 0;
 
+    /* Zero-copy is disabled system-wide (see AUDMGR_ZERO_COPY_ENABLED
+     * comment above) — always report an unmapped ring so every client
+     * takes the copy-batch SUBMIT path. We deliberately do NOT call
+     * g_api->devfs_mmap_region() here anymore: it was observed to
+     * succeed intermittently, which silently broke playback for every
+     * current client (see handle_submit()'s ring_is_mapped branch). */
+#if AUDMGR_ZERO_COPY_ENABLED
     if (g_api->devfs_mmap_region) {
         void *uva = g_api->devfs_mmap_region((uint64_t)(uintptr_t)s->ring, bytes, 3 /*R|W*/, 0 /*virt*/);
         if (uva != (void *)-1) {
@@ -292,6 +317,12 @@ static void handle_map_ring(audmgr_session_t *s, const aud_map_ring_req_t *req) 
         resp.slot_count = want_slots;
         log_("MAP_RING: devfs_mmap_region unavailable, copy-batch fallback only");
     }
+#else
+    resp.user_addr = 0;
+    resp.actual_size = bytes;
+    resp.slot_count = want_slots;
+    log_("MAP_RING: zero-copy disabled (pending kernel fixes), copy-batch only");
+#endif
 
     /* First mapped-ring session becomes the playback source. Same
      * single-active-session simplification as g_active_output_id. */
@@ -309,14 +340,20 @@ static void handle_submit(audmgr_session_t *s, const aud_submit_t *sub, uint32_t
         /* Zero-copy mode: userland already wrote directly into the mapped
          * ring. We only need to record how far to advance the write
          * cursor; the OUTPUT controller's pull consumes from ring_head
-         * up to ring_write_pos. */
+         * up to ring_write_pos.
+         *
+         * Unreachable while AUDMGR_ZERO_COPY_ENABLED is 0, since
+         * ring_is_mapped can then never be set — kept intact so
+         * re-enabling zero-copy later doesn't require reconstructing
+         * this branch. */
         uint32_t adv = sub->advance;
         if (adv > s->ring_slot_count) adv = s->ring_slot_count;
         s->ring_write_pos = (s->ring_write_pos + adv) % s->ring_slot_count;
         return;
     }
 
-    /* Copy-batch fallback: slots were appended inline in the packet. */
+    /* Copy-batch fallback: slots were appended inline in the packet.
+     * This is now the ONLY path any session takes. */
     uint32_t avail_bytes = consumed - sizeof(aud_hdr_t) - sizeof(uint32_t) * 2;
     uint32_t max_inline = (uint32_t)(avail_bytes / sizeof(audmgr_ring_slot_t));
     uint32_t n = sub->inline_count;
@@ -447,9 +484,18 @@ static ssize_t aud0_write(void *ctx, const void *buf, size_t count) {
 }
 
 static void *aud0_mmap(void *ctx, void *hint, size_t length, int prot, int flags, uint64_t offset) {
-    (void)hint; (void)flags;
+    (void)hint; (void)flags; (void)length; (void)prot; (void)offset;
     audmgr_session_t *s = (audmgr_session_t *)ctx;
-    if (!s || !g_api->devfs_mmap_region) return (void *)-1;
+    if (!s) return (void *)-1;
+
+    /* Zero-copy is disabled system-wide — see AUDMGR_ZERO_COPY_ENABLED.
+     * Always refuse the mmap so ring_is_mapped can never be set via
+     * this path either, even if a future/other client calls mmap()
+     * directly on the fd instead of going through MAP_RING. Every
+     * session therefore stays on copy-batch SUBMIT, matching every
+     * current client's actual behavior. */
+#if AUDMGR_ZERO_COPY_ENABLED
+    if (!g_api->devfs_mmap_region) return (void *)-1;
 
     if (offset == AUDMGR_OFF_RING) {
         if (!s->ring || s->ring_slot_count == 0) return (void *)-1;
@@ -464,6 +510,9 @@ static void *aud0_mmap(void *ctx, void *hint, size_t length, int prot, int flags
     }
 
     return (void *)-1;
+#else
+    return (void *)-1;
+#endif
 }
 
 static devfs_device_ops_t g_ops_aud0 = {
@@ -476,6 +525,64 @@ static devfs_device_ops_t g_ops_aud0 = {
     .can_replace = NULL,
 };
 
+/* ── Built-in self-test tone ───────────────────────────────────────────
+ *
+ * Whenever there is no active playback session, pull_output_frames()
+ * used to just silence-fill and return. Instead it now synthesizes a
+ * square-wave test tone right here, entirely inside audmgr_sqrm.c, with
+ * zero involvement from any userland process or the write()/SUBMIT wire
+ * protocol. This deliberately exercises ONLY the "AudMgr -> AC97 ->
+ * hardware" half of the pipeline, letting it be tested independently
+ * of wavplay/beep and the User -> AudMgr transport:
+ *
+ *   - Tone audible at boot (before any app runs)  => AudMgr -> AC97 ->
+ *     hardware is proven fine. If beep/wavplay are then silent, the bug
+ *     is isolated to User -> AudMgr (the wire protocol, write() path,
+ *     or the app itself).
+ *   - No tone at boot either => the bug is in AudMgr's pull path or
+ *     below (ac97_audio.c's BDL refill, or the hardware), independent
+ *     of any userland app entirely.
+ *
+ * Set AUDMGR_SELFTEST_ENABLED to 0 once this stops being useful. */
+#define AUDMGR_SELFTEST_ENABLED       1
+#define AUDMGR_SELFTEST_FREQ_HZ       440u    /* concert A — ~2.8 octaves below AC97's 3000 Hz boot tone */
+#define AUDMGR_SELFTEST_AMPLITUDE     14000
+#define AUDMGR_SELFTEST_ON_MS         300u    /* pulse pattern so it can't be mistaken for a steady whine */
+#define AUDMGR_SELFTEST_OFF_MS        200u
+
+static uint64_t g_selftest_phase = 0;   /* running sample index, kept
+                                          * continuous across calls so
+                                          * there's no phase discontinuity
+                                          * (audible click) between IRQs */
+static int g_selftest_was_active = 0;   /* for one-shot transition logging
+                                          * only — NOT read every IRQ */
+
+static void selftest_fill(int16_t *out, uint32_t frame_count) {
+    uint32_t half_period = 48000u / (AUDMGR_SELFTEST_FREQ_HZ * 2u);
+    if (half_period == 0) half_period = 1;
+
+    uint32_t on_samples  = (48000u * AUDMGR_SELFTEST_ON_MS) / 1000u;
+    uint32_t off_samples = (48000u * AUDMGR_SELFTEST_OFF_MS) / 1000u;
+    uint32_t cycle_samples = on_samples + off_samples;
+
+    for (uint32_t f = 0; f < frame_count; f++) {
+        uint64_t idx = g_selftest_phase + f;
+        uint32_t pos_in_cycle = (uint32_t)(idx % cycle_samples);
+
+        int16_t v;
+        if (pos_in_cycle < on_samples) {
+            v = (int16_t)(((idx / half_period) % 2 == 0)
+                               ? AUDMGR_SELFTEST_AMPLITUDE
+                               : -AUDMGR_SELFTEST_AMPLITUDE);
+        } else {
+            v = 0; /* off phase of the pulse */
+        }
+        out[f * 2 + 0] = v;
+        out[f * 2 + 1] = v;
+    }
+    g_selftest_phase += frame_count;
+}
+
 /* ── Pull hook, called by an OUTPUT controller (e.g. ac97audio's IRQ
  * handler) via the audiomanager service to get frames to play. Runs in
  * whatever context the caller is in — for AC'97 that's IRQ context, so
@@ -487,9 +594,25 @@ static uint32_t pull_output_frames(void *buf, uint32_t frame_count) {
     uint32_t written_frames = 0;
 
     if (!g_playback_session || !g_playback_session->ring) {
+#if AUDMGR_SELFTEST_ENABLED
+        if (!g_selftest_was_active) {
+            log_("SELFTEST: no active playback session, generating built-in test tone (AudMgr->AC97 path only)");
+            g_selftest_was_active = 1;
+        }
+        selftest_fill(out, frame_count);
+        return frame_count;
+#else
         memset_(buf, 0, (size_t)frame_count * 2 * sizeof(int16_t));
         return 0;
+#endif
     }
+
+#if AUDMGR_SELFTEST_ENABLED
+    if (g_selftest_was_active) {
+        log_("SELFTEST: real playback session now active, self-test tone stopped");
+        g_selftest_was_active = 0;
+    }
+#endif
 
     audmgr_session_t *s = g_playback_session;
 

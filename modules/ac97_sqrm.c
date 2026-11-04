@@ -1,21 +1,10 @@
 /*
  * ac97_audio.c — AC'97 driver, registered as SQRM_TYPE_AUDIO.
  *
- * Uses "moduos/kernel/sqrm.h" (the in-tree kernel header), not the
- * third-party sqrm_sdk.h — this gives us the real pci_device_t layout
- * instead of an opaque void*, which was the actual bug last time: the
- * previous version read PCI config space at bus/dev/func = 0,0,0 instead
- * of the AC'97 controller's real location, so every register access was
- * hitting the wrong device.
- *
- * Registers itself with the "audiomanager" service (see contract.h) as
- * an OUTPUT controller. Once registered, each playback IRQ refills the
- * BDL entry that just finished by pulling fresh frames from the audio
- * manager's ring via audio_api_t::pull_output_frames, instead of just
- * looping the fixed boot self-test tone forever. If "audiomanager"
- * isn't present at init time (module load order, or it's simply not
- * loaded), this falls back to the original direct-hardware, tone-only
- * behavior rather than failing to load.
+ * DIAGNOSTIC BUILD: instrumented to determine why the IRQ-driven BDL
+ * refill loop never appears to engage after the initial pre-filled
+ * buffers play through once. Search "DEBUG" for every change relative
+ * to the last known-good version. Remove once resolved.
  */
 
 #include "moduos/kernel/sqrm.h"
@@ -30,19 +19,13 @@ const sqrm_kernel_api_t *g_api;
 static const char *deps[] = { "audiomanager" };
 SQRM_DEFINE_MODULE_V2(SQRM_TYPE_AUDIO, "ac97", 2, 1, 1, deps);
 
-/* Intel 82801 (ICH) AC'97 Audio Controller — classic reference ID.
- * If your target is a different chipset, this is the value to change. */
 #define AC97_PCI_VENDOR_INTEL   0x8086
 #define AC97_PCI_DEVICE_ICH     0x2415
 
-/* ===================== AC'97 register offsets ===================== */
-
-/* NAM = Native Audio Mixer (codec registers), relative to NAMBAR */
 #define AC97_NAM_RESET          0x00
 #define AC97_NAM_MASTER_VOL     0x02
 #define AC97_NAM_PCM_OUT_VOL    0x18
 
-/* NABM = Native Audio Bus Master (controller registers), relative to NABMBAR */
 #define AC97_NABM_PO_BDBAR      0x10
 #define AC97_NABM_PO_CIV        0x14
 #define AC97_NABM_PO_LVI        0x15
@@ -81,24 +64,45 @@ static ac97_dev_t g_ac97;
 static dma_buffer_t g_bdl_dma;
 static dma_buffer_t g_pcm_dma;
 
-/* NULL until (and unless) "audiomanager" is found at init; the IRQ
- * handler checks this on every interrupt to decide whether to pull real
- * frames or keep looping the self-test tone. */
 static const audio_api_t *g_audmgr = NULL;
 static int g_ac97_output_id = -1;
 
-/* ===================== real PCI discovery ===================== */
+/* ── DEBUG: tiny hex/decimal logging helpers (no printf available) ── */
+static void dbg_hex16(const char *prefix, uint16_t v) {
+    static const char hexd[] = "0123456789ABCDEF";
+    char buf[7];
+    buf[0] = '0'; buf[1] = 'x';
+    buf[2] = hexd[(v >> 12) & 0xF];
+    buf[3] = hexd[(v >> 8) & 0xF];
+    buf[4] = hexd[(v >> 4) & 0xF];
+    buf[5] = hexd[v & 0xF];
+    buf[6] = 0;
+    g_api->com_write_string(COM1_PORT, "[ac97][DEBUG] ");
+    g_api->com_write_string(COM1_PORT, prefix);
+    g_api->com_write_string(COM1_PORT, buf);
+    g_api->com_write_string(COM1_PORT, "\n");
+}
+
+static void dbg_dec32(const char *prefix, uint32_t v) {
+    char buf[12];
+    int i = 10;
+    buf[11] = 0;
+    if (v == 0) { buf[i--] = '0'; }
+    else { while (v > 0 && i >= 0) { buf[i--] = (char)('0' + (v % 10)); v /= 10; } }
+    g_api->com_write_string(COM1_PORT, "[ac97][DEBUG] ");
+    g_api->com_write_string(COM1_PORT, prefix);
+    g_api->com_write_string(COM1_PORT, &buf[i + 1]);
+    g_api->com_write_string(COM1_PORT, "\n");
+}
+
+/* Caps so a working system doesn't spam the serial console forever —
+ * we only need the first few data points to diagnose this. */
+static uint32_t g_dbg_handler_entries = 0;
+#define DBG_HANDLER_LOG_CAP   8u
+static uint32_t g_dbg_refills = 0;
+#define DBG_REFILL_LOG_CAP    8u
 
 static int ac97_pci_find_and_map(void) {
-    /*
-    pci_device_t *dev = g_api->pci_find_device(AC97_PCI_VENDOR_INTEL, AC97_PCI_DEVICE_ICH);
-    if (!dev) {
-        g_api->com_write_string(COM1_PORT, "[ac97] no matching PCI AC'97 controller found\n");
-        return -1;
-    }
-    g_ac97.pci_dev = dev;
-    */
-
     pci_device_t *dev = NULL;
     for (int i = 0; i < 256; i++) {
         pci_device_t *tmpdev = g_api->pci_get_device(i);
@@ -120,10 +124,6 @@ static int ac97_pci_find_and_map(void) {
     g_api->pci_enable_io_space(dev);
     g_api->pci_enable_bus_mastering(dev);
 
-    /* dev->bar[0]/[1] are already parsed by the kernel's PCI scan — no
-     * need to re-read config space ourselves. bar_type[i] == PCI_BAR_IO
-     * (1) confirms these are I/O-space BARs, matching a legacy AC'97
-     * controller's NAMBAR/NABMBAR layout. */
     if (dev->bar_type[0] != PCI_BAR_IO || dev->bar_type[1] != PCI_BAR_IO) {
         g_api->com_write_string(COM1_PORT,
             "[ac97] BAR0/BAR1 aren't both I/O-space — unexpected layout, bailing\n");
@@ -134,10 +134,20 @@ static int ac97_pci_find_and_map(void) {
     g_ac97.nabm_base = (uint16_t)(dev->bar[1] & 0xFFFC);
     g_ac97.irq_line  = dev->interrupt_line;
 
+    /* DEBUG: confirm exactly what we think the IRQ line and I/O bases
+     * are, and — critically — whether bus mastering actually stuck
+     * (some chipsets/emulators silently ignore the enable if written
+     * before other init steps, or need it re-asserted later). */
+    dbg_hex16("nam_base=", g_ac97.nam_base);
+    dbg_hex16("nabm_base=", g_ac97.nabm_base);
+    dbg_dec32("irq_line=", g_ac97.irq_line);
+    /* (Bus-mastering-enable readback dropped: pci_cfg_read32() takes
+     * raw (bus, device, function, offset), and pci_device_t's field
+     * names for those aren't visible here to wire it up correctly.
+     * Not essential to the core diagnosis below.) */
+
     return 0;
 }
-
-/* ===================== codec bring-up ===================== */
 
 static void ac97_codec_reset(void) {
     g_api->outw(g_ac97.nam_base + AC97_NAM_RESET, 0x0000);
@@ -150,8 +160,6 @@ static void ac97_set_master_volume(uint8_t left_atten, uint8_t right_atten, int 
     g_api->outw(g_ac97.nam_base + AC97_NAM_MASTER_VOL, v);
     g_api->outw(g_ac97.nam_base + AC97_NAM_PCM_OUT_VOL, v);
 }
-
-/* ===================== tone generation ===================== */
 
 #define AC97_TONE_FREQ_HZ    3000
 #define AC97_SAMPLE_RATE_HZ  48000
@@ -168,26 +176,24 @@ static void ac97_fill_tone_buffer(int16_t *frames, size_t frame_count) {
     }
 }
 
-/* Bytes per BDL entry's own segment of g_pcm_dma. Each entry now gets a
- * distinct segment (rather than all AC97_BDL_ENTRIES entries pointing at
- * one shared buffer) so the IRQ handler can refill exactly the segment
- * hardware just finished playing without disturbing the others. */
 #define AC97_SEGMENT_BYTES ((size_t)AC97_SAMPLES_PER_ENTRY * 2 * sizeof(int16_t))
 
 static int16_t *ac97_segment(uint8_t idx) {
     return (int16_t *)((uint8_t *)g_pcm_dma.virt + (size_t)idx * AC97_SEGMENT_BYTES);
 }
 
-/* Refill one BDL segment: pull real frames from the audio manager if
- * we're registered with it, otherwise keep regenerating the boot
- * self-test tone (same deterministic waveform each call, so looping
- * this way is seamless — no phase discontinuity at segment boundaries). */
 static void ac97_refill_segment(uint8_t idx) {
     int16_t *seg = ac97_segment(idx);
     if (g_audmgr) {
         g_audmgr->pull_output_frames(seg, AC97_SAMPLES_PER_ENTRY);
     } else {
         ac97_fill_tone_buffer(seg, AC97_SAMPLES_PER_ENTRY);
+    }
+    /* DEBUG: confirm the refill path itself actually executes and
+     * which source (audmgr vs local tone) it took. */
+    if (g_dbg_refills < DBG_REFILL_LOG_CAP) {
+        g_dbg_refills++;
+        dbg_dec32("refill executed, segment=", idx);
     }
 }
 
@@ -207,10 +213,6 @@ static int ac97_setup_dma(void) {
 
     ac97_bdl_entry_t *bdl = (ac97_bdl_entry_t *)g_bdl_dma.virt;
     for (int i = 0; i < AC97_BDL_ENTRIES; i++) {
-        /* g_audmgr isn't registered yet at this point in init, so this
-         * always seeds with the self-test tone; segments get pulled from
-         * the audio manager (once registered) starting with the first
-         * IRQ-driven refill. */
         ac97_fill_tone_buffer(ac97_segment((uint8_t)i), AC97_SAMPLES_PER_ENTRY);
 
         bdl[i].buf_addr    = (uint32_t)(g_pcm_dma.phys + (uint64_t)i * AC97_SEGMENT_BYTES);
@@ -221,23 +223,32 @@ static int ac97_setup_dma(void) {
     g_api->outl(g_ac97.nabm_base + AC97_NABM_PO_BDBAR, (uint32_t)g_bdl_dma.phys);
     g_api->outb(g_ac97.nabm_base + AC97_NABM_PO_LVI, AC97_BDL_ENTRIES - 1);
 
+    /* DEBUG: read back BDBAR/LVI immediately to confirm the writes
+     * actually landed (catches I/O port mis-mapping). */
+    dbg_hex16("BDBAR low16 readback=", (uint16_t)g_api->inl(g_ac97.nabm_base + AC97_NABM_PO_BDBAR));
+    dbg_dec32("LVI readback=", g_api->inb(g_ac97.nabm_base + AC97_NABM_PO_LVI));
+
     return 0;
 }
 
-/* ===================== keep it playing forever ===================== */
-
 static void ac97_irq_handler(void) {
     uint16_t sr = g_api->inw(g_ac97.nabm_base + AC97_NABM_PO_SR);
+
+    /* DEBUG: log every entry into this handler (capped) with the raw SR
+     * value, BEFORE the condition check, so we can tell apart:
+     *   (a) handler never entered at all -> nothing logged, ever
+     *   (b) handler entered but sr bits never match -> logged, but
+     *       "refill executed" from ac97_refill_segment() never appears
+     *   (c) handler entered, bits matched, refill executed -> both
+     *       lines appear and audio should actually flow */
+    if (g_dbg_handler_entries < DBG_HANDLER_LOG_CAP) {
+        g_dbg_handler_entries++;
+        dbg_hex16("IRQ handler entered, SR=", sr);
+    }
+
     if (sr & (AC97_SR_BCIS | AC97_SR_LVBCI)) {
         g_api->outw(g_ac97.nabm_base + AC97_NABM_PO_SR, sr);
         uint8_t civ = g_api->inb(g_ac97.nabm_base + AC97_NABM_PO_CIV);
-        /* civ - 1 (mod N) is the descriptor hardware just moved past —
-         * it's done with that buffer, so it's safe to refill here. This
-         * is the same index the original code computed to extend LVI
-         * and keep the loop going forever; now we also rewrite its
-         * contents before re-extending into it.
-         * pull_output_frames() runs in IRQ context per contract.h — it
-         * must not (and doesn't) allocate or block. */
         uint8_t finished = (uint8_t)((civ + AC97_BDL_ENTRIES - 1) % AC97_BDL_ENTRIES);
         ac97_refill_segment(finished);
         g_api->outb(g_ac97.nabm_base + AC97_NABM_PO_LVI, finished);
@@ -247,9 +258,10 @@ static void ac97_irq_handler(void) {
 
 static void ac97_boot_test_tone_start(void) {
     g_api->outb(g_ac97.nabm_base + AC97_NABM_PO_CR, AC97_CR_RPBM | AC97_CR_IOCE);
+    /* DEBUG: read CR back immediately — if RPBM doesn't stick, the bus
+     * master never actually started despite the write "succeeding". */
+    dbg_hex16("PO_CR readback after start=", g_api->inb(g_ac97.nabm_base + AC97_NABM_PO_CR));
 }
-
-/* ===================== module entry point ===================== */
 
 int sqrm_module_init(const sqrm_kernel_api_t *api) {
     if (!api) return -1;
@@ -262,6 +274,7 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     }
 
     uint32_t sta = g_api->inl(g_ac97.nabm_base + AC97_NABM_GLOB_STA);
+    dbg_hex16("GLOB_STA at init=", (uint16_t)sta);
     if (!(sta & AC97_GLOB_STA_PCRDY)) {
         g_api->com_write_string(COM1_PORT, "[ac97] codec not ready (GLOB_STA.PCRDY clear)\n");
         return -1;
@@ -278,10 +291,6 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
         size_t api_size = 0;
         g_audmgr = (const audio_api_t *)api->sqrm_service_get("audiomanager", &api_size);
         if (g_audmgr && api_size < sizeof(audio_api_t)) {
-            /* audiomanager registered a smaller/older blob than the
-             * audio_api_t we're linked against — treat as absent rather
-             * than risk calling through a function pointer past the end
-             * of what it actually published. */
             g_api->com_write_string(COM1_PORT,
                 "[ac97] audiomanager service blob smaller than expected audio_api_t, ignoring\n");
             g_audmgr = NULL;
@@ -315,6 +324,13 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     g_api->irq_install_handler(g_ac97.irq_line, ac97_irq_handler);
 
     ac97_boot_test_tone_start();
+
+    /* DEBUG: one final readback ~immediately after starting, of SR and
+     * CIV, to see the very first hardware state post-start without even
+     * needing an interrupt to have fired yet. */
+    dbg_hex16("SR right after start=", g_api->inw(g_ac97.nabm_base + AC97_NABM_PO_SR));
+    dbg_dec32("CIV right after start=", g_api->inb(g_ac97.nabm_base + AC97_NABM_PO_CIV));
+
     if (g_audmgr) {
         g_api->com_write_string(COM1_PORT,
             "[ac97] playback started — registered with audiomanager, "

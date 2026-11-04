@@ -47,6 +47,8 @@ int sqrm_module_init(const sqrm_kernel_api_t *api) {
     /* api is NEVER NULL, the kernel ALWAYS fills it, and check in the SDK header what your SQRM_TYPE is available to.*/
     /* This is great practice but not very needed, but it is good practice:*/
     if (!api) return -1;
+    /* ↑ this is really useless */
+    
     g_api = api;
     
     this_will_not_crash_sys();
