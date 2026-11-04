@@ -9,10 +9,12 @@
 // v3 adds TCP (see netd.c): TCP_OPEN/SEND/RECV/CLOSE. Unlike
 // PING/RESOLVE_ARP/UDP_SEND, a TCP connection outlives any single mailbox
 // call -- it's identified by tcp_handle across calls, and netd keeps
-// servicing it (retransmits, incoming segments, TIME_WAIT expiry) whether
-// or not a client is currently blocked on the mailbox. The mailbox itself
-// is still just one slot: only one client call is in flight at a time,
-// same locking model as v1/v2.
+// servicing it (retransmits, incoming segments, window updates, TIME_WAIT
+// expiry) whether or not a client is currently blocked on the mailbox. The
+// mailbox itself is still just one slot: only one client call is in flight
+// at a time. TCP_SEND returns once the data is in netd's send buffer, not
+// once it is acknowledged; a connection that later fails is reported by the
+// next SEND/RECV on that handle.
 //
 // v4 adds a DHCP client inside netd itself (no new mailbox command --
 // it runs before the mailbox is even created, see md_main() in netd.c).
@@ -22,6 +24,13 @@
 // does that at startup (falling back to the old static address if no
 // server answers) and re-runs it when the lease is about to expire.
 // GET_STATUS's response gained a `netmask` field as part of this.
+//
+// v5 adds passive-open TCP: TCP_LISTEN / TCP_ACCEPT / TCP_UNLISTEN. A
+// listener is identified by its own handle (valid only with ACCEPT and
+// UNLISTEN). Connections whose handshake completes wait inside netd until
+// a client calls ACCEPT, which returns an ordinary tcp_handle for
+// SEND/RECV/CLOSE plus the peer's address. The response gained
+// peer_ip/peer_port for that.
 //
 // Server side (netd):
 //   shm_open(NETD_IPC_SHM_NAME, O_RDWR | SHM_O_CREAT, 0644, sizeof(netd_shm_t))
@@ -34,7 +43,7 @@
 //   mmap(..., MAP_SHARED, handle) once, then netd_ipc_call() per request.
 
 #pragma once
-#include "libc.h"
+#include "libc/libc.h"
 
 #define NETD_IPC_SHM_NAME "netd_ipc"
 
@@ -53,9 +62,11 @@
 // v1: PING / GET_STATUS / RESOLVE_ARP.
 // v2: UDP_SEND -- send one datagram, wait up to timeout_ms for one reply
 // datagram back from the same (ip, port). No sockets, no "listen".
-// v3: TCP_OPEN/SEND/RECV/CLOSE -- a real (stop-and-wait, no options,
-// no simultaneous-close) TCP connection, identified by a handle that
-// stays valid across calls until CLOSE.
+// v3: TCP_OPEN/SEND/RECV/CLOSE -- an active-open TCP connection (sliding
+// window, congestion control, MSS option; no SACK), identified
+// by a handle that is valid until the client calls CLOSE. A stale or
+// already-closed handle is rejected.
+// v5: TCP_LISTEN/ACCEPT/UNLISTEN -- passive open.
 
 #define NETD_CMD_PING         1
 #define NETD_CMD_GET_STATUS   2
@@ -65,12 +76,14 @@
 #define NETD_CMD_TCP_SEND     6
 #define NETD_CMD_TCP_RECV     7
 #define NETD_CMD_TCP_CLOSE    8
+#define NETD_CMD_TCP_LISTEN   9   // tcp_dst_port = local port -> resp tcp_handle (listener)
+#define NETD_CMD_TCP_ACCEPT   10  // tcp_handle = listener, waits up to timeout_ms
+                                  //   -> resp tcp_handle (new connection, 0 = none yet),
+                                  //      peer_ip, peer_port
+#define NETD_CMD_TCP_UNLISTEN 11  // tcp_handle = listener
 
 // Payload cap for UDP_SEND requests/replies. Comfortably covers a DNS
-// query/response (the reference test case), which is why it was picked;
-// bump it if you need bigger datagrams later. The mailbox is still a
-// single SHM page either way (shm_open() rounds size up to one), so this
-// has plenty of headroom before it'd matter.
+// query/response (the reference test case).
 #define NETD_UDP_MAX_PAYLOAD  512
 
 // Payload cap per TCP SEND/RECV call. Bigger than NETD_UDP_MAX_PAYLOAD
@@ -91,8 +104,8 @@ typedef struct {
     uint8_t  udp_payload[NETD_UDP_MAX_PAYLOAD];
 
     // TCP (v3):
-    uint16_t tcp_dst_port;              // OPEN only
-    int      tcp_handle;                // SEND/RECV/CLOSE; ignored by OPEN
+    uint16_t tcp_dst_port;              // OPEN: remote port. LISTEN (v5): local port to listen on.
+    int      tcp_handle;                // SEND/RECV/CLOSE/ACCEPT/UNLISTEN; ignored by OPEN/LISTEN
     uint16_t tcp_payload_len;           // SEND: bytes to send
     uint8_t  tcp_payload[NETD_TCP_MAX_PAYLOAD]; // SEND: data out
     uint16_t tcp_recv_cap;              // RECV: max bytes wanted, <= NETD_TCP_MAX_PAYLOAD
@@ -115,10 +128,16 @@ typedef struct {
     uint8_t  udp_reply[NETD_UDP_MAX_PAYLOAD];
 
     // TCP (v3):
-    int      tcp_handle;                // OPEN: the new connection's handle
+    int      tcp_handle;                // OPEN/LISTEN/ACCEPT: the new handle (ACCEPT: 0 = nobody yet)
     uint16_t tcp_payload_len;           // RECV: bytes actually copied into tcp_payload
     uint8_t  tcp_payload[NETD_TCP_MAX_PAYLOAD]; // RECV: data in
     uint8_t  tcp_eof;                   // RECV: peer sent FIN and buffer is drained -- no more data ever
+
+    // TCP passive open (v5):
+    uint8_t  peer_ip[4];                // ACCEPT: remote address of the accepted connection
+    uint16_t peer_port;                 // ACCEPT: remote port
+
+    uint8_t  dns_ip[4];
 } netd_response_t;
 
 // ── Mailbox slot ────────────────────────────────────────────────────────
