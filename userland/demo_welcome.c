@@ -1,8 +1,8 @@
 // demo_welcome.c
-// A tiny client of $/user/wm — creates a window, draws a static welcome
-// panel into its shared-memory buffer, tells the WM about it, then just
-// keeps the mapping alive. Mirrors calc_client.c's structure.
-#include "libc.h"
+// A tiny client of mdw's SHM mailbox — creates a window, draws a static
+// welcome panel into its shared-memory buffer, tells the WM about it, then
+// just keeps the mapping alive.
+#include "libc/libc.h"
 #include "lib_fnt.h"
 #include "wm_protocol.h"
 
@@ -57,8 +57,8 @@ static void put_text(uint32_t *buf, int bw, int bh, int x, int y, const char *s,
 int md_main(long argc, char **argv) {
     (void)argc; (void)argv;
 
-    int fd = wm_connect(3000); /* mdw may still be starting up — poll, don't fail on the first race */
-    if (fd < 0) {
+    wm_shm_t *mb = wm_ipc_connect(3000); /* mdw may still be starting up — poll, don't fail on the first race */
+    if (!mb) {
         puts("welcome: mdw never came up (waited 3s)\n");
         return 1;
     }
@@ -73,22 +73,19 @@ int md_main(long argc, char **argv) {
     { const char *t = "Welcome"; int i = 0; while (t[i] && i < 63) { req.title[i] = t[i]; i++; } req.title[i] = 0; }
 
     wm_response_t resp;
-    if (invoke(fd, &req, sizeof(req), &resp, sizeof(resp)) <= 0 || !resp.success) {
+    if (wm_ipc_call(mb, &req, &resp, 3000) != 0 || !resp.success) {
         printf("welcome: create failed: %s\n", resp.message);
-        close(fd);
         return 1;
     }
 
     int shmfd = shm_open(resp.shm_name, O_RDWR, 0, 0);
     if (shmfd < 0) {
         puts("welcome: shm_open failed\n");
-        close(fd);
         return 1;
     }
     uint32_t *buf = (uint32_t *)mmap(NULL, (size_t)resp.shm_size, PROT_R | PROT_W, MAP_SHARED, shmfd);
     if (buf == MAP_FAILED) {
         puts("welcome: mmap failed\n");
-        close(fd);
         return 1;
     }
 
@@ -124,7 +121,7 @@ int md_main(long argc, char **argv) {
     dmg.win_id = resp.win_id;
     dmg.x = 0; dmg.y = 0; dmg.w = (uint32_t)W; dmg.h = (uint32_t)H;
     wm_response_t dresp;
-    invoke(fd, &dmg, sizeof(dmg), &dresp, sizeof(dresp));
+    wm_ipc_call(mb, &dmg, &dresp, 3000);
 
     if (font) fnt_free_font(font);
 

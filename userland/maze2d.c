@@ -11,7 +11,7 @@
  * Build like snakegfx.c; entry point is md_main().
  */
 
-#include "libc.h"
+#include "libc/libc.h"
 #include "NodGL.h"
 #include "../include/moduos/kernel/events/events.h"
 

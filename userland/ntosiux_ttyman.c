@@ -5,7 +5,7 @@
 //
 // Output goes through NodGL + lib_FNT — never to fd 1/2 (those are kprint).
 
-#include "libc.h"
+#include "libc/libc.h"
 #include "nodgl.h"
 #include "lib_FNT.h"
 

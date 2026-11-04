@@ -1,6 +1,6 @@
 // mkdir.c - create directories (supports -p)
-#include "libc.h"
-#include "string.h"
+#include "../libc/libc.h"
+#include "../libc/string.h"
 
 static void usage(void) {
     printf("Usage: mkdir [-p] <path>\n");

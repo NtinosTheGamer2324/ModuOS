@@ -1,9 +1,9 @@
 // demo_notes.c
-// A second $/user/wm client. Draws a static note list once, then updates
-// just a one-line "uptime" counter every second — and only sends damage
-// for that one line's rect, not the whole window. This is the payoff of
-// clients reporting precise sub-rects: the WM never has to guess.
-#include "libc.h"
+// A second mdw client. Draws a static note list once, then updates just a
+// one-line "uptime" counter every second — and only sends damage for that
+// one line's rect, not the whole window. This is the payoff of clients
+// reporting precise sub-rects: the WM never has to guess.
+#include "libc/libc.h"
 #include "lib_fnt.h"
 #include "wm_protocol.h"
 
@@ -64,8 +64,8 @@ static void fill_rect(uint32_t *buf, int bw, int bh, int x, int y, int w, int h,
 int md_main(long argc, char **argv) {
     (void)argc; (void)argv;
 
-    int fd = wm_connect(3000); /* mdw may still be starting up — poll, don't fail on the first race */
-    if (fd < 0) {
+    wm_shm_t *mb = wm_ipc_connect(3000); /* mdw may still be starting up — poll, don't fail on the first race */
+    if (!mb) {
         puts("notes: mdw never came up (waited 3s)\n");
         return 1;
     }
@@ -80,22 +80,19 @@ int md_main(long argc, char **argv) {
     { const char *t = "Notes"; int i = 0; while (t[i] && i < 63) { req.title[i] = t[i]; i++; } req.title[i] = 0; }
 
     wm_response_t resp;
-    if (invoke(fd, &req, sizeof(req), &resp, sizeof(resp)) <= 0 || !resp.success) {
+    if (wm_ipc_call(mb, &req, &resp, 3000) != 0 || !resp.success) {
         printf("notes: create failed: %s\n", resp.message);
-        close(fd);
         return 1;
     }
 
     int shmfd = shm_open(resp.shm_name, O_RDWR, 0, 0);
     if (shmfd < 0) {
         puts("notes: shm_open failed\n");
-        close(fd);
         return 1;
     }
     uint32_t *buf = (uint32_t *)mmap(NULL, (size_t)resp.shm_size, PROT_R | PROT_W, MAP_SHARED, shmfd);
     if (buf == MAP_FAILED) {
         puts("notes: mmap failed\n");
-        close(fd);
         return 1;
     }
 
@@ -124,7 +121,7 @@ int md_main(long argc, char **argv) {
     full_dmg.cmd = WM_CMD_DAMAGE; full_dmg.win_id = resp.win_id;
     full_dmg.x = 0; full_dmg.y = 0; full_dmg.w = (uint32_t)W; full_dmg.h = (uint32_t)H;
     wm_response_t dresp;
-    invoke(fd, &full_dmg, sizeof(full_dmg), &dresp, sizeof(dresp));
+    wm_ipc_call(mb, &full_dmg, &dresp, 3000);
 
     unsigned int secs = 0;
     uint64_t next_tick = time_ms() + 1000;
@@ -144,7 +141,7 @@ int md_main(long argc, char **argv) {
         dmg.cmd = WM_CMD_DAMAGE; dmg.win_id = resp.win_id;
         dmg.x = 12; dmg.y = uptime_y; dmg.w = (uint32_t)(W - 24); dmg.h = (uint32_t)uptime_h;
         wm_response_t r2;
-        invoke(fd, &dmg, sizeof(dmg), &r2, sizeof(r2));
+        wm_ipc_call(mb, &dmg, &r2, 3000);
 
         secs++;
     }

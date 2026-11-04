@@ -1,6 +1,6 @@
 // NodGL GPU Benchmark - Measure 2D/3D Performance
 #include "NodGL.h"
-#include "libc.h"
+#include "libc/libc.h"
 
 #define BENCH_ITERATIONS 1000
 

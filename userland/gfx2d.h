@@ -13,7 +13,7 @@
  * 4 GiB; a 32-bit field would silently corrupt addresses in that range and
  * cause usercopy_from_user to read garbage, producing silent blit failures.
  *
- * Copyright © 2025-2026 ModuOS Project Contributors — GPL v2.0
+ * Copyright © 2025-2026 New Technologies Software — GPL v2.0
  */
 
 #include <stdint.h>

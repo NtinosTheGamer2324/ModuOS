@@ -1,6 +1,6 @@
-#include "libc.h"
+#include "libc/libc.h"
 #include "userman.h"
-#include "string.h"
+#include "libc/string.h"
 
 static void copy_str(char *dst, size_t dst_sz, const char *src) {
     if (!dst || !src || dst_sz == 0) return;

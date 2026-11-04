@@ -1,6 +1,6 @@
-#include "libc.h"
+#include "libc/libc.h"
 #include "userman.h"
-#include "string.h"
+#include "libc/string.h"
 
 #define USER_DB_PATH "/ModuOS/System64/users.db"
 #define MAX_LINE 256

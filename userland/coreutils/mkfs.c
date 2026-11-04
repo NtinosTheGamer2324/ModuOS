@@ -1,6 +1,6 @@
 // mkfs.c - unified filesystem formatter (VFS mkfs syscall)
-#include "libc.h"
-#include "string.h"
+#include "../libc/libc.h"
+#include "../libc/string.h"
 
 static void usage(void) {
     printf("Usage: mkfs <fs> <vdrive> <pN|lba> [sizeMB|sectorsS] [label] [--spc N] [--force]\n");
@@ -22,6 +22,32 @@ static int parse_u32(const char *s, uint32_t *out) {
         if (v > 0xFFFFFFFFu) return -3;
     }
     *out = (uint32_t)v;
+    return 0;
+}
+
+static uint32_t read_le32(const uint8_t *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static int get_partition(uint8_t vdrive_id, int part_no, vfs_part_info_t *out) {
+    if (!out || part_no < 1 || part_no > 4) return -1;
+
+    uint8_t mbr[512];
+    if (vdrive_read_sector(vdrive_id, 0, mbr) != 0) return -4;
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) return -4;
+
+    const uint8_t *entry = mbr + 446 + (part_no - 1) * 16;
+    uint32_t start_lba = read_le32(entry + 8);
+    uint32_t sectors = read_le32(entry + 12);
+    if (entry[4] == 0 || start_lba == 0 || sectors == 0) return -4;
+
+    memset(out, 0, sizeof(*out));
+    out->start_lba = start_lba;
+    out->sectors = sectors;
+    out->type = entry[4];
     return 0;
 }
 
@@ -69,14 +95,10 @@ int md_main(long argc, char **argv) {
     if ((part_s[0] == 'p' || part_s[0] == 'P') && part_s[1] >= '1' && part_s[1] <= '4' && part_s[2] == 0) {
         using_part_no = 1;
         part_no = (int)(part_s[1] - '0');
-        vfs_part_req_t preq;
         vfs_part_info_t pinfo;
-        memset(&preq, 0, sizeof(preq));
         memset(&pinfo, 0, sizeof(pinfo));
-        preq.vdrive_id = (int32_t)vdrive_id_u;
-        preq.part_no = (int32_t)part_no;
 
-        int prc = vfs_getpart(&preq, &pinfo);
+        int prc = get_partition((uint8_t)vdrive_id_u, part_no, &pinfo);
         if (prc != 0) {
             printf("mkfs: could not query %s on vDrive%u (rc=%d)\n", part_s, (unsigned)vdrive_id_u, prc);
             return 1;

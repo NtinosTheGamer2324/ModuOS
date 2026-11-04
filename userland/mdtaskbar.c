@@ -13,8 +13,8 @@
  * No special-cased mdw support — same wm_protocol.h any other client uses.
  */
 
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 #include "lib_fnt.h"
 #include "wm_protocol.h"
 #include <stdint.h>

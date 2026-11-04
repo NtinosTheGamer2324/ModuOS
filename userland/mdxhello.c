@@ -1,5 +1,5 @@
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 #include "mdx_proto.h"
 
 /*

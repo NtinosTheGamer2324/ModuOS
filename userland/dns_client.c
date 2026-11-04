@@ -15,7 +15,7 @@
 //
 
 
-#include "libc.h"
+#include "libc/libc.h"
 #include "netd_ipc.h"
 
 #define DNS_SERVER_IP   ((uint8_t[4]){8, 8, 8, 8})

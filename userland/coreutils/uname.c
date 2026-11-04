@@ -2,7 +2,7 @@
 // Reads from $/dev/md64api/sysinfo like zsfetch.
 // pcname is read from /ModuOS/System64/pcname.txt like zenith.
 
-#include "libc.h"
+#include "../libc/libc.h"
 
 static const char *read_pcname(char *buf, size_t bufsz)
 {
@@ -92,7 +92,7 @@ int md_main(long argc, char **argv)
     snprintf(rel_buf, sizeof(rel_buf), "%d", info->SystemVersion);
 
     int first = 1;
-#define EMIT(str) do { if (!first) putc(' '); puts_raw(str); first = 0; } while(0)
+#define EMIT(str) do { if (!first) putchar(' '); puts_raw(str); first = 0; } while(0)
 
     if (opt_all || opt_s) EMIT(info->os_name && info->os_name[0] ? info->os_name : "ModuOS");
     if (opt_all || opt_n) EMIT(pcname);
@@ -103,7 +103,7 @@ int md_main(long argc, char **argv)
 
 #undef EMIT
 
-    putc('\n');
+    putchar('\n');
     free(info);
     return 0;
 }

@@ -1,5 +1,5 @@
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 
 static int is_dot_entry(const char *name) {
     return (strcmp(name, ".") == 0) || (strcmp(name, "..") == 0);

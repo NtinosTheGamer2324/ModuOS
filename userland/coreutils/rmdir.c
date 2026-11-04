@@ -1,6 +1,6 @@
 // rmdir.c - remove empty directories
-#include "libc.h"
-#include "string.h"
+#include "../libc/libc.h"
+#include "../libc/string.h"
 
 static void usage(void) {
     printf("Usage: rmdir <path>\n");

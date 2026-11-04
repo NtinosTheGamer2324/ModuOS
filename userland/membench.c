@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 void mem_diag() {
     printf("\n[MEM] Heap Top: %x\n", sbrk(0));

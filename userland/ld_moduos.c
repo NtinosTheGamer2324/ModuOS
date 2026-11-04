@@ -1,80 +1,80 @@
-#include "libc.h"
-#include "string.h"
-
-/* ld-moduos: userland ELF interpreter (PT_INTERP) + dynamic linker.
+/*
+ * ld-moduos.sqrl - ModuOS dynamic linker (the ld-linux.so equivalent).
  *
- * Kernel launches this program when an executable has PT_INTERP.
- * argv layout:
- *   argv[0] = interpreter path/name
- *   argv[1] = target executable path
- *   argv[2..] = original user arguments
+ * The kernel maps the executable (SQR, ET_EXEC) and this interpreter into one
+ * address space and enters here. The executable's program headers and entry
+ * point arrive through SYS_DLINFO. This file then:
+ *   1. loads every DT_NEEDED library (SQRL, ET_DYN) breadth-first,
+ *   2. applies x86-64 RELA relocations against the global scope,
+ *   3. runs initialisers dependencies-first,
+ *   4. jumps to the executable's entry with the original argc/argv.
  *
- * Features:
- * - Load ET_EXEC and ET_DYN (PIE) executables
- * - Load DT_NEEDED shared objects (.sqrl) from /ModuOS/shared/lib
- * - Apply x86_64 RELA relocations:
- *     R_X86_64_RELATIVE, R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT
+ * Deliberately freestanding: no libc.h, no malloc. The application's heap
+ * must not be touched before it starts, and a second allocator sharing the
+ * brk area would corrupt it. All state is static; library images come from
+ * anonymous mmap (non-fixed, so the kernel places them in the mmap region).
  *
- * Notes / limitations:
- * - Uses SysV DT_HASH to determine symbol count (we force --hash-style=sysv in build.sh).
- * - No TLS, no init/fini arrays, no lazy binding, no versioning.
+ * Search order: LD_LIBRARY_PATH (colon separated), then /ModuOS/shared/lib.
+ * Limits: DT_HASH only (link with --hash-style=sysv), eager binding, no TLS,
+ * no symbol versioning, no dlopen. Executables must be ET_EXEC.
  */
 
-#define EI_NIDENT 16
-#define PT_LOAD    1
-#define PT_DYNAMIC 2
+#include <stddef.h>
+#include <stdint.h>
 
-#define ET_EXEC 2
-#define ET_DYN  3
-
-#define PF_X 1
-#define PF_W 2
-#define PF_R 4
-
-#define DT_NULL    0
-#define DT_NEEDED  1
-#define DT_HASH    4
-#define DT_STRTAB  5
-#define DT_SYMTAB  6
-#define DT_RELA    7
-#define DT_RELASZ  8
-#define DT_RELAENT 9
-#define DT_STRSZ   10
-
-#define STB_LOCAL  0
-#define STB_GLOBAL 1
-#define STB_WEAK   2
-
-#define SHN_UNDEF  0
-
-#define ELF64_ST_BIND(i)   ((i) >> 4)
-#define ELF64_ST_TYPE(i)   ((i) & 0xF)
-
-#define ELF64_R_SYM(i)     ((uint32_t)((i) >> 32))
-#define ELF64_R_TYPE(i)    ((uint32_t)((i) & 0xffffffffu))
-
-/* x86_64 relocs */
-#define R_X86_64_64        1
-#define R_X86_64_GLOB_DAT  6
-#define R_X86_64_JUMP_SLOT 7
-#define R_X86_64_RELATIVE  8
-
-/* sys_mmap flags as defined in ModuOS kernel syscall.c */
-#define MMAP_FLAG_FIXED 1
-#define MMAP_FLAG_ANON  2
-
-/* sys_mmap prot bits */
-#define MMAP_PROT_R 1
-#define MMAP_PROT_W 2
-#define MMAP_PROT_X 4
+#include "../include/moduos/kernel/loader/dlinfo.h"
+#include "../include/moduos/kernel/syscall/syscall_numbers.h"
 
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
-typedef uint8_t  u8;
+typedef uint8_t u8;
+
+#define LD_DEFAULT_DIR "/ModuOS/shared/lib"
+#define LD_MAX_OBJECTS 64
+#define LD_MAX_NEEDED 16
+#define LD_PATH_MAX 256
+#define LD_HDR_MAX 8192
+
+#define PT_LOAD 1
+#define PT_DYNAMIC 2
+
+#define ET_DYN 3
+#define EM_X86_64 62
+
+#define DT_NULL 0
+#define DT_NEEDED 1
+#define DT_PLTRELSZ 2
+#define DT_HASH 4
+#define DT_STRTAB 5
+#define DT_SYMTAB 6
+#define DT_RELA 7
+#define DT_RELASZ 8
+#define DT_RELAENT 9
+#define DT_STRSZ 10
+#define DT_INIT 12
+#define DT_JMPREL 23
+#define DT_INIT_ARRAY 25
+#define DT_INIT_ARRAYSZ 27
+
+#define SHN_UNDEF 0
+#define STB_LOCAL 0
+#define STB_WEAK 2
+#define STT_TLS 6
+
+#define R_X86_64_NONE 0
+#define R_X86_64_64 1
+#define R_X86_64_COPY 5
+#define R_X86_64_GLOB_DAT 6
+#define R_X86_64_JUMP_SLOT 7
+#define R_X86_64_RELATIVE 8
+
+#define MMAP_FIXED 0x1
+#define MMAP_ANON 0x2
+#define PROT_RWX 7
 
 typedef struct {
-    u8  e_ident[EI_NIDENT];
+    u8 e_ident[16];
     u16 e_type;
     u16 e_machine;
     u32 e_version;
@@ -88,7 +88,7 @@ typedef struct {
     u16 e_shentsize;
     u16 e_shnum;
     u16 e_shstrndx;
-} __attribute__((packed)) ehdr_t;
+} ld_ehdr_t;
 
 typedef struct {
     u32 p_type;
@@ -99,501 +99,451 @@ typedef struct {
     u64 p_filesz;
     u64 p_memsz;
     u64 p_align;
-} __attribute__((packed)) phdr_t;
+} ld_phdr_t;
 
 typedef struct {
     u64 d_tag;
     u64 d_val;
-} __attribute__((packed)) dyn_t;
+} ld_dyn_t;
 
 typedef struct {
     u64 r_offset;
     u64 r_info;
-    u64 r_addend;
-} __attribute__((packed)) rela_t;
+    int64_t r_addend;
+} ld_rela_t;
 
 typedef struct {
     u32 st_name;
-    u8  st_info;
-    u8  st_other;
+    u8 st_info;
+    u8 st_other;
     u16 st_shndx;
     u64 st_value;
     u64 st_size;
-} __attribute__((packed)) sym_t;
+} ld_sym_t;
 
-typedef struct so_obj so_obj_t;
-struct so_obj {
-    char path[256];
+typedef struct ld_object ld_object_t;
+struct ld_object {
+    char name[LD_PATH_MAX];
     u64 base;
-    u64 entry;
-
-    const dyn_t *dyn;
-
+    const ld_dyn_t *dyn;
     const char *strtab;
     u64 strsz;
-
-    const sym_t *symtab;
-    u32 nsyms; /* from DT_HASH nchain */
-
-    const u32 *hash; /* DT_HASH, points to nbucket,nchain,buckets[],chains[] */
-
-    const rela_t *rela;
+    const ld_sym_t *symtab;
+    const u32 *hash;
+    const ld_rela_t *rela;
     u64 relasz;
-    u64 relaent;
-
-    char **needed; /* malloc'd copies */
+    const ld_rela_t *jmprel;
+    u64 jmprelsz;
+    void (*init_fn)(void);
+    void (**init_array)(void);
+    u64 init_arraysz;
+    u32 needed[LD_MAX_NEEDED];
     u32 needed_count;
-
-    so_obj_t *next;
+    ld_object_t *deps[LD_MAX_NEEDED];
+    int is_exe;
+    int initialised;
 };
 
-/* ── mmap/munmap wrappers ───────────────────────────────────────────────── */
+/* Load order == global symbol scope order (executable first). */
+static ld_object_t g_objects[LD_MAX_OBJECTS];
+static u32 g_object_count;
+static u8 g_hdr[LD_HDR_MAX];
+static char g_libpath[LD_PATH_MAX * 2];
 
-static inline void *mm_mmap(void *addr, size_t size, int prot, int flags) {
-    return (void*)syscall4(SYS_MMAP, (long)addr, (long)size, (long)prot, (long)flags);
+typedef void (*ld_entry_fn_t)(long argc, char **argv, char **envp);
+
+void *memcpy(void *dst, const void *src, size_t n);
+void *memset(void *dst, int c, size_t n);
+
+/* The compiler may lower struct copies and zeroing to these. */
+void *memcpy(void *dst, const void *src, size_t n) {
+    u8 *d = dst;
+    const u8 *s = src;
+    while (n--) *d++ = *s++;
+    return dst;
 }
 
-static inline int mm_munmap(void *addr, size_t size) {
-    return (int)syscall(SYS_MUNMAP, (long)addr, (long)size, 0);
+void *memset(void *dst, int c, size_t n) {
+    u8 *d = dst;
+    while (n--) *d++ = (u8)c;
+    return dst;
 }
 
-/* Returns 1 if mm_mmap returned an error (kernel returns (void*)-1 on fail) */
-static inline int mmap_failed(void *p) {
-    return (u64)(uintptr_t)p == (u64)-1ULL;
+static inline long ld_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
+    register long r10 __asm__("r10") = a4;
+    register long r8 __asm__("r8") = a5;
+    long ret;
+
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8)
+                     : "rcx", "r11", "memory");
+    return ret;
 }
 
-/* ── address alignment helpers ──────────────────────────────────────────── */
+static size_t ld_strlen(const char *s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    return n;
+}
 
-static u64 align_down(u64 v) { return v & ~0xFFFULL; }
-static u64 align_up(u64 v)   { return (v + 0xFFFULL) & ~0xFFFULL; }
+static int ld_strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return (u8)*a - (u8)*b;
+}
 
-/* ── file helpers ───────────────────────────────────────────────────────── */
+/* Bounded append; returns 0 on truncation so callers can skip the candidate. */
+static int ld_append(char *dst, size_t cap, const char *src) {
+    size_t n = ld_strlen(dst);
+    size_t m = ld_strlen(src);
+    if (n + m + 1 > cap) return 0;
+    memcpy(dst + n, src, m + 1);
+    return 1;
+}
 
-static int read_all(int fd, void *buf, size_t n) {
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = read(fd, (u8*)buf + got, n - got);
+static void ld_write(const char *s) {
+    ld_syscall(SYS_WRITE, 1, (long)s, (long)ld_strlen(s), 0, 0);
+}
+
+static __attribute__((noreturn)) void ld_die(const char *msg, const char *arg) {
+    ld_write("ld-moduos: ");
+    ld_write(msg);
+    if (arg) {
+        ld_write(": ");
+        ld_write(arg);
+    }
+    ld_write("\n");
+    ld_syscall(SYS_EXIT, 127, 0, 0, 0, 0);
+    for (;;) {
+    }
+}
+
+static int ld_mmap_failed(long r) {
+    return (u64)r >= (u64)-4095LL;
+}
+
+static u32 ld_elf_hash(const char *name) {
+    u32 h = 0;
+    while (*name) {
+        h = (h << 4) + (u8)*name++;
+        u32 g = h & 0xf0000000u;
+        if (g) h ^= g >> 24;
+        h &= ~g;
+    }
+    return h;
+}
+
+/* A JUMP_SLOT whose symbol is missing binds here, so a never-called import
+ * does not stop the program (matches what lazy binding would have done). */
+static __attribute__((noreturn)) void ld_unresolved_trap(void) {
+    ld_die("call through unresolved symbol", NULL);
+}
+
+static void ld_parse_dynamic(ld_object_t *o) {
+    const ld_dyn_t *d;
+
+    for (d = o->dyn; d->d_tag != DT_NULL; d++) {
+        u64 v = d->d_val;
+        switch (d->d_tag) {
+        case DT_STRTAB: o->strtab = (const char *)(o->base + v); break;
+        case DT_STRSZ: o->strsz = v; break;
+        case DT_SYMTAB: o->symtab = (const ld_sym_t *)(o->base + v); break;
+        case DT_HASH: o->hash = (const u32 *)(o->base + v); break;
+        case DT_RELA: o->rela = (const ld_rela_t *)(o->base + v); break;
+        case DT_RELASZ: o->relasz = v; break;
+        case DT_JMPREL: o->jmprel = (const ld_rela_t *)(o->base + v); break;
+        case DT_PLTRELSZ: o->jmprelsz = v; break;
+        case DT_INIT: o->init_fn = (void (*)(void))(o->base + v); break;
+        case DT_INIT_ARRAY: o->init_array = (void (**)(void))(o->base + v); break;
+        case DT_INIT_ARRAYSZ: o->init_arraysz = v; break;
+        default: break;
+        }
+    }
+
+    /* DT_NEEDED holds strtab offsets, so it needs DT_STRTAB already known. */
+    for (d = o->dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag != DT_NEEDED) continue;
+        if (o->needed_count >= LD_MAX_NEEDED) ld_die("too many DT_NEEDED entries", o->name);
+        o->needed[o->needed_count++] = (u32)d->d_val;
+    }
+}
+
+static int ld_read_full(int fd, void *buf, u64 n) {
+    u8 *p = buf;
+    while (n) {
+        long r = ld_syscall(SYS_READ, fd, (long)p, (long)n, 0, 0);
         if (r <= 0) return -1;
-        got += (size_t)r;
+        p += r;
+        n -= (u64)r;
     }
     return 0;
 }
 
-static int load_file(const char *path, void **out_buf, size_t *out_sz) {
-    fs_file_info_t st;
-    if (stat(path, &st) != 0) return -1;
-    if (st.is_directory) return -1;
-
-    int fd = open(path, O_RDONLY, 0);
-    if (fd < 0) return -1;
-
-    void *b = malloc(st.size);
-    if (!b) { close(fd); return -1; }
-
-    if (read_all(fd, b, st.size) != 0) {
-        close(fd);
-        free(b);
-        return -1;
-    }
-    close(fd);
-
-    *out_buf = b;
-    *out_sz  = (size_t)st.size;
-    return 0;
+static ld_object_t *ld_alloc_object(const char *name) {
+    if (g_object_count >= LD_MAX_OBJECTS) ld_die("too many loaded objects", name);
+    ld_object_t *o = &g_objects[g_object_count++];
+    memset(o, 0, sizeof(*o));
+    if (ld_strlen(name) >= sizeof(o->name)) ld_die("name too long", name);
+    memcpy(o->name, name, ld_strlen(name) + 1);
+    return o;
 }
 
-/* ── ELF segment loader ─────────────────────────────────────────────────── */
+/* Maps one ET_DYN image. Returns NULL if the file cannot be opened so the
+ * caller can try the next search directory; any later failure is fatal. */
+static ld_object_t *ld_map_library(const char *path, const char *soname) {
+    int fd = (int)ld_syscall(SYS_OPEN, (long)path, 0, 0, 0, 0);
+    if (fd < 0) return NULL;
 
-static int map_load_segments(const void *file, u64 base,
-                             u64 *out_entry, u64 *out_dyn_vaddr) {
-    const ehdr_t *eh = (const ehdr_t*)file;
-    const phdr_t *ph = (const phdr_t*)((const u8*)file + eh->e_phoff);
+    long got = ld_syscall(SYS_READ, fd, (long)g_hdr, LD_HDR_MAX, 0, 0);
+    const ld_ehdr_t *eh = (const ld_ehdr_t *)g_hdr;
+    if (got < (long)sizeof(*eh) || eh->e_ident[0] != 0x7f || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L' || eh->e_ident[3] != 'F' || eh->e_ident[4] != 2 ||
+        eh->e_machine != EM_X86_64 || eh->e_type != ET_DYN)
+        ld_die("not an x86-64 shared object", path);
 
-    *out_dyn_vaddr = 0;
+    u64 phsz = (u64)eh->e_phnum * sizeof(ld_phdr_t);
+    if (eh->e_phentsize != sizeof(ld_phdr_t) || eh->e_phoff + phsz > (u64)got)
+        ld_die("program headers out of range", path);
+    const ld_phdr_t *ph = (const ld_phdr_t *)(g_hdr + eh->e_phoff);
+
+    u64 lo = ~0ULL, hi = 0;
+    for (u16 i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD || ph[i].p_memsz == 0) continue;
+        u64 s = ph[i].p_vaddr & ~0xFFFULL;
+        u64 e = (ph[i].p_vaddr + ph[i].p_memsz + 0xFFFULL) & ~0xFFFULL;
+        if (s < lo) lo = s;
+        if (e > hi) hi = e;
+    }
+    if (lo == ~0ULL) ld_die("no loadable segments", path);
+
+    long m = ld_syscall(SYS_MMAP, 0, (long)(hi - lo), PROT_RWX, MMAP_ANON, -1);
+    if (ld_mmap_failed(m)) ld_die("out of address space for", path);
+
+    ld_object_t *o = ld_alloc_object(soname);
+    o->base = (u64)m - lo;
 
     for (u16 i = 0; i < eh->e_phnum; i++) {
-        if (ph[i].p_type == PT_DYNAMIC) {
-            *out_dyn_vaddr = base + ph[i].p_vaddr;
-        }
-        if (ph[i].p_type != PT_LOAD) continue;
-
-        u64    seg_vaddr = base + ph[i].p_vaddr;
-        u64    seg_start = align_down(seg_vaddr);
-        u64    seg_end   = align_up(seg_vaddr + ph[i].p_memsz);
-        size_t map_sz    = (size_t)(seg_end - seg_start);
-
-        int prot = MMAP_PROT_R | MMAP_PROT_W;
-
-        void *m = mm_mmap((void*)(uintptr_t)seg_start, map_sz,
-                          prot, MMAP_FLAG_FIXED | MMAP_FLAG_ANON);
-        if (mmap_failed(m)) {
-            printf("ld-moduos: mmap failed for segment at 0x%lx size 0x%lx\n",
-                   (unsigned long)seg_start, (unsigned long)map_sz);
-            return -1;
-        }
-
-        /* Zero the whole region first — handles the .bss area between
-         * p_filesz and p_memsz automatically.                          */
-        memset((void*)(uintptr_t)seg_start, 0, map_sz);
-
-        /* Copy initialised data from the file image.                   */
-        if (ph[i].p_filesz) {
-            memcpy((void*)(uintptr_t)seg_vaddr,
-                   (const u8*)file + ph[i].p_offset,
-                   (size_t)ph[i].p_filesz);
-        }
+        if (ph[i].p_type == PT_DYNAMIC) o->dyn = (const ld_dyn_t *)(o->base + ph[i].p_vaddr);
+        if (ph[i].p_type != PT_LOAD || ph[i].p_filesz == 0) continue;
+        /* mmap already zero-filled the span, which covers .bss. */
+        if (ld_syscall(SYS_LSEEK, fd, (long)ph[i].p_offset, 0, 0, 0) < 0 ||
+            ld_read_full(fd, (void *)(o->base + ph[i].p_vaddr), ph[i].p_filesz) != 0)
+            ld_die("short read", path);
     }
+    ld_syscall(SYS_CLOSE, fd, 0, 0, 0, 0);
 
-    *out_entry = base + eh->e_entry;
+    if (!o->dyn) ld_die("missing PT_DYNAMIC", path);
+    ld_parse_dynamic(o);
+    return o;
+}
+
+static int ld_has_slash(const char *s) {
+    for (; *s; s++)
+        if (*s == '/') return 1;
     return 0;
 }
 
-/* ── dynamic section parser ─────────────────────────────────────────────── */
-
-static void obj_free_needed(so_obj_t *o) {
-    if (!o || !o->needed) return;
-    for (u32 i = 0; i < o->needed_count; i++) {
-        if (o->needed[i]) free(o->needed[i]);
-    }
-    free(o->needed);
-    o->needed       = NULL;
-    o->needed_count = 0;
+static ld_object_t *ld_find_loaded(const char *soname) {
+    for (u32 i = 0; i < g_object_count; i++)
+        if (ld_strcmp(g_objects[i].name, soname) == 0) return &g_objects[i];
+    return NULL;
 }
 
-static int obj_parse_dynamic(so_obj_t *o, u64 dyn_vaddr) {
-    if (!dyn_vaddr) return 0;
+static ld_object_t *ld_try_dir(const char *dir, size_t dir_len, const char *soname) {
+    char path[LD_PATH_MAX];
 
-    o->dyn = (const dyn_t*)(uintptr_t)dyn_vaddr;
-    const dyn_t *dyn = o->dyn;
-
-    /* First pass: collect pointers.
-     * NOTE: DT_STRTAB / DT_SYMTAB / DT_HASH / DT_RELA values are
-     * virtual addresses relative to the load base for ET_DYN objects. */
-    for (size_t i = 0;; i++) {
-        if (dyn[i].d_tag == DT_NULL) break;
-        switch (dyn[i].d_tag) {
-            case DT_STRTAB:  o->strtab  = (const char*)(uintptr_t)(o->base + dyn[i].d_val); break;
-            case DT_STRSZ:   o->strsz   = dyn[i].d_val; break;
-            case DT_SYMTAB:  o->symtab  = (const sym_t*)(uintptr_t)(o->base + dyn[i].d_val); break;
-            case DT_HASH:    o->hash    = (const u32*)(uintptr_t)(o->base + dyn[i].d_val); break;
-            case DT_RELA:    o->rela    = (const rela_t*)(uintptr_t)(o->base + dyn[i].d_val); break;
-            case DT_RELASZ:  o->relasz  = dyn[i].d_val; break;
-            case DT_RELAENT: o->relaent = dyn[i].d_val; break;
-            default: break;
-        }
-    }
-
-    if (o->hash) {
-        /* DT_HASH layout: [nbucket, nchain, buckets[nbucket], chains[nchain]] */
-        o->nsyms = o->hash[1]; /* nchain == number of symbol table entries */
-    }
-
-    /* Second pass: gather DT_NEEDED entries. */
-    obj_free_needed(o);
-    u32 count = 0;
-    for (size_t i = 0;; i++) {
-        if (dyn[i].d_tag == DT_NULL) break;
-        if (dyn[i].d_tag == DT_NEEDED) count++;
-    }
-
-    if (count) {
-        o->needed = (char**)malloc((size_t)count * sizeof(char*));
-        if (!o->needed) return -1;
-        memset(o->needed, 0, (size_t)count * sizeof(char*));
-        o->needed_count = count;
-
-        u32 out = 0;
-        for (size_t i = 0;; i++) {
-            if (dyn[i].d_tag == DT_NULL) break;
-            if (dyn[i].d_tag != DT_NEEDED) continue;
-            if (!o->strtab) return -1;
-            const char *s = o->strtab + dyn[i].d_val;
-            size_t n = strlen(s);
-            o->needed[out] = (char*)malloc(n + 1);
-            if (!o->needed[out]) return -1;
-            memcpy(o->needed[out], s, n + 1);
-            out++;
-            if (out >= count) break;
-        }
-    }
-
-    return 0;
+    if (dir_len + 1 + ld_strlen(soname) + 1 > sizeof(path)) return NULL;
+    memcpy(path, dir, dir_len);
+    path[dir_len] = 0;
+    if (dir_len == 0 || !ld_append(path, sizeof(path), "/")) return NULL;
+    if (!ld_append(path, sizeof(path), soname)) return NULL;
+    return ld_map_library(path, soname);
 }
 
-/* ── loaded-object list ─────────────────────────────────────────────────── */
+static ld_object_t *ld_load_needed(const char *soname) {
+    ld_object_t *o = ld_find_loaded(soname);
+    if (o) return o;
 
-static so_obj_t *g_objs = NULL;
+    if (ld_has_slash(soname)) {
+        o = ld_map_library(soname, soname);
+        if (!o) ld_die("cannot open library", soname);
+        return o;
+    }
 
-static so_obj_t *obj_find_loaded_by_path(const char *path) {
-    for (so_obj_t *o = g_objs; o; o = o->next) {
-        if (strcmp(o->path, path) == 0) return o;
+    for (const char *p = g_libpath; *p;) {
+        const char *end = p;
+        while (*end && *end != ':') end++;
+        if (end > p && (o = ld_try_dir(p, (size_t)(end - p), soname)) != NULL) return o;
+        p = *end ? end + 1 : end;
+    }
+
+    o = ld_try_dir(LD_DEFAULT_DIR, sizeof(LD_DEFAULT_DIR) - 1, soname);
+    if (!o) ld_die("cannot find library", soname);
+    return o;
+}
+
+/* Breadth-first so the global scope matches the DT_NEEDED order the linker saw. */
+static void ld_load_dependencies(void) {
+    for (u32 i = 0; i < g_object_count; i++) {
+        ld_object_t *o = &g_objects[i];
+        for (u32 n = 0; n < o->needed_count; n++)
+            o->deps[n] = ld_load_needed(o->strtab + o->needed[n]);
+    }
+}
+
+static const ld_sym_t *ld_lookup_in(const ld_object_t *o, const char *name, u32 h) {
+    if (!o->hash || !o->symtab || !o->strtab) return NULL;
+
+    u32 nbucket = o->hash[0];
+    const u32 *bucket = o->hash + 2;
+    const u32 *chain = bucket + nbucket;
+
+    if (nbucket == 0) return NULL;
+    for (u32 i = bucket[h % nbucket]; i != 0; i = chain[i]) {
+        const ld_sym_t *s = &o->symtab[i];
+        if (s->st_shndx == SHN_UNDEF || (s->st_info & 0xF) == STT_TLS) continue;
+        if (ld_strcmp(o->strtab + s->st_name, name) == 0) return s;
     }
     return NULL;
 }
 
-static so_obj_t *obj_add_loaded(const char *path) {
-    so_obj_t *o = (so_obj_t*)malloc(sizeof(*o));
-    if (!o) return NULL;
-    memset(o, 0, sizeof(*o));
-    strncpy(o->path, path, sizeof(o->path) - 1);
-    o->path[sizeof(o->path) - 1] = 0;
-    o->relaent = sizeof(rela_t);
-    o->next = g_objs;
-    g_objs  = o;
-    return o;
-}
+/* A strong definition anywhere beats an earlier weak one, as in ld.so. */
+static int ld_resolve_symbol(const char *name, const ld_object_t *skip, u64 *out_addr,
+                             u64 *out_size) {
+    u32 h = ld_elf_hash(name);
+    const ld_object_t *weak_obj = NULL;
+    const ld_sym_t *weak_sym = NULL;
 
-/* ── object loader ──────────────────────────────────────────────────────── */
-
-static int obj_load(const char *path, so_obj_t **out_obj) {
-    if (!path || !out_obj) return -1;
-
-    /* Return cached object if already loaded. */
-    so_obj_t *already = obj_find_loaded_by_path(path);
-    if (already) { *out_obj = already; return 0; }
-
-    void  *file    = NULL;
-    size_t file_sz = 0;
-    if (load_file(path, &file, &file_sz) != 0) {
-        printf("ld-moduos: cannot read %s\n", path);
-        return -1;
-    }
-
-    const ehdr_t *eh = (const ehdr_t*)file;
-    if (file_sz < sizeof(ehdr_t) ||
-        eh->e_ident[0] != 0x7f ||
-        eh->e_ident[1] != 'E'  ||
-        eh->e_ident[2] != 'L'  ||
-        eh->e_ident[3] != 'F') {
-        printf("ld-moduos: %s is not an ELF file\n", path);
-        free(file);
-        return -1;
-    }
-
-    so_obj_t *o = obj_add_loaded(path);
-    if (!o) { free(file); return -1; }
-
-    if (eh->e_type == ET_DYN) {
-        u64 min_vaddr = (u64)-1ULL;
-        u64 max_vaddr = 0;
-        const phdr_t *ph = (const phdr_t*)((const u8*)file + eh->e_phoff);
-        for (u16 i = 0; i < eh->e_phnum; i++) {
-            if (ph[i].p_type != PT_LOAD) continue;
-            u64 lo = align_down(ph[i].p_vaddr);
-            u64 hi = align_up(ph[i].p_vaddr + ph[i].p_memsz);
-            if (lo < min_vaddr) min_vaddr = lo;
-            if (hi > max_vaddr) max_vaddr = hi;
-        }
-        if (min_vaddr == (u64)-1ULL) min_vaddr = 0;
-        size_t reserve_sz = (size_t)(max_vaddr - min_vaddr);
-
-        void *reservation = mm_mmap(NULL, reserve_sz,
-                                    MMAP_PROT_R | MMAP_PROT_W,
-                                    MMAP_FLAG_ANON);
-        if (mmap_failed(reservation)) {
-            printf("ld-moduos: cannot reserve VA for %s\n", path);
-            free(file);
-            return -1;
-        }
-        /* base = reservation start - min_vaddr so that
-         * base + ph[i].p_vaddr lands inside the reservation. */
-        o->base = (u64)(uintptr_t)reservation - min_vaddr;
-    } else {
-        /* ET_EXEC: fixed virtual addresses, no base slide. */
-        o->base = 0;
-    }
-
-    u64 dyn_vaddr = 0;
-    if (map_load_segments(file, o->base, &o->entry, &dyn_vaddr) != 0) {
-        free(file);
-        return -1;
-    }
-
-    if (obj_parse_dynamic(o, dyn_vaddr) != 0) {
-        free(file);
-        return -1;
-    }
-
-    free(file);
-    *out_obj = o;
-    return 0;
-}
-
-/* ── recursive dependency loader ────────────────────────────────────────── */
-
-static int obj_load_deps_recursive(so_obj_t *o) {
-    if (!o) return -1;
-
-    for (u32 i = 0; i < o->needed_count; i++) {
-        const char *soname = o->needed[i];
-        if (!soname || !soname[0]) continue;
-
-        char full[256];
-        strcpy(full, "/ModuOS/shared/lib/");
-        strncat(full, soname, sizeof(full) - strlen(full) - 1);
-
-        so_obj_t *dep = NULL;
-        if (obj_load(full, &dep) != 0) {
-            printf("ld-moduos: cannot load needed lib: %s\n", full);
-            return -1;
-        }
-
-        if (obj_load_deps_recursive(dep) != 0) return -1;
-    }
-
-    return 0;
-}
-
-/* ── symbol resolution ──────────────────────────────────────────────────── */
-
-static u64 obj_sym_addr(so_obj_t *o, const sym_t *s) {
-    return o->base + s->st_value;
-}
-
-static int sym_is_usable_definition(const sym_t *s) {
-    if (!s) return 0;
-    if (s->st_shndx == SHN_UNDEF) return 0;
-    u8 bind = ELF64_ST_BIND(s->st_info);
-    if (bind == STB_LOCAL) return 0;
-    return 1;
-}
-
-static u64 resolve_symbol_addr(const char *name, int *out_is_weak) {
-    if (out_is_weak) *out_is_weak = 0;
-    if (!name || !name[0]) return 0;
-
-    u64 weak_addr = 0;
-
-    for (so_obj_t *o = g_objs; o; o = o->next) {
-        if (!o->symtab || !o->strtab || o->nsyms == 0) continue;
-
-        for (u32 i = 0; i < o->nsyms; i++) {
-            const sym_t *s = &o->symtab[i];
-            if (s->st_name >= o->strsz) continue;
-
-            const char *sname = o->strtab + s->st_name;
-            if (strcmp(sname, name) != 0) continue;
-            if (s->st_shndx == SHN_UNDEF) continue;
-
-            u8 bind = ELF64_ST_BIND(s->st_info);
-            if (bind == STB_GLOBAL) {
-                return obj_sym_addr(o, s);
+    for (u32 i = 0; i < g_object_count; i++) {
+        const ld_object_t *o = &g_objects[i];
+        if (o == skip) continue;
+        const ld_sym_t *s = ld_lookup_in(o, name, h);
+        if (!s) continue;
+        if ((s->st_info >> 4) == STB_WEAK) {
+            if (!weak_sym) {
+                weak_sym = s;
+                weak_obj = o;
             }
-            if (bind == STB_WEAK && weak_addr == 0) {
-                weak_addr = obj_sym_addr(o, s);
-            }
+            continue;
         }
+        *out_addr = o->base + s->st_value;
+        if (out_size) *out_size = s->st_size;
+        return 1;
     }
-
-    if (weak_addr) {
-        if (out_is_weak) *out_is_weak = 1;
-        return weak_addr;
+    if (weak_sym) {
+        *out_addr = weak_obj->base + weak_sym->st_value;
+        if (out_size) *out_size = weak_sym->st_size;
+        return 1;
     }
-
     return 0;
 }
 
-/* ── relocation ─────────────────────────────────────────────────────────── */
+static void ld_apply_relocs(ld_object_t *o, const ld_rela_t *r, u64 bytes) {
+    for (u64 i = 0; i < bytes / sizeof(ld_rela_t); i++) {
+        u32 type = (u32)(r[i].r_info & 0xffffffffu);
+        u32 symi = (u32)(r[i].r_info >> 32);
+        u64 *where = (u64 *)(o->base + r[i].r_offset);
 
-static int relocate_one_object(so_obj_t *o) {
-    if (!o || !o->rela || !o->relasz) return 0;
-
-    u64 ent   = o->relaent ? o->relaent : sizeof(rela_t);
-    u64 count = o->relasz / ent;
-
-    for (u64 i = 0; i < count; i++) {
-        const rela_t *r = (const rela_t*)((const u8*)o->rela + (size_t)(i * ent));
-        u32 type = ELF64_R_TYPE(r->r_info);
-        u32 symi = ELF64_R_SYM(r->r_info);
-
-        u64 *where = (u64*)(uintptr_t)(o->base + r->r_offset);
-
+        if (type == R_X86_64_NONE) continue;
         if (type == R_X86_64_RELATIVE) {
-            *where = o->base + (u64)r->r_addend;
+            *where = o->base + (u64)r[i].r_addend;
+            continue;
+        }
+        if (type != R_X86_64_64 && type != R_X86_64_GLOB_DAT && type != R_X86_64_JUMP_SLOT &&
+            type != R_X86_64_COPY)
+            ld_die("unsupported relocation type", o->name);
+        if (!o->symtab || !o->strtab) ld_die("relocation without symbol table", o->name);
+
+        const ld_sym_t *sym = &o->symtab[symi];
+        const char *name = o->strtab + sym->st_name;
+        u64 addr = 0, size = 0;
+        int found;
+
+        if (type == R_X86_64_COPY) {
+            /* Only the executable has these; the data lives in a library. */
+            if (!ld_resolve_symbol(name, o, &addr, &size)) ld_die("undefined symbol", name);
+            memcpy(where, (const void *)addr, sym->st_size ? sym->st_size : size);
             continue;
         }
 
-        if (type == R_X86_64_64       ||
-            type == R_X86_64_GLOB_DAT ||
-            type == R_X86_64_JUMP_SLOT) {
+        if ((sym->st_info >> 4) == STB_LOCAL && sym->st_shndx != SHN_UNDEF) {
+            addr = o->base + sym->st_value;
+            found = 1;
+        } else {
+            found = ld_resolve_symbol(name, NULL, &addr, NULL);
+        }
 
-            if (!o->symtab || !o->strtab || o->nsyms == 0) {
-                printf("ld-moduos: missing symtab/strtab for reloc in %s\n", o->path);
-                return -1;
-            }
-            if (symi >= o->nsyms) {
-                printf("ld-moduos: bad sym index %u in %s\n", symi, o->path);
-                return -1;
-            }
-
-            const sym_t *sym  = &o->symtab[symi];
-            const char  *name = (sym->st_name < o->strsz)
-                                ? (o->strtab + sym->st_name) : "";
-
-            u64 S = 0;
-            if (sym_is_usable_definition(sym)) {
-                S = obj_sym_addr(o, sym);
+        if (!found) {
+            if ((sym->st_info >> 4) == STB_WEAK) {
+                addr = 0;
+            } else if (type == R_X86_64_JUMP_SLOT) {
+                addr = (u64)(uintptr_t)ld_unresolved_trap;
             } else {
-                int is_weak = 0;
-                S = resolve_symbol_addr(name, &is_weak);
-                if (S == 0 && ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
-                    printf("ld-moduos: unresolved symbol '%s' in %s\n",
-                           name, o->path);
-                    return -1;
-                }
+                ld_die("undefined symbol", name);
             }
-
-            *where = S + (u64)r->r_addend;
-            continue;
         }
 
-        printf("ld-moduos: unsupported reloc type %u in %s\n",
-               (unsigned)type, o->path);
-        return -1;
+        *where = (type == R_X86_64_64) ? addr + (u64)r[i].r_addend : addr;
     }
-
-    return 0;
 }
 
-static int relocate_all_objects(void) {
-    /* Two passes in case of forward references between objects. */
-    for (int pass = 0; pass < 2; pass++) {
-        for (so_obj_t *o = g_objs; o; o = o->next) {
-            if (relocate_one_object(o) != 0) return -1;
-        }
-    }
-    return 0;
+/* Dependencies first, so a library's initialisers never see an uninitialised
+ * dependency. */
+static void ld_run_init(ld_object_t *o) {
+    if (o->initialised) return;
+    o->initialised = 1;
+
+    for (u32 n = 0; n < o->needed_count; n++)
+        if (o->deps[n]) ld_run_init(o->deps[n]);
+
+    if (o->init_fn) o->init_fn();
+    for (u64 i = 0; i < o->init_arraysz / sizeof(void *); i++)
+        if (o->init_array[i]) o->init_array[i]();
 }
 
-/* ── entry point ────────────────────────────────────────────────────────── */
+static void ld_setup_executable(const dlinfo_t *info) {
+    if (!info->exe_phdr || info->exe_phent != sizeof(ld_phdr_t))
+        ld_die("executable program headers are not mapped", NULL);
 
-int md_main(long argc, char **argv) {
-    if (argc < 2) {
-        printf("Usage: ld-moduos <program> [args...]\n");
-        return 1;
+    ld_object_t *o = ld_alloc_object("<executable>");
+    o->is_exe = 1;
+    o->base = 0;
+
+    const ld_phdr_t *ph = (const ld_phdr_t *)info->exe_phdr;
+    for (u64 i = 0; i < info->exe_phnum; i++)
+        if (ph[i].p_type == PT_DYNAMIC) o->dyn = (const ld_dyn_t *)ph[i].p_vaddr;
+    if (!o->dyn) ld_die("executable has PT_INTERP but no PT_DYNAMIC", NULL);
+    ld_parse_dynamic(o);
+}
+
+__attribute__((noreturn, used)) void _start(long argc, char **argv, char **envp) {
+    dlinfo_t info;
+
+    if (ld_syscall(SYS_DLINFO, (long)&info, 0, 0, 0, 0) != 0)
+        ld_die("kernel did not provide dynamic-link info", NULL);
+
+    if (ld_syscall(SYS_GETENV, (long)"LD_LIBRARY_PATH", (long)g_libpath,
+                   (long)sizeof(g_libpath) - 1, 0, 0) < 0)
+        g_libpath[0] = 0;
+
+    ld_setup_executable(&info);
+    ld_load_dependencies();
+
+    for (u32 i = 0; i < g_object_count; i++) {
+        ld_object_t *o = &g_objects[i];
+        if (o->rela) ld_apply_relocs(o, o->rela, o->relasz);
+        if (o->jmprel) ld_apply_relocs(o, o->jmprel, o->jmprelsz);
     }
 
-    const char *target = argv[1];
+    /* Nothing else runs the executable's own init_array: its _start is the
+     * application entry, there is no crt. */
+    for (u32 i = g_object_count; i-- > 0;) ld_run_init(&g_objects[i]);
 
-    so_obj_t *main_obj = NULL;
-    if (obj_load(target, &main_obj) != 0) {
-        printf("ld-moduos: cannot load target '%s'\n", target);
-        return 1;
+    ((ld_entry_fn_t)(uintptr_t)info.exe_entry)(argc, argv, envp);
+    ld_syscall(SYS_EXIT, 0, 0, 0, 0, 0);
+    for (;;) {
     }
-
-    if (obj_load_deps_recursive(main_obj) != 0) {
-        printf("ld-moduos: dependency load failed\n");
-        return 1;
-    }
-
-    if (relocate_all_objects() != 0) {
-        printf("ld-moduos: relocation failed\n");
-        return 1;
-    }
-
-    void (*entry_fn)(long, char**) = (void(*)(long, char**))(uintptr_t)main_obj->entry;
-    entry_fn(argc - 1, &argv[1]);
-
-    /* entry_fn should not return, but if it does, exit cleanly. */
-    return 0;
 }

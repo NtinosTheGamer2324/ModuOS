@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 /*
  * audiotest: generate a 440Hz sine-ish tone (square wave) and write to $/dev/audio/pcm0.

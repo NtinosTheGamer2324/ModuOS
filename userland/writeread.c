@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 static void usage(const char *argv0) {
     printf("Usage: %s <path> <text>\n", argv0);

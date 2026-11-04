@@ -13,7 +13,7 @@
 // (cleanup for repeat runs of the demo).
 //
 
-#include "libc.h"
+#include "libc/libc.h"
 
 #define SHM_NAME "/shm_demo"
 #define TICKS    10

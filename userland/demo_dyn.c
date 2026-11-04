@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 /* Demo: call into a shared library function.
  * Requires ld-moduos symbol relocations (GLOB_DAT/JUMP_SLOT/64).

@@ -1,13 +1,14 @@
-#include "libc.h"
+#include "libc/libc.h"
 #include <stdbool.h>
 #include <stdint.h>
-#include "string.h"
+#include "libc/string.h"
 
 #define ANSI_RED     "\033[31m\b"
 #define ANSI_PURPLE  "\033[35m\b"
 #define ANSI_GREEN   "\033[32m\b"
 #define ANSI_CYAN    "\033[36m\b"
 #define ANSI_ORANGE  "\033[38;5;214m\b"
+#undef ANSI_RESET
 #define ANSI_RESET   "\033[0m\b"
 
 int g_running = 1;
@@ -72,6 +73,8 @@ const char* get_pc_name() {
 int md_main(long argc, char **argv) {
     (void)argc; (void)argv;
 
+    printf("\033[2J\b");
+
     zsbanner();
 
     printf(ANSI_CYAN "New Technologies Software (c) 2026\n" ANSI_RESET);
@@ -85,28 +88,20 @@ int md_main(long argc, char **argv) {
     static char app_path[256];
     static char args_copy[192];
 
+    int who = (int)syscall(SYS_GETUID, 0, 0, 0);
+    if (who < 0) who = 1;
     const char* host = get_pc_name();
+    if (!host || strcmp(host, "") == 0) { host = "{unknown}"; }
 
     while (g_running) {
         if (getcwd(cwd, sizeof(cwd)) == NULL) {
             strcpy(cwd, "?");
         }
 
-        int who = (int)syscall(SYS_GETUID, 0, 0, 0);
-        if (who < 0) who = 1;
-
-        if (host) {
-            if (who == 0) {
-                printf("\n┌─%s# %s%d@%s\n└─[%s]>", ANSI_RED, ANSI_RESET, who, host, cwd);
-            } else {
-                printf("\n┌─%s$ %s%d@%s\n└─[%s]>", ANSI_GREEN, ANSI_RESET, who, host, cwd);
-            }
+        if (who == 0) {
+            printf("\n┌─%s# %s%d@%s\n└─[%s]>", ANSI_RED, ANSI_RESET, who, host, cwd);
         } else {
-            if (who == 0) {
-                printf("\n┌─%s# %s%d@{unknown}\n└─[%s]>", ANSI_RED, ANSI_RESET, who, cwd);
-            } else {
-                printf("\n┌─%s$ %s%d@{unknown}\n└─[%s]>", ANSI_GREEN, ANSI_RESET, who, cwd);
-            }
+            printf("\n┌─%s$ %s%d@%s\n└─[%s]>", ANSI_GREEN, ANSI_RESET, who, host, cwd);
         }
 
         char *user_input = input();
@@ -157,7 +152,9 @@ int md_main(long argc, char **argv) {
             }
         } else if (strcmp(command, "pwd") == 0) {
             printf("%s\n", cwd);
-
+        
+        } else if (strcmp(command, "cls") == 0 || strcmp(command, "clear") == 0) {
+            printf("\033[2J\b");
         } else if (strlen(command) > 0) {
             snprintf(app_path, sizeof(app_path), "/Apps/%s.sqr", command);
 

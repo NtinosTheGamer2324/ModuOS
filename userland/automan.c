@@ -1,6 +1,6 @@
 // automan.c - Autostart Manager (ModuOS Init / PID 1)
 // Full-featured init: service registry, respawn, fg/bg/run, signals, shutdown
-#include "libc.h"
+#include "libc/libc.h"
 
 #define AUTOSTART_PATH   "/ModuOS/System64/auto/autostart"
 #define MAX_LINE         1280

@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 #define AUTOSTART "/ModuOS/shared/config/.autoshell.cfg"
 
@@ -7,6 +7,7 @@
 #define ANSI_GREEN   "\033[32m\b"
 #define ANSI_CYAN    "\033[36m\b"
 #define ANSI_ORANGE  "\033[38;5;214m\b"
+#undef ANSI_RESET
 #define ANSI_RESET   "\033[0m\b"
 
 void execapp(const char *path, const char *args) {

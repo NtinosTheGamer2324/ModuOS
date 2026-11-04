@@ -1,6 +1,6 @@
-#include "libc.h"
+#include "libc/libc.h"
 #include "NodGL.h"
-#include "string.h"
+#include "libc/string.h"
 #include "../include/moduos/kernel/events/events.h"
 
 #define MAX_BULLETS 10

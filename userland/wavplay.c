@@ -20,7 +20,7 @@
  * so only libc.h is included externally.
  */
 
-#include "libc.h"
+#include "libc/libc.h"
 
 /* ---------------------------------------------------------------------
  * audiosqrm/types.h and audiosqrm/audmgr_wire.h embedded directly below

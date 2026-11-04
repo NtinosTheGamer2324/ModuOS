@@ -1,5 +1,5 @@
 // n_kbdcat.c — reads structured key events from $/dev/n_input/kbd0
-#include "libc.h"
+#include "libc/libc.h"
 #include "../include/moduos/drivers/input/gscancode.h"
 
 static const char* state_str(key_state_t s) {

@@ -2,7 +2,7 @@
 // Cross-filesystem moves are handled as copy + unlink since the kernel
 // has no dedicated rename/mv syscall.
 
-#include "libc.h"
+#include "../libc/libc.h"
 
 int md_main(long argc, char **argv)
 {

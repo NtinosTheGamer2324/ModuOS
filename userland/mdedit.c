@@ -35,7 +35,7 @@
  * Copyright © 2026 New Technologies Software — GPL v2.0
  */
 
-#include "libc.h"
+#include "libc/libc.h"
 #include "wm_protocol.h"
 #include "wm_client_resize.h"
 #include "lib_fnt.h"

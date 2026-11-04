@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 // ANSI Utility Macros
 #define CLS          "\x1b[2J"
@@ -18,13 +18,13 @@ void draw_window(int r, int c, int w, int h, const char* title) {
     for (int i = 0; i < h; i++) {
         GOTO(r + i, c);
         COLOR(FG_WHITE, BG_BLUE);
-        for (int j = 0; j < w; j++) putc(' ');
+        for (int j = 0; j < w; j++) putchar(' ');
     }
 
     // Header bar
     GOTO(r, c);
     COLOR(FG_BLACK, BG_CYAN);
-    for (int i = 0; i < w; i++) putc(' ');
+    for (int i = 0; i < w; i++) putchar(' ');
     GOTO(r, c + (w/2) - (strlen(title)/2));
     printf("%s", title);
 
@@ -64,7 +64,7 @@ void draw_ui(int sel) {
     // Status line
     GOTO(48, 1);
     COLOR(FG_BLACK, 47); // Black on Light Gray
-    for(int i=0; i<128; i++) putc(' ');
+    for(int i=0; i<128; i++) putchar(' ');
     GOTO(48, 2);
     printf("W/S: Move | ENTER: Confirm | ModuOS OOBE Phase");
     RESET;

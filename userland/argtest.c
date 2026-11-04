@@ -1,6 +1,6 @@
 // argtest.c - debug argv passing into userland
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 #include <stdint.h>
 
 static void print_hex_byte(uint8_t b) {
@@ -18,7 +18,7 @@ static void print_ptr(const void *p) {
     for (int i = (int)(sizeof(uintptr_t) * 2) - 1; i >= 0; i--) {
         uint8_t nib = (v >> (i * 4)) & 0xF;
         char c = (nib < 10) ? ('0' + nib) : ('a' + (nib - 10));
-        putc(c);
+        putchar(c);
     }
 }
 
@@ -26,7 +26,7 @@ static void hexdump_prefix(const void *p, size_t n) {
     const uint8_t *b = (const uint8_t*)p;
     for (size_t i = 0; i < n; i++) {
         print_hex_byte(b[i]);
-        if (i + 1 < n) putc(' ');
+        if (i + 1 < n) putchar(' ');
     }
 }
 
@@ -57,9 +57,9 @@ int md_main(long argc, char **argv) {
             char c = s[j];
             if (c == 0) break;
             if ((unsigned char)c < 32 || (unsigned char)c > 126) {
-                putc('.');
+                putchar('.');
             } else {
-                putc(c);
+                putchar(c);
             }
         }
         printf("'\n");

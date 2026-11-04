@@ -1,4 +1,4 @@
-#include "libc.h"
+#include "libc/libc.h"
 
 /*
  * CP437 calibration tool.

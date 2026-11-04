@@ -1,6 +1,6 @@
 // rm.c - remove files (and directories with -r)
-#include "libc.h"
-#include "string.h"
+#include "../libc/libc.h"
+#include "../libc/string.h"
 
 static void usage(void) {
     printf("Usage: rm [-r] <path>\n");

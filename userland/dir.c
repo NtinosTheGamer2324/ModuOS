@@ -1,6 +1,6 @@
 // dir.c - MS-DOS style manual formatting
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 
 // Helper to print padding manually
 static void print_padding(int count) {

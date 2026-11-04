@@ -1,5 +1,5 @@
-#include "libc.h"
-#include "string.h"
+#include "libc/libc.h"
+#include "libc/string.h"
 
 #define MAX_DEPTH 8
 #define MAX_PATH 256
