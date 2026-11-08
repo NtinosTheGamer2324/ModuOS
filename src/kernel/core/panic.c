@@ -1,3 +1,4 @@
+#include "moduos/kernel/tty/tty.h"
 #include "moduos/kernel/panic.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/drivers/power/ACPI.h"
@@ -690,6 +691,9 @@ static void panic_draw_gui(const char* title, const char* message, const char* t
 void panic(const char* title, const char* message, const char* tips, const char* err_cat, const char* err_code, int reboot_delay)
 {
     __asm__ volatile("cli" ::: "memory");
+
+    /* Hand the display back to the raw console before drawing. */
+    tty_panic_release();
 
     /* Encoded once up front: the redraw loop below only blits the result. */
     panic_qr_build(title, err_cat, err_code);

@@ -207,21 +207,41 @@ int snprintf(char *str, size_t size, const char *format, ...) {
 
 // Optimized memset function using word-sized accesses if possible
 void *memset(void *dest, int val, size_t len) {
+#if defined(__x86_64__) || defined(__amd64__)
+    /* Full-width stores: this is the path under framebuffer clears and every
+     * kzalloc, and a byte loop is 8x the store count (far worse on WC/UC). */
+    uint64_t pat = 0x0101010101010101ULL * (uint8_t)val;
+    void *d = dest;
+    size_t q = len >> 3, r = len & 7;
+    __asm__ volatile("rep stosq" : "+D"(d), "+c"(q) : "a"(pat) : "memory");
+    __asm__ volatile("rep stosb" : "+D"(d), "+c"(r) : "a"(pat) : "memory");
+    return dest;
+#else
     unsigned char *ptr = dest;
     while (len--) {
         *ptr++ = (unsigned char)val;
     }
     return dest;
+#endif
 }
 
 // Optimized memcpy function
 void *memcpy(void *dest, const void *src, size_t len) {
+#if defined(__x86_64__) || defined(__amd64__)
+    void *d = dest;
+    const void *s = src;
+    size_t q = len >> 3, r = len & 7;
+    __asm__ volatile("rep movsq" : "+D"(d), "+S"(s), "+c"(q) :: "memory");
+    __asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(r) :: "memory");
+    return dest;
+#else
     const unsigned char *s = src;
     unsigned char *d = dest;
     while (len--) {
         *d++ = *s++;
     }
     return dest;
+#endif
 }
 
 // Optimized strlen function using pointer arithmetic

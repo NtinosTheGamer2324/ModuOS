@@ -8,6 +8,7 @@
 #include "moduos/fs/userfs.h"
 #include "moduos/kernel/syscall/userfs_user.h"
 #include "moduos/kernel/syscall/syscall_numbers.h"
+#include "moduos/kernel/tty/tty.h"
 #include "moduos/kernel/md64api.h"
 #include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/user_identity.h"
@@ -138,6 +139,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_CLOSE:   return sys_close((int)arg1);
         case SYS_WAIT:    return sys_wait((int*)arg1);
         case SYS_GETPID:  return sys_getpid();
+        case SYS_SETSID:  return tty_sys_setsid();
+        case SYS_SETPGID: return tty_sys_setpgid((int)arg1, (int)arg2);
+        case SYS_GETPGID: return tty_sys_getpgid((int)arg1);
+        case SYS_GETSID:  return tty_sys_getsid((int)arg1);
         case SYS_GETPPID: return sys_getppid();
         case SYS_GETUID: {
             process_t *p = process_get_current();
@@ -461,6 +466,7 @@ int sys_exit(int status) {
          * leaving dangling nodes backed by a dead process. */
         userfs_pid_exited(proc->pid);
         fd_close_all(proc->pid);
+        tty_proc_exit(proc);
         com_write_string(COM1_PORT, "[SYS_EXIT] pid=");
         char pbuf[12];
         itoa((int)proc->pid, pbuf, 10);
@@ -493,7 +499,14 @@ ssize_t sys_read(int fd, void *buf, size_t count) {
     size_t tmp_sz = (count > 4096) ? 4096 : count;
     char tmp[4096];
 
-    ssize_t result = fd_read(fd, tmp, tmp_sz);
+    ssize_t result;
+    if (fd == STDIN_FILENO && tty_is_ready() && fd_is_tty_routed(fd)) {
+        /* stdin is the caller's controlling TTY (line discipline) unless it
+         * has been redirected to a pipe or file. */
+        result = tty_proc_read(process_get_current(), tmp, tmp_sz);
+    } else {
+        result = fd_read(fd, tmp, tmp_sz);
+    }
     if (result > 0) {
         if (usercopy_to_user(buf, tmp, (size_t)result) != 0) return -1;
     }
@@ -545,7 +558,14 @@ ssize_t sys_writefile(int fd, const char *user_buf, size_t count) {
             return -1;
         }
 
-        if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
+        if ((fd == STDOUT_FILENO || fd == STDERR_FILENO) && fd_is_tty_routed(fd)) {
+            if (tty_is_ready()) {
+                ssize_t tw = tty_proc_write(process_get_current(), kbuf, n);
+                if (tw < 0) { kfree(kbuf); return tw; }
+                total += (size_t)tw;
+                if ((size_t)tw < n) break;
+                continue;
+            }
             VGA_WriteN(kbuf, n);
             com_write_string(COM3_PORT, kbuf);
             total += n;
@@ -1472,12 +1492,13 @@ int sys_raise(int sig) {
     return sys_kill((int)p->pid, sig);
 }
 
-// FD injection syscall (for privileged processes like TTY manager)
-extern int process_inject_fd(uint32_t pid, int fd, void *fd_obj);
-
-int sys_fd_inject(uint32_t pid, int fd, void *fd_obj) {
-    // TODO: Add permission check - only allow root
-    return process_inject_fd(pid, fd, fd_obj);
+/* Install a duplicate of the caller's src_fd into process pid's table at
+ * slot fd. Root only; the target slot must be free. The third argument is a
+ * descriptor number in the caller, not a pointer. */
+int sys_fd_inject(uint32_t pid, int fd, void *src_fd) {
+    process_t *p = process_get_current();
+    if (!p || p->uid != 0) return -EPERM;
+    return fd_inject_dup(pid, fd, (int)(intptr_t)src_fd);
 }
 
 int sys_userfs_register(const userfs_user_node_t *user_node) {

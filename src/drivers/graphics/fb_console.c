@@ -862,3 +862,98 @@ void fbcon_backspace(fb_console_t *c) {
 }
 
 
+
+/* ======================================================================
+ * Cell-addressed API used by the kernel TTY layer (src/kernel/tty/vt.c)
+ * ====================================================================== */
+
+void fbcon_get_geometry(const fb_console_t *c, uint32_t *rows, uint32_t *cols) {
+    if (!c || !c->ready || !c->cell_w || !c->cell_h) { if (rows) *rows = 0; if (cols) *cols = 0; return; }
+    uint32_t w = c->fb.width  > c->margin_left ? c->fb.width  - c->margin_left : 0;
+    uint32_t h = c->fb.height > c->margin_top  ? c->fb.height - c->margin_top  : 0;
+    if (cols) *cols = w / c->cell_w;
+    if (rows) *rows = h / c->cell_h;
+}
+
+void fbcon_begin_batch(fb_console_t *c) {
+    if (!c || !c->ready) return;
+    c->batch_flush = true;
+}
+
+void fbcon_end_batch(fb_console_t *c) {
+    if (!c || !c->ready) return;
+    c->batch_flush = false;
+    fbcon_flush_commit(c);
+}
+
+void fbcon_draw_cell(fb_console_t *c, uint32_t row, uint32_t col, uint32_t cp,
+                     uint8_t fg, uint8_t bg, uint8_t underline) {
+    if (!c || !c->ready || !c->fb.addr) return;
+
+    uint32_t px0 = c->margin_left + col * c->cell_w;
+    uint32_t py0 = c->margin_top  + row * c->cell_h;
+    if (px0 + c->cell_w > c->fb.width || py0 + c->cell_h > c->fb.height) return;
+
+    uint8_t sfg = c->fg, sbg = c->bg;
+    uint32_t sx = c->x, sy = c->y;
+    c->fg = fg & 0x0F; c->bg = bg & 0x0F;
+    c->x = px0; c->y = py0;
+    bool drawn = false;
+
+    if (cp == ' ' || cp == 0 || cp == 0xA0) {
+        uint8_t r, g, b; vga16_to_rgb(c->bg, &r, &g, &b);
+        fb_fill_rect(&c->fb, px0, py0, c->cell_w, c->cell_h, fb_pack_rgb888(&c->fb, r, g, b));
+        drawn = true;
+    }
+    if (!drawn && c->fnt_font_ready && c->fnt_font) {
+        uint16_t adv = c->cell_w;
+        drawn = fbcon_draw_glyph_fnt(c, cp, &adv) != 0;
+    }
+    if (!drawn && c->pf2_font_ready && c->pf2_font)
+        drawn = fbcon_draw_glyph_pf2(c, cp) != 0;
+    if (!drawn)
+        fbcon_draw_glyph(c, fbcon_unicode_to_cp437(cp));
+
+    if (underline) {
+        uint8_t r, g, b; vga16_to_rgb(c->fg, &r, &g, &b);
+        fb_fill_rect(&c->fb, px0, py0 + c->cell_h - 2, c->cell_w, 1, fb_pack_rgb888(&c->fb, r, g, b));
+    }
+
+    fbcon_flush_rect(c, px0, py0, c->cell_w, c->cell_h);
+
+    c->fg = sfg; c->bg = sbg; c->x = sx; c->y = sy;
+}
+
+/* lines > 0 scrolls the cell rows [top,bot] up, < 0 down. Exposed rows get bg. */
+void fbcon_scroll_cells(fb_console_t *c, uint32_t top, uint32_t bot, int lines, uint8_t bg) {
+    if (!c || !c->ready || !c->fb.addr || !lines || bot < top) return;
+    uint32_t n = (uint32_t)(lines > 0 ? lines : -lines);
+    uint32_t h_rows = bot - top + 1;
+    if (n > h_rows) n = h_rows;
+
+    uint32_t bypp = c->fb.bpp / 8;
+    uint32_t y0   = c->margin_top + top * c->cell_h;
+    uint32_t hpx  = h_rows * c->cell_h;
+    uint32_t dy   = n * c->cell_h;
+    uint64_t span = (uint64_t)c->fb.width * bypp;
+    if (y0 + hpx > c->fb.height) return;
+
+    uint8_t *base = (uint8_t *)c->fb.addr;
+    if (n < h_rows) {
+        if (lines > 0) {
+            for (uint32_t y = 0; y < hpx - dy; y++)
+                memmove(base + (uint64_t)(y0 + y) * c->fb.pitch,
+                        base + (uint64_t)(y0 + y + dy) * c->fb.pitch, span);
+        } else {
+            for (uint32_t y = hpx - dy; y-- > 0; )
+                memmove(base + (uint64_t)(y0 + y + dy) * c->fb.pitch,
+                        base + (uint64_t)(y0 + y) * c->fb.pitch, span);
+        }
+    }
+    uint8_t r, g, b; vga16_to_rgb(bg & 0x0F, &r, &g, &b);
+    uint32_t px = fb_pack_rgb888(&c->fb, r, g, b);
+    uint32_t fy = (lines > 0) ? y0 + hpx - dy : y0;
+    fb_fill_rect(&c->fb, 0, fy, c->fb.width, dy, px);
+
+    fbcon_flush_rect(c, 0, y0, c->fb.width, hpx);
+}

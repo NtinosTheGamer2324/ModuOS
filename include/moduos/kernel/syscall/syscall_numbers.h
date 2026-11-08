@@ -105,7 +105,7 @@
 #define SYS_SIGACTION          89  /* sigaction(signum, act*, oldact*) -> 0 or -errno */
 
 /* File Descriptor Injection (for TTY manager) */
-#define SYS_FD_INJECT          90  /* fd_inject(pid, fd, fd_obj) -> 0 or -errno */
+#define SYS_FD_INJECT          90  /* fd_inject(pid, fd, src_fd) -> 0 or -errno (dup caller src_fd into target) */
 
 /* POSIX Sessions and Process Groups */
 #define SYS_SETSID             91  /* setsid() -> new SID or -errno */

@@ -24,7 +24,10 @@
 #define ENOTDIR 20
 #define EISDIR  21
 #define EINVAL  22
+#define EMFILE  24
+#define ENOTTY  25
 #define EROFS   30
+#define EPIPE   32
 #define ENOSYS  38
 
 #define ERR_PTR(x) ((void*)(intptr_t)(-(x)))

@@ -12,8 +12,9 @@ typedef int64_t ssize_t;
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
 
-/* Maximum number of file descriptors per process */
-#define MAX_FDS 256
+/* Maximum number of file descriptors per process. Each process owns its own
+ * table; this must stay in sync with PROCESS_MAX_FDS. */
+#define MAX_FDS 1024
 
 /* File descriptor flags */
 #define FD_FLAG_READ     0x01
@@ -46,6 +47,7 @@ typedef int64_t ssize_t;
 #define FD_TYPE_DEVFS  2
 #define FD_TYPE_PIPE   3
 #define FD_TYPE_USERFS 4
+#define FD_TYPE_CONSOLE 5  /* default stdio: kernel console / controlling tty */
 
 /* File descriptor structure */
 typedef struct {
@@ -80,8 +82,8 @@ int fd_pipe(int fds[2]);
 int fd_fcntl(int fd, int cmd, int arg);
 
 /**
- * Initialize file descriptor table
- * Called once during kernel init
+ * One-time subsystem init. Descriptor tables themselves live in process_t;
+ * stdio is installed lazily on a process's first descriptor operation.
  */
 void fd_init(void);
 
@@ -163,7 +165,9 @@ int fd_dup(int oldfd);
 int fd_dup2(int oldfd, int newfd);
 
 /**
- * Clone all open FDs from parent into child (used by fork).
+ * Give the child a copy of the parent's table (used by fork). Entries share
+ * the underlying open file description, so offsets and pipe ends behave as
+ * in POSIX.
  */
 void fd_clone_for_fork(int parent_pid, int child_pid);
 
@@ -172,6 +176,19 @@ void fd_clone_for_fork(int parent_pid, int child_pid);
  * @param pid: Process ID (0 for current process)
  */
 void fd_close_all(int pid);
+
+/**
+ * Install a duplicate of the calling process's src_fd at target_fd in
+ * process pid (which must have that slot free). Returns 0 or -errno.
+ */
+int fd_inject_dup(uint32_t pid, int target_fd, int src_fd);
+
+/**
+ * 1 if fd refers to a console stdio entry or a tty-style device node, i.e.
+ * something the kernel should route through the controlling tty for
+ * fds 0/1/2. Pipes and regular files return 0.
+ */
+int fd_is_tty_routed(int fd);
 
 /**
  * Get current position in file

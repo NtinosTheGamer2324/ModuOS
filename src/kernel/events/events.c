@@ -151,6 +151,12 @@ void event_update_modifiers(KeyCode keycode, bool pressed) {
             }
             break;
             
+        case KEY_LEFT_SUPER:
+        case KEY_RIGHT_SUPER:
+            if (pressed) g_modifier_state |= MOD_SUPER;
+            else         g_modifier_state &= ~MOD_SUPER;
+            break;
+
         case KEY_CAPS_LOCK:
             if (pressed) {
                 g_modifier_state ^= MOD_CAPS;  // Toggle
@@ -188,6 +194,8 @@ KeyCode scancode_to_keycode(uint8_t scancode, bool extended) {
             case 0x71: return KEY_DELETE;
             case 0x14: return KEY_RIGHT_CTRL;
             case 0x11: return KEY_RIGHT_ALT;
+            case 0x1F: return KEY_LEFT_SUPER;   /* E0 1F  left GUI  */
+            case 0x27: return KEY_RIGHT_SUPER;  /* E0 27  right GUI */
             default: return KEY_UNKNOWN;
         }
     } else {

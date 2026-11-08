@@ -8,6 +8,7 @@
 #include "moduos/kernel/interrupts/irq_lock.h"
 #include "moduos/kernel/interrupts/hlt_wait.h"
 #include "moduos/kernel/spinlock.h"
+#include "moduos/kernel/tty/tty.h"
 
 /*
  * devfs.c — ModuOS DevFS
@@ -66,6 +67,7 @@ typedef struct {
     int is_tree;
     const devfs_device_ops_t *ops;
     void *opened_ctx;
+    int   gfx_client;      /* opened a graphics device: owns its VT's display */
     union {
         devfs_node_t  *node;   /* tree device  */
         devfs_device_t *legacy; /* legacy flat  */
@@ -399,6 +401,14 @@ void *devfs_open_path(const char *path, int flags) {
                   ? h->ops->open(n->ctx, flags)
                   : n->ctx;
     h->u.node     = n;
+    h->gfx_client = 0;
+    /* A process that opens the GPU/MVC device is about to draw on the
+     * framebuffer itself: put its VT into KD_GRAPHICS so the text
+     * renderer stays out of the way until the last client closes. */
+    if (n->name && n->name[0]=='m' && n->name[1]=='v' && n->name[2]=='i' && tty_is_ready()) {
+        h->gfx_client = 1;
+        vt_graphics_client_open();
+    }
     return h;
 }
 
@@ -448,6 +458,7 @@ int devfs_close(void *handle) {
     if (!h) return -1;
     if (h->ops && h->ops->close)
         h->ops->close(h->opened_ctx);
+    if (h->gfx_client) vt_graphics_client_close();
     kfree(h);
     return 0;
 }
@@ -725,9 +736,14 @@ int devfs_input_init(void) {
 void devfs_input_push_event(const Event *e) {
     if (!e) return;
 
-    evt_stream_push(&g_evt0, e);
+    /* TTY layer first: it handles VT switching and, for text VTs, takes the
+     * keyboard (line discipline) instead of the legacy kbd0 byte stream. */
+    unsigned tflags = tty_input_event(e);
+
+    if (!(tflags & TTY_EV_NO_EVENT0)) evt_stream_push(&g_evt0, e);
 
     if (e->type != EVENT_KEY_PRESSED) return;
+    if (tflags & TTY_EV_NO_KBD0) return;
 
     /* Emit VT100/ANSI escape sequences for special keys onto kbd0. */
     const char *seq = NULL;

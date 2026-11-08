@@ -5,6 +5,7 @@
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/memory/paging.h"
 #include "moduos/fs/fd.h"
+#include "moduos/kernel/tty/tty.h"
 #include "moduos/fs/userfs.h"
 
 extern char *itoa(int value, char *str, int base);
@@ -44,17 +45,12 @@ static void process_teardown_resources(process_t *p) {
      * until process_destroy() frees it at reap time). */
     fpu_lazy_on_process_exit(p);
 
-    /* Real open files: flushes write buffers, releases pipe endpoints,
-     * drops VFS/devfs/userfs cache references. */
+    /* Drops this process's reference on every open file description; the
+     * last reference flushes write buffers, releases pipe ends and drops
+     * VFS/devfs/userfs cache references. */
     fd_close_all((int)p->pid);
+    tty_proc_exit(p);          /* session leader gone: hang up its ctty */
     userfs_pid_exited(p->pid);
-
-    /* Opaque fds injected via process_inject_fd() (tty/pipe handles). The
-     * referenced object's own lifetime belongs to whichever subsystem
-     * injected it; here we only drop this process's slot. */
-    for (int i = 0; i < PROCESS_MAX_FDS; i++) {
-        p->fd_table[i] = NULL;
-    }
 
     /* User address space. Leaf pages (heap/stack/mmap/image) first, while
      * still on p's own CR3, then the page-table structure. We move to the

@@ -29,6 +29,17 @@ void VGA_ClearFrameBuffer(uint32_t color);
 void VGA_SetFlushHook(void (*flush)(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h));
 void VGA_FlushRect(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
+/* ---- text-cell backend used by the kernel TTY layer ----
+ * VGA_SetConsoleOwned(true): the TTY layer owns the display; the legacy
+ * VGA_Write* family becomes a no-op (kernel messages still reach COM1). */
+void VGA_SetConsoleOwned(bool owned);
+void VGA_GetTextGeometry(int *rows, int *cols);
+void VGA_DrawCell(int row, int col, uint32_t cp, uint8_t fg, uint8_t bg, uint8_t flags /* bit0 underline */);
+void VGA_ScrollCells(int top, int bot, int lines /* >0 up, <0 down */, uint8_t bg);
+void VGA_DrawBatchBegin(void);
+void VGA_DrawBatchEnd(void);
+void VGA_ClearScreenBG(uint8_t bg);
+
 /* Basic VGA output functions */
 void VGA_WriteChar(char c);
 void VGA_Write(const char* str);

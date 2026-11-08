@@ -84,6 +84,10 @@ uint64_t paging_get_scratch_base(void);
  */
 void* ioremap(uint64_t phys_addr, uint64_t size);
 
+// Like ioremap(), but write-combining (framebuffers). Returns NULL if the CPU
+// has no PAT; the caller should then keep its uncached mapping.
+void* ioremap_wc(uint64_t phys_addr, uint64_t size);
+
 // Like ioremap(), but reserves one extra unmapped guard page after the mapping.
 // If callers write past the end of the mapped region they will fault immediately.
 void* ioremap_guarded(uint64_t phys_addr, uint64_t size);

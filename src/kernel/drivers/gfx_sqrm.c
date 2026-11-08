@@ -135,6 +135,20 @@ int gfx_register_framebuffer_from_sqrm(const sqrm_gpu_device_t *dev) {
         g_active_gpu->fb.size_bytes = (fb_size + 4095ULL) & ~4095ULL;
     }
 
+    /* Passive linear framebuffers (no mode-set, nothing else programming the
+     * device) are remapped write-combining. The default uncached mapping makes
+     * every store its own bus transaction; WC lets the CPU burst whole cache
+     * lines. Devices that do their own mode-setting keep the module's mapping
+     * because they may touch the same memory through it. */
+    if (!g_active_gpu->set_mode && !g_active_gpu->enumerate_modes &&
+        g_active_gpu->fb.phys_addr && g_active_gpu->fb.size_bytes) {
+        void *wc = ioremap_wc(g_active_gpu->fb.phys_addr, g_active_gpu->fb.size_bytes);
+        if (wc) {
+            g_active_gpu->fb.addr = wc;
+            com_write_string(COM1_PORT, "[GFX] framebuffer remapped write-combining\n");
+        }
+    }
+
     /* Install flush hook BEFORE switching into graphics mode. */
     VGA_SetFlushHook(g_active_gpu->flush);
     VGA_SetFrameBuffer(&g_active_gpu->fb);

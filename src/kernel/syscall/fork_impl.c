@@ -187,6 +187,7 @@ int sys_fork_impl(void) {
     child->ppid       = parent->pid;
     child->pgid       = parent->pgid;
     child->sid        = parent->sid;
+    child->controlling_tty = parent->controlling_tty;   /* inherit ctty */
     child->uid        = parent->uid;
     child->gid        = parent->gid;
     child->euid       = parent->euid;
@@ -266,6 +267,8 @@ int sys_fork_impl(void) {
      * the fully up-to-date kernel_master_cr3 high-half entries. */
     int rc = clone_user_address_space(parent, child);
     if (rc != 0) {
+        extern void fd_close_all(int pid);
+        fd_close_all((int)child->pid);   /* drop refs taken by fd_clone_for_fork */
         kfree(child->kernel_stack);
         child->kernel_stack = NULL;
         process_free(child);

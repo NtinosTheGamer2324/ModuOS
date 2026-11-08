@@ -17,7 +17,7 @@
 #define USER_STACK_SIZE 65536
 #endif
 #ifndef MAX_OPEN_FILES
-#define MAX_OPEN_FILES 256   /* matches PROCESS_MAX_FDS in process_new.h */
+#define MAX_OPEN_FILES 1024  /* matches PROCESS_MAX_FDS in process_new.h */
 #endif
 
 // cpu_state_t is the same layout as cpu_context_t.

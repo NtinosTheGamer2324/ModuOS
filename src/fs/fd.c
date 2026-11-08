@@ -1,4 +1,9 @@
-//fd.c - File descriptor management implementation (with HVFS)
+//fd.c - Per-process file descriptor tables (with HVFS)
+//
+// Each process_t owns a table of pointers to refcounted open file
+// descriptions (fd_file_t). dup/dup2/fork share a description, so file
+// offsets, pipe ends and write buffers behave as in POSIX, and a description
+// is torn down exactly once when its last descriptor is closed.
 #include "moduos/fs/fd.h"
 #include "moduos/fs/fs.h"
 #include "moduos/fs/hvfs.h"
@@ -6,7 +11,6 @@
 #include "moduos/kernel/COM/com.h"
 #include "moduos/kernel/memory/string.h"
 #include "moduos/kernel/memory/memory.h"
-// #include "moduos/kernel/process/process.h"  // OLD
 #include "moduos/kernel/process/process_new.h"
 #include "moduos/drivers/Drive/vDrive.h"
 #include "moduos/fs/path.h"
@@ -16,7 +20,7 @@
 #include "moduos/fs/MDFS/mdfs.h"
 #include "moduos/kernel/errno.h"
 
-/* Pipe ring buffer — shared between read and write fd entries. */
+/* Pipe ring buffer shared between the read and write descriptions. */
 #define PIPE_BUF_SIZE 4096
 
 typedef struct {
@@ -24,12 +28,12 @@ typedef struct {
     int     read_pos;
     int     write_pos;
     int     count;
-    int     write_end_open;  /* 0 when write fd is closed → EOF on read */
+    int     write_end_open;  /* 0 when write end is closed -> EOF on read */
+    int     read_end_open;   /* 0 when read end is closed -> EPIPE on write */
+    int     ends_alive;      /* buffer is freed when this reaches 0 */
 } pipe_buf_t;
 
-/* NOTE: FD_DEBUG can be enabled to trace file operations to COM1.
- * This is extremely slow on real hardware/VMs (serial output bottleneck).
- */
+/* FD_DEBUG traces to COM1; far too slow to leave on outside of debugging. */
 #ifndef FD_DEBUG
 #define FD_DEBUG 0
 #endif
@@ -40,296 +44,268 @@ typedef struct {
 #define FD_LOG(s) do { (void)(s); } while (0)
 #endif
 
-/* Enhanced file descriptor structure with cached data */
-typedef struct {
-    int mount_slot;           /* Which filesystem mount (0-25) */
-    char path[256];           /* Full file path */
-    size_t position;          /* Current read/write position */
-    size_t file_size;         /* Total file size */
-    int flags;                /* FD_FLAG_* flags */
-    int in_use;               /* Is this FD active? */
-    int pid;                  /* Owner process ID (0 for kernel) */
+/* Open file description. The leading members mirror file_descriptor_t so
+ * fd_get() can hand the same object out under the public type. */
+struct fd_file {
+    int mount_slot;
+    char path[256];
+    size_t position;
+    size_t file_size;
+    int flags;                /* FD_FLAG_* */
+    int in_use;
+    int pid;                  /* process that opened it */
     int type;                 /* FD_TYPE_* */
-    void* cached_data;        /* Cached file contents (for reading) OR devfs/userfs handle */
-    int is_directory;         /* 1 if this is a directory descriptor */
-    void* dir_handle;         /* Directory handle (fs_dir_t*) or DEVVFS handle */
-    int is_devvfs;            /* 1 if dir_handle is a DEVVFS pseudo dir */
-    int is_devfs;             /* 1 if cached_data is a devfs handle */
-    int is_userfs;            /* 1 if cached_data is a userfs handle or userfs dir */
-
-    /* Pipe support */
-    void *pipe_buf;           /* pipe_buf_t* when type==FD_TYPE_PIPE */
-    int   is_read_end;        /* 1=read end, 0=write end of pipe */
-
-    /* FS-specific cache to accelerate repeated writes (MDFS). */
-    uint32_t cached_inode;
+    void *pipe_buf;
+    int   is_read_end;
+    uint32_t cached_inode;    /* MDFS inode resolved at open() for writes */
     uint8_t  cached_type;
     uint8_t  cache_valid;
     uint8_t  _pad_cache;
 
-    /* Write coalescing buffer (for large sequential file writes). */
+    /* Private to this file. */
+    int refcount;
+    void *cached_data;        /* HVFS file image, or devfs/userfs handle */
+    int is_directory;
+    void *dir_handle;         /* fs_dir_t* or devvfs_dir_t* */
+    int is_devvfs;
+    int is_devfs;
+    int is_userfs;
+
+    /* Write coalescing buffer (large sequential writes). */
     uint8_t *wbuf;
     size_t   wbuf_cap;
     size_t   wbuf_len;
     size_t   wbuf_file_off;
-} file_descriptor_internal_t;
+};
+typedef struct fd_file fd_file_t;
 
-/* Global file descriptor table */
-static file_descriptor_internal_t fd_table[MAX_FDS];
-static int fd_initialized = 0;
+_Static_assert(offsetof(fd_file_t, pipe_buf) == offsetof(file_descriptor_t, pipe_buf),
+               "fd_file_t must start with the file_descriptor_t layout");
+_Static_assert(offsetof(fd_file_t, cached_inode) == offsetof(file_descriptor_t, cached_inode),
+               "fd_file_t must start with the file_descriptor_t layout");
+_Static_assert(MAX_FDS == PROCESS_MAX_FDS, "MAX_FDS must match PROCESS_MAX_FDS");
 
 #define FD_WRITEBUF_DEFAULT_CAP (256u * 1024u) /* 256KiB */
 #define FD_WRITEBUF_MAX_CAP     (4u * 1024u * 1024u) /* 4MiB */
 
-static int fd_flush_write_buffer(int fd) {
-    if (fd < 0 || fd >= MAX_FDS) return -1;
-    if (!fd_table[fd].in_use) return -1;
-    if (fd_table[fd].wbuf_len == 0) return 0;
+typedef struct {
+    int kind;   /* 0=$/, 1=$/mnt, 2=$/dev, 3=$/user */
+    int index;
+    int cookie; /* devfs/userfs listing cursor */
+    char dev_path[128];
+    char user_path[128];
+} devvfs_dir_t;
 
-    fs_mount_t *mount = fs_get_mount(fd_table[fd].mount_slot);
+/* ------------------------------------------------------------------ */
+/* Description lifetime                                                */
+/* ------------------------------------------------------------------ */
+
+static fd_file_t *file_alloc(void) {
+    fd_file_t *f = (fd_file_t*)kzalloc(sizeof(fd_file_t));
+    if (!f) return NULL;
+    f->refcount = 1;
+    f->in_use = 1;
+    f->mount_slot = -1;
+    return f;
+}
+
+static void file_get(fd_file_t *f) {
+    __atomic_add_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL);
+}
+
+static int file_flush_wbuf(fd_file_t *f) {
+    if (f->wbuf_len == 0) return 0;
+
+    fs_mount_t *mount = fs_get_mount(f->mount_slot);
     if (!mount || !mount->valid) return -3;
 
     int rc;
-    if (mount->type == FS_TYPE_MDFS && fd_table[fd].cache_valid && fd_table[fd].cached_type == 1 && fd_table[fd].cached_inode != 0) {
-        rc = mdfs_write_file_at_by_inode(mount->handle, fd_table[fd].cached_inode,
-                                         fd_table[fd].wbuf, fd_table[fd].wbuf_len,
-                                         fd_table[fd].wbuf_file_off);
+    if (mount->type == FS_TYPE_MDFS && f->cache_valid && f->cached_type == 1 && f->cached_inode != 0) {
+        rc = mdfs_write_file_at_by_inode(mount->handle, f->cached_inode,
+                                         f->wbuf, f->wbuf_len, f->wbuf_file_off);
     } else {
-        rc = fs_write_file_at(mount, fd_table[fd].path, fd_table[fd].wbuf, fd_table[fd].wbuf_len, fd_table[fd].wbuf_file_off);
+        rc = fs_write_file_at(mount, f->path, f->wbuf, f->wbuf_len, f->wbuf_file_off);
     }
-
     if (rc != 0) return (rc < 0) ? rc : -3;
 
-    /* If we flushed data at the current position, advance position accordingly.
-     * Note: fd_table[fd].position tracks the logical file position used by fd_write().
-     */
-    if (fd_table[fd].position == fd_table[fd].wbuf_file_off + fd_table[fd].wbuf_len) {
-        /* position already accounts for buffered writes */
-    }
-
-    fd_table[fd].wbuf_len = 0;
+    f->wbuf_len = 0;
     return 0;
 }
 
-/* Initialize FD table */
-void fd_init(void) {
-    if (fd_initialized) return;
-    
-    for (int i = 0; i < MAX_FDS; i++) {
-        fd_table[i].in_use = 0;
-        fd_table[i].mount_slot = -1;
-        fd_table[i].path[0] = '\0';
-        fd_table[i].position = 0;
-        fd_table[i].file_size = 0;
-        fd_table[i].flags = 0;
-        fd_table[i].pid = 0;
-        fd_table[i].cached_data = NULL;
-        fd_table[i].is_directory = 0;
-        fd_table[i].dir_handle = NULL;
-        fd_table[i].is_devvfs = 0;
-        fd_table[i].is_devfs = 0;
-        fd_table[i].is_userfs = 0;
+/* Runs once, when the last descriptor referencing f goes away. */
+static void file_release(fd_file_t *f) {
+    (void)file_flush_wbuf(f);
 
-        fd_table[i].cached_inode = 0;
-        fd_table[i].cached_type = 0;
-        fd_table[i].cache_valid = 0;
-        fd_table[i]._pad_cache = 0;
-
-        fd_table[i].wbuf = NULL;
-        fd_table[i].wbuf_cap = 0;
-        fd_table[i].wbuf_len = 0;
-        fd_table[i].wbuf_file_off = 0;
+    if (f->type != FD_TYPE_PIPE && f->mount_slot >= 0) {
+        fs_mount_t *m = fs_get_mount(f->mount_slot);
+        if (m && m->valid && m->type == FS_TYPE_MDFS && f->cache_valid &&
+            f->cached_type == 1 && f->cached_inode != 0) {
+            (void)mdfs_flush_inode(m->handle, f->cached_inode);
+        }
     }
-    
-    /* Reserve standard file descriptors */
-    fd_table[STDIN_FILENO].in_use = 1;
-    fd_table[STDIN_FILENO].flags = FD_FLAG_READ;
-    fd_table[STDIN_FILENO].pid = 0;
-    fd_table[STDIN_FILENO].cached_data = NULL;
-    
-    fd_table[STDOUT_FILENO].in_use = 1;
-    fd_table[STDOUT_FILENO].flags = FD_FLAG_WRITE;
-    fd_table[STDOUT_FILENO].pid = 0;
-    fd_table[STDOUT_FILENO].cached_data = NULL;
-    
-    fd_table[STDERR_FILENO].in_use = 1;
-    fd_table[STDERR_FILENO].flags = FD_FLAG_WRITE;
-    fd_table[STDERR_FILENO].pid = 0;
-    fd_table[STDERR_FILENO].cached_data = NULL;
-    
-    fd_initialized = 1;
-    FD_LOG("[FD] File descriptor table initialized\n");
+
+    if (f->wbuf) kfree(f->wbuf);
+
+    if (f->type == FD_TYPE_PIPE && f->pipe_buf) {
+        pipe_buf_t *pb = (pipe_buf_t*)f->pipe_buf;
+        if (f->is_read_end) pb->read_end_open = 0;
+        else                pb->write_end_open = 0;
+        if (__atomic_sub_fetch(&pb->ends_alive, 1, __ATOMIC_ACQ_REL) == 0)
+            kfree(pb);
+    }
+
+    if (f->is_directory && f->dir_handle) {
+        if (f->is_devvfs) kfree(f->dir_handle);
+        else              fs_closedir((fs_dir_t*)f->dir_handle);
+    } else if (f->cached_data) {
+        if (f->is_devfs) {
+            devfs_close(f->cached_data);
+        } else if (f->is_userfs) {
+            userfs_close(f->cached_data);
+        } else if (!hvfs_cache_release(f->mount_slot, f->path, f->cached_data)) {
+            kfree(f->cached_data);
+        }
+    }
+
+    kfree(f);
 }
 
-/* Find lowest free file descriptor at or above min_fd. */
-static int find_free_fd_from(int min_fd) {
-    for (int i = min_fd; i < MAX_FDS; i++) {
-        if (!fd_table[i].in_use)
-            return i;
+static void file_put(fd_file_t *f) {
+    if (__atomic_sub_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL) == 0)
+        file_release(f);
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-process table                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Returns p's table, installing console stdio on first use. Lazy so every
+ * process-creation path (fork, kernel spawn, idle) gets stdio without each
+ * having to know about it. */
+static fd_file_t **fd_proc_table(process_t *p) {
+    if (!p) return NULL;
+    if (!p->fd_ready) {
+        p->fd_ready = 1;
+        for (int i = STDIN_FILENO; i <= STDERR_FILENO; i++) {
+            if (p->fd_table[i]) continue;
+            fd_file_t *f = file_alloc();
+            if (!f) break;
+            f->type = FD_TYPE_CONSOLE;
+            f->flags = (i == STDIN_FILENO) ? FD_FLAG_READ : FD_FLAG_WRITE;
+            f->pid = (int)p->pid;
+            p->fd_table[i] = f;
+        }
     }
+    return p->fd_table;
+}
+
+static fd_file_t *fd_lookup(int fd) {
+    if (fd < 0 || fd >= PROCESS_MAX_FDS) return NULL;
+    fd_file_t **t = fd_proc_table(process_get_current());
+    return t ? t[fd] : NULL;
+}
+
+static int fd_find_free_from(fd_file_t **t, int min_fd) {
+    if (!t) return -1;
+    for (int i = min_fd; i < PROCESS_MAX_FDS; i++)
+        if (!t[i]) return i;
     return -1;
 }
 
-static int find_free_fd(void) {
-    /* POSIX: allocate the lowest available fd >= 0. */
-    return find_free_fd_from(0);
+/* Takes ownership of the caller's reference to f. */
+static int fd_install(fd_file_t *f) {
+    fd_file_t **t = fd_proc_table(process_get_current());
+    int fd = fd_find_free_from(t, 0);
+    if (fd < 0) {
+        file_put(f);
+        return -EMFILE;
+    }
+    t[fd] = f;
+    return fd;
 }
 
-static int fd_open_devfs_internal(const char *node, int flags) {
-    fd_init();
-    if (!node || !*node) return -1;
+static int fd_has_free_slot(void) {
+    return fd_find_free_from(fd_proc_table(process_get_current()), 0) >= 0;
+}
 
-    // Prefer tree-based open (supports subpaths like input/kbd0)
-    void *h = devfs_open_path(node, flags);
-    if (!h) {
-        // fallback legacy root-only
-        h = devfs_open(node, flags);
+static int fd_cur_pid(void) {
+    process_t *p = process_get_current();
+    return p ? (int)p->pid : 0;
+}
+
+static int oflags_to_fd_flags(int flags) {
+    int fd_flags;
+    if ((flags & O_RDWR) == O_RDWR)  fd_flags = FD_FLAG_READ | FD_FLAG_WRITE;
+    else if (flags & O_WRONLY)       fd_flags = FD_FLAG_WRITE;
+    else                             fd_flags = FD_FLAG_READ;
+    return fd_flags;
+}
+
+void fd_init(void) {
+    FD_LOG("[FD] per-process descriptor tables ready\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Open                                                                */
+/* ------------------------------------------------------------------ */
+
+static int fd_open_node(const char *node, int flags, int want_devfs) {
+    if (!node || !*node) return -1;
+    if (!process_get_current()) return -1;
+    if (!fd_has_free_slot()) return -EMFILE;
+
+    void *h;
+    if (want_devfs) {
+        /* Prefer tree-based open (supports subpaths like input/kbd0). */
+        h = devfs_open_path(node, flags);
+        if (!h) h = devfs_open(node, flags);
+    } else {
+        h = userfs_open_path(node, flags);
     }
     if (!h) return -1;
 
-    int fd = find_free_fd();
-    if (fd < 0) {
-        devfs_close(h);
-        return -6;
+    fd_file_t *f = file_alloc();
+    if (!f) {
+        if (want_devfs) devfs_close(h); else userfs_close(h);
+        return -ENOMEM;
     }
 
-    // Convert flags
-    int fd_flags = 0;
-    if ((flags & O_RDWR) == O_RDWR) {
-        fd_flags = FD_FLAG_READ | FD_FLAG_WRITE;
-    } else if (flags & O_WRONLY) {
-        fd_flags = FD_FLAG_WRITE;
-    } else {
-        fd_flags = FD_FLAG_READ;
-    }
+    strncpy(f->path, node, sizeof(f->path) - 1);
+    f->flags = oflags_to_fd_flags(flags);
+    f->pid = fd_cur_pid();
+    f->cached_data = h;
+    f->is_devfs = want_devfs ? 1 : 0;
+    f->is_userfs = want_devfs ? 0 : 1;
+    f->type = want_devfs ? FD_TYPE_DEVFS : FD_TYPE_USERFS;
 
-    process_t* proc = process_get_current();
-    int pid = proc ? proc->pid : 0;
-
-    fd_table[fd].mount_slot = -1;
-    strncpy(fd_table[fd].path, node, sizeof(fd_table[fd].path) - 1);
-    fd_table[fd].path[sizeof(fd_table[fd].path) - 1] = 0;
-    fd_table[fd].position = 0;
-    fd_table[fd].file_size = 0;
-    fd_table[fd].flags = fd_flags;
-    fd_table[fd].pid = pid;
-    fd_table[fd].cached_data = h;
-    fd_table[fd].in_use = 1;
-    fd_table[fd].is_directory = 0;
-    fd_table[fd].dir_handle = NULL;
-    fd_table[fd].is_devvfs = 0;
-    fd_table[fd].is_devfs = 1;
-    fd_table[fd].is_userfs = 0;
-
-    return fd;
-}
-
-static int fd_open_userfs_internal(const char *node, int flags) {
-    fd_init();
-    if (!node || !*node) return -1;
-
-    void *h = userfs_open_path(node, flags);
-    if (!h) {
-        return -1;
-    }
-
-    int fd = find_free_fd();
-    if (fd < 0) {
-        userfs_close(h);
-        return -6;
-    }
-
-    int fd_flags = 0;
-    if ((flags & O_RDWR) == O_RDWR) {
-        fd_flags = FD_FLAG_READ | FD_FLAG_WRITE;
-    } else if (flags & O_WRONLY) {
-        fd_flags = FD_FLAG_WRITE;
-    } else {
-        fd_flags = FD_FLAG_READ;
-    }
-
-    process_t* proc = process_get_current();
-    int pid = proc ? proc->pid : 0;
-
-    fd_table[fd].mount_slot = -1;
-    strncpy(fd_table[fd].path, node, sizeof(fd_table[fd].path) - 1);
-    fd_table[fd].path[sizeof(fd_table[fd].path) - 1] = 0;
-    fd_table[fd].position = 0;
-    fd_table[fd].file_size = 0;
-    fd_table[fd].flags = fd_flags;
-    fd_table[fd].pid = pid;
-    fd_table[fd].cached_data = h;
-    fd_table[fd].in_use = 1;
-    fd_table[fd].is_directory = 0;
-    fd_table[fd].dir_handle = NULL;
-    fd_table[fd].is_devvfs = 0;
-    fd_table[fd].is_devfs = 0;
-    fd_table[fd].is_userfs = 1;
-
-    return fd;
+    return fd_install(f);
 }
 
 int fd_open_devfs(const char *node, int flags) {
-    return fd_open_devfs_internal(node, flags);
+    return fd_open_node(node, flags, 1);
 }
 
 int fd_open_userfs(const char *node, int flags) {
-    return fd_open_userfs_internal(node, flags);
+    return fd_open_node(node, flags, 0);
 }
 
-/* Open file - now uses HVFS to cache file contents */
+/* Open file - uses HVFS to cache file contents */
 int fd_open(int mount_slot, const char* path, int flags, int mode) {
-    (void)mode; /* Unused for now */
-    
-    fd_init();
-    
-    if (!path || mount_slot < 0 || mount_slot >= 26) {
-        FD_LOG("[FD] Invalid parameters\n");
-        return -1;
-    }
-    
-    /* Find free FD first */
-    int fd = find_free_fd();
-    if (fd < 0) {
-        FD_LOG("[FD] No free file descriptors\n");
-        return -6;
-    }
-    
-    /* Convert flags */
-    int fd_flags = 0;
-    if ((flags & O_RDWR) == O_RDWR) {
-        fd_flags = FD_FLAG_READ | FD_FLAG_WRITE;
-    } else if (flags & O_WRONLY) {
-        fd_flags = FD_FLAG_WRITE;
-    } else {
-        fd_flags = FD_FLAG_READ;
-    }
-    
-    if (flags & O_APPEND) {
-        fd_flags |= FD_FLAG_APPEND;
-    }
-    
-    /* Get current process PID */
-    process_t* proc = process_get_current();
-    int pid = proc ? proc->pid : 0;
-    
-    /* Use HVFS to read file into memory (if reading) */
+    (void)mode;
+
+    if (!path || mount_slot < 0 || mount_slot >= 26) return -1;
+    if (!process_get_current()) return -1;
+    if (!fd_has_free_slot()) return -EMFILE;
+
+    int fd_flags = oflags_to_fd_flags(flags);
+    if (flags & O_APPEND) fd_flags |= FD_FLAG_APPEND;
+
     void* file_buffer = NULL;
     size_t file_size = 0;
-    
+
     if (fd_flags & FD_FLAG_READ) {
         int hvfs_result = hvfs_read(mount_slot, path, &file_buffer, &file_size);
-        
         if (hvfs_result != 0) {
-            FD_LOG("[FD] HVFS read failed: ");
-            if (FD_DEBUG) {
-                char err_str[16];
-                itoa(hvfs_result, err_str, 10);
-                com_write_string(COM1_PORT, err_str);
-                com_write_string(COM1_PORT, "\n");
-            }
-            
-            /* Map HVFS errors to fd_open errors */
             switch (hvfs_result) {
                 case 1:  return -3; /* File not found */
                 case 2:  return -5; /* Is directory */
@@ -338,167 +314,150 @@ int fd_open(int mount_slot, const char* path, int flags, int mode) {
                 default: return -7; /* Other error */
             }
         }
-        
-        if (FD_DEBUG) {
-            com_write_string(COM1_PORT, "[FD] HVFS loaded file: ");
-            char size_str[32];
-            itoa(file_size, size_str, 10);
-            com_write_string(COM1_PORT, size_str);
-            com_write_string(COM1_PORT, " bytes\n");
-        }
     }
-    
-    /* Initialize FD */
-    fd_table[fd].mount_slot = mount_slot;
-    strncpy(fd_table[fd].path, path, sizeof(fd_table[fd].path) - 1);
-    fd_table[fd].path[sizeof(fd_table[fd].path) - 1] = '\0';
-    fd_table[fd].position = (flags & O_APPEND) ? file_size : 0;
-    fd_table[fd].file_size = file_size;
-    fd_table[fd].flags = fd_flags;
-    fd_table[fd].pid = pid;
-    fd_table[fd].cached_data = file_buffer;
-    fd_table[fd].in_use = 1;
 
-    fd_table[fd].cache_valid = 0;
-    fd_table[fd].cached_inode = 0;
-    fd_table[fd].cached_type = 0;
+    fd_file_t *f = file_alloc();
+    if (!f) {
+        if (file_buffer && !hvfs_cache_release(mount_slot, path, file_buffer))
+            kfree(file_buffer);
+        return -ENOMEM;
+    }
 
-    /* If this is an MDFS mount and we intend to write, resolve/create inode once.
-     * This avoids path lookup and directory scans on every write().
-     */
+    f->mount_slot = mount_slot;
+    strncpy(f->path, path, sizeof(f->path) - 1);
+    f->position = (flags & O_APPEND) ? file_size : 0;
+    f->file_size = file_size;
+    f->flags = fd_flags;
+    f->pid = fd_cur_pid();
+    f->cached_data = file_buffer;
+    f->type = FD_TYPE_FILE;
+
+    /* Resolve/create the MDFS inode once so write() avoids a path lookup and
+     * directory scan per call. */
     fs_mount_t *m = fs_get_mount(mount_slot);
     if (m && m->valid && m->type == FS_TYPE_MDFS && (fd_flags & FD_FLAG_WRITE)) {
         uint32_t ino_n = 0;
         int tr = (flags & O_TRUNC) ? 1 : 0;
-        int rc2 = mdfs_create_file_trunc(m->handle, path, tr, &ino_n);
-        if (rc2 == 0) {
-            fd_table[fd].cache_valid = 1;
-            fd_table[fd].cached_inode = ino_n;
-            fd_table[fd].cached_type = 1;
+        if (mdfs_create_file_trunc(m->handle, path, tr, &ino_n) == 0) {
+            f->cache_valid = 1;
+            f->cached_inode = ino_n;
+            f->cached_type = 1;
         }
     }
-    
-    if (FD_DEBUG) {
-        com_write_string(COM1_PORT, "[FD] Opened file: ");
-        com_write_string(COM1_PORT, path);
-        com_write_string(COM1_PORT, " as FD ");
-        char fd_str[16];
-        itoa(fd, fd_str, 10);
-        com_write_string(COM1_PORT, fd_str);
-        com_write_string(COM1_PORT, "\n");
-    }
-    
-    return fd;
+
+    return fd_install(f);
 }
 
-/* Close file descriptor */
+/* ------------------------------------------------------------------ */
+/* Close / dup / fork                                                  */
+/* ------------------------------------------------------------------ */
+
 int fd_close(int fd) {
-    fd_init();
-    
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
-        return -1;
-    }
-    
-    /* Closing fd 0/1/2 is valid POSIX — just mark slot free. */
-    
-    /* Flush pending buffered writes before closing. */
-    (void)fd_flush_write_buffer(fd);
+    fd_file_t *f = fd_lookup(fd);
+    if (!f) return -1;
 
-    /* Flush MDFS inode write-behind cache (performance optimization) */
-    {
-        fs_mount_t *m = fs_get_mount(fd_table[fd].mount_slot);
-        if (m && m->valid && m->type == FS_TYPE_MDFS && fd_table[fd].cache_valid && fd_table[fd].cached_type == 1 && fd_table[fd].cached_inode != 0) {
-            (void)mdfs_flush_inode(m->handle, fd_table[fd].cached_inode);
-        }
-    }
-
-    /* Free write buffer */
-    if (fd_table[fd].wbuf) {
-        kfree(fd_table[fd].wbuf);
-        fd_table[fd].wbuf = NULL;
-        fd_table[fd].wbuf_cap = 0;
-        fd_table[fd].wbuf_len = 0;
-        fd_table[fd].wbuf_file_off = 0;
-    }
-
-    /* Pipe cleanup: mark write end closed so readers see EOF */
-    if (fd_table[fd].type == FD_TYPE_PIPE && fd_table[fd].pipe_buf) {
-        pipe_buf_t *pb = (pipe_buf_t*)fd_table[fd].pipe_buf;
-        if (!fd_table[fd].is_read_end)
-            pb->write_end_open = 0;
-        /* The pipe_buf is shared between read and write ends.
-         * Only free it when both ends are closed.
-         * We use a simple ref-count via write_end_open + a separate flag. */
-        fd_table[fd].pipe_buf = NULL;
-    }
-
-    /* Close devfs/userfs handle OR free cached file data */
-    if (fd_table[fd].cached_data) {
-        if (fd_table[fd].is_devfs) {
-            devfs_close(fd_table[fd].cached_data);
-        } else if (fd_table[fd].is_userfs) {
-            userfs_close(fd_table[fd].cached_data);
-        } else {
-            /* cached_data may be an HVFS cached buffer. */
-            if (!hvfs_cache_release(fd_table[fd].mount_slot, fd_table[fd].path, fd_table[fd].cached_data)) {
-                kfree(fd_table[fd].cached_data);
-            }
-        }
-        fd_table[fd].cached_data = NULL;
-    }
-    
-    if (FD_DEBUG) {
-        com_write_string(COM1_PORT, "[FD] Closed FD ");
-        char fd_str[16];
-        itoa(fd, fd_str, 10);
-        com_write_string(COM1_PORT, fd_str);
-        com_write_string(COM1_PORT, "\n");
-    }
-    
-    fd_table[fd].in_use = 0;
-    fd_table[fd].mount_slot = -1;
-    fd_table[fd].path[0] = '\0';
-    fd_table[fd].position = 0;
-    fd_table[fd].file_size = 0;
-    fd_table[fd].flags = 0;
-    fd_table[fd].is_directory = 0;
-    fd_table[fd].dir_handle = NULL;
-    fd_table[fd].is_devvfs = 0;
-    fd_table[fd].is_devfs = 0;
-    fd_table[fd].is_userfs = 0;
-
-    fd_table[fd].wbuf = NULL;
-    fd_table[fd].wbuf_cap = 0;
-    fd_table[fd].wbuf_len = 0;
-    fd_table[fd].wbuf_file_off = 0;
-    
+    /* Clear the slot before tearing down so a blocked/preempted release can
+     * never be re-entered through the same descriptor number. */
+    process_get_current()->fd_table[fd] = NULL;
+    file_put(f);
     return 0;
 }
 
-/* Read from file descriptor - now uses cached data */
-ssize_t fd_read(int fd, void* buffer, size_t count) {
-    fd_init();
-    
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
-        return -1;
-    }
-    
-    /* Check read permission */
-    if (!(fd_table[fd].flags & FD_FLAG_READ)) {
-        FD_LOG("[FD] No read permission\n");
-        return -2;
-    }
-    
-    /* Handle stdin specially (not implemented) */
-    if (fd == STDIN_FILENO) {
-        return -3;
-    }
+int fd_dup(int oldfd) {
+    fd_file_t *f = fd_lookup(oldfd);
+    if (!f) return -EBADF;
 
-    /* Pipe read */
-    if (fd_table[fd].type == FD_TYPE_PIPE) {
-        pipe_buf_t *pb = (pipe_buf_t*)fd_table[fd].pipe_buf;
-        if (!pb || !fd_table[fd].is_read_end) return -1;
-        /* Spin-wait for data (simple blocking read; no sleep/wakeup yet) */
+    fd_file_t **t = fd_proc_table(process_get_current());
+    int newfd = fd_find_free_from(t, 0);
+    if (newfd < 0) return -EMFILE;
+
+    file_get(f);
+    t[newfd] = f;
+    return newfd;
+}
+
+int fd_dup2(int oldfd, int newfd) {
+    fd_file_t *f = fd_lookup(oldfd);
+    if (!f) return -EBADF;
+    if (newfd < 0 || newfd >= PROCESS_MAX_FDS) return -EBADF;
+    if (oldfd == newfd) return newfd;
+
+    fd_file_t **t = fd_proc_table(process_get_current());
+    fd_file_t *old = t[newfd];
+
+    file_get(f);
+    t[newfd] = f;
+    if (old) file_put(old);
+    return newfd;
+}
+
+void fd_clone_for_fork(int parent_pid, int child_pid) {
+    process_t *parent = process_find((uint32_t)parent_pid);
+    process_t *child  = process_find((uint32_t)child_pid);
+    if (!parent || !child || parent == child) return;
+
+    fd_file_t **pt = fd_proc_table(parent);
+    if (!pt) return;
+
+    for (int i = 0; i < PROCESS_MAX_FDS; i++) {
+        fd_file_t *f = pt[i];
+        if (f) file_get(f);
+        child->fd_table[i] = f;
+    }
+    child->fd_ready = 1;
+}
+
+void fd_close_all(int pid) {
+    process_t *p;
+    if (pid == 0) p = process_get_current();
+    else          p = process_find((uint32_t)pid);
+    if (!p) return;
+
+    for (int i = 0; i < PROCESS_MAX_FDS; i++) {
+        fd_file_t *f = p->fd_table[i];
+        if (!f) continue;
+        p->fd_table[i] = NULL;
+        file_put(f);
+    }
+    /* A dying process must not get fresh stdio from a late fd call. */
+    p->fd_ready = 1;
+}
+
+int fd_inject_dup(uint32_t pid, int target_fd, int src_fd) {
+    if (target_fd < 0 || target_fd >= PROCESS_MAX_FDS) return -EBADF;
+
+    fd_file_t *src = fd_lookup(src_fd);
+    if (!src) return -EBADF;
+
+    process_t *target = process_find(pid);
+    if (!target) return -ESRCH;
+
+    fd_file_t **t = fd_proc_table(target);
+    if (!t) return -ESRCH;
+    if (t[target_fd]) return -EBUSY;
+
+    file_get(src);
+    t[target_fd] = src;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Read / write                                                        */
+/* ------------------------------------------------------------------ */
+
+ssize_t fd_read(int fd, void* buffer, size_t count) {
+    fd_file_t *f = fd_lookup(fd);
+    if (!f) return -1;
+
+    if (!(f->flags & FD_FLAG_READ)) return -2;
+
+    /* Console stdin is serviced by the tty layer in the syscall path. */
+    if (f->type == FD_TYPE_CONSOLE) return -3;
+
+    if (f->type == FD_TYPE_PIPE) {
+        pipe_buf_t *pb = (pipe_buf_t*)f->pipe_buf;
+        if (!pb || !f->is_read_end) return -1;
+        /* Spin-wait for data (no sleep/wakeup yet). */
         while (pb->count == 0) {
             if (!pb->write_end_open) return 0; /* EOF */
             process_yield();
@@ -513,78 +472,52 @@ ssize_t fd_read(int fd, void* buffer, size_t count) {
         return (ssize_t)n;
     }
 
-    /* devfs-backed FD */
-    if (fd_table[fd].is_devfs) {
-        if (!fd_table[fd].cached_data) return -4;
-        return devfs_read(fd_table[fd].cached_data, buffer, count);
+    if (f->is_devfs) {
+        if (!f->cached_data) return -4;
+        return devfs_read(f->cached_data, buffer, count);
     }
 
-    /* userfs-backed FD */
-    if (fd_table[fd].is_userfs) {
-        if (!fd_table[fd].cached_data) return -4;
-        return userfs_read(fd_table[fd].cached_data, buffer, count);
+    if (f->is_userfs) {
+        if (!f->cached_data) return -4;
+        return userfs_read(f->cached_data, buffer, count);
     }
 
-    /* Check if we have cached data */
-    if (!fd_table[fd].cached_data) {
-        FD_LOG("[FD] No cached data for reading\n");
-        return -4;
-    }
-    
-    /* Check if at EOF */
-    if (fd_table[fd].position >= fd_table[fd].file_size) {
-        return 0; /* EOF */
-    }
-    
-    /* Calculate how much to read */
-    size_t remaining = fd_table[fd].file_size - fd_table[fd].position;
+    if (!f->cached_data) return -4;
+    if (f->position >= f->file_size) return 0; /* EOF */
+
+    size_t remaining = f->file_size - f->position;
     size_t to_read = (count < remaining) ? count : remaining;
-    
-    /* Copy from cached buffer at current position */
-    memcpy(buffer, (uint8_t*)fd_table[fd].cached_data + fd_table[fd].position, to_read);
-    
-    /* Update position */
-    fd_table[fd].position += to_read;
-    
+
+    memcpy(buffer, (uint8_t*)f->cached_data + f->position, to_read);
+    f->position += to_read;
     return (ssize_t)to_read;
 }
 
-/* Write to file descriptor */
 ssize_t fd_write(int fd, const void* buffer, size_t count) {
-    fd_init();
-
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
-        return -1;
-    }
+    fd_file_t *f = fd_lookup(fd);
+    if (!f) return -1;
 
     if (!buffer && count != 0) return -1;
+    if (!(f->flags & FD_FLAG_WRITE)) return -2;
 
-    /* Check write permission */
-    if (!(fd_table[fd].flags & FD_FLAG_WRITE)) {
-        return -2;
-    }
-
-
-    /* Handle stdout/stderr specially */
-    if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
-        /* Userspace typically writes via SYS_WRITE (string) for console output.
-         * SYS_WRITEFILE is primarily used for binary-safe writes.
-         */
-        if (buffer && count) {
-            VGA_WriteN((const char*)buffer, count);
-        }
+    if (f->type == FD_TYPE_CONSOLE) {
+        if (buffer && count) VGA_WriteN((const char*)buffer, count);
         return (ssize_t)count;
     }
 
-    /* Pipe write */
-    if (fd_table[fd].type == FD_TYPE_PIPE) {
-        pipe_buf_t *pb = (pipe_buf_t*)fd_table[fd].pipe_buf;
-        if (!pb || fd_table[fd].is_read_end) return -1;
+    if (f->type == FD_TYPE_PIPE) {
+        pipe_buf_t *pb = (pipe_buf_t*)f->pipe_buf;
+        if (!pb || f->is_read_end) return -1;
         const char *src = (const char*)buffer;
         size_t written = 0;
         while (written < count) {
-            while (pb->count == PIPE_BUF_SIZE)
-                process_yield(); /* wait for space */
+            if (!pb->read_end_open)
+                return written ? (ssize_t)written : -EPIPE;
+            while (pb->count == PIPE_BUF_SIZE) {
+                if (!pb->read_end_open)
+                    return written ? (ssize_t)written : -EPIPE;
+                process_yield();
+            }
             pb->buf[pb->write_pos] = src[written++];
             pb->write_pos = (pb->write_pos + 1) % PIPE_BUF_SIZE;
             pb->count++;
@@ -592,435 +525,240 @@ ssize_t fd_write(int fd, const void* buffer, size_t count) {
         return (ssize_t)count;
     }
 
-    /* devfs-backed FD: dispatch to devfs_write */
-    if (fd_table[fd].is_devfs) {
-        if (!fd_table[fd].cached_data) return -4;
-        return devfs_write(fd_table[fd].cached_data, buffer, count);
+    if (f->is_devfs) {
+        if (!f->cached_data) return -4;
+        return devfs_write(f->cached_data, buffer, count);
     }
 
-    /* userfs-backed FD: dispatch to userfs_write */
-    if (fd_table[fd].is_userfs) {
-        if (!fd_table[fd].cached_data) return -4;
-        return userfs_write(fd_table[fd].cached_data, buffer, count);
+    if (f->is_userfs) {
+        if (!f->cached_data) return -4;
+        return userfs_write(f->cached_data, buffer, count);
     }
 
-    /* Regular file writing: COALESCE small sequential writes into bigger IO.
-     * Without this, userland writing in 4KiB chunks can cause hundreds of thousands of
-     * vdrive_write() calls.
-     */
+    /* Regular file: coalesce small sequential writes into larger I/O. Without
+     * this, userland writing in 4KiB chunks causes hundreds of thousands of
+     * vdrive_write() calls. */
     if (count == 0) return 0;
 
-    /* Ensure buffer exists. */
-    if (!fd_table[fd].wbuf) {
-        fd_table[fd].wbuf_cap = FD_WRITEBUF_DEFAULT_CAP;
-        fd_table[fd].wbuf = (uint8_t*)kmalloc(fd_table[fd].wbuf_cap);
-        fd_table[fd].wbuf_len = 0;
-        fd_table[fd].wbuf_file_off = fd_table[fd].position;
-        if (!fd_table[fd].wbuf) {
-            // Fall back to direct write if we can't allocate the buffer.
-            fs_mount_t *mount = fs_get_mount(fd_table[fd].mount_slot);
+    if (!f->wbuf) {
+        f->wbuf_cap = FD_WRITEBUF_DEFAULT_CAP;
+        f->wbuf = (uint8_t*)kmalloc(f->wbuf_cap);
+        f->wbuf_len = 0;
+        f->wbuf_file_off = f->position;
+        if (!f->wbuf) {
+            f->wbuf_cap = 0;
+            fs_mount_t *mount = fs_get_mount(f->mount_slot);
             if (!mount || !mount->valid) return -3;
             int rc;
-            if (mount->type == FS_TYPE_MDFS && fd_table[fd].cache_valid && fd_table[fd].cached_type == 1 && fd_table[fd].cached_inode != 0) {
-                rc = mdfs_write_file_at_by_inode(mount->handle, fd_table[fd].cached_inode, buffer, count, fd_table[fd].position);
+            if (mount->type == FS_TYPE_MDFS && f->cache_valid && f->cached_type == 1 && f->cached_inode != 0) {
+                rc = mdfs_write_file_at_by_inode(mount->handle, f->cached_inode, buffer, count, f->position);
             } else {
-                rc = fs_write_file_at(mount, fd_table[fd].path, buffer, count, fd_table[fd].position);
+                rc = fs_write_file_at(mount, f->path, buffer, count, f->position);
             }
             if (rc != 0) return (rc < 0) ? (ssize_t)rc : -3;
-            fd_table[fd].position += count;
-            if (fd_table[fd].position > fd_table[fd].file_size) fd_table[fd].file_size = fd_table[fd].position;
+            f->position += count;
+            if (f->position > f->file_size) f->file_size = f->position;
             return (ssize_t)count;
         }
     }
 
-    /* If this write is not contiguous with buffered data, flush first. */
-    size_t expected_off = fd_table[fd].wbuf_file_off + fd_table[fd].wbuf_len;
-    if (fd_table[fd].position != expected_off) {
-        int frc = fd_flush_write_buffer(fd);
+    /* Non-contiguous with buffered data: flush first. */
+    size_t expected_off = f->wbuf_file_off + f->wbuf_len;
+    if (f->position != expected_off) {
+        int frc = file_flush_wbuf(f);
         if (frc != 0) return (ssize_t)frc;
-        fd_table[fd].wbuf_file_off = fd_table[fd].position;
+        f->wbuf_file_off = f->position;
     }
 
     const uint8_t *src = (const uint8_t*)buffer;
     size_t remaining = count;
     while (remaining > 0) {
-        size_t space = fd_table[fd].wbuf_cap - fd_table[fd].wbuf_len;
+        size_t space = f->wbuf_cap - f->wbuf_len;
         if (space == 0) {
-            /* Buffer full. For sequential workloads, prefer growing the buffer up to a cap
-             * instead of flushing too often.
-             */
-            if (fd_table[fd].wbuf_cap < FD_WRITEBUF_MAX_CAP) {
-                size_t new_cap = fd_table[fd].wbuf_cap * 2u;
+            /* Prefer growing up to a cap over flushing too often. */
+            if (f->wbuf_cap < FD_WRITEBUF_MAX_CAP) {
+                size_t new_cap = f->wbuf_cap * 2u;
                 if (new_cap > FD_WRITEBUF_MAX_CAP) new_cap = FD_WRITEBUF_MAX_CAP;
 
                 uint8_t *nb = (uint8_t*)kmalloc(new_cap);
                 if (nb) {
-                    memcpy(nb, fd_table[fd].wbuf, fd_table[fd].wbuf_len);
-                    kfree(fd_table[fd].wbuf);
-                    fd_table[fd].wbuf = nb;
-                    fd_table[fd].wbuf_cap = new_cap;
-                    space = fd_table[fd].wbuf_cap - fd_table[fd].wbuf_len;
+                    memcpy(nb, f->wbuf, f->wbuf_len);
+                    kfree(f->wbuf);
+                    f->wbuf = nb;
+                    f->wbuf_cap = new_cap;
+                    space = f->wbuf_cap - f->wbuf_len;
                 } else {
-                    int frc = fd_flush_write_buffer(fd);
+                    int frc = file_flush_wbuf(f);
                     if (frc != 0) return (ssize_t)frc;
-                    fd_table[fd].wbuf_file_off = fd_table[fd].position;
-                    space = fd_table[fd].wbuf_cap;
+                    f->wbuf_file_off = f->position;
+                    space = f->wbuf_cap;
                 }
             } else {
-                int frc = fd_flush_write_buffer(fd);
+                int frc = file_flush_wbuf(f);
                 if (frc != 0) return (ssize_t)frc;
-                fd_table[fd].wbuf_file_off = fd_table[fd].position;
-                space = fd_table[fd].wbuf_cap;
+                f->wbuf_file_off = f->position;
+                space = f->wbuf_cap;
             }
         }
 
         size_t take = (remaining < space) ? remaining : space;
-        memcpy(fd_table[fd].wbuf + fd_table[fd].wbuf_len, src, take);
-        fd_table[fd].wbuf_len += take;
-        fd_table[fd].position += take;
+        memcpy(f->wbuf + f->wbuf_len, src, take);
+        f->wbuf_len += take;
+        f->position += take;
         src += take;
         remaining -= take;
 
-        /* Flush eagerly once buffer is full; otherwise keep coalescing. */
-        if (fd_table[fd].wbuf_len == fd_table[fd].wbuf_cap) {
-            int frc = fd_flush_write_buffer(fd);
+        if (f->wbuf_len == f->wbuf_cap) {
+            int frc = file_flush_wbuf(f);
             if (frc != 0) return (ssize_t)frc;
-            fd_table[fd].wbuf_file_off = fd_table[fd].position;
+            f->wbuf_file_off = f->position;
         }
     }
 
-    if (fd_table[fd].position > fd_table[fd].file_size) fd_table[fd].file_size = fd_table[fd].position;
+    if (f->position > f->file_size) f->file_size = f->position;
     return (ssize_t)count;
 }
 
-/*
- * Invoke (ioctl-style RPC) on a file descriptor.
- * Mainly used for UserFS nodes (and potentially DevFS devices later).
- */
+/* Invoke (ioctl-style RPC) on a device-backed descriptor. */
 ssize_t fd_invoke(int fd,
                   const void *in_buf,  size_t in_size,
                   void *out_buf, size_t out_size)
 {
-    fd_init();
+    fd_file_t *f = fd_lookup(fd);
+    if (!f) return -1;      /* EBADF */
 
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
-        return -1;      /* EBADF */
-    }
+    if (!f->is_userfs && !f->is_devfs) return -2;
+    if (!(f->flags & (FD_FLAG_READ | FD_FLAG_WRITE))) return -3;
+    if (!f->cached_data) return -4;
 
-    /* Only devices (UserFS / DevFS) support invoke for now */
-    if (!fd_table[fd].is_userfs && !fd_table[fd].is_devfs) {
-        return -2;      /* ENOTTY or ENOSYS */
-    }
-
-    /* Check that the FD was opened with sufficient permissions */
-    if (!(fd_table[fd].flags & (FD_FLAG_READ | FD_FLAG_WRITE))) {
-        return -3;      /* EACCES */
-    }
-
-    if (fd_table[fd].is_userfs) {
-        if (!fd_table[fd].cached_data) return -4;
-        return userfs_invoke(fd_table[fd].cached_data,
-                             in_buf, in_size,
-                             out_buf, out_size);
-    }
-
-    if (fd_table[fd].is_devfs) {
-        if (!fd_table[fd].cached_data) return -4;
-        return devfs_invoke(fd_table[fd].cached_data,
-                            in_buf, in_size,
-                            out_buf, out_size);
-    }
-
-    return -2;  /* Not supported */
+    if (f->is_userfs)
+        return userfs_invoke(f->cached_data, in_buf, in_size, out_buf, out_size);
+    return devfs_invoke(f->cached_data, in_buf, in_size, out_buf, out_size);
 }
 
-/* mmap a device-backed file descriptor into the calling process's address space.
- * Only devfs-backed FDs support this (e.g. $/dev/mvc/mvi0 framebuffer).
- * Returns mapped VA on success, MAP_FAILED ((void*)-1) on error.
- */
+/* mmap a devfs-backed descriptor (e.g. $/dev/mvc/mvi0 framebuffer).
+ * Returns the mapped VA, or (void*)-1 on error. */
 void *fd_mmap(int fd, void *hint, size_t length, int prot, int flags, uint64_t offset) {
-    fd_init();
+    fd_file_t *f = fd_lookup(fd);
+    if (!f || length == 0) return (void*)-1;
+    if (!f->is_devfs || !f->cached_data) return (void*)-1;
 
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use)
-        return (void*)-1;
-
-    if (length == 0)
-        return (void*)-1;
-
-    /* Only devfs nodes support mmap for now */
-    if (!fd_table[fd].is_devfs || !fd_table[fd].cached_data)
-        return (void*)-1;
-
-    return devfs_mmap(fd_table[fd].cached_data, hint, length, prot, flags, offset);
+    return devfs_mmap(f->cached_data, hint, length, prot, flags, offset);
 }
 
-/* Seek in file */
 off_t fd_lseek(int fd, off_t offset, int whence) {
-    fd_init();
-    
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
-        return -1;
-    }
-    
-    /* Can't seek stdin/stdout/stderr */
-    if (fd <= 2) {
-        return -2;
-    }
-    
+    fd_file_t *f = fd_lookup(fd);
+    if (!f) return -1;
+
+    if (f->type == FD_TYPE_CONSOLE || f->type == FD_TYPE_PIPE) return -2;
+
     off_t new_pos;
-    
-    /* Seeking changes the write position. If we have buffered writes, flush first
-     * to preserve ordering and file offsets.
-     */
-    if ((fd_table[fd].flags & FD_FLAG_WRITE) && fd_table[fd].wbuf_len) {
-        int frc = fd_flush_write_buffer(fd);
+
+    /* Flush buffered writes first to preserve ordering and file offsets. */
+    if ((f->flags & FD_FLAG_WRITE) && f->wbuf_len) {
+        int frc = file_flush_wbuf(f);
         if (frc != 0) return frc;
-        fd_table[fd].wbuf_file_off = fd_table[fd].position;
+        f->wbuf_file_off = f->position;
     }
 
     switch (whence) {
-        case SEEK_SET:
-            new_pos = offset;
-            break;
-            
-        case SEEK_CUR:
-            new_pos = fd_table[fd].position + offset;
-            break;
-            
-        case SEEK_END:
-            new_pos = fd_table[fd].file_size + offset;
-            break;
-            
-        default:
-            return -3;
+        case SEEK_SET: new_pos = offset; break;
+        case SEEK_CUR: new_pos = f->position + offset; break;
+        case SEEK_END: new_pos = f->file_size + offset; break;
+        default:       return -3;
     }
-    
-    /* Clamp to valid range */
-    if (new_pos < 0) {
-        new_pos = 0;
-    } else if ((size_t)new_pos > fd_table[fd].file_size) {
-        new_pos = fd_table[fd].file_size;
-    }
-    
-    fd_table[fd].position = new_pos;
-    
+
+    if (new_pos < 0) new_pos = 0;
+    else if ((size_t)new_pos > f->file_size) new_pos = f->file_size;
+
+    f->position = new_pos;
     return new_pos;
 }
 
-/* Get file descriptor structure */
 file_descriptor_t* fd_get(int fd) {
-    fd_init();
-    
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
-        return NULL;
-    }
-    
-    /* Return as public type (without cached_data pointer) */
-    return (file_descriptor_t*)&fd_table[fd];
+    return (file_descriptor_t*)fd_lookup(fd);
 }
 
-/* Check if FD is valid */
 int fd_is_valid(int fd) {
-    fd_init();
-    
-    return (fd >= 0 && fd < MAX_FDS && fd_table[fd].in_use) ? 1 : 0;
+    return fd_lookup(fd) ? 1 : 0;
 }
 
-/* Duplicate file descriptor */
-int fd_dup(int oldfd) {
-    fd_init();
-    
-    if (oldfd < 0 || oldfd >= MAX_FDS || !fd_table[oldfd].in_use) {
-        return -1;
-    }
-    
-    int newfd = find_free_fd();
-    if (newfd < 0) {
-        return -2;
-    }
-    
-    /* Copy FD structure */
-    fd_table[newfd] = fd_table[oldfd];
-    
-    /* Important: Don't share cached data pointer! 
-       Each FD needs its own copy if we want independent positions */
-    if (fd_table[oldfd].cached_data && fd_table[oldfd].file_size > 0) {
-        void* new_cache = kmalloc(fd_table[oldfd].file_size);
-        if (new_cache) {
-            memcpy(new_cache, fd_table[oldfd].cached_data, fd_table[oldfd].file_size);
-            fd_table[newfd].cached_data = new_cache;
-        } else {
-            /* Failed to allocate, can't dup */
-            fd_table[newfd].in_use = 0;
-            return -3;
-        }
-    }
-    
-    return newfd;
+int fd_is_tty_routed(int fd) {
+    fd_file_t *f = fd_lookup(fd);
+    if (!f) return 0;
+    return f->type == FD_TYPE_CONSOLE || f->is_devfs || f->is_userfs;
 }
 
-/* Duplicate oldfd into newfd exactly (dup2 semantics).
- * If newfd is already open, it is closed first.
- * Returns newfd on success, -1 on error. */
-int fd_dup2(int oldfd, int newfd) {
-    fd_init();
-
-    if (oldfd < 0 || oldfd >= MAX_FDS || !fd_table[oldfd].in_use) return -1;
-    if (newfd < 0 || newfd >= MAX_FDS) return -1;
-    if (oldfd == newfd) return newfd;
-
-    /* Close newfd if open — suppress errors, POSIX says best-effort. */
-    if (fd_table[newfd].in_use)
-        fd_close(newfd);
-
-    fd_table[newfd] = fd_table[oldfd];
-    fd_table[newfd].in_use = 1;
-
-    /* Duplicate cached data buffer so both FDs have independent position. */
-    if (fd_table[oldfd].cached_data && fd_table[oldfd].file_size > 0
-        && !fd_table[oldfd].is_devfs && !fd_table[oldfd].is_userfs) {
-        void *nb = kmalloc(fd_table[oldfd].file_size);
-        if (nb) {
-            memcpy(nb, fd_table[oldfd].cached_data, fd_table[oldfd].file_size);
-            fd_table[newfd].cached_data = nb;
-        } else {
-            fd_table[newfd].cached_data = NULL;
-        }
-    }
-    /* Write buffer is not inherited — child starts fresh. */
-    fd_table[newfd].wbuf = NULL;
-    fd_table[newfd].wbuf_cap = 0;
-    fd_table[newfd].wbuf_len = 0;
-    fd_table[newfd].wbuf_file_off = 0;
-
-    return newfd;
+off_t fd_tell(int fd) {
+    fd_file_t *f = fd_lookup(fd);
+    return f ? (off_t)f->position : -1;
 }
 
-/* Clone all open FDs from parent_pid into child_pid.
- * Used by fork() to give the child the same open file table. */
-void fd_clone_for_fork(int parent_pid, int child_pid) {
-    fd_init();
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (!fd_table[i].in_use || fd_table[i].pid != parent_pid) continue;
-        /* Duplicate the slot into a fresh entry for the child. */
-        file_descriptor_internal_t copy = fd_table[i];
-        copy.pid = child_pid;
-        /* Give the child its own cached data copy so seek positions diverge. */
-        if (copy.cached_data && copy.file_size > 0
-            && !copy.is_devfs && !copy.is_userfs) {
-            void *nb = kmalloc(copy.file_size);
-            if (nb) {
-                memcpy(nb, fd_table[i].cached_data, copy.file_size);
-                copy.cached_data = nb;
-            } else {
-                copy.cached_data = NULL;
-            }
-        }
-        copy.wbuf = NULL;
-        copy.wbuf_cap = 0;
-        copy.wbuf_len = 0;
-        copy.wbuf_file_off = 0;
-        fd_table[i] = copy;  /* preserve parent slot untouched; child needs its own slot */
-        /* Actually we need a NEW slot for the child at the same fd number. */
-        /* Restore parent slot first, then copy to the same index — this only
-         * works if we treat fd as process-local.  Since the table is global,
-         * we reuse the same index but tag it with child_pid when fd_close_all
-         * is called per-pid.  The parent's slot stays as-is (pid=parent_pid).
-         * We need a second slot at the same fd number for the child — not
-         * possible with a global flat table.
-         *
-         * Practical compromise: share the slot but update pid to child_pid
-         * only for FDs 0,1,2 (stdio).  All other FDs get fresh duplicates
-         * in new slots. */
-        fd_table[i] = fd_table[i]; /* restore */
-        fd_table[i].pid = parent_pid; /* keep parent ownership */
-        if (i < 3) {
-            /* stdio is shared read-only — no separate slot needed.
-             * Just mark child as a co-owner by leaving pid as parent for now;
-             * child's fd_close_all skips these slots. */
-        } else {
-            int nfd = find_free_fd_from(3);
-            if (nfd >= 0) {
-                fd_table[nfd] = copy;
-                fd_table[nfd].pid = child_pid;
-            }
-        }
-    }
-}
+/* ------------------------------------------------------------------ */
+/* Pipes / fcntl                                                       */
+/* ------------------------------------------------------------------ */
 
-/* pipe() — create an anonymous read/write fd pair backed by a kernel ring buffer. */
 int fd_pipe(int fds[2]) {
-    fd_init();
+    if (!process_get_current()) return -1;
 
-    /* Allocate ring buffer */
-    pipe_buf_t *pb = (pipe_buf_t*)kmalloc(sizeof(pipe_buf_t));
+    pipe_buf_t *pb = (pipe_buf_t*)kzalloc(sizeof(pipe_buf_t));
     if (!pb) return -1;
-    pb->read_pos     = 0;
-    pb->write_pos    = 0;
-    pb->count        = 0;
     pb->write_end_open = 1;
+    pb->read_end_open  = 1;
+    pb->ends_alive     = 2;
 
-    int rfd = find_free_fd_from(0);
-    if (rfd < 0) { kfree(pb); return -1; }
-    fd_table[rfd].in_use    = 1;
-    fd_table[rfd].type      = FD_TYPE_PIPE;
-    fd_table[rfd].flags     = FD_FLAG_READ;
-    fd_table[rfd].pipe_buf  = pb;
-    fd_table[rfd].is_read_end = 1;
-
-    int wfd = find_free_fd_from(rfd + 1);
-    if (wfd < 0) {
-        fd_table[rfd].in_use = 0;
+    fd_file_t *rf = file_alloc();
+    fd_file_t *wf = file_alloc();
+    if (!rf || !wf) {
+        if (rf) kfree(rf);
+        if (wf) kfree(wf);
         kfree(pb);
         return -1;
     }
-    fd_table[wfd].in_use    = 1;
-    fd_table[wfd].type      = FD_TYPE_PIPE;
-    fd_table[wfd].flags     = FD_FLAG_WRITE;
-    fd_table[wfd].pipe_buf  = pb;
-    fd_table[wfd].is_read_end = 0;
 
+    int pid = fd_cur_pid();
+    rf->type = FD_TYPE_PIPE; rf->flags = FD_FLAG_READ;  rf->pipe_buf = pb;
+    rf->is_read_end = 1;     rf->pid = pid;
+    wf->type = FD_TYPE_PIPE; wf->flags = FD_FLAG_WRITE; wf->pipe_buf = pb;
+    wf->is_read_end = 0;     wf->pid = pid;
+
+    fd_file_t **t = fd_proc_table(process_get_current());
+    int rfd = fd_find_free_from(t, 0);
+    int wfd = (rfd >= 0) ? fd_find_free_from(t, rfd + 1) : -1;
+    if (rfd < 0 || wfd < 0) {
+        /* Release through the normal path so ends_alive reaches zero. */
+        file_put(rf);
+        file_put(wf);
+        return -EMFILE;
+    }
+
+    t[rfd] = rf;
+    t[wfd] = wf;
     fds[0] = rfd;
     fds[1] = wfd;
     return 0;
 }
 
-/* fcntl() — get/set file descriptor flags.
- *
- * F_GETFL: returns the current flags as a user-space O_* bitmask.
- * F_SETFL: sets flags from a user-space O_* bitmask.
- *          Only O_NONBLOCK (0x0800) is acted on; other bits are ignored.
- *
- * This allows userspace to do:
- *   fcntl(fd, F_SETFL, O_NONBLOCK)   — make pipe read non-blocking
- *   fcntl(fd, F_GETFL, 0)            — query current flags
- */
+/* F_GETFL / F_SETFL. Only O_NONBLOCK is acted on by F_SETFL. */
 int fd_fcntl(int fd, int cmd, int arg) {
-    fd_init();
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use)
-        return -EBADF;
+    fd_file_t *f = fd_lookup(fd);
+    if (!f) return -EBADF;
 
     switch (cmd) {
         case F_GETFL: {
-            /* Translate internal flags back to O_* */
             int oflags = 0;
-            if ((fd_table[fd].flags & FD_FLAG_READ) &&
-                (fd_table[fd].flags & FD_FLAG_WRITE))
-                oflags |= 2; /* O_RDWR */
-            else if (fd_table[fd].flags & FD_FLAG_WRITE)
-                oflags |= 1; /* O_WRONLY */
-            /* else O_RDONLY = 0 */
-            if (fd_table[fd].flags & FD_FLAG_APPEND)   oflags |= 0x0400;
-            if (fd_table[fd].flags & FD_FLAG_NONBLOCK)  oflags |= 0x0800;
+            if ((f->flags & FD_FLAG_READ) && (f->flags & FD_FLAG_WRITE))
+                oflags |= O_RDWR;
+            else if (f->flags & FD_FLAG_WRITE)
+                oflags |= O_WRONLY;
+            if (f->flags & FD_FLAG_APPEND)   oflags |= O_APPEND;
+            if (f->flags & FD_FLAG_NONBLOCK) oflags |= O_NONBLOCK;
             return oflags;
         }
 
         case F_SETFL:
-            /* Only O_NONBLOCK (0x0800) is supported via F_SETFL */
-            if (arg & 0x0800)
-                fd_table[fd].flags |= FD_FLAG_NONBLOCK;
-            else
-                fd_table[fd].flags &= ~FD_FLAG_NONBLOCK;
+            if (arg & O_NONBLOCK) f->flags |= FD_FLAG_NONBLOCK;
+            else                  f->flags &= ~FD_FLAG_NONBLOCK;
             return 0;
 
         default:
@@ -1028,219 +766,90 @@ int fd_fcntl(int fd, int cmd, int arg) {
     }
 }
 
-/* Close all FDs for a process */
-void fd_close_all(int pid) {
-    fd_init();
-    
-    if (pid == 0) {
-        process_t* proc = process_get_current();
-        if (proc) pid = proc->pid;
-    }
-
-    /* Close from 0 — fd 0/1/2 may now be owned by this process */
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (fd_table[i].in_use && fd_table[i].pid == pid) {
-            fd_close(i);
-        }
-    }
-}
-
-/* Get current position */
-off_t fd_tell(int fd) {
-    fd_init();
-    
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
-        return -1;
-    }
-    
-    return fd_table[fd].position;
-}
-
-/* --- DIRECTORY OPERATIONS --- */
+/* ------------------------------------------------------------------ */
+/* Directories                                                         */
+/* ------------------------------------------------------------------ */
 
 int fd_opendir(int mount_slot, const char* path) {
-    fd_init();
-    
-    if (!path || mount_slot < 0) {
-        return -1;
-    }
-    
-    /* Get mount */
+    if (!path || mount_slot < 0) return -1;
+    if (!process_get_current()) return -1;
+    if (!fd_has_free_slot()) return -EMFILE;
+
     fs_mount_t* mount = fs_get_mount(mount_slot);
-    if (!mount || !mount->valid) {
-        return -1;
-    }
-    
-    /* Open directory using filesystem layer */
+    if (!mount || !mount->valid) return -1;
+
     fs_dir_t* dir = fs_opendir(mount, path);
-    if (!dir) {
-        return -1;
-    }
-    
-    /* Find free FD slot */
-    int fd = -1;
-    for (int i = 3; i < MAX_FDS; i++) {
-        if (!fd_table[i].in_use) {
-            fd = i;
-            break;
-        }
-    }
-    
-    if (fd < 0) {
+    if (!dir) return -1;
+
+    fd_file_t *f = file_alloc();
+    if (!f) {
         fs_closedir(dir);
         return -1;
     }
-    
-    /* Get current process PID */
-    process_t* proc = process_get_current();
-    int pid = proc ? proc->pid : 0;
-    
-    /* Set up FD entry */
-    fd_table[fd].in_use = 1;
-    fd_table[fd].mount_slot = mount_slot;
-    strncpy(fd_table[fd].path, path, sizeof(fd_table[fd].path) - 1);
-    fd_table[fd].path[sizeof(fd_table[fd].path) - 1] = '\0';
-    fd_table[fd].position = 0;
-    fd_table[fd].file_size = 0;
-    fd_table[fd].flags = FD_FLAG_READ;
-    fd_table[fd].pid = pid;
-    fd_table[fd].cached_data = NULL;
-    fd_table[fd].is_directory = 1;
-    fd_table[fd].dir_handle = dir;
-    
-    return fd;
+
+    f->mount_slot = mount_slot;
+    strncpy(f->path, path, sizeof(f->path) - 1);
+    f->flags = FD_FLAG_READ;
+    f->pid = fd_cur_pid();
+    f->type = FD_TYPE_DIR;
+    f->is_directory = 1;
+    f->dir_handle = dir;
+
+    return fd_install(f);
 }
 
-typedef struct {
-    int kind;   /* 0=$/, 1=$/mnt, 2=$/dev, 3=$/user */
-    int index;  /* current index */
-    int cookie; /* for devfs/userfs directory listing */
-    char dev_path[128]; /* for kind=2: subdir path under $/dev ("" for root) */
-    char user_path[128]; /* for kind=3: subpath under $/user ("" for root) */
-} devvfs_dir_t;
+static int fd_devvfs_open(int kind, const char *dev_sub, const char *user_sub) {
+    if (!process_get_current()) return -1;
+    if (!fd_has_free_slot()) return -EMFILE;
 
-int fd_devvfs_opendir_dev(const char *dev_subdir) {
-    fd_init();
-
-    int fd = find_free_fd();
-    if (fd < 0) return -1;
-
-    devvfs_dir_t *h = (devvfs_dir_t*)kmalloc(sizeof(devvfs_dir_t));
+    devvfs_dir_t *h = (devvfs_dir_t*)kzalloc(sizeof(devvfs_dir_t));
     if (!h) return -1;
-    memset(h, 0, sizeof(*h));
-    h->kind = 2;
-    h->index = 0;
-    h->cookie = 0;
-    if (dev_subdir) {
-        strncpy(h->dev_path, dev_subdir, sizeof(h->dev_path) - 1);
-        h->dev_path[sizeof(h->dev_path) - 1] = 0;
+    h->kind = kind;
+    if (dev_sub) {
+        strncpy(h->dev_path, dev_sub, sizeof(h->dev_path) - 1);
+    }
+    if (user_sub) {
+        strncpy(h->user_path, user_sub, sizeof(h->user_path) - 1);
     }
 
-    process_t* proc = process_get_current();
-    int pid = proc ? proc->pid : 0;
+    fd_file_t *f = file_alloc();
+    if (!f) {
+        kfree(h);
+        return -1;
+    }
 
-    fd_table[fd].in_use = 1;
-    fd_table[fd].mount_slot = -1;
-    fd_table[fd].path[0] = '\0';
-    fd_table[fd].position = 0;
-    fd_table[fd].file_size = 0;
-    fd_table[fd].flags = FD_FLAG_READ;
-    fd_table[fd].pid = pid;
-    fd_table[fd].cached_data = NULL;
-    fd_table[fd].is_directory = 1;
-    fd_table[fd].is_devvfs = 1;
-    fd_table[fd].dir_handle = h;
+    f->flags = FD_FLAG_READ;
+    f->pid = fd_cur_pid();
+    f->type = FD_TYPE_DIR;
+    f->is_directory = 1;
+    f->is_devvfs = 1;
+    f->dir_handle = h;
 
-    return fd;
+    return fd_install(f);
+}
+
+int fd_devvfs_opendir_dev(const char *dev_subdir) {
+    return fd_devvfs_open(2, dev_subdir, NULL);
 }
 
 int fd_devvfs_opendir_user(const char *user_subpath) {
-    fd_init();
-
-    int fd = find_free_fd();
-    if (fd < 0) return -1;
-
-    devvfs_dir_t *h = (devvfs_dir_t*)kmalloc(sizeof(devvfs_dir_t));
-    if (!h) return -1;
-    memset(h, 0, sizeof(*h));
-    h->kind = 3;
-    h->index = 0;
-    h->cookie = 0;
-    if (user_subpath) {
-        strncpy(h->user_path, user_subpath, sizeof(h->user_path) - 1);
-        h->user_path[sizeof(h->user_path) - 1] = '\0';
-    }
-
-    process_t* proc = process_get_current();
-    int pid = proc ? proc->pid : 0;
-
-    fd_table[fd].in_use = 1;
-    fd_table[fd].mount_slot = -1;
-    fd_table[fd].path[0] = '\0';
-    fd_table[fd].position = 0;
-    fd_table[fd].file_size = 0;
-    fd_table[fd].flags = FD_FLAG_READ;
-    fd_table[fd].pid = pid;
-    fd_table[fd].cached_data = NULL;
-    fd_table[fd].is_directory = 1;
-    fd_table[fd].is_devvfs = 1;
-    fd_table[fd].dir_handle = h;
-
-    return fd;
+    return fd_devvfs_open(3, NULL, user_subpath);
 }
 
 int fd_devvfs_opendir(int kind) {
-    fd_init();
-
     if (kind != 0 && kind != 1 && kind != 3) return -1;
-
-    int fd = find_free_fd();
-    if (fd < 0) return -1;
-
-    devvfs_dir_t *h = (devvfs_dir_t*)kmalloc(sizeof(devvfs_dir_t));
-    if (!h) return -1;
-    memset(h, 0, sizeof(*h));
-    h->kind = kind;
-    if (kind == 0) h->index = 0;
-    else h->index = 0;
-    h->cookie = 0;
-    h->dev_path[0] = 0;
-
-    process_t* proc = process_get_current();
-    int pid = proc ? proc->pid : 0;
-
-    fd_table[fd].in_use = 1;
-    fd_table[fd].mount_slot = -1;
-    fd_table[fd].path[0] = '\0';
-    fd_table[fd].position = 0;
-    fd_table[fd].file_size = 0;
-    fd_table[fd].flags = FD_FLAG_READ;
-    fd_table[fd].pid = pid;
-    fd_table[fd].cached_data = NULL;
-    fd_table[fd].is_directory = 1;
-    fd_table[fd].is_devvfs = 1;
-    fd_table[fd].dir_handle = h;
-
-    return fd;
+    return fd_devvfs_open(kind, NULL, NULL);
 }
 
 int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* size) {
-    fd_init();
+    fd_file_t *f = fd_lookup(fd);
+    if (!f) return -1;
 
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
-        return -1;
-    }
+    if (!f->is_directory || !f->dir_handle) return -1;
+    if (!name_buf || buf_size == 0) return -1;
 
-    if (!fd_table[fd].is_directory || !fd_table[fd].dir_handle) {
-        return -1;
-    }
-
-    if (!name_buf || buf_size == 0) {
-        return -1;
-    }
-
-    if (fd_table[fd].is_devvfs) {
-        devvfs_dir_t *h = (devvfs_dir_t*)fd_table[fd].dir_handle;
+    if (f->is_devvfs) {
+        devvfs_dir_t *h = (devvfs_dir_t*)f->dir_handle;
 
         if (h->kind == 0) {
             // $/: DEVVFS root
@@ -1256,8 +865,8 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
         }
 
         if (h->kind == 1) {
-            // $/mnt: list mounted filesystems (one entry per mount slot).
-            // Names must be stable and non-colliding even for same-model drives and multi-partition mounts.
+            // $/mnt: one entry per mount slot. Names must be stable and
+            // non-colliding even for same-model drives and multi-partition mounts.
             int produced = 0;
             int seen = 0;
 
@@ -1289,12 +898,9 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
         }
 
         if (h->kind == 2) {
-            // $/dev or $/dev/<subdir>: list DEVFS tree.
-            // Every present vdrive (native or SQRM-backed) has a real node
-            // registered here by vdrive_register_devfs_nodes(), so this walk
-            // alone is authoritative -- do not also synthesize vDriveN-Model
-            // names from vdrive_system directly, or every drive shows up
-            // twice (once from the tree, once synthesized).
+            // $/dev or $/dev/<subdir>. Every present vdrive has a real node
+            // registered by vdrive_register_devfs_nodes(), so this walk is
+            // authoritative; synthesizing names as well would list drives twice.
             int d_is_dir = 0;
             int rc = devfs_list_dir_next(h->dev_path, &h->cookie, name_buf, buf_size, &d_is_dir);
             if (rc == 1) {
@@ -1306,7 +912,6 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
         }
 
         if (h->kind == 3) {
-            // $/user: list userfs tree
             int d_is_dir = 0;
             int rc = userfs_list_dir_next(h->user_path, &h->cookie, name_buf, buf_size, &d_is_dir);
             if (rc == 1) {
@@ -1320,53 +925,24 @@ int fd_readdir(int fd, char* name_buf, size_t buf_size, int* is_dir, uint32_t* s
         return 0;
     }
 
-    fs_dir_t* dir = (fs_dir_t*)fd_table[fd].dir_handle;
+    fs_dir_t* dir = (fs_dir_t*)f->dir_handle;
     fs_dirent_t entry;
 
     int result = fs_readdir(dir, &entry);
-    if (result <= 0) {
-        return result; /* 0 = end of directory, -1 = error */
-    }
+    if (result <= 0) return result; /* 0 = end of directory, -1 = error */
 
-    /* Copy data to output buffers */
     strncpy(name_buf, entry.name, buf_size - 1);
     name_buf[buf_size - 1] = '\0';
 
-    if (is_dir) {
-        *is_dir = entry.is_directory;
-    }
+    if (is_dir) *is_dir = entry.is_directory;
+    if (size) *size = entry.size;
 
-    if (size) {
-        *size = entry.size;
-    }
-
-    fd_table[fd].position++;
-    return 1; /* Successfully read entry */
+    f->position++;
+    return 1;
 }
 
 int fd_closedir(int fd) {
-    fd_init();
-    
-    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
-        return -1;
-    }
-    
-    if (!fd_table[fd].is_directory) {
-        return -1;
-    }
-
-    if (fd_table[fd].dir_handle) {
-        if (fd_table[fd].is_devvfs) {
-            kfree(fd_table[fd].dir_handle);
-        } else {
-            fs_closedir((fs_dir_t*)fd_table[fd].dir_handle);
-        }
-        fd_table[fd].dir_handle = NULL;
-    }
-
-    fd_table[fd].in_use = 0;
-    fd_table[fd].is_directory = 0;
-    fd_table[fd].is_devvfs = 0;
-
-    return 0;
+    fd_file_t *f = fd_lookup(fd);
+    if (!f || !f->is_directory) return -1;
+    return fd_close(fd);
 }

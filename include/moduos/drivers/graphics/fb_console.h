@@ -97,6 +97,14 @@ void fbcon_set_cursor_enabled(fb_console_t *c, bool enabled);
 void fbcon_get_cursor_pos(const fb_console_t *c, uint32_t *row, uint32_t *col);
 void fbcon_set_cursor_pos(fb_console_t *c, uint32_t row, uint32_t col);
 
+/* ---- cell-addressed API for the TTY layer ---- */
+void fbcon_get_geometry(const fb_console_t *c, uint32_t *rows, uint32_t *cols);
+void fbcon_begin_batch(fb_console_t *c);
+void fbcon_end_batch(fb_console_t *c);
+void fbcon_draw_cell(fb_console_t *c, uint32_t row, uint32_t col, uint32_t cp,
+                     uint8_t fg, uint8_t bg, uint8_t underline);
+void fbcon_scroll_cells(fb_console_t *c, uint32_t top, uint32_t bot, int lines, uint8_t bg);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,5 +1,6 @@
 /* process_init_new.c - Process management bring-up: idle (PID 0) and init */
 
+#include "moduos/kernel/tty/tty.h"
 #include "moduos/kernel/process/process_new.h"
 #include "moduos/kernel/memory/kheap.h"
 #include "moduos/kernel/memory/string.h"
@@ -136,6 +137,11 @@ process_t *create_init_process(const char *path) {
             "[PROCESS] Init created but not found in process table\n");
         return NULL;
     }
+
+    /* PID 1 is the session leader of the system console (VT1). */
+    init->sid = 1;
+    init->pgid = 1;
+    init->controlling_tty = TTY_CTTY_CONSOLE;
 
     return init;
 }

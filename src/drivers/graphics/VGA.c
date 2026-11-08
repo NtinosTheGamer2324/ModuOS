@@ -1,3 +1,4 @@
+#include "moduos/kernel/tty/tty.h"
 #include <stdint.h>
 #include <stddef.h>
 #include "moduos/drivers/graphics/VGA.h"
@@ -27,6 +28,8 @@ static bool vga_scrolling_enabled = true;
 static fb_console_t g_fbcon;
 static bool g_fbcon_inited = false;
 static bool g_splash_lock = false;
+/* TTY layer owns the display: legacy VGA_Write* become no-ops (kernel logs go to COM1). */
+static bool g_console_owned = false;
 
 /* Optional flush hook for paravirtual GPUs (e.g., QXL). */
 static void (*g_flush_hook)(const framebuffer_t *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h) = NULL;
@@ -284,10 +287,13 @@ void VGA_ReinitFrameBufferConsole(void) {
         if (g_fbcon_fnt_loaded && g_fbcon_fnt) {
             fbcon_set_fnt_font(&g_fbcon, g_fbcon_fnt);
         }
+        if (g_console_owned) fbcon_set_cursor_enabled(&g_fbcon, false);
     }
+    if (g_console_owned) tty_display_changed();
 }
 
 void VGA_ForceRedrawConsole(void) {
+    if (g_console_owned) { tty_display_changed(); return; }
     if (g_fb_mode != FB_MODE_GRAPHICS) return;
 
     vga_try_init_fb_console();
@@ -700,6 +706,7 @@ void VGA_Clear(void) {
 }
 
 void VGA_WriteChar(char c) {
+    if (g_console_owned) return;
     if (g_fb_mode == FB_MODE_GRAPHICS && g_splash_lock) {
         return;
     }
@@ -758,6 +765,7 @@ void VGA_WriteChar(char c) {
 }
 
 void VGA_Write(const char* str) {
+    if (g_console_owned) return;
     if (g_fb_mode == FB_MODE_GRAPHICS && g_splash_lock) {
         return;
     }
@@ -897,6 +905,7 @@ void VGA_Write(const char* str) {
 }
 
 void VGA_WriteN(const char *buf, size_t count) {
+    if (g_console_owned) return;
     if (g_fb_mode == FB_MODE_GRAPHICS && g_splash_lock) {
         return;
     }
@@ -1042,7 +1051,7 @@ void VGA_WriteN(const char *buf, size_t count) {
 }
 
 void VGA_WriteTextAtPosition(int row, int col, const char *str) {
-    if (!str) return;
+    if (!str || g_console_owned) return;
     if (g_fb_mode == FB_MODE_GRAPHICS && g_splash_lock) return;
 
     /* clamp */
@@ -1073,6 +1082,7 @@ void VGA_WriteTextAtPosition(int row, int col, const char *str) {
 }
 
 void VGA_Writef(const char* fmt, ...) {
+    if (g_console_owned) return;
     if (g_fb_mode == FB_MODE_GRAPHICS) {
         if (!fmt) return;
         vga_try_init_fb_console();
@@ -1335,6 +1345,7 @@ void VGA_Writef(const char* fmt, ...) {
 }
 
 void VGA_Backspace(void) {
+    if (g_console_owned) return;
     if (g_fb_mode == FB_MODE_GRAPHICS) {
         vga_try_init_fb_console();
         if (g_fbcon_inited) fbcon_backspace(&g_fbcon);
@@ -1437,4 +1448,89 @@ void VGA_ShowCursor(void) {
     outb(0x3D4, 0x0B);
     outb(0x3D5, 0x0F);
     update_cursor(cursor_row, cursor_col);
+}
+
+/* ======================================================================
+ * Text-cell backend for the kernel TTY layer (src/kernel/tty/vt.c)
+ * ====================================================================== */
+
+void VGA_SetConsoleOwned(bool owned) {
+    g_console_owned = owned;
+    if (g_fb_mode == FB_MODE_GRAPHICS) {
+        vga_try_init_fb_console();
+        if (g_fbcon_inited) fbcon_set_cursor_enabled(&g_fbcon, !owned);
+    }
+}
+
+void VGA_GetTextGeometry(int *rows, int *cols) {
+    int r = HEIGHT, c = WIDTH;
+    if (g_fb_mode == FB_MODE_GRAPHICS) {
+        vga_try_init_fb_console();
+        if (g_fbcon_inited) {
+            uint32_t fr = 0, fc = 0;
+            fbcon_get_geometry(&g_fbcon, &fr, &fc);
+            if (fr && fc) { r = (int)fr; c = (int)fc; }
+        }
+    }
+    if (rows) *rows = r;
+    if (cols) *cols = c;
+}
+
+void VGA_DrawCell(int row, int col, uint32_t cp, uint8_t fg, uint8_t bg, uint8_t flags) {
+    if (row < 0 || col < 0) return;
+    if (g_fb_mode == FB_MODE_GRAPHICS) {
+        if (!g_fbcon_inited) return;
+        fbcon_draw_cell(&g_fbcon, (uint32_t)row, (uint32_t)col, cp, fg, bg, (flags & 1) != 0);
+        return;
+    }
+    if (row >= HEIGHT || col >= WIDTH) return;
+    uint8_t ch = (cp >= 0x20 && cp < 0x7F) ? (uint8_t)cp : (cp == ' ' ? ' ' : '?');
+    if (cp == 0 || cp == 0xA0) ch = ' ';
+    VGA_BUFFER[row * WIDTH + col] = (uint16_t)ch | ((uint16_t)(((bg & 0x07) << 4) | (fg & 0x0F)) << 8);
+}
+
+void VGA_ScrollCells(int top, int bot, int lines, uint8_t bg) {
+    if (top < 0 || bot < top || !lines) return;
+    if (g_fb_mode == FB_MODE_GRAPHICS) {
+        if (g_fbcon_inited) fbcon_scroll_cells(&g_fbcon, (uint32_t)top, (uint32_t)bot, lines, bg);
+        return;
+    }
+    if (bot >= HEIGHT) bot = HEIGHT - 1;
+    int n = lines > 0 ? lines : -lines;
+    int h = bot - top + 1;
+    if (n > h) n = h;
+    uint16_t blank = (uint16_t)' ' | ((uint16_t)((bg & 0x07) << 4 | 0x07) << 8);
+    if (lines > 0) {
+        for (int r = top; r + n <= bot; r++)
+            for (int c = 0; c < WIDTH; c++) VGA_BUFFER[r * WIDTH + c] = VGA_BUFFER[(r + n) * WIDTH + c];
+        for (int r = bot - n + 1; r <= bot; r++)
+            for (int c = 0; c < WIDTH; c++) VGA_BUFFER[r * WIDTH + c] = blank;
+    } else {
+        for (int r = bot; r - n >= top; r--)
+            for (int c = 0; c < WIDTH; c++) VGA_BUFFER[r * WIDTH + c] = VGA_BUFFER[(r - n) * WIDTH + c];
+        for (int r = top; r < top + n; r++)
+            for (int c = 0; c < WIDTH; c++) VGA_BUFFER[r * WIDTH + c] = blank;
+    }
+}
+
+void VGA_DrawBatchBegin(void) {
+    if (g_fb_mode == FB_MODE_GRAPHICS && g_fbcon_inited) fbcon_begin_batch(&g_fbcon);
+}
+
+void VGA_DrawBatchEnd(void) {
+    if (g_fb_mode == FB_MODE_GRAPHICS && g_fbcon_inited) fbcon_end_batch(&g_fbcon);
+}
+
+/* Fill the whole screen with a palette colour without touching console state. */
+void VGA_ClearScreenBG(uint8_t bg) {
+    if (g_fb_mode == FB_MODE_GRAPHICS) {
+        if (!g_fbcon_inited) return;
+        uint8_t sfg = g_fbcon.fg, sbg = g_fbcon.bg;
+        fbcon_set_text_color(&g_fbcon, sfg, bg & 0x0F);
+        fbcon_clear(&g_fbcon);
+        fbcon_set_text_color(&g_fbcon, sfg, sbg);
+        return;
+    }
+    uint16_t blank = (uint16_t)' ' | ((uint16_t)(((bg & 0x07) << 4) | 0x07) << 8);
+    for (int i = 0; i < WIDTH * HEIGHT; i++) VGA_BUFFER[i] = blank;
 }

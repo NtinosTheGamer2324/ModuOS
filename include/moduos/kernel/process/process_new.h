@@ -83,8 +83,13 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 #define PROCESS_NAME_MAX 64
-#define PROCESS_MAX_FDS  256
+/* Per-process descriptor limit. The table holds pointers only; open file
+ * descriptions are heap-allocated on demand, so the footprint is 8 KiB per
+ * process regardless of how many descriptors are actually open. */
+#define PROCESS_MAX_FDS  1024
 #define PROCESS_MAX_PATH 256
+
+struct fd_file;
 
 typedef struct process {
     // Process identification
@@ -170,8 +175,9 @@ typedef struct process {
     int  root_slot;
     int  current_slot;
 
-    // File descriptors
-    void *fd_table[PROCESS_MAX_FDS];
+    // File descriptors (owned and interpreted by src/fs/fd.c)
+    struct fd_file *fd_table[PROCESS_MAX_FDS];
+    int             fd_ready;   // stdio installed; see fd_proc_table()
 
     // Parent-child relationships
     struct process *parent;
@@ -329,14 +335,6 @@ process_t *process_create_with_args(const char *name, void (*entry_point)(void),
                                     int priority, int argc, char **argv);
 void       process_set_build_pml4(uint64_t *pml4_virt, uint64_t pml4_phys);
 uint64_t  *process_get_build_pml4(void);
-
-// ---------------------------------------------------------------------------
-// FD injection
-// ---------------------------------------------------------------------------
-
-int   process_inject_fd(uint32_t pid, int fd, void *fd_obj);
-void *process_get_fd(uint32_t pid, int fd);
-int   process_close_fd(uint32_t pid, int fd);
 
 // ---------------------------------------------------------------------------
 // Signals / init

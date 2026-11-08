@@ -11,6 +11,7 @@ typedef enum {
     EVENT_CHAR_INPUT,
     EVENT_MOUSE_MOVE,      // For future expansion
     EVENT_MOUSE_BUTTON,    // For future expansion
+    EVENT_VT_SWITCH,       // TTY: VT changed. keyboard.scancode = VT (1-based), keyboard.modifiers = 1 if it became active, 0 if it lost focus
 } EventType;
 
 // Key codes for special keys
@@ -42,6 +43,8 @@ typedef enum {
     KEY_ARROW_DOWN,
     KEY_ARROW_LEFT,
     KEY_ARROW_RIGHT,
+    KEY_LEFT_SUPER,
+    KEY_RIGHT_SUPER,
     // Add more as needed
 } KeyCode;
 
@@ -53,6 +56,7 @@ typedef enum {
     MOD_ALT = (1 << 2),
     MOD_CAPS = (1 << 3),
     MOD_NUM = (1 << 4),
+    MOD_SUPER = (1 << 5),
 } ModifierFlags;
 
 // Keyboard event data

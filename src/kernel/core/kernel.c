@@ -1,4 +1,5 @@
 //kernel.c
+#include "moduos/kernel/tty/tty.h"
 #include "moduos/kernel/COM/com.h"
 #include "moduos/drivers/graphics/VGA.h"
 #include "moduos/kernel/macros.h"
@@ -646,6 +647,9 @@ void kernel_main(uint64_t mb2_ptr)
     /* Release the splash screen lock so userland output reaches the framebuffer. */
     bootscreen_overlay_set_enabled(0);
     VGA_Clear();
+
+    /* Bring up the kernel TTY layer (VT1..VT4, ptys) before PID 1 exists. */
+    tty_init();
 
     // Create init process (PID 1) - AutoMan (like systemd)
     com_write_string(COM1_PORT, "[KERNEL] Creating init process (AutoMan)...\n");

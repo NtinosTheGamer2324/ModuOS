@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "moduos/kernel/memory/string.h"
+#include "moduos/arch/AMD64/msr.h"
 
 /* SMP Safety: Track whether SMP has started */
 static int paging_smp_started = 0;
@@ -823,7 +824,46 @@ uint64_t paging_get_scratch_base(void) {
     return scratch_base;
 }
 
+static void *ioremap_flags(uint64_t phys_addr, uint64_t size, uint64_t flags);
+
 void* ioremap(uint64_t phys_addr, uint64_t size) {
+    return ioremap_flags(phys_addr, size, PFLAG_WRITABLE | PFLAG_PWT | PFLAG_PCD);
+}
+
+/* Write-combining needs the PAT: PA1 (selected by PWT alone) is reprogrammed
+ * from write-through to WC, which nothing else in the kernel maps with. Done
+ * lazily on first use and only once; ioremap_wc() returns NULL when the CPU
+ * has no PAT so callers keep their uncached mapping. */
+#define MSR_IA32_PAT   0x277
+#define PAT_TYPE_WC    0x01
+static int pat_wc_state = 0;   /* 0 = untried, 1 = ready, -1 = unavailable */
+
+static int paging_pat_wc_init(void) {
+    if (pat_wc_state) return pat_wc_state > 0;
+
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
+    if (!(edx & (1u << 16))) {
+        pat_wc_state = -1;
+        return 0;
+    }
+
+    uint64_t pat = rdmsr(MSR_IA32_PAT);
+    pat = (pat & ~(0xFFULL << 8)) | ((uint64_t)PAT_TYPE_WC << 8);
+    wrmsr(MSR_IA32_PAT, pat);
+    __asm__ volatile("mfence" ::: "memory");
+
+    pat_wc_state = 1;
+    com_write_string(COM1_PORT, "[PAT] PA1 reprogrammed to write-combining\n");
+    return 1;
+}
+
+void* ioremap_wc(uint64_t phys_addr, uint64_t size) {
+    if (!paging_pat_wc_init()) return NULL;
+    return ioremap_flags(phys_addr, size, PFLAG_WRITABLE | PFLAG_PWT);
+}
+
+static void *ioremap_flags(uint64_t phys_addr, uint64_t size, uint64_t flags) {
     ASSERT_BSP_ONLY();
 
     com_write_string(COM1_PORT, "[IOREMAP] phys=");
@@ -881,7 +921,7 @@ void* ioremap(uint64_t phys_addr, uint64_t size) {
         com_write_string(COM1_PORT, "[IOREMAP] WARNING: ioremap_next was non-canonical; reinitializing\n");
         ioremap_base = 0;
         ioremap_next = 0;
-        return ioremap(phys_addr, size);
+        return ioremap_flags(phys_addr, size, flags);
     }
 
     uint64_t virt_base = ioremap_next;
@@ -906,9 +946,8 @@ void* ioremap(uint64_t phys_addr, uint64_t size) {
                    (uint32_t)((virt_base + aligned_size - 1) & 0xFFFFFFFF));
     }
 
-    uint64_t flags = PFLAG_WRITABLE | PFLAG_PWT | PFLAG_PCD;
     if (kernel_debug_is_on())
-        com_printf(COM1_PORT, "[IOREMAP] Mapping with flags: 0x%x (W+PCD+PWT)\n", (uint32_t)flags);
+        com_printf(COM1_PORT, "[IOREMAP] Mapping with flags: 0x%x\n", (uint32_t)flags);
 
     uint64_t mapped = 0;
     if ((phys_base % huge_sz) == 0 && (virt_base % huge_sz) == 0) {
