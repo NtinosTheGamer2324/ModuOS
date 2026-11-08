@@ -50,11 +50,11 @@ LD_SCRIPT_LIB="lib_user.ld"  # shared libs (ET_DYN)
 #
 # libc (libc/libc.c -> dist/libc.sqrl) is built from libc/, not from lib_libc.c,
 # and every other library and every app is linked against it, so it comes first.
-SHARED_LIBS="libc demo_gfx fnt crypto tls"
+SHARED_LIBS="libc demo_gfx fnt crypto tls windows"
 
 # Libraries that need other .sqrl libraries, as lib:dep1,dep2. The deps become
 # DT_NEEDED entries so ld-moduos loads them when the library is loaded.
-LIB_DEPS="tls:crypto"
+LIB_DEPS="tls:crypto windows:fnt"
 
 # Apps linked dynamically, as app:lib1,lib2 (names without lib_/.sqrl).
 DYNAMIC_APPS="demo_dyn:demo_gfx
@@ -77,7 +77,8 @@ DYNAMIC_APPS="demo_dyn:demo_gfx
     mdedit:fnt
     mdtaskbar:fnt
     mddesktop:fnt
-    ntosiux_ttyman:fnt"
+    ntosiux_ttyman:fnt
+    win_demo:fnt,windows"
 
 list_has() {
     for item in $2; do
