@@ -71,6 +71,9 @@ const char* get_pc_name() {
 }
 
 int md_main(long argc, char **argv) {
+    /* ^C at the prompt must not kill the shell; children restore SIG_DFL. */
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
     (void)argc; (void)argv;
 
     printf("\033[2J\b");
@@ -156,7 +159,31 @@ int md_main(long argc, char **argv) {
         } else if (strcmp(command, "cls") == 0 || strcmp(command, "clear") == 0) {
             printf("\033[2J\b");
         } else if (strlen(command) > 0) {
-            snprintf(app_path, sizeof(app_path), "/Apps/%s.sqr", command);
+            bool background = false;
+            char actual_command[64];
+
+            if (strcmp(command, "bg") == 0) {
+                background = true;
+                char *p = args;
+                while (*p == ' ' || *p == '\t') p++;
+
+                int i = 0;
+                while (*p && *p != ' ' && *p != '\t' && i < (int)sizeof(actual_command) - 1) {
+                    actual_command[i++] = *p++;
+                }
+                actual_command[i] = '\0';
+
+                while (*p == ' ' || *p == '\t') p++;
+                char *dest = args;
+                while (*p) {
+                    *dest++ = *p++;
+                }
+                *dest = '\0';
+            } else {
+                strcpy(actual_command, command);
+            }
+
+            snprintf(app_path, sizeof(app_path), "/Apps/%s.sqr", actual_command);
 
             int fdex = open(app_path, O_RDONLY, 0);
             if (fdex >= 0) {
@@ -180,19 +207,25 @@ int md_main(long argc, char **argv) {
                     argv_exec[argc_exec] = NULL;
 
                     char *envp[] = { NULL };
+                    signal(SIGINT, SIG_DFL);
+                    signal(SIGQUIT, SIG_DFL);
                     execve(app_path, argv_exec, envp);
                     printf("%sFailed to execute %s%s\n", ANSI_RED, app_path, ANSI_RESET);
                     exit(1);
                 } else if (pid > 0) {
-                    int status = 0;
-                    waitpid(pid, &status, 0);
+                    if (!background) {
+                        int status = 0;
+                        waitpid(pid, &status, 0);
+                    } else {
+                        printf("[%d] Background process started\n", pid);
+                    }
                 } else {
                     printf("%sError: fork failed%s\n", ANSI_RED, ANSI_RESET);
                 }
             } else {
                 printf("%s%s : The term '%s' is not recognized as a klet or program.\n"
                        "Check spelling and try again.\n+ %s %s\n%s",
-                       ANSI_RED, command, command, command, args, ANSI_RESET);
+                       ANSI_RED, actual_command, actual_command, actual_command, args, ANSI_RESET);
             }
         }
     }

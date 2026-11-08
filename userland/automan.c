@@ -170,9 +170,20 @@ static int svc_launch(service_t *s) {
     }
     if (pid == 0) {
         // Child process
-        char *argv[] = { s->path, NULL };
+        // Autostart lines may carry arguments: "<path> [arg ...]" (e.g. getty 2).
+        char cmdline[MAX_NAME_LEN + 1];
+        safe_copy(cmdline, s->path, sizeof(cmdline));
+        char *argv[9];
+        int argc = 0;
+        for (char *p = cmdline; *p && argc < 8; ) {
+            while (*p == ' ' || *p == '\t') *p++ = 0;
+            if (!*p) break;
+            argv[argc++] = p;
+            while (*p && *p != ' ' && *p != '\t') p++;
+        }
+        argv[argc] = NULL;
         char *envp[] = { NULL };
-        int rc = execve(s->path, argv, envp);
+        int rc = execve(argv[0] ? argv[0] : s->path, argv, envp);
         printf("[AutoMan] execve failed for %s (rc=%d)\n", s->path, rc);
         exit(1);
     }

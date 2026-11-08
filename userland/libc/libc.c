@@ -1821,7 +1821,18 @@ void input_flush_events(void) {
     }
 }
 
+static int have_ctty_cached = -1;
+
 void input_flush(void) {
+    if (have_ctty_cached != 0) {
+        int tfd = open("$/dev/tty", O_RDWR, 0);
+        if (tfd >= 0) {
+            unsigned char io[8 + 96] = {0};
+            io[0] = 0x0B; io[1] = 0x54;   /* TTY_IOC_FLUSH_IN = 0x540B (LE) */
+            invoke(tfd, io, sizeof io, io, sizeof io);
+            close(tfd);
+        }
+    }
     int kfd = open("$/dev/input/kbd0", O_RDONLY | O_NONBLOCK, 0);
     if (kfd >= 0) {
         char c;
@@ -1831,11 +1842,39 @@ void input_flush(void) {
     input_flush_events();
 }
 
-/* Blocking line editor on kbd0 with echo and backspace. Returns length
- * (no newline stored), or -1 if kbd0 can't be opened. */
+/* Line input. If the caller has a controlling TTY, the kernel line discipline
+ * does editing + echo and we just read(0). Otherwise (early boot, no TTY layer)
+ * fall back to the old kbd0 editor. Returns length (no newline), or -1. */
+static int have_ctty(void) {
+    if (have_ctty_cached < 0) {
+        int fd = open("$/dev/tty", O_RDWR, 0);
+        have_ctty_cached = (fd >= 0);
+        if (fd >= 0) close(fd);
+    }
+    return have_ctty_cached;
+}
+
+static ssize_t tty_readline_kbd0(char *buf, size_t maxlen, int echo_nl);
+
 static ssize_t tty_readline(char *buf, size_t maxlen, int echo_nl) {
     if (!buf || maxlen == 0 || maxlen > 0x7FFFFFFF) return -1;
+    if (!have_ctty()) return tty_readline_kbd0(buf, maxlen, echo_nl);
 
+    size_t n = 0;
+    for (;;) {
+        char c;
+        ssize_t r = read(STDIN_FILENO, &c, 1);
+        if (r == 0) break;               /* EOF (^D) */
+        if (r < 0) { if (n) break; buf[0] = 0; return -1; }
+        if (c == '\n') break;           /* canonical mode delivers whole lines */
+        if (n + 1 < maxlen) buf[n++] = c;
+    }
+    buf[n] = 0;
+    (void)echo_nl;                       /* the tty already echoed the newline */
+    return (ssize_t)n;
+}
+
+static ssize_t tty_readline_kbd0(char *buf, size_t maxlen, int echo_nl) {
     int fd = open("$/dev/input/kbd0", O_RDONLY, 0);
     if (fd < 0) { buf[0] = 0; return -1; }
 

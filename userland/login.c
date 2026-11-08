@@ -66,11 +66,16 @@ retry:
 
     {
         int pid = fork();
-        char *shell_argv[] = { "/Apps/zenith5.1.sqr", NULL };
-        char *envp[] = { NULL };
-        execve("/Apps/zenith5.1.sqr", shell_argv, envp);
-        int status = 0;
-        waitpid(pid, &status, 0);
+        if (pid == 0) {
+            char *shell_argv[] = { "/Apps/zenith5.1.sqr", NULL };
+            char *envp[] = { NULL };
+            execve("/Apps/zenith5.1.sqr", shell_argv, envp);
+            _exit(127);
+        }
+        if (pid > 0) {
+            int status = 0;
+            waitpid(pid, &status, 0);
+        }
     }
 
     goto retry;
