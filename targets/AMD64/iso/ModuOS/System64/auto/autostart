@@ -2,7 +2,12 @@
 // This file is read by automan (PID 1 OR 2 (based on the kernel mood)) on boot
 
 // Core system services
-// critical /Apps/ntosiux_ttyman.sqr // BS -- deprecated -- delete -- TTY Will eventualy exist, but in-kernel for serveral issues -- also not as a SQRM but baked into the kernel.
+// currently absolutely nothing.
+
+// Extra virtual consoles (SHIFT+SUPER+ALT+F2..F4), each runs getty -> login -> zenith
+service /Apps/getty.sqr 2
+service /Apps/getty.sqr 3
+service /Apps/getty.sqr 4
 
 // User services
 //service /Apps/calc_service.sqr // UserFS demo
