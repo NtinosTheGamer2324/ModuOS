@@ -458,8 +458,8 @@ static ENTRY void collect_sysinfo(void) {
 
     /* ---------------- Static strings ---------------- */
     LOG("stage 2: static strings");
-    safe_copy(o->SystemVersion, sizeof(o->SystemVersion), "0.6.6");
-    safe_copy(o->KernelVersion, sizeof(o->KernelVersion), "0.6.6");
+    safe_copy(o->SystemVersion, sizeof(o->SystemVersion), "0.6.8");
+    safe_copy(o->KernelVersion, sizeof(o->KernelVersion), "0.6.8");
     safe_copy(o->KernelVendor,  sizeof(o->KernelVendor),  "NTSoftware");
     safe_copy(o->os_name,       sizeof(o->os_name),       "ModuOS");
     safe_copy(o->os_arch,       sizeof(o->os_arch),       "AMD64");
