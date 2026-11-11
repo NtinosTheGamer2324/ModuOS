@@ -44,8 +44,8 @@ LD_SCRIPT_DYN="user_dyn.ld"  # fixed 0x400000 (ET_EXEC) + PT_INTERP/PT_DYNAMIC
 LD_SCRIPT_LD="ld_user.ld"    # interpreter (ET_EXEC at DL_INTERP_BASE)
 LD_SCRIPT_LIB="lib_user.ld"  # shared libs (ET_DYN)
 
-# Libraries shipped as .sqrl (lib_<name>.c, compiled -fPIC). Anything not
-# listed here is still linked statically into the apps that use it.
+# Libraries shipped as .sqrl (lib_<name>.c or a specifically handled source,
+# compiled -fPIC). Anything not listed here is linked statically into apps.
 # Order matters: a library must come after the libraries it depends on.
 #
 # libc (libc/libc.c -> dist/libc.sqrl) is built from libc/, not from lib_libc.c,
@@ -78,7 +78,9 @@ DYNAMIC_APPS="demo_dyn:demo_gfx
     mdtaskbar:fnt
     mddesktop:fnt
     ntosiux_ttyman:fnt
-    win_demo:fnt,windows"
+    win_demo:fnt,windows
+    sshc:crypto
+    sshd:crypto"
 
 list_has() {
     for item in $2; do
@@ -178,6 +180,9 @@ for src in *.c; do
     esac
 
     obj="$BUILD_DIR/${src%.c}.o"
+    if [ "$src" = "mdwebkit.c" ]; then
+        obj="$BUILD_DIR/lib_mdwebkit.o"
+    fi
     echo "[BUILD] CC $src -> $obj"
 
     lib_name="${src#lib_}"
@@ -186,6 +191,11 @@ for src in *.c; do
         ld_moduos.c)
             # Runs before anything else in the process: no stack protector, no PIC.
             "$CC" $GCC_FLAGS_COMMON -fno-pic -fno-stack-protector "$src" -o "$obj" &
+            ;;
+        mdwebkit.c)
+            # Keep the requested source name while emitting a shared-lib object.
+            "$CC" $GCC_FLAGS_COMMON -fPIC -DLIBC_NO_START "$src" \
+                -o "$obj" &
             ;;
         lib_*.c)
             if list_has "$lib_name" "$SHARED_LIBS"; then
