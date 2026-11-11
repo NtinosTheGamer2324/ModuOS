@@ -44,7 +44,17 @@ int p256_shared(const uint8_t priv[32], const uint8_t peer[65], uint8_t out[32])
 
 /* X.509: just enough DER to get at the leaf's key and DNS names.
  * Pointers refer into the DER buffer, which must outlive the mcert_t. */
-enum { MC_KEY_NONE = 0, MC_KEY_RSA = 1, MC_KEY_EC_P256 = 2 };
+enum { MC_KEY_NONE = 0, MC_KEY_RSA = 1, MC_KEY_EC_P256 = 2, MC_KEY_EC_P384 = 3 };
+
+/* Certificate signature algorithms understood by mcert_verify_issued_by().
+ * (SHA-1, MD5 and RSASSA-PSS certificate signatures are deliberately rejected.) */
+enum { MC_SIG_NONE = 0,
+       MC_SIG_RSA_SHA256 = 1, MC_SIG_RSA_SHA384 = 2, MC_SIG_RSA_SHA512 = 3,
+       MC_SIG_ECDSA_SHA256 = 4, MC_SIG_ECDSA_SHA384 = 5, MC_SIG_ECDSA_SHA512 = 6 };
+
+/* key_usage bit numbers (RFC 5280 4.2.1.3) */
+#define MC_KU_DIGITAL_SIGNATURE 0
+#define MC_KU_KEY_CERT_SIGN     5
 
 typedef struct {
     const uint8_t *der;       size_t der_len;
@@ -54,14 +64,42 @@ typedef struct {
     const uint8_t *ec_point;                        /* 65 bytes, uncompressed */
     const uint8_t *rsa_n;     size_t rsa_n_len;     /* big-endian, leading zero stripped */
     const uint8_t *rsa_e;     size_t rsa_e_len;
+
+    /* --- fields used for chain validation --- */
+    const uint8_t *tbs;       size_t tbs_len;       /* whole TBSCertificate TLV (what the CA signed) */
+    const uint8_t *issuer;    size_t issuer_len;    /* contents of the issuer Name SEQUENCE */
+    const uint8_t *tbs_sigalg; size_t tbs_sigalg_len;   /* AlgorithmIdentifier contents inside the TBS */
+    const uint8_t *sigalg;    size_t sigalg_len;        /* AlgorithmIdentifier contents outside the TBS */
+    const uint8_t *sig;       size_t sig_len;       /* signature value (unused-bits byte stripped) */
+    int            sig_alg;                         /* MC_SIG_* */
+    int64_t        not_before, not_after;           /* unix seconds */
+    int            has_bc, is_ca;                   /* basicConstraints present / cA */
+    int            path_len;                        /* pathLenConstraint, -1 if absent */
+    int            has_ku;  unsigned key_usage;     /* keyUsage bits, see MC_KU_* */
+    int            has_eku, eku_server_auth;        /* extKeyUsage present / contains serverAuth or anyEKU */
 } mcert_t;
 
 int mcert_parse(mcert_t *out, const uint8_t *der, size_t der_len);
 
 /* 1 if `host` matches a dNSName in subjectAltName (exact, or "*." wildcard for
- * the leftmost label); falls back to the subject CN only when there is no SAN
+ * the leftmost label), or - when `host` is a dotted IPv4 literal - an iPAddress
+ * entry; falls back to the subject CN only when there is no SAN
  * extension. Case-insensitive. 0 otherwise. */
 int mcert_match_host(const mcert_t *c, const char *host);
+
+/* Same Name (byte-for-byte DER contents)? */
+int mcert_name_equal(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen);
+/* CN (else O) of a Name's contents as printable ASCII, for error messages. */
+void mcert_name_label(const uint8_t *name, size_t nlen, char *out, size_t cap);
+/* 0 = valid at `now` (unix seconds), 1 = not yet valid, 2 = expired. */
+int mcert_check_dates(const mcert_t *c, int64_t now);
+/* 0 only if `cert` carries a valid signature made by `issuer`'s key
+ * (RSA PKCS#1 v1.5 or ECDSA P-256/P-384, with SHA-256/384/512). */
+int mcert_verify_issued_by(const mcert_t *cert, const mcert_t *issuer);
+
+/* SHA-384 / SHA-512 (SHA-256 comes from sha256.h). */
+void sha384_hash(const uint8_t *msg, size_t len, uint8_t out[48]);
+void sha512_hash(const uint8_t *msg, size_t len, uint8_t out[64]);
 
 /* Verify a ServerKeyExchange signature against the leaf's public key.
  * Supported schemes (these are the ones lib_tls.c advertises):

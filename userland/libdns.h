@@ -153,7 +153,7 @@ static inline int __dns_build_query(const char *name, uint16_t id, uint8_t *out,
 }
 
 // Bounds-checked: returns the offset just past the name, or -1.
-static inline int __dns_skip_name(const uint8_t *b, int len, int pos) {
+static inline int __libdns_skip_name(const uint8_t *b, int len, int pos) {
     while (pos < len) {
         uint8_t c = b[pos];
         if (c == 0) return pos + 1;
@@ -165,7 +165,8 @@ static inline int __dns_skip_name(const uint8_t *b, int len, int pos) {
 }
 
 // Returns DNS_OK and fills ip, or a DNS_E_* code.
-static inline int __dns_parse(const uint8_t *b, int len, uint16_t id, uint8_t ip[4]) {
+static inline int __libdns_parse(const uint8_t *b, int len, uint16_t id,
+                                 uint8_t ip[4]) {
     if (len < 12) return DNS_E_MALFORMED;
     if ((uint16_t)((b[0] << 8) | b[1]) != id) return DNS_E_MALFORMED;
     if (!(b[2] & 0x80)) return DNS_E_MALFORMED;      // not a response
@@ -177,12 +178,12 @@ static inline int __dns_parse(const uint8_t *b, int len, uint16_t id, uint8_t ip
     int an = (b[6] << 8) | b[7];
     int pos = 12;
     for (int i = 0; i < qd; i++) {
-        pos = __dns_skip_name(b, len, pos);
+        pos = __libdns_skip_name(b, len, pos);
         if (pos < 0 || pos + 4 > len) return DNS_E_MALFORMED;
         pos += 4;
     }
     for (int i = 0; i < an; i++) {
-        pos = __dns_skip_name(b, len, pos);
+        pos = __libdns_skip_name(b, len, pos);
         if (pos < 0 || pos + 10 > len) return DNS_E_MALFORMED;
         int type  = (b[pos] << 8) | b[pos + 1];
         int rdlen = (b[pos + 8] << 8) | b[pos + 9];
@@ -212,7 +213,7 @@ static inline int __dns_ask(const uint8_t server[4], int qlen, uint16_t id, uint
     ssize_t r = sock_recvfrom(s, __dns_r, sizeof(__dns_r), NULL);
     sock_close(s);
     if (r < 0) return DNS_E_TIMEOUT;
-    return __dns_parse(__dns_r, (int)r, id, ip);
+    return __libdns_parse(__dns_r, (int)r, id, ip);
 }
 
 // ── Public API ──────────────────────────────────────────────────────

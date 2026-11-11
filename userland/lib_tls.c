@@ -1,6 +1,7 @@
 // tls.c -- minimal TLS 1.2 client for ModuOS (C port of mytls.py)
-// Protocol logic only: records, handshake messages, PRF, key schedule.
-// All primitives come from crypto.h.
+// Protocol logic only: records, handshake messages, PRF, key schedule, and the
+// certificate-chain check against a PEM trust store. All primitives come from
+// crypto.h.
 #include "tls.h"
 
 enum { CT_CCS = 20, CT_ALERT = 21, CT_HANDSHAKE = 22, CT_APPDATA = 23 };
@@ -75,6 +76,18 @@ static int fail_io(tls_t *t, const char *what) {
 const char *tls_error(const tls_t *t) { return t->errmsg; }
 
 int tls_clean_close(const tls_t *t) { return t->clean_close; }
+int tls_chain_verified(const tls_t *t) { return t->chain_verified; }
+int tls_dates_checked(const tls_t *t) { return t->dates_checked; }
+
+/* Configuration. Lives in this translation unit, so set it through these calls. */
+static const char *g_ca_path = TLS_CA_PATH;
+static int64_t     g_now;                                /* unix seconds, 0 = unknown */
+
+void tls_set_ca_path(const char *path) { g_ca_path = (path && *path) ? path : TLS_CA_PATH; }
+void tls_set_time(int64_t unix_seconds) { g_now = unix_seconds; }
+
+/* An unset RTC tends to read as 1970 or the build date; do not trust anything before 2024. */
+static int64_t clock_now(void) { return g_now >= 1704067200LL ? g_now : 0; }
 
 const char *tls_cipher_name(const tls_t *t) {
     switch (t->cipher_suite) {
@@ -210,6 +223,225 @@ static int next_hs_msg(tls_t *t, uint8_t **msg, size_t *len) {
     }
 }
 
+
+/* ------------------------------------------------------------ trust store + chain validation */
+typedef struct {
+    int      fd;
+    int      err;
+    uint8_t *io;  size_t io_cap, io_len, io_pos;
+    uint8_t *der; size_t der_cap;
+} pem_t;
+
+static int pem_getc(pem_t *r) {
+    if (r->io_pos == r->io_len) {
+        ssize_t n = read(r->fd, r->io, r->io_cap);
+        if (n < 0) r->err = 1;
+        if (n <= 0) return -1;
+        r->io_len = (size_t)n;
+        r->io_pos = 0;
+    }
+    return r->io[r->io_pos++];
+}
+
+static int b64_val(int c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int has_prefix(const char *s, const char *p) {
+    while (*p) if (*s++ != *p++) return 0;
+    return 1;
+}
+
+/* Next certificate from a PEM bundle, DER-decoded into r->der.
+ * Returns its length, 0 at end of file, -1 on a read error. Text between the
+ * blocks (curl's "Name\n=====" headers, comments) is ignored; certificates that
+ * are malformed or larger than the buffer are skipped. */
+static long pem_next(pem_t *r) {
+    char line[128];
+    int in_cert = 0, overflow = 0, bad = 0, bits = 0;
+    uint32_t acc = 0;
+    size_t dl = 0;
+    for (;;) {
+        size_t ll = 0;
+        int c, got = 0;
+        while ((c = pem_getc(r)) >= 0) {
+            got = 1;
+            if (c == '\n') break;
+            if (ll < sizeof(line) - 1) line[ll++] = (char)c;
+        }
+        if (c < 0 && !got) return r->err ? -1 : 0;
+        line[ll] = 0;
+
+        if (has_prefix(line, "-----BEGIN CERTIFICATE-----")) {      /* also restarts a truncated block */
+            in_cert = 1; overflow = 0; bad = 0; bits = 0; acc = 0; dl = 0;
+        } else if (!in_cert) {
+            /* text between blocks */
+        } else if (has_prefix(line, "-----END CERTIFICATE-----")) {
+            if (!overflow && !bad && dl > 0) return (long)dl;
+            in_cert = 0;
+        } else if (has_prefix(line, "-----")) {
+            in_cert = 0;                                 /* some other block: give up on this one */
+        } else {
+            for (size_t i = 0; i < ll; i++) {
+                int ch = (unsigned char)line[i];
+                if (ch == '=') break;
+                if (ch == ' ' || ch == '\r' || ch == '\t') continue;
+                int v = b64_val(ch);
+                if (v < 0) { bad = 1; break; }
+                acc = (acc << 6) | (uint32_t)v;
+                bits += 6;
+                if (bits >= 8) {
+                    bits -= 8;
+                    if (dl < r->der_cap) r->der[dl++] = (uint8_t)(acc >> bits);
+                    else overflow = 1;
+                    acc &= (1u << bits) - 1;
+                }
+            }
+        }
+        if (c < 0) return r->err ? -1 : 0;
+    }
+}
+
+enum { PC_OK = 0, PC_EXPIRED, PC_NOT_YET, PC_NOT_CA, PC_KEY_USAGE, PC_PATHLEN, PC_EKU };
+
+static const char *pc_text(int code) {
+    switch (code) {
+    case PC_EXPIRED:   return "certificate has expired";
+    case PC_NOT_YET:   return "certificate is not yet valid";
+    case PC_NOT_CA:    return "issuer is not a CA (basicConstraints)";
+    case PC_KEY_USAGE: return "issuer may not sign certificates (keyUsage)";
+    case PC_PATHLEN:   return "CA path length constraint exceeded";
+    case PC_EKU:       return "certificate is not valid for server authentication";
+    default:           return "ok";
+    }
+}
+
+/* Constraint checks for chain[path[0..upto]] ending at `anchor`. */
+static int check_path(const mcert_t *ch, const int *path, int upto, const mcert_t *anchor,
+                      int64_t now, const mcert_t **bad) {
+    for (int j = 0; j <= upto; j++) {
+        const mcert_t *c = &ch[path[j]];
+        *bad = c;
+        if (now) {
+            int d = mcert_check_dates(c, now);
+            if (d == 1) return PC_NOT_YET;
+            if (d == 2) return PC_EXPIRED;
+        }
+        if (j == 0) {
+            if (c->has_eku && !c->eku_server_auth) return PC_EKU;
+            continue;
+        }
+        /* certificates above the leaf act as CAs */
+        if (!c->has_bc || !c->is_ca) return PC_NOT_CA;
+        if (c->has_ku && !((c->key_usage >> MC_KU_KEY_CERT_SIGN) & 1)) return PC_KEY_USAGE;
+        if (c->path_len >= 0 && (j - 1) > c->path_len) return PC_PATHLEN;
+    }
+    *bad = anchor;
+    if (anchor->has_bc && !anchor->is_ca) return PC_NOT_CA;
+    if (anchor->path_len >= 0 && upto > anchor->path_len) return PC_PATHLEN;
+    return PC_OK;
+}
+
+/* Validate the server's chain (ders[0] is the leaf) against the PEM bundle.
+ * `ders` point into hs_buf, so this must run while the Certificate message is current. */
+static int verify_chain(tls_t *t, const uint8_t *const *ders, const size_t *lens, int n) {
+    mcert_t ch[TLS_MAX_CHAIN];
+    int path[TLS_MAX_CHAIN], plen = 0, used = 0;
+    char label[64];
+
+    for (int i = 0; i < n; i++)
+        if (mcert_parse(&ch[i], ders[i], lens[i]) != 0) {
+            snprintf(t->errmsg, sizeof(t->errmsg), "certificate #%d in the server chain is malformed", i);
+            return -1;
+        }
+    const int64_t now = clock_now();
+    t->dates_checked = now != 0;
+
+    /* 1. Order the chain: follow issuer links from the leaf through the certs the server sent. */
+    path[plen++] = 0;
+    used = 1;
+    for (;;) {
+        const mcert_t *cur = &ch[path[plen - 1]];
+        int next = -1;
+        for (int k = 1; k < n; k++) {
+            if (used & (1 << k)) continue;
+            if (!mcert_name_equal(cur->issuer, cur->issuer_len, ch[k].subject, ch[k].subject_len)) continue;
+            if (mcert_verify_issued_by(cur, &ch[k]) != 0) continue;
+            next = k;
+            break;
+        }
+        if (next < 0) break;
+        path[plen++] = next;
+        used |= 1 << next;
+    }
+
+    /* 2. Stream the bundle; the first CA that signed one of path[] and passes the constraints wins. */
+    int fd = open(g_ca_path, O_RDONLY, 0);
+    if (fd < 0) {
+        snprintf(t->errmsg, sizeof(t->errmsg), "cannot open CA bundle '%s' (use -k to skip verification)", g_ca_path);
+        return -1;
+    }
+    pem_t pr;
+    memset(&pr, 0, sizeof(pr));
+    pr.fd = fd;
+    pr.io = t->ca_io;   pr.io_cap = sizeof(t->ca_io);
+    pr.der = t->ca_der; pr.der_cap = sizeof(t->ca_der);
+
+    int found = 0, ncerts = 0, path_code = PC_OK;
+    char path_who[64] = "";
+    for (;;) {
+        long dl = pem_next(&pr);
+        if (dl <= 0) break;
+        mcert_t s;
+        if (mcert_parse(&s, t->ca_der, (size_t)dl) != 0) continue;
+        ncerts++;
+        for (int i = 0; i < plen && !found; i++) {
+            const mcert_t *c = &ch[path[i]];
+            if (!mcert_name_equal(c->issuer, c->issuer_len, s.subject, s.subject_len)) continue;
+            if (mcert_verify_issued_by(c, &s) != 0) continue;
+            if (s.has_ku && !((s.key_usage >> MC_KU_KEY_CERT_SIGN) & 1)) continue;
+            const mcert_t *bad = NULL;
+            int code;
+            if (now && mcert_check_dates(&s, now)) { code = mcert_check_dates(&s, now) == 1 ? PC_NOT_YET : PC_EXPIRED; bad = &s; }
+            else code = check_path(ch, path, i, &s, now, &bad);
+            if (code == PC_OK) { found = 1; break; }
+            if (path_code == PC_OK && bad) {
+                path_code = code;
+                mcert_name_label(bad->subject, bad->subject_len, path_who, sizeof(path_who));
+            }
+        }
+        if (found) break;
+    }
+    int io_err = pr.err;
+    close(fd);
+
+    if (found) { t->chain_verified = 1; return 0; }
+
+    if (io_err)
+        snprintf(t->errmsg, sizeof(t->errmsg), "read error on CA bundle '%s'", g_ca_path);
+    else if (ncerts == 0)
+        snprintf(t->errmsg, sizeof(t->errmsg), "no certificates found in CA bundle '%s'", g_ca_path);
+    else if (path_code != PC_OK)
+        snprintf(t->errmsg, sizeof(t->errmsg), "%s: %s", path_who, pc_text(path_code));
+    else {
+        const mcert_t *last = &ch[path[plen - 1]];
+        if (mcert_name_equal(last->issuer, last->issuer_len, last->subject, last->subject_len)) {
+            mcert_name_label(last->subject, last->subject_len, label, sizeof(label));
+            snprintf(t->errmsg, sizeof(t->errmsg), "self-signed certificate '%s' is not in the CA bundle", label);
+        } else {
+            mcert_name_label(last->issuer, last->issuer_len, label, sizeof(label));
+            snprintf(t->errmsg, sizeof(t->errmsg),
+                     "unable to verify the server certificate: issuer '%s' is not trusted (or the signature is bad)", label);
+        }
+    }
+    return -1;
+}
+
 /* ------------------------------------------------------------ handshake */
 static int build_client_hello(tls_t *t, uint8_t *ch, size_t *out_len) {
     size_t hl = strlen(t->host);
@@ -260,7 +492,7 @@ static int build_client_hello(tls_t *t, uint8_t *ch, size_t *out_len) {
     return 0;
 }
 
-static int do_handshake(tls_t *t, int verify_hostname) {
+static int do_handshake(tls_t *t, int verify) {
     uint8_t ch[512];
     size_t  ch_len;
 
@@ -321,19 +553,27 @@ static int do_handshake(tls_t *t, int verify_hostname) {
             if (3 + total > blen) return fail(t, "Certificate list malformed");
             size_t pos = 3;
             int n = 0;
+            const uint8_t *cp[TLS_MAX_CHAIN];
+            size_t cl[TLS_MAX_CHAIN];
             while (pos + 3 <= 3 + total) {
                 size_t ln = get24(body + pos);
                 pos += 3;
                 if (pos + ln > 3 + total) return fail(t, "Certificate entry malformed");
-                if (n == 0) {                            /* keep only the leaf */
+                if (n == 0) {                            /* copy the leaf; the rest is checked in place */
                     if (ln > TLS_LEAF_MAX) return fail(t, "leaf certificate too large");
                     memcpy(t->leaf_der, body + pos, ln);
                     t->leaf_len = ln;
                 }
+                if (n < TLS_MAX_CHAIN) { cp[n] = body + pos; cl[n] = ln; }
                 n++;
                 pos += ln;
             }
             got_cert = n > 0;
+            t->chain_len = n;
+            if (got_cert && (verify & TLS_VERIFY_CHAIN)) {
+                if (n > TLS_MAX_CHAIN) return fail(t, "server sent too many certificates");
+                if (verify_chain(t, cp, cl, n) != 0) return -1;
+            }
 
         } else if (type == HS_SERVER_KEY_EXCHANGE) {
             if (blen > TLS_SKE_MAX) return fail(t, "ServerKeyExchange too large");
@@ -350,11 +590,12 @@ static int do_handshake(tls_t *t, int verify_hostname) {
         /* other message types are hashed and ignored */
     }
     if (!got_hello || !got_cert || !got_ske) return fail(t, "server flight missing messages");
+    if ((verify & TLS_VERIFY_CHAIN) && !t->chain_verified) return fail(t, "certificate chain was not verified");
 
     /* ---- leaf certificate ---- */
     mcert_t leaf;
     if (mcert_parse(&leaf, t->leaf_der, t->leaf_len) != 0) return fail(t, "could not parse server certificate");
-    if (verify_hostname && !mcert_match_host(&leaf, t->host)) return fail(t, "certificate is not valid for this host");
+    if ((verify & TLS_VERIFY_HOST) && !mcert_match_host(&leaf, t->host)) return fail(t, "certificate is not valid for this host");
 
     /* ---- ServerKeyExchange: parse + verify signature ---- */
     const uint8_t *ske = t->ske;
@@ -465,12 +706,13 @@ static int do_handshake(tls_t *t, int verify_hostname) {
 
 /* ------------------------------------------------------------ public API */
 int tls_connect_to(tls_t *t, const char *addr, const char *host, uint16_t port,
-                    int timeout_ms, int verify_hostname) {
+                    int timeout_ms, int verify) {
     memset(t, 0, sizeof(*t));
     t->host = host;                                      /* SNI + certificate name check */
+    t->verify = verify;
     t->fd = create_connection(addr, port, timeout_ms);   /* where we actually connect */
     if (t->fd < 0) { note_io_error(t); return fail_io(t, "TCP connect failed"); }
-    if (do_handshake(t, verify_hostname) != 0) {
+    if (do_handshake(t, verify) != 0) {
         sock_close(t->fd);
         t->fd = -1;
         return -1;
@@ -479,8 +721,8 @@ int tls_connect_to(tls_t *t, const char *addr, const char *host, uint16_t port,
     return 0;
 }
 
-int tls_connect(tls_t *t, const char *host, uint16_t port, int timeout_ms, int verify_hostname) {
-    return tls_connect_to(t, host, host, port, timeout_ms, verify_hostname);
+int tls_connect(tls_t *t, const char *host, uint16_t port, int timeout_ms, int verify) {
+    return tls_connect_to(t, host, host, port, timeout_ms, verify);
 }
 
 int tls_sendall(tls_t *t, const void *data, size_t len) {
@@ -510,7 +752,7 @@ ssize_t tls_recv(tls_t *t, void *buf, size_t max) {
 
         uint8_t type; size_t n;
         int r = read_record(t, &type, &n);
-        if (r == -2) { t->peer_closed = 1; return 0; }   /* EOF without close_notify, normal for HTTP/1.0 */
+        if (r == -2) { t->peer_closed = 1; return 0; }   /* EOF without close_notify; callers check tls_clean_close() */
         if (r != 0) { if (!t->errmsg[0]) fail_io(t, "receive error"); return -1; }
         int pl = open_record(t, type, n, t->plain);
         if (pl < 0) return -1;

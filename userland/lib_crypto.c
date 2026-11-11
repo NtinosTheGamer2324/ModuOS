@@ -1,8 +1,9 @@
 // lib_crypto.c -- crypto primitives for lib_tls.c (shared as crypto.sqrl, no entry point)
 //
 // SHA-256 comes from sha256.h. Everything else is here: HMAC, AES-128-GCM,
-// x25519, P-256 (ECDH + ECDSA verify), RSA verify (PKCS#1 v1.5 + PSS), a DER
-// walker for X.509 leaf certs, and a random source (the md64api urandom node).
+// x25519, P-256 / P-384 (ECDH for P-256 only, ECDSA verify for both), RSA verify
+// (PKCS#1 v1.5 + PSS), SHA-384/512, an X.509 walker (leaf + CA certs, chain
+// signature checks) and a random source (the md64api urandom node).
 //
 // Written for clarity first: bignums are 32-bit limbs with Montgomery
 // multiplication, GHASH is bit-serial, scalar multiplication is plain
@@ -456,7 +457,136 @@ static void fld_inv(const fld_t *f, uint32_t *r, const uint32_t *a) {      /* m 
     fld_pow(f, r, a, e, f->n);
 }
 
-/* ================================================================ P-256 */
+/* ================================================================ SHA-384 / SHA-512 */
+/* Needed to check certificate signatures (many CAs sign with SHA-384). */
+static const uint64_t K512[80] = {
+    0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL,
+    0xb5c0fbcfec4d3b2fULL, 0xe9b5dba58189dbbcULL,
+    0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL,
+    0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL,
+    0xd807aa98a3030242ULL, 0x12835b0145706fbeULL,
+    0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL,
+    0x9bdc06a725c71235ULL, 0xc19bf174cf692694ULL,
+    0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL,
+    0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL,
+    0x2de92c6f592b0275ULL, 0x4a7484aa6ea6e483ULL,
+    0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL,
+    0xb00327c898fb213fULL, 0xbf597fc7beef0ee4ULL,
+    0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL,
+    0x06ca6351e003826fULL, 0x142929670a0e6e70ULL,
+    0x27b70a8546d22ffcULL, 0x2e1b21385c26c926ULL,
+    0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL,
+    0x81c2c92e47edaee6ULL, 0x92722c851482353bULL,
+    0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL,
+    0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL,
+    0xd192e819d6ef5218ULL, 0xd69906245565a910ULL,
+    0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL,
+    0x2748774cdf8eeb99ULL, 0x34b0bcb5e19b48a8ULL,
+    0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL,
+    0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL,
+    0x748f82ee5defb2fcULL, 0x78a5636f43172f60ULL,
+    0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL,
+    0xbef9a3f7b2c67915ULL, 0xc67178f2e372532bULL,
+    0xca273eceea26619cULL, 0xd186b8c721c0c207ULL,
+    0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL,
+    0x06f067aa72176fbaULL, 0x0a637dc5a2c898a6ULL,
+    0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL, 0x32caab7b40c72493ULL,
+    0x3c9ebe0a15c9bebcULL, 0x431d67c49c100d4cULL,
+    0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL,
+    0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL,
+};
+static const uint64_t H512_INIT[8] = {
+    0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+    0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+    0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+    0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL,
+};
+static const uint64_t H384_INIT[8] = {
+    0xcbbb9d5dc1059ed8ULL, 0x629a292a367cd507ULL,
+    0x9159015a3070dd17ULL, 0x152fecd8f70e5939ULL,
+    0x67332667ffc00b31ULL, 0x8eb44a8768581511ULL,
+    0xdb0c2e0d64f98fa7ULL, 0x47b5481dbefa4fa4ULL,
+};
+
+typedef struct { uint64_t h[8]; uint64_t len; uint8_t buf[128]; size_t n; } sha512_ctx;
+
+#define ROR64(x, n) (((x) >> (n)) | ((x) << (64 - (n))))
+
+static void sha512_block(sha512_ctx *c, const uint8_t *p) {
+    uint64_t w[80], a, b, cc, d, e, f, g, h;
+    for (int i = 0; i < 16; i++) {
+        w[i] = 0;
+        for (int j = 0; j < 8; j++) w[i] = (w[i] << 8) | p[8 * i + j];
+    }
+    for (int i = 16; i < 80; i++) {
+        uint64_t s0 = ROR64(w[i - 15], 1) ^ ROR64(w[i - 15], 8) ^ (w[i - 15] >> 7);
+        uint64_t s1 = ROR64(w[i - 2], 19) ^ ROR64(w[i - 2], 61) ^ (w[i - 2] >> 6);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = c->h[0]; b = c->h[1]; cc = c->h[2]; d = c->h[3];
+    e = c->h[4]; f = c->h[5]; g = c->h[6]; h = c->h[7];
+    for (int i = 0; i < 80; i++) {
+        uint64_t S1 = ROR64(e, 14) ^ ROR64(e, 18) ^ ROR64(e, 41);
+        uint64_t ch = (e & f) ^ (~e & g);
+        uint64_t t1 = h + S1 + ch + K512[i] + w[i];
+        uint64_t S0 = ROR64(a, 28) ^ ROR64(a, 34) ^ ROR64(a, 39);
+        uint64_t mj = (a & b) ^ (a & cc) ^ (b & cc);
+        uint64_t t2 = S0 + mj;
+        h = g; g = f; f = e; e = d + t1; d = cc; cc = b; b = a; a = t1 + t2;
+    }
+    c->h[0] += a; c->h[1] += b; c->h[2] += cc; c->h[3] += d;
+    c->h[4] += e; c->h[5] += f; c->h[6] += g; c->h[7] += h;
+}
+
+static void sha512_start(sha512_ctx *c, const uint64_t *iv) {
+    memcpy(c->h, iv, 64);
+    c->len = 0;
+    c->n = 0;
+}
+
+static void sha512_feed(sha512_ctx *c, const uint8_t *d, size_t l) {
+    c->len += l;
+    while (l) {
+        size_t t = 128 - c->n;
+        if (t > l) t = l;
+        memcpy(c->buf + c->n, d, t);
+        c->n += t; d += t; l -= t;
+        if (c->n == 128) { sha512_block(c, c->buf); c->n = 0; }
+    }
+}
+
+static void sha512_finish(sha512_ctx *c, uint8_t *out, size_t outlen) {
+    uint64_t bits = c->len * 8;
+    uint8_t pad = 0x80, zero = 0, lb[16];
+    sha512_feed(c, &pad, 1);
+    while (c->n != 112) sha512_feed(c, &zero, 1);
+    memset(lb, 0, 8);                                   /* high 64 bits of the 128-bit length */
+    for (int i = 0; i < 8; i++) lb[8 + i] = (uint8_t)(bits >> (56 - 8 * i));
+    sha512_feed(c, lb, 16);
+    for (size_t i = 0; i < outlen; i++) out[i] = (uint8_t)(c->h[i / 8] >> (56 - 8 * (i % 8)));
+}
+
+void sha512_hash(const uint8_t *msg, size_t len, uint8_t out[64]) {
+    sha512_ctx c;
+    sha512_start(&c, H512_INIT);
+    sha512_feed(&c, msg, len);
+    sha512_finish(&c, out, 64);
+}
+
+void sha384_hash(const uint8_t *msg, size_t len, uint8_t out[48]) {
+    sha512_ctx c;
+    sha512_start(&c, H384_INIT);
+    sha512_feed(&c, msg, len);
+    sha512_finish(&c, out, 48);
+}
+
+/* ================================================================ elliptic curves (P-256, P-384) */
 static const uint8_t P256_P[32]  = {0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
                                     0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff};
 static const uint8_t P256_N[32]  = {0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
@@ -468,21 +598,67 @@ static const uint8_t P256_GX[32] = {0x6b,0x17,0xd1,0xf2,0xe1,0x2c,0x42,0x47,0xf8
 static const uint8_t P256_GY[32] = {0x4f,0xe3,0x42,0xe2,0xfe,0x1a,0x7f,0x9b,0x8e,0xe7,0xeb,0x4a,0x7c,0x0f,0x9e,0x16,
                                     0x2b,0xce,0x33,0x57,0x6b,0x31,0x5e,0xce,0xcb,0xb6,0x40,0x68,0x37,0xbf,0x51,0xf5};
 
-typedef struct { uint32_t x[8], y[8], z[8]; } pt_t;       /* Jacobian, Montgomery form; z==0 is infinity */
+static const uint8_t P384_P[48] = {
+    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xfe,
+    0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,
+};
+static const uint8_t P384_N[48] = {
+    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xc7,0x63,0x4d,0x81,0xf4,0x37,0x2d,0xdf,
+    0x58,0x1a,0x0d,0xb2,0x48,0xb0,0xa7,0x7a,0xec,0xec,0x19,0x6a,0xcc,0xc5,0x29,0x73,
+};
+static const uint8_t P384_B[48] = {
+    0xb3,0x31,0x2f,0xa7,0xe2,0x3e,0xe7,0xe4,0x98,0x8e,0x05,0x6b,0xe3,0xf8,0x2d,0x19,
+    0x18,0x1d,0x9c,0x6e,0xfe,0x81,0x41,0x12,0x03,0x14,0x08,0x8f,0x50,0x13,0x87,0x5a,
+    0xc6,0x56,0x39,0x8d,0x8a,0x2e,0xd1,0x9d,0x2a,0x85,0xc8,0xed,0xd3,0xec,0x2a,0xef,
+};
+static const uint8_t P384_GX[48] = {
+    0xaa,0x87,0xca,0x22,0xbe,0x8b,0x05,0x37,0x8e,0xb1,0xc7,0x1e,0xf3,0x20,0xad,0x74,
+    0x6e,0x1d,0x3b,0x62,0x8b,0xa7,0x9b,0x98,0x59,0xf7,0x41,0xe0,0x82,0x54,0x2a,0x38,
+    0x55,0x02,0xf2,0x5d,0xbf,0x55,0x29,0x6c,0x3a,0x54,0x5e,0x38,0x72,0x76,0x0a,0xb7,
+};
+static const uint8_t P384_GY[48] = {
+    0x36,0x17,0xde,0x4a,0x96,0x26,0x2c,0x6f,0x5d,0x9e,0x98,0xbf,0x92,0x92,0xdc,0x29,
+    0xf8,0xf4,0x1d,0xbd,0x28,0x9a,0x14,0x7c,0xe9,0xda,0x31,0x13,0xb5,0xf0,0xb8,0xc0,
+    0x0a,0x60,0xb1,0xce,0x1d,0x7e,0x81,0x9d,0x7a,0x43,0x1d,0x7c,0x90,0xea,0x0e,0x5f,
+};
 
-static fld_t    g_fp, g_fn;                               /* field mod p, field mod group order n */
-static uint32_t g_b_m[8], g_gx_m[8], g_gy_m[8];
-static int      g_ecc_ready;
 
-static void ecc_init(void) {
-    if (g_ecc_ready) return;
-    uint32_t t[8];
-    bn_from_be(t, 8, P256_P, 32); fld_init(&g_fp, t, 8);
-    bn_from_be(t, 8, P256_N, 32); fld_init(&g_fn, t, 8);
-    bn_from_be(t, 8, P256_B, 32);  fld_to_mont(&g_fp, g_b_m, t);
-    bn_from_be(t, 8, P256_GX, 32); fld_to_mont(&g_fp, g_gx_m, t);
-    bn_from_be(t, 8, P256_GY, 32); fld_to_mont(&g_fp, g_gy_m, t);
-    g_ecc_ready = 1;
+#define EC_MAXL 12                                        /* 384 bits */
+
+typedef struct { uint32_t x[EC_MAXL], y[EC_MAXL], z[EC_MAXL]; } pt_t;   /* Jacobian, Montgomery form; z==0 is infinity */
+
+typedef struct {
+    int      n;                                           /* limbs: 8 (P-256) or 12 (P-384) */
+    fld_t    fp, fn;                                      /* field mod p, field mod group order n */
+    uint32_t b_m[EC_MAXL], gx_m[EC_MAXL], gy_m[EC_MAXL];
+    int      ready;
+} curve_t;
+
+static curve_t  g_c256, g_c384;
+static curve_t *g_cv;                                     /* curve used by the pt_* / ec_* helpers below */
+
+#define NL   (g_cv->n)
+#define NB   (4 * g_cv->n)
+#define g_fp (g_cv->fp)
+#define g_fn (g_cv->fn)
+
+static void ecc_select(int bits) {
+    curve_t *c = (bits == 384) ? &g_c384 : &g_c256;
+    g_cv = c;
+    if (c->ready) return;
+    const uint8_t *P, *N, *B, *GX, *GY;
+    size_t len;
+    if (bits == 384) { P = P384_P; N = P384_N; B = P384_B; GX = P384_GX; GY = P384_GY; len = 48; c->n = 12; }
+    else             { P = P256_P; N = P256_N; B = P256_B; GX = P256_GX; GY = P256_GY; len = 32; c->n = 8; }
+    uint32_t t[EC_MAXL];
+    bn_from_be(t, c->n, P, len);  fld_init(&c->fp, t, c->n);
+    bn_from_be(t, c->n, N, len);  fld_init(&c->fn, t, c->n);
+    bn_from_be(t, c->n, B, len);  fld_to_mont(&c->fp, c->b_m, t);
+    bn_from_be(t, c->n, GX, len); fld_to_mont(&c->fp, c->gx_m, t);
+    bn_from_be(t, c->n, GY, len); fld_to_mont(&c->fp, c->gy_m, t);
+    c->ready = 1;
 }
 
 #define FM(r, a, b) fld_mul(&g_fp, r, a, b)
@@ -490,15 +666,16 @@ static void ecc_init(void) {
 #define FS(r, a, b) fld_sub(&g_fp, r, a, b)
 
 static void pt_set_inf(pt_t *p) {
-    memcpy(p->x, g_fp.one, 32);
-    memcpy(p->y, g_fp.one, 32);
-    memset(p->z, 0, 32);
+    memcpy(p->x, g_fp.one, NB);
+    memcpy(p->y, g_fp.one, NB);
+    memset(p->z, 0, NB);
 }
 
 static void pt_dbl(pt_t *r, const pt_t *p) {
-    if (bn_is_zero(p->z, 8)) { *r = *p; return; }
-    uint32_t delta[8], gamma[8], beta[8], alpha[8], t1[8], t2[8], b2[8], b4[8], b8[8];
-    uint32_t x3[8], y3[8], z3[8], g2[8], g4[8], g8[8];
+    if (bn_is_zero(p->z, NL)) { *r = *p; return; }
+    uint32_t delta[EC_MAXL], gamma[EC_MAXL], beta[EC_MAXL], alpha[EC_MAXL], t1[EC_MAXL], t2[EC_MAXL];
+    uint32_t b2[EC_MAXL], b4[EC_MAXL], b8[EC_MAXL];
+    uint32_t x3[EC_MAXL], y3[EC_MAXL], z3[EC_MAXL], g2[EC_MAXL], g4[EC_MAXL], g8[EC_MAXL];
     FM(delta, p->z, p->z);
     FM(gamma, p->y, p->y);
     FM(beta, p->x, gamma);
@@ -506,7 +683,7 @@ static void pt_dbl(pt_t *r, const pt_t *p) {
     FA(t2, p->x, delta);
     FM(alpha, t1, t2);
     FA(t1, alpha, alpha);
-    FA(alpha, t1, alpha);                                 /* alpha = 3(x-delta)(x+delta) */
+    FA(alpha, t1, alpha);                                 /* alpha = 3(x-delta)(x+delta)  (curve has a = -3) */
     FA(b2, beta, beta); FA(b4, b2, b2); FA(b8, b4, b4);
     FM(t1, alpha, alpha);
     FS(x3, t1, b8);                                       /* x3 = alpha^2 - 8 beta */
@@ -519,14 +696,15 @@ static void pt_dbl(pt_t *r, const pt_t *p) {
     FM(g2, gamma, gamma);
     FA(g4, g2, g2); FA(g4, g4, g4); FA(g8, g4, g4);
     FS(y3, t2, g8);                                       /* y3 = alpha(4beta - x3) - 8 gamma^2 */
-    memcpy(r->x, x3, 32); memcpy(r->y, y3, 32); memcpy(r->z, z3, 32);
+    memcpy(r->x, x3, NB); memcpy(r->y, y3, NB); memcpy(r->z, z3, NB);
 }
 
 static void pt_add(pt_t *r, const pt_t *p, const pt_t *q) {
-    if (bn_is_zero(p->z, 8)) { *r = *q; return; }
-    if (bn_is_zero(q->z, 8)) { *r = *p; return; }
-    uint32_t z1z1[8], z2z2[8], u1[8], u2[8], s1[8], s2[8], h[8], rr[8], i[8], j[8], v[8], t[8], t2[8];
-    uint32_t x3[8], y3[8], z3[8];
+    if (bn_is_zero(p->z, NL)) { *r = *q; return; }
+    if (bn_is_zero(q->z, NL)) { *r = *p; return; }
+    uint32_t z1z1[EC_MAXL], z2z2[EC_MAXL], u1[EC_MAXL], u2[EC_MAXL], s1[EC_MAXL], s2[EC_MAXL];
+    uint32_t h[EC_MAXL], rr[EC_MAXL], i[EC_MAXL], j[EC_MAXL], v[EC_MAXL], t[EC_MAXL], t2[EC_MAXL];
+    uint32_t x3[EC_MAXL], y3[EC_MAXL], z3[EC_MAXL];
     FM(z1z1, p->z, p->z);
     FM(z2z2, q->z, q->z);
     FM(u1, p->x, z2z2);
@@ -535,8 +713,8 @@ static void pt_add(pt_t *r, const pt_t *p, const pt_t *q) {
     FM(t, p->z, z1z1); FM(s2, q->y, t);
     FS(h, u2, u1);
     FS(rr, s2, s1);
-    if (bn_is_zero(h, 8)) {
-        if (bn_is_zero(rr, 8)) { pt_dbl(r, p); return; }
+    if (bn_is_zero(h, NL)) {
+        if (bn_is_zero(rr, NL)) { pt_dbl(r, p); return; }
         pt_set_inf(r);
         return;
     }
@@ -548,15 +726,15 @@ static void pt_add(pt_t *r, const pt_t *p, const pt_t *q) {
     FS(t, v, x3); FM(t, rr, t);
     FM(t2, s1, j); FA(t2, t2, t2); FS(y3, t, t2);
     FA(t, p->z, q->z); FM(t, t, t); FS(t, t, z1z1); FS(t, t, z2z2); FM(z3, t, h);
-    memcpy(r->x, x3, 32); memcpy(r->y, y3, 32); memcpy(r->z, z3, 32);
+    memcpy(r->x, x3, NB); memcpy(r->y, y3, NB); memcpy(r->z, z3, NB);
 }
 
 /* r = k * (px, py); k plain little-endian limbs, px/py Montgomery affine */
-static void ec_mul(pt_t *r, const uint32_t k[8], const uint32_t *px, const uint32_t *py) {
+static void ec_mul(pt_t *r, const uint32_t *k, const uint32_t *px, const uint32_t *py) {
     pt_t acc, base;
-    memcpy(base.x, px, 32); memcpy(base.y, py, 32); memcpy(base.z, g_fp.one, 32);
+    memcpy(base.x, px, NB); memcpy(base.y, py, NB); memcpy(base.z, g_fp.one, NB);
     pt_set_inf(&acc);
-    for (int i = 255; i >= 0; i--) {
+    for (int i = NL * 32 - 1; i >= 0; i--) {
         pt_dbl(&acc, &acc);
         if ((k[i >> 5] >> (i & 31)) & 1) pt_add(&acc, &acc, &base);
     }
@@ -564,9 +742,9 @@ static void ec_mul(pt_t *r, const uint32_t k[8], const uint32_t *px, const uint3
 }
 
 /* Jacobian -> affine, plain (non-Montgomery) limbs. Fails on infinity. */
-static int pt_affine(const pt_t *p, uint32_t x[8], uint32_t y[8]) {
-    if (bn_is_zero(p->z, 8)) return -1;
-    uint32_t zi[8], zi2[8], zi3[8], t[8];
+static int pt_affine(const pt_t *p, uint32_t *x, uint32_t *y) {
+    if (bn_is_zero(p->z, NL)) return -1;
+    uint32_t zi[EC_MAXL], zi2[EC_MAXL], zi3[EC_MAXL], t[EC_MAXL];
     fld_inv(&g_fp, zi, p->z);
     FM(zi2, zi, zi);
     FM(zi3, zi2, zi);
@@ -576,31 +754,31 @@ static int pt_affine(const pt_t *p, uint32_t x[8], uint32_t y[8]) {
 }
 
 /* Validate and load an uncompressed point into Montgomery coordinates. */
-static int pt_load(const uint8_t *b, uint32_t xm[8], uint32_t ym[8]) {
-    uint32_t x[8], y[8], l[8], r[8], t[8];
+static int pt_load(const uint8_t *b, uint32_t *xm, uint32_t *ym) {
+    uint32_t x[EC_MAXL], y[EC_MAXL], l[EC_MAXL], r[EC_MAXL], t[EC_MAXL];
     if (b[0] != 4) return -1;
-    bn_from_be(x, 8, b + 1, 32);
-    bn_from_be(y, 8, b + 33, 32);
-    if (bn_cmp(x, g_fp.m, 8) >= 0 || bn_cmp(y, g_fp.m, 8) >= 0) return -1;
+    bn_from_be(x, NL, b + 1, NB);
+    bn_from_be(y, NL, b + 1 + NB, NB);
+    if (bn_cmp(x, g_fp.m, NL) >= 0 || bn_cmp(y, g_fp.m, NL) >= 0) return -1;
     fld_to_mont(&g_fp, xm, x);
     fld_to_mont(&g_fp, ym, y);
     FM(l, ym, ym);                                        /* y^2 */
     FM(t, xm, xm); FM(r, t, xm);                          /* x^3 */
     FA(t, xm, xm); FA(t, t, xm);                          /* 3x */
     FS(r, r, t);
-    FA(r, r, g_b_m);                                      /* x^3 - 3x + b */
-    return bn_cmp(l, r, 8) == 0 ? 0 : -1;
+    FA(r, r, g_cv->b_m);                                  /* x^3 - 3x + b */
+    return bn_cmp(l, r, NL) == 0 ? 0 : -1;
 }
 
 int p256_keypair(uint8_t priv[32], uint8_t pub[65]) {
-    ecc_init();
-    uint32_t k[8], x[8], y[8];
+    ecc_select(256);
+    uint32_t k[EC_MAXL], x[EC_MAXL], y[EC_MAXL];
     pt_t p;
     for (int tries = 0; tries < 100; tries++) {
         if (random_bytes(priv, 32) != 0) return -1;
         bn_from_be(k, 8, priv, 32);
         if (bn_is_zero(k, 8) || bn_cmp(k, g_fn.m, 8) >= 0) continue;
-        ec_mul(&p, k, g_gx_m, g_gy_m);
+        ec_mul(&p, k, g_cv->gx_m, g_cv->gy_m);
         if (pt_affine(&p, x, y) != 0) continue;
         pub[0] = 4;
         bn_to_be(pub + 1, 32, x, 8);
@@ -611,8 +789,8 @@ int p256_keypair(uint8_t priv[32], uint8_t pub[65]) {
 }
 
 int p256_shared(const uint8_t priv[32], const uint8_t peer[65], uint8_t out[32]) {
-    ecc_init();
-    uint32_t k[8], xm[8], ym[8], x[8], y[8];
+    ecc_select(256);
+    uint32_t k[EC_MAXL], xm[EC_MAXL], ym[EC_MAXL], x[EC_MAXL], y[EC_MAXL];
     pt_t p;
     if (pt_load(peer, xm, ym) != 0) return -1;
     bn_from_be(k, 8, priv, 32);
@@ -657,6 +835,7 @@ static int parse_spki(mcert_t *c, const uint8_t *v, size_t l) {
     static const uint8_t oid_rsa[9]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x01};
     static const uint8_t oid_ec[7]   = {0x2a,0x86,0x48,0xce,0x3d,0x02,0x01};
     static const uint8_t oid_p256[8] = {0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07};
+    static const uint8_t oid_p384[5] = {0x2b,0x81,0x04,0x00,0x22};
     const uint8_t *p = v, *end = v + l, *alg, *key, *oid, *par;
     size_t alen, klen, olen, plen;
     if (der_expect(&p, end, 0x30, &alg, &alen) != 0) return -1;
@@ -679,10 +858,133 @@ static int parse_spki(mcert_t *c, const uint8_t *v, size_t l) {
         c->rsa_n = n; c->rsa_n_len = nlen;
         c->rsa_e = e; c->rsa_e_len = elen;
     } else if (olen == 7 && bytes_eq(oid, oid_ec, 7)) {
-        if (der_expect(&ap, aend, 0x06, &par, &plen) == 0 && plen == 8 && bytes_eq(par, oid_p256, 8) &&
-            klen == 65 && key[0] == 4) {
-            c->key_type = MC_KEY_EC_P256;
-            c->ec_point = key;
+        if (der_expect(&ap, aend, 0x06, &par, &plen) == 0) {
+            if (plen == 8 && bytes_eq(par, oid_p256, 8) && klen == 65 && key[0] == 4) {
+                c->key_type = MC_KEY_EC_P256;
+                c->ec_point = key;
+            } else if (plen == 5 && bytes_eq(par, oid_p384, 5) && klen == 97 && key[0] == 4) {
+                c->key_type = MC_KEY_EC_P384;
+                c->ec_point = key;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ---- times ---- */
+static int64_t days_from_civil(int64_t y, int m, int d) {
+    y -= (m <= 2);
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/* UTCTime (0x17) "YYMMDDHHMMSSZ" or GeneralizedTime (0x18) "YYYYMMDDHHMMSSZ". */
+static int parse_time(uint8_t tag, const uint8_t *v, size_t l, int64_t *out) {
+    size_t want = (tag == 0x17) ? 13 : 15;
+    if ((tag != 0x17 && tag != 0x18) || l != want || v[l - 1] != 'Z') return -1;
+    int dig[14], nd = (int)(l - 1);
+    for (int i = 0; i < nd; i++) {
+        if (v[i] < '0' || v[i] > '9') return -1;
+        dig[i] = v[i] - '0';
+    }
+    int k = 0;
+    int64_t year;
+    if (tag == 0x17) {
+        int yy = dig[0] * 10 + dig[1];
+        year = (yy >= 50) ? 1900 + yy : 2000 + yy;
+        k = 2;
+    } else {
+        year = dig[0] * 1000 + dig[1] * 100 + dig[2] * 10 + dig[3];
+        k = 4;
+    }
+    int mo = dig[k] * 10 + dig[k + 1];
+    int dd = dig[k + 2] * 10 + dig[k + 3];
+    int hh = dig[k + 4] * 10 + dig[k + 5];
+    int mi = dig[k + 6] * 10 + dig[k + 7];
+    int ss = dig[k + 8] * 10 + dig[k + 9];
+    if (mo < 1 || mo > 12 || dd < 1 || dd > 31 || hh > 23 || mi > 59 || ss > 60) return -1;
+    *out = days_from_civil(year, mo, dd) * 86400 + hh * 3600 + mi * 60 + ss;
+    return 0;
+}
+
+/* ---- signature algorithm identifiers (contents of an AlgorithmIdentifier) ---- */
+static int sigalg_id(const uint8_t *alg, size_t len) {
+    static const uint8_t rsa_pfx[8]   = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01};   /* + 0x0b/0x0c/0x0d */
+    static const uint8_t ecdsa_pfx[7] = {0x2a,0x86,0x48,0xce,0x3d,0x04,0x03};         /* + 0x02/0x03/0x04 */
+    const uint8_t *p = alg, *end = alg + len, *oid;
+    size_t olen;
+    if (der_expect(&p, end, 0x06, &oid, &olen) != 0) return MC_SIG_NONE;
+    size_t rest = (size_t)(end - p);
+    if (olen == 9 && bytes_eq(oid, rsa_pfx, 8) && oid[8] >= 0x0b && oid[8] <= 0x0d) {
+        if (!(rest == 0 || (rest == 2 && p[0] == 0x05 && p[1] == 0x00))) return MC_SIG_NONE;   /* params must be NULL */
+        return MC_SIG_RSA_SHA256 + (oid[8] - 0x0b);
+    }
+    if (olen == 8 && bytes_eq(oid, ecdsa_pfx, 7) && oid[7] >= 0x02 && oid[7] <= 0x04) {
+        if (rest != 0) return MC_SIG_NONE;                                                      /* params must be absent */
+        return MC_SIG_ECDSA_SHA256 + (oid[7] - 0x02);
+    }
+    return MC_SIG_NONE;                                   /* SHA-1, MD5, RSASSA-PSS, ... : rejected */
+}
+
+/* ---- extensions ---- */
+static int parse_extensions(mcert_t *c) {
+    static const uint8_t oid_bc[3]  = {0x55, 0x1d, 0x13};
+    static const uint8_t oid_ku[3]  = {0x55, 0x1d, 0x0f};
+    static const uint8_t oid_eku[3] = {0x55, 0x1d, 0x25};
+    static const uint8_t eku_server[8] = {0x2b,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
+    static const uint8_t eku_any[4]    = {0x55,0x1d,0x25,0x00};
+    c->path_len = -1;
+    if (!c->exts) return 0;
+    const uint8_t *p = c->exts, *end = c->exts + c->exts_len;
+    while (p < end) {
+        const uint8_t *ext, *oid, *val, *inner;
+        size_t elen, olen, vlen, ilen;
+        uint8_t tag;
+        if (der_expect(&p, end, 0x30, &ext, &elen) != 0) return -1;
+        const uint8_t *ep = ext, *eend = ext + elen;
+        if (der_expect(&ep, eend, 0x06, &oid, &olen) != 0) return -1;
+        if (der_read(&ep, eend, &tag, &val, &vlen) != 0) return -1;
+        if (tag == 0x01 && der_read(&ep, eend, &tag, &val, &vlen) != 0) return -1;   /* skip "critical" */
+        if (tag != 0x04) return -1;                                                  /* extnValue OCTET STRING */
+
+        if (olen == 3 && bytes_eq(oid, oid_bc, 3)) {
+            const uint8_t *bp = val, *bend = val + vlen;
+            if (der_expect(&bp, bend, 0x30, &inner, &ilen) != 0) return -1;
+            const uint8_t *ip = inner, *iend = inner + ilen, *iv;
+            size_t il;
+            c->has_bc = 1;
+            c->is_ca = 0;
+            if (ip < iend && *ip == 0x01) {                                           /* cA BOOLEAN */
+                if (der_expect(&ip, iend, 0x01, &iv, &il) != 0 || il != 1) return -1;
+                c->is_ca = iv[0] != 0;
+            }
+            if (ip < iend && *ip == 0x02) {                                           /* pathLenConstraint */
+                if (der_expect(&ip, iend, 0x02, &iv, &il) != 0 || il < 1 || il > 2 || (iv[0] & 0x80)) return -1;
+                c->path_len = (il == 1) ? iv[0] : (iv[0] << 8) | iv[1];
+            }
+        } else if (olen == 3 && bytes_eq(oid, oid_ku, 3)) {
+            const uint8_t *kp = val, *kend = val + vlen;
+            if (der_expect(&kp, kend, 0x03, &inner, &ilen) != 0 || ilen < 2) return -1;
+            unsigned bits = 0;
+            for (size_t i = 1; i < ilen && i <= 2; i++)                               /* bit n lives in byte n/8, MSB first */
+                for (int b = 0; b < 8; b++)
+                    if (inner[i] & (0x80 >> b)) bits |= 1u << ((i - 1) * 8 + b);
+            c->has_ku = 1;
+            c->key_usage = bits;
+        } else if (olen == 3 && bytes_eq(oid, oid_eku, 3)) {
+            const uint8_t *kp = val, *kend = val + vlen;
+            if (der_expect(&kp, kend, 0x30, &inner, &ilen) != 0) return -1;
+            const uint8_t *ip = inner, *iend = inner + ilen, *iv;
+            size_t il;
+            c->has_eku = 1;
+            while (ip < iend) {
+                if (der_expect(&ip, iend, 0x06, &iv, &il) != 0) return -1;
+                if ((il == 8 && bytes_eq(iv, eku_server, 8)) || (il == 4 && bytes_eq(iv, eku_any, 4)))
+                    c->eku_server_auth = 1;
+            }
         }
     }
     return 0;
@@ -692,20 +994,34 @@ int mcert_parse(mcert_t *c, const uint8_t *der, size_t der_len) {
     memset(c, 0, sizeof(*c));
     c->der = der;
     c->der_len = der_len;
+    c->path_len = -1;
     const uint8_t *p = der, *end = der + der_len, *v;
     size_t l;
     uint8_t tag;
 
     if (der_expect(&p, end, 0x30, &v, &l) != 0) return -1;          /* Certificate */
-    p = v; end = v + l;
-    if (der_expect(&p, end, 0x30, &v, &l) != 0) return -1;          /* TBSCertificate */
+    const uint8_t *op = v, *oend = v + l;                           /* walk the outer SEQUENCE later for sigalg + signature */
+
+    const uint8_t *tbs_start = op;
+    if (der_expect(&op, oend, 0x30, &v, &l) != 0) return -1;        /* TBSCertificate */
+    c->tbs = tbs_start;
+    c->tbs_len = (size_t)(op - tbs_start);
     p = v; end = v + l;
 
     if (p < end && *p == 0xa0 && der_read(&p, end, &tag, &v, &l) != 0) return -1;   /* [0] version */
     if (der_expect(&p, end, 0x02, &v, &l) != 0) return -1;          /* serial */
     if (der_expect(&p, end, 0x30, &v, &l) != 0) return -1;          /* signature alg */
+    c->tbs_sigalg = v; c->tbs_sigalg_len = l;
     if (der_expect(&p, end, 0x30, &v, &l) != 0) return -1;          /* issuer */
+    c->issuer = v; c->issuer_len = l;
     if (der_expect(&p, end, 0x30, &v, &l) != 0) return -1;          /* validity */
+    {
+        const uint8_t *vp = v, *vend = v + l, *tv;
+        size_t tl;
+        uint8_t tt;
+        if (der_read(&vp, vend, &tt, &tv, &tl) != 0 || parse_time(tt, tv, tl, &c->not_before) != 0) return -1;
+        if (der_read(&vp, vend, &tt, &tv, &tl) != 0 || parse_time(tt, tv, tl, &c->not_after) != 0) return -1;
+    }
     if (der_expect(&p, end, 0x30, &v, &l) != 0) return -1;          /* subject */
     c->subject = v; c->subject_len = l;
     if (der_expect(&p, end, 0x30, &v, &l) != 0) return -1;          /* SubjectPublicKeyInfo */
@@ -720,7 +1036,15 @@ int mcert_parse(mcert_t *c, const uint8_t *der, size_t der_len) {
             c->exts = seq; c->exts_len = slen;
         }
     }
-    return 0;
+
+    /* outer signatureAlgorithm + signatureValue */
+    if (der_expect(&op, oend, 0x30, &v, &l) != 0) return -1;
+    c->sigalg = v; c->sigalg_len = l;
+    if (der_expect(&op, oend, 0x03, &v, &l) != 0 || l < 1 || v[0] != 0) return -1;
+    c->sig = v + 1; c->sig_len = l - 1;
+    c->sig_alg = sigalg_id(c->sigalg, c->sigalg_len);
+
+    return parse_extensions(c);
 }
 
 static char lc(char ch) { return (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch; }
@@ -743,10 +1067,30 @@ static int name_matches(const uint8_t *name, size_t nlen, const char *host) {
     return 1;
 }
 
+/* "a.b.c.d" -> 4 bytes. 0 if `s` is not a dotted-quad IPv4 literal. */
+static int parse_ipv4(const char *s, uint8_t out[4]) {
+    int part = 0;
+    unsigned val = 0, digits = 0;
+    for (;; s++) {
+        if (*s >= '0' && *s <= '9') {
+            val = val * 10 + (unsigned)(*s - '0');
+            if (++digits > 3 || val > 255) return 0;
+        } else if (*s == '.' || *s == 0) {
+            if (digits == 0 || part > 3) return 0;
+            out[part++] = (uint8_t)val;
+            val = 0; digits = 0;
+            if (*s == 0) break;
+        } else return 0;
+    }
+    return part == 4;
+}
+
 int mcert_match_host(const mcert_t *c, const char *host) {
     static const uint8_t oid_san[3] = {0x55, 0x1d, 0x11};
     static const uint8_t oid_cn[3]  = {0x55, 0x04, 0x03};
     int have_san = 0;
+    uint8_t ip[4];
+    int host_is_ip = parse_ipv4(host, ip);
 
     const uint8_t *p = c->exts, *end = c->exts + c->exts_len;
     while (c->exts && p < end) {
@@ -766,10 +1110,13 @@ int mcert_match_host(const mcert_t *c, const char *host) {
         have_san = 1;
         const uint8_t *np = names, *nend = names + nlen, *nv;
         size_t nvl;
-        while (np < nend && der_read(&np, nend, &tag, &nv, &nvl) == 0)
-            if (tag == 0x82 && name_matches(nv, nvl, host)) return 1;
+        while (np < nend && der_read(&np, nend, &tag, &nv, &nvl) == 0) {
+            if (host_is_ip) {
+                if (tag == 0x87 && nvl == 4 && bytes_eq(nv, ip, 4)) return 1;       /* iPAddress */
+            } else if (tag == 0x82 && name_matches(nv, nvl, host)) return 1;        /* dNSName */
+        }
     }
-    if (have_san) return 0;
+    if (have_san || host_is_ip) return 0;
 
     /* no SAN extension: subject CN (legacy) */
     p = c->subject; end = c->subject + c->subject_len;
@@ -788,51 +1135,50 @@ int mcert_match_host(const mcert_t *c, const char *host) {
     return 0;
 }
 
-/* ================================================================ signatures */
-static int ecdsa_p256_sha256_verify(const mcert_t *cert, const uint8_t *msg, size_t msg_len,
-                                    const uint8_t *sig, size_t sig_len) {
-    if (cert->key_type != MC_KEY_EC_P256) return -1;
-    ecc_init();
-
-    const uint8_t *p = sig, *end = sig + sig_len, *seq, *rb, *sb;
-    size_t slen, rl, sl;
-    if (der_expect(&p, end, 0x30, &seq, &slen) != 0) return -1;
-    const uint8_t *sp = seq, *send = seq + slen;
-    if (der_expect(&sp, send, 0x02, &rb, &rl) != 0) return -1;
-    if (der_expect(&sp, send, 0x02, &sb, &sl) != 0) return -1;
-    strip_zeros(&rb, &rl); strip_zeros(&sb, &sl);
-    if (rl > 32 || sl > 32) return -1;
-
-    uint32_t r[8], s[8], z[8], qx[8], qy[8];
-    bn_from_be(r, 8, rb, rl);
-    bn_from_be(s, 8, sb, sl);
-    if (bn_is_zero(r, 8) || bn_is_zero(s, 8) || bn_cmp(r, g_fn.m, 8) >= 0 || bn_cmp(s, g_fn.m, 8) >= 0) return -1;
-    if (pt_load(cert->ec_point, qx, qy) != 0) return -1;
-
-    uint8_t h[32];
-    sha256(msg, msg_len, h);
-    bn_from_be(z, 8, h, 32);
-    if (bn_cmp(z, g_fn.m, 8) >= 0) bn_sub(z, z, g_fn.m, 8);
-
-    uint32_t sm[8], w[8], zm[8], rm[8], u1m[8], u2m[8], u1[8], u2[8];
-    fld_to_mont(&g_fn, sm, s);
-    fld_inv(&g_fn, w, sm);
-    fld_to_mont(&g_fn, zm, z);
-    fld_to_mont(&g_fn, rm, r);
-    fld_mul(&g_fn, u1m, zm, w);
-    fld_mul(&g_fn, u2m, rm, w);
-    fld_from_mont(&g_fn, u1, u1m);
-    fld_from_mont(&g_fn, u2, u2m);
-
-    pt_t a, b;
-    ec_mul(&a, u1, g_gx_m, g_gy_m);
-    ec_mul(&b, u2, qx, qy);
-    pt_add(&a, &a, &b);
-    uint32_t x[8], y[8];
-    if (pt_affine(&a, x, y) != 0) return -1;
-    if (bn_cmp(x, g_fn.m, 8) >= 0) bn_sub(x, x, g_fn.m, 8);
-    return bn_cmp(x, r, 8) == 0 ? 0 : -1;
+/* ---- names ---- */
+int mcert_name_equal(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+    return alen == blen && alen > 0 && bytes_eq(a, b, alen);
 }
+
+/* Copies the CN (or, failing that, the O) of a Name's contents into `out` as printable ASCII. */
+void mcert_name_label(const uint8_t *name, size_t nlen, char *out, size_t cap) {
+    static const uint8_t oid_cn[3] = {0x55, 0x04, 0x03};
+    static const uint8_t oid_o[3]  = {0x55, 0x04, 0x0a};
+    const uint8_t *found = NULL;
+    size_t found_len = 0;
+    int have_cn = 0;
+    const uint8_t *p = name, *end = name + nlen;
+    while (p < end) {
+        const uint8_t *set, *seq, *oid, *val;
+        size_t slen, qlen, olen, vlen;
+        uint8_t tag;
+        if (der_expect(&p, end, 0x31, &set, &slen) != 0) break;
+        const uint8_t *sp = set, *send = set + slen;
+        if (der_expect(&sp, send, 0x30, &seq, &qlen) != 0) continue;
+        const uint8_t *qp = seq, *qend = seq + qlen;
+        if (der_expect(&qp, qend, 0x06, &oid, &olen) != 0 || olen != 3) continue;
+        if (der_read(&qp, qend, &tag, &val, &vlen) != 0) continue;
+        if (bytes_eq(oid, oid_cn, 3)) { found = val; found_len = vlen; have_cn = 1; }
+        else if (bytes_eq(oid, oid_o, 3) && !have_cn) { found = val; found_len = vlen; }
+    }
+    size_t o = 0;
+    if (cap == 0) return;
+    if (!found) { const char *u = "(unnamed)"; while (*u && o + 1 < cap) out[o++] = *u++; }
+    for (size_t i = 0; found && i < found_len && o + 1 < cap; i++)
+        out[o++] = (found[i] >= 32 && found[i] < 127) ? (char)found[i] : '?';
+    out[o] = 0;
+}
+
+int mcert_check_dates(const mcert_t *c, int64_t now) {
+    if (now < c->not_before) return 1;       /* not yet valid */
+    if (now > c->not_after)  return 2;       /* expired */
+    return 0;
+}
+
+/* ================================================================ signatures */
+static int rsa_pkcs1_verify_digest(const mcert_t *c, const uint8_t *prefix, size_t plen,
+                                   const uint8_t *h, size_t hlen,
+                                   const uint8_t *sig, size_t sig_len);
 
 static fld_t g_frsa;
 
@@ -868,21 +1214,32 @@ static int rsa_public(const mcert_t *c, const uint8_t *sig, size_t sig_len, uint
     return 0;
 }
 
-static int rsa_pkcs1_sha256_verify(const mcert_t *c, const uint8_t *msg, size_t msg_len,
+/* DigestInfo prefixes for EMSA-PKCS1-v1_5 */
+static const uint8_t DI_SHA256[19] = {0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20};
+static const uint8_t DI_SHA384[19] = {0x30,0x41,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x02,0x05,0x00,0x04,0x30};
+static const uint8_t DI_SHA512[19] = {0x30,0x51,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x03,0x05,0x00,0x04,0x40};
+
+static int rsa_pkcs1_verify_digest(const mcert_t *c, const uint8_t *prefix, size_t plen,
+                                   const uint8_t *h, size_t hlen,
                                    const uint8_t *sig, size_t sig_len) {
-    static const uint8_t prefix[19] = {0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20};
-    uint8_t em[512], want[512], h[32];
+    uint8_t em[512], want[512];
     size_t k;
     if (rsa_public(c, sig, sig_len, em, &k) != 0) return -1;
-    sha256(msg, msg_len, h);
-    if (k < 3 + 8 + 19 + 32) return -1;
-    size_t ps = k - 3 - 19 - 32;
+    if (k < 3 + 8 + plen + hlen) return -1;
+    size_t ps = k - 3 - plen - hlen;
     want[0] = 0; want[1] = 1;
     memset(want + 2, 0xff, ps);
     want[2 + ps] = 0;
-    memcpy(want + 3 + ps, prefix, 19);
-    memcpy(want + 3 + ps + 19, h, 32);
+    memcpy(want + 3 + ps, prefix, plen);
+    memcpy(want + 3 + ps + plen, h, hlen);
     return bytes_eq(em, want, k) ? 0 : -1;
+}
+
+static int rsa_pkcs1_sha256_verify(const mcert_t *c, const uint8_t *msg, size_t msg_len,
+                                   const uint8_t *sig, size_t sig_len) {
+    uint8_t h[32];
+    sha256(msg, msg_len, h);
+    return rsa_pkcs1_verify_digest(c, DI_SHA256, 19, h, 32, sig, sig_len);
 }
 
 static void mgf1_sha256(const uint8_t *seed, size_t seed_len, uint8_t *out, size_t len) {
@@ -939,12 +1296,86 @@ static int rsa_pss_sha256_verify(const mcert_t *c, const uint8_t *msg, size_t ms
     return bytes_eq(hh, H, hlen) ? 0 : -1;
 }
 
+/* ECDSA verify over an already-computed digest. The curve comes from the key. */
+static int ecdsa_verify_hash(const mcert_t *cert, const uint8_t *hash, size_t hlen,
+                             const uint8_t *sig, size_t sig_len) {
+    if (cert->key_type == MC_KEY_EC_P256)      ecc_select(256);
+    else if (cert->key_type == MC_KEY_EC_P384) ecc_select(384);
+    else return -1;
+    const int nl = NL;
+    const size_t nb = (size_t)NB;
+
+    const uint8_t *p = sig, *end = sig + sig_len, *seq, *rb, *sb;
+    size_t slen, rl, sl;
+    if (der_expect(&p, end, 0x30, &seq, &slen) != 0) return -1;
+    const uint8_t *sp = seq, *send = seq + slen;
+    if (der_expect(&sp, send, 0x02, &rb, &rl) != 0) return -1;
+    if (der_expect(&sp, send, 0x02, &sb, &sl) != 0) return -1;
+    strip_zeros(&rb, &rl); strip_zeros(&sb, &sl);
+    if (rl > nb || sl > nb) return -1;
+
+    uint32_t r[EC_MAXL], s[EC_MAXL], z[EC_MAXL], qx[EC_MAXL], qy[EC_MAXL];
+    bn_from_be(r, nl, rb, rl);
+    bn_from_be(s, nl, sb, sl);
+    if (bn_is_zero(r, nl) || bn_is_zero(s, nl) || bn_cmp(r, g_fn.m, nl) >= 0 || bn_cmp(s, g_fn.m, nl) >= 0) return -1;
+    if (pt_load(cert->ec_point, qx, qy) != 0) return -1;
+
+    /* leftmost min(hlen, order size) bytes of the digest (both orders are whole bytes) */
+    bn_from_be(z, nl, hash, hlen < nb ? hlen : nb);
+    if (bn_cmp(z, g_fn.m, nl) >= 0) bn_sub(z, z, g_fn.m, nl);
+
+    uint32_t sm[EC_MAXL], w[EC_MAXL], zm[EC_MAXL], rm[EC_MAXL], u1m[EC_MAXL], u2m[EC_MAXL], u1[EC_MAXL], u2[EC_MAXL];
+    fld_to_mont(&g_fn, sm, s);
+    fld_inv(&g_fn, w, sm);
+    fld_to_mont(&g_fn, zm, z);
+    fld_to_mont(&g_fn, rm, r);
+    fld_mul(&g_fn, u1m, zm, w);
+    fld_mul(&g_fn, u2m, rm, w);
+    fld_from_mont(&g_fn, u1, u1m);
+    fld_from_mont(&g_fn, u2, u2m);
+
+    pt_t a, b;
+    ec_mul(&a, u1, g_cv->gx_m, g_cv->gy_m);
+    ec_mul(&b, u2, qx, qy);
+    pt_add(&a, &a, &b);
+    uint32_t x[EC_MAXL], y[EC_MAXL];
+    if (pt_affine(&a, x, y) != 0) return -1;
+    if (bn_cmp(x, g_fn.m, nl) >= 0) bn_sub(x, x, g_fn.m, nl);
+    return bn_cmp(x, r, nl) == 0 ? 0 : -1;
+}
+
 int verify_signature(const mcert_t *leaf, uint16_t scheme, const uint8_t *msg, size_t msg_len,
                      const uint8_t *sig, size_t sig_len) {
     switch (scheme) {
-    case 0x0403: return ecdsa_p256_sha256_verify(leaf, msg, msg_len, sig, sig_len);
+    case 0x0403: {                                        /* ecdsa_secp256r1_sha256: key must be P-256 */
+        uint8_t h[32];
+        if (leaf->key_type != MC_KEY_EC_P256) return -1;
+        sha256(msg, msg_len, h);
+        return ecdsa_verify_hash(leaf, h, 32, sig, sig_len);
+    }
     case 0x0804: return rsa_pss_sha256_verify(leaf, msg, msg_len, sig, sig_len);
     case 0x0401: return rsa_pkcs1_sha256_verify(leaf, msg, msg_len, sig, sig_len);
     default:     return -1;
     }
+}
+
+/* Is `cert`'s signature (over its TBSCertificate) valid under `issuer`'s public key? */
+int mcert_verify_issued_by(const mcert_t *cert, const mcert_t *issuer) {
+    uint8_t h[64];
+    size_t hlen;
+    int alg = cert->sig_alg;
+    if (alg == MC_SIG_NONE || !cert->tbs || !cert->sig) return -1;
+    /* the AlgorithmIdentifier inside the TBS must match the outer one */
+    if (cert->tbs_sigalg_len != cert->sigalg_len || !bytes_eq(cert->tbs_sigalg, cert->sigalg, cert->sigalg_len)) return -1;
+
+    int hash_bits = 256 + 128 * ((alg - 1) % 3);          /* 256 / 384 / 512 */
+    if (hash_bits == 256)      { sha256(cert->tbs, cert->tbs_len, h); hlen = 32; }
+    else if (hash_bits == 384) { sha384_hash(cert->tbs, cert->tbs_len, h); hlen = 48; }
+    else                       { sha512_hash(cert->tbs, cert->tbs_len, h); hlen = 64; }
+
+    if (alg >= MC_SIG_RSA_SHA256 && alg <= MC_SIG_RSA_SHA512) {
+        const uint8_t *di = hash_bits == 256 ? DI_SHA256 : hash_bits == 384 ? DI_SHA384 : DI_SHA512;
+        return rsa_pkcs1_verify_digest(issuer, di, 19, h, hlen, cert->sig, cert->sig_len);
+    }
+    return ecdsa_verify_hash(issuer, h, hlen, cert->sig, cert->sig_len);
 }
