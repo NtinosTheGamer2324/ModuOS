@@ -1,40 +1,18 @@
-// userctl_service.c
+// userctl_service.c - account database and authentication service (SHM IPC)
 #include "libc/libc.h"
 #include "errno.h"
 #include "libc/string.h"
 #include <stdint.h>
 #include "sha256.h"
+#include "userctl_ipc.h"
 
 #define USER_BASE_DIR "/ModuOS/System64/Auth/usr"
 #define MAX_USERS 256
 
-typedef enum {
-    CMD_GETUSERNAME,
-    CMD_LOGIN,
-    CMD_SETPASSWORD,
-    CMD_CREATEUSER,
-    CMD_DELETEUSER,
-    CMD_WHOAMI,
-} uctl_cmd_t;
-
-typedef struct {
-    uctl_cmd_t cmd;
-    uint64_t intarg;
-    uint32_t caller_pid;   /* client fills this with its own getpid() */
-    char arg1[32];
-    char arg2[32];
-    char arg3[32];
-} uctl_packet_t;
-
-typedef struct {
-    char type1ret[32];
-    uint64_t type2ret;
-    uint64_t callerpid;
-} uctl_ret_t;
-
 typedef struct {
     char username[32];
     uint64_t uid;
+    uint64_t gid;
     char salt_hex[33];
     char hash_hex[65];
     char groups[64];
@@ -76,7 +54,7 @@ static int dbuf_append(dbuf_t *b, const char *s, size_t n) {
 
 typedef struct {
     char key[32];
-    char value[64];
+    char value[96]; /* must hold a 64-char hex hash plus NUL */
 } scf_kv_t;
 
 typedef struct {
@@ -199,20 +177,44 @@ static void bytes_to_hex(const uint8_t *bytes, size_t n, char *out_hex) {
     out_hex[n*2] = 0;
 }
 
-static void generate_salt_hex(char *salt_hex, size_t salt_hex_sz) {
-    if (!salt_hex || salt_hex_sz < 33) return;
-    uint8_t salt_bytes[16];
+#define URANDOM_PATH "$/dev/md64api/urandom"
 
-    for (int i = 0; i < 2; i++) {
-        uint64_t rand_val;
-        int attempts = 0;
-        while (!rdrand64(&rand_val) && attempts++ < 10);
-        if (attempts >= 10)
-            rand_val = (uint64_t)__builtin_ia32_rdtsc();
-        memcpy(salt_bytes + i * 8, &rand_val, 8);
+static int random_bytes(void *buf, size_t len) {
+    int fd = open(URANDOM_PATH, O_RDONLY, 0);
+    if (fd < 0) return -1;
+
+    uint8_t *p = buf;
+    size_t done = 0;
+
+    while (done < len) {
+        ssize_t n = read(fd, p + done, len - done);
+
+        if (n <= 0) {
+            close(fd);
+            memset(buf, 0, len);
+            return -1;
+        }
+
+        done += (size_t)n;
     }
 
-    bytes_to_hex(salt_bytes, 16, salt_hex);
+    close(fd);
+    return 0;
+}
+
+static int generate_salt_hex(char *salt_hex, size_t salt_hex_sz) {
+    if (!salt_hex || salt_hex_sz < 33)
+        return -1;
+
+    uint8_t salt_bytes[16];
+
+    if (random_bytes(salt_bytes, sizeof(salt_bytes)) != 0)
+        return -1;
+
+    bytes_to_hex(salt_bytes, sizeof(salt_bytes), salt_hex);
+    memset(salt_bytes, 0, sizeof(salt_bytes));
+
+    return 0;
 }
 
 /* password hash = SHA256(salt_hex || password), stored as 64 hex chars */
@@ -287,7 +289,22 @@ static void user_scf_path(const char *username, char *buf, size_t sz) {
     snprintf(buf, sz, "%s/%s/user.scf", USER_BASE_DIR, username);
 }
 
+/* Names become directory names under USER_BASE_DIR, so anything that could
+ * traverse or confuse the path is rejected. */
+static int username_valid(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n >= UCTL_NAME_MAX) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
 static int user_exists(const char *username) {
+    if (!username_valid(username)) return 0;
     char path[96];
     user_scf_path(username, path, sizeof(path));
     int fd = open(path, O_RDONLY, 0);
@@ -325,6 +342,7 @@ static int write_user_scf(const char *username, scf_file_t *f) {
 static int record_from_scf(scf_file_t *f, user_record_t *rec) {
     const char *username = scf_get(f, "user", "username");
     const char *uid_s     = scf_get(f, "user", "uid");
+    const char *gid_s     = scf_get(f, "user", "gid");
     const char *salt      = scf_get(f, "user", "salt");
     const char *hash      = scf_get(f, "user", "password");
     const char *groups    = scf_get(f, "user", "groups");
@@ -333,6 +351,8 @@ static int record_from_scf(scf_file_t *f, user_record_t *rec) {
 
     strlcpy(rec->username, username, sizeof(rec->username));
     rec->uid = (uint64_t)atoi(uid_s);
+    /* Accounts created before gid existed get a private group (gid == uid). */
+    rec->gid = gid_s ? (uint64_t)atoi(gid_s) : rec->uid;
     strlcpy(rec->salt_hex, salt, sizeof(rec->salt_hex));
     strlcpy(rec->hash_hex, hash, sizeof(rec->hash_hex));
     strlcpy(rec->groups, groups ? groups : "", sizeof(rec->groups));
@@ -340,6 +360,7 @@ static int record_from_scf(scf_file_t *f, user_record_t *rec) {
 }
 
 static int find_user(const char *username, user_record_t *rec) {
+    if (!username_valid(username)) return -ENOENT;
     scf_file_t *f = malloc(sizeof(scf_file_t));
     if (!f) return -ENOENT;
 
@@ -396,6 +417,8 @@ static uint64_t get_next_uid(void) {
     char *names;
     int n = list_usernames(&names, MAX_USERS);
 
+    if (n == 0) { free(names); return 0; }
+
     uint64_t max_uid = 0;
     for (int i = 0; i < n; i++) {
         user_record_t r;
@@ -406,6 +429,7 @@ static uint64_t get_next_uid(void) {
 }
 
 static int create_user(const char *username, const char *password, uint64_t *out_uid) {
+    if (!username_valid(username)) return -EINVAL;
     if (user_exists(username)) return -EEXIST;
 
     char dirpath[96];
@@ -425,6 +449,7 @@ static int create_user(const char *username, const char *password, uint64_t *out
     if (!f) { rmdir(dirpath); return -ENOMEM; }
     memset(f, 0, sizeof(*f));
     scf_set(f, "user", "uid", uid_s);
+    scf_set(f, "user", "gid", uid_s);
     scf_set(f, "user", "groups", "user:1;");
     scf_set(f, "user", "salt", salt_hex);
     scf_set(f, "user", "username", username);
@@ -482,105 +507,85 @@ static int set_password(const char *username, const char *old_pw, const char *ne
     return rc;
 }
 
-/* ---------------- identity helpers ---------------- */
+/* ---------------- authorization ---------------- */
 
-/* getuid()/geteuid() inside this callback may not reflect the real caller
- * (see userfs_invoke_owner_callback's CR3 swap) — ask the kernel about the
- * caller's pid directly instead. Also requires userctl_service itself to
- * run as uid 0 / KERNEL_UID, since SYS_GETUID_OF_OTHER_PROCESS gates on
- * self's privilege, not the target's.
- *
- * NOTE: caller_pid here comes from packet->caller_pid, which the CLIENT
- * fills in with its own getpid() — it is NOT verified by the kernel and
- * a malicious client could lie about it. Fine for now; revisit if this
- * ever needs to be trustworthy against an adversarial client. */
-static int caller_is_root(uint32_t caller_pid) {
-    return getuid_of_other_process(caller_pid) == 0;
+static int ct_streq(const char *a, const char *b) {
+    unsigned char diff = 0;
+    size_t la = strlen(a), lb = strlen(b);
+    diff |= (unsigned char)(la != lb);
+    for (size_t i = 0; i < la && i < lb; i++) diff |= (unsigned char)(a[i] ^ b[i]);
+    return diff == 0;
 }
 
-/* ---------------- invoke handler ---------------- */
+static int password_matches(const user_record_t *r, const char *password) {
+    char hex[65];
+    hash_password(r->salt_hex, password, hex);
+    return ct_streq(hex, r->hash_hex);
+}
 
-static ssize_t uctl_invoke(void* ctx, const void* in_buf, size_t in_size,
-                            void* out_buf, size_t out_size) {
-    (void)ctx;
-    if (in_size != sizeof(uctl_packet_t)) return -EINVAL;
+/* The mailbox cannot identify callers, so privileged commands must carry
+ * the credentials of a uid 0 account. */
+static int admin_authenticated(const uctl_request_t *req) {
+    user_record_t r;
+    if (find_user(req->admin_user, &r) != 0) return 0;
+    return r.uid == 0 && password_matches(&r, req->admin_pass);
+}
 
-    const uctl_packet_t* packet = (const uctl_packet_t*)in_buf;
-    uint32_t caller_pid = packet->caller_pid;
+static int any_user_exists(void) {
+    char *names;
+    int n = list_usernames(&names, 1);
+    free(names);
+    return n > 0;
+}
 
-    switch (packet->cmd) {
+/* ---------------- command dispatch ---------------- */
 
-        case CMD_GETUSERNAME: {
-            uctl_ret_t *ret = (uctl_ret_t*)out_buf;
-            if (out_size < sizeof(uctl_ret_t)) return -EINVAL;
-            ret->callerpid = caller_pid;
+static int uctl_handle(const uctl_request_t *req, uctl_response_t *resp) {
+    switch (req->cmd) {
 
+        case UCTL_CMD_GETUSERNAME: {
             user_record_t r;
-            int rc = find_user_by_uid(packet->intarg, &r);
-            if (rc != 0) return rc;
-
-            strlcpy(ret->type1ret, r.username, sizeof(ret->type1ret));
-            return sizeof(uctl_ret_t);
+            if (find_user_by_uid(req->intarg, &r) != 0) return -ENOENT;
+            strlcpy(resp->name, r.username, sizeof(resp->name));
+            return 0;
         }
 
-        case CMD_LOGIN: {
-            uctl_ret_t *ret = (uctl_ret_t*)out_buf;
-            if (out_size < sizeof(uctl_ret_t)) return -EINVAL;
-            ret->callerpid = caller_pid;
-
+        case UCTL_CMD_LOGIN: {
             user_record_t r;
-            if (find_user(packet->arg1, &r) != 0) return -ENOENT;
-
-            char hash_hex[65];
-            hash_password(r.salt_hex, packet->arg2, hash_hex);
-            if (strcmp(hash_hex, r.hash_hex) != 0) return -EACCES;
-
-            /* setuid() only changes the caller of setuid()'s own uid —
-             * which here would be this service, not the client. caller_pid
-             * comes from the client's own packet->caller_pid field. */
-            if (setuid_of_other_process((int)r.uid, caller_pid) != 0) return -EPERM;
-
-            ret->type2ret = r.uid;
-            strlcpy(ret->type1ret, r.groups, sizeof(ret->type1ret));
-            return sizeof(uctl_ret_t);
+            /* Same error for unknown user and bad password. */
+            if (find_user(req->arg_user, &r) != 0) return -EACCES;
+            if (!password_matches(&r, req->arg_pass)) return -EACCES;
+            resp->uid = r.uid;
+            resp->gid = r.gid;
+            strlcpy(resp->name, r.username, sizeof(resp->name));
+            strlcpy(resp->groups, r.groups, sizeof(resp->groups));
+            return 0;
         }
 
-        case CMD_SETPASSWORD: {
-            if (packet->arg1[0] == 0 || packet->arg3[0] == 0) return -EINVAL;
-            int rc = set_password(packet->arg1, packet->arg2, packet->arg3, caller_is_root(caller_pid));
-            return rc == 0 ? 0 : rc;
+        case UCTL_CMD_SETPASSWORD: {
+            if (req->arg_user[0] == 0 || req->arg_new[0] == 0) return -EINVAL;
+            int as_admin = req->admin_user[0] != 0;
+            if (as_admin && !admin_authenticated(req)) return -EACCES;
+            return set_password(req->arg_user, req->arg_pass, req->arg_new, as_admin);
         }
 
-        case CMD_CREATEUSER: {
-            uctl_ret_t *ret = (uctl_ret_t*)out_buf;
-            if (out_size < sizeof(uctl_ret_t)) return -EINVAL;
-            ret->callerpid = caller_pid;
-            if (packet->arg1[0] == 0 || packet->arg2[0] == 0) return -EINVAL;
-
+        case UCTL_CMD_CREATEUSER: {
+            if (req->arg_user[0] == 0 || req->arg_pass[0] == 0) return -EINVAL;
+            if (any_user_exists() && !admin_authenticated(req)) return -EACCES;
             uint64_t uid;
-            int rc = create_user(packet->arg1, packet->arg2, &uid);
+            int rc = create_user(req->arg_user, req->arg_pass, &uid);
             if (rc != 0) return rc;
-
-            ret->type2ret = uid;
-            return sizeof(uctl_ret_t);
+            resp->uid = uid;
+            resp->gid = uid;
+            return 0;
         }
 
-        case CMD_DELETEUSER: {
-            if (!caller_is_root(caller_pid)) return -EACCES;
-            int rc = delete_user(packet->arg1);
-            return rc == 0 ? 0 : rc;
-        }
-
-        case CMD_WHOAMI: {
-            uctl_ret_t *ret = (uctl_ret_t*)out_buf;
-            if (out_size < sizeof(uctl_ret_t)) return -EINVAL;
-            ret->callerpid = caller_pid;
-
-            int caller_uid = getuid_of_other_process(caller_pid);
-
-            snprintf(ret->type1ret, sizeof(ret->type1ret), "pid=%u uid=%d", caller_pid, caller_uid);
-            ret->type2ret = (uint64_t)caller_pid;
-            return sizeof(uctl_ret_t);
+        case UCTL_CMD_DELETEUSER: {
+            if (!admin_authenticated(req)) return -EACCES;
+            user_record_t r;
+            if (find_user(req->arg_user, &r) != 0) return -ENOENT;
+            if (r.uid == 0) return -EPERM; /* never delete the last way in */
+            return delete_user(req->arg_user);
         }
 
         default:
@@ -588,7 +593,7 @@ static ssize_t uctl_invoke(void* ctx, const void* in_buf, size_t in_size,
     }
 }
 
-int md_main(long argc, char** argv) {
+int md_main(long argc, char **argv) {
     (void)argc; (void)argv;
 
     printf("userctl service starting...\n");
@@ -598,25 +603,47 @@ int md_main(long argc, char** argv) {
      * or if the filesystem is read-only and it was created at install time. */
     mkdir(USER_BASE_DIR);
 
-    userfs_user_ops_t ops = {0};
-    ops.invoke = uctl_invoke;
-
-    userfs_user_node_t node = {0};
-    node.path     = "userctl";
-    node.owner_id = "userctl_service";
-    node.perms    = USERFS_PERM_READ_WRITE | USERFS_PERM_INVOKE;
-    node.ops      = ops;
-    node.ctx      = NULL;
-
-    int ret = userfs_register(&node);
-    if (ret != 0) {
-        printf("Failed to register userctl service: %d\n", ret);
+    /* Drop a stale segment from a previous run, then create ours exclusively:
+     * clients trust whoever owns the name, and shm_unlink is owner-only. */
+    shm_unlink(UCTL_IPC_SHM_NAME);
+    int h = shm_open(UCTL_IPC_SHM_NAME, O_RDWR | SHM_O_CREAT | SHM_O_EXCL, 0666,
+                     sizeof(uctl_shm_t));
+    if (h < 0) {
+        printf("userctl: shm_open(%s) failed (errno=%d)\n", UCTL_IPC_SHM_NAME, -h);
         return 1;
     }
 
-    printf("userctl service registered at $/user/userctl\n");
+    uctl_shm_t *shm = (uctl_shm_t *)mmap(NULL, sizeof(uctl_shm_t), PROT_R | PROT_W,
+                                         MAP_SHARED, h);
+    if (shm == MAP_FAILED) {
+        printf("userctl: mmap of mailbox failed\n");
+        return 1;
+    }
+    memset(shm, 0, sizeof(*shm));
 
-    while (1) {
+    printf("userctl: mailbox '%s' ready\n", UCTL_IPC_SHM_NAME);
+
+    uctl_request_t  req;
+    uctl_response_t resp;
+    for (;;) {
+        if (uctl_get_state(shm) == UCTL_SLOT_REQUEST_PENDING) {
+            /* Work on a private copy so the secrets leave shared memory
+             * before the slow part (filesystem I/O) starts. */
+            memcpy(&req, &shm->req, sizeof(req));
+            uctl_scrub(&shm->req, sizeof(shm->req));
+            req.arg_user[sizeof(req.arg_user) - 1] = 0;
+            req.admin_user[sizeof(req.admin_user) - 1] = 0;
+            req.arg_pass[sizeof(req.arg_pass) - 1] = 0;
+            req.arg_new[sizeof(req.arg_new) - 1] = 0;
+            req.admin_pass[sizeof(req.admin_pass) - 1] = 0;
+
+            memset(&resp, 0, sizeof(resp));
+            resp.status = uctl_handle(&req, &resp);
+            uctl_scrub(&req, sizeof(req));
+
+            memcpy(&shm->resp, &resp, sizeof(resp));
+            uctl_set_state(shm, UCTL_SLOT_RESPONSE_READY);
+        }
         yield();
     }
 

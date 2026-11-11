@@ -13,7 +13,7 @@
 #include "libc/libc.h"
 #include "libc/tty.h"
 
-#define LOGIN_PATH "/Apps/zenith5.1.sqr"
+#define LOGIN_PATH "/Apps/login.sqr"
 
 static void build_path(char *out, size_t sz, const char *arg) {
     if (arg[0] >= '1' && arg[0] <= '9' && arg[1] == 0) {

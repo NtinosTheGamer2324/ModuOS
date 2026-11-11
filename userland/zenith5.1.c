@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "libc/string.h"
+#include "userctl_ipc.h"
 
 #define ANSI_RED     "\033[31m\b"
 #define ANSI_PURPLE  "\033[35m\b"
@@ -76,7 +77,7 @@ int md_main(long argc, char **argv) {
     signal(SIGQUIT, SIG_IGN);
     (void)argc; (void)argv;
 
-    printf("\033[2J\b");
+    printf("\033[2J\033[H");
 
     zsbanner();
 
@@ -93,6 +94,14 @@ int md_main(long argc, char **argv) {
 
     int who = (int)syscall(SYS_GETUID, 0, 0, 0);
     if (who < 0) who = 1;
+    char name[UCTL_NAME_MAX];
+
+    uctl_shm_t *shm = uctl_attach();
+    
+    if (!shm || uctl_name_of_uid(shm, (uint64_t)who, name, sizeof(name)) != 0) {
+        itoa(who, name, 10);
+    }
+
     const char* host = get_pc_name();
     if (!host || strcmp(host, "") == 0) { host = "{unknown}"; }
 
@@ -102,9 +111,9 @@ int md_main(long argc, char **argv) {
         }
 
         if (who == 0) {
-            printf("\n┌─%s# %s%d@%s\n└─[%s]>", ANSI_RED, ANSI_RESET, who, host, cwd);
+            printf("\n┌─%s# %s%s@%s\n└─[%s]>", ANSI_RED, ANSI_RESET, name, host, cwd);
         } else {
-            printf("\n┌─%s$ %s%d@%s\n└─[%s]>", ANSI_GREEN, ANSI_RESET, who, host, cwd);
+            printf("\n┌─%s$ %s%s@%s\n└─[%s]>", ANSI_GREEN, ANSI_RESET, name, host, cwd);
         }
 
         char *user_input = input();
@@ -157,7 +166,7 @@ int md_main(long argc, char **argv) {
             printf("%s\n", cwd);
         
         } else if (strcmp(command, "cls") == 0 || strcmp(command, "clear") == 0) {
-            printf("\033[2J\b");
+            printf("\033[2J\033[H");
         } else if (strlen(command) > 0) {
             bool background = false;
             char actual_command[64];

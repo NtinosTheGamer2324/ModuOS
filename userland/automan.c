@@ -433,6 +433,11 @@ static void execute_autostart_line(char *line) {
         return;
     }
 
+    if (strcmp(cmd, "cls") == 0 || strcmp(cmd, "clear") == 0) {
+        printf("\033[2J \033[H");
+        return;
+    }
+
     //  setenv <KEY=VALUE>  
     if (strcmp(cmd, "setenv") == 0) {
         if (!arg || !*arg) { printf("[AutoMan] 'setenv' requires KEY=VALUE\n"); return; }
@@ -509,6 +514,7 @@ static void service_monitor_loop(void) {
             handle_child_exit(pid, status);
         }
 
+        /*
         // Periodic status dump every 60 s
         uint64_t now = time_ms();
         if (last_status_ms == 0) last_status_ms = now;
@@ -516,6 +522,7 @@ static void service_monitor_loop(void) {
             print_service_status();
             last_status_ms = now;
         }
+        */
 
         sleep(1);
     }
