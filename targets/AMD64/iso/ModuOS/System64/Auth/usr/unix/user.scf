@@ -1,0 +1,9 @@
+[user]
+uid=1
+groups=mdauthority:1;
+salt=5e060752eac32d6c22b45cf25797d17e
+username=unix
+password=0931e63aaa83bd55d84db987e5dc96d340103f4d7b4caa45917cca8b33967e2c
+
+[properties]
+needs_oobe=false

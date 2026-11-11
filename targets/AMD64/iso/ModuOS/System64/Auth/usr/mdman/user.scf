@@ -1,9 +1,9 @@
 [user]
 uid=0
 groups=mdauthority:1;
-salt=A34q543AHJD253546y754gsASDF5464
+salt=be103863f0ce99a130b1f2d5d3d64458
 username=mdman
-password=72524a9c98b8f6d3ab2ceca40493b5ab562da94aaa4c09d9794ecf6404390686
+password=0251a6e45427066446477cd1e258f7e4275c5e7c1252ac7fdec75f667b623103
 
 [properties]
 needs_oobe=false
