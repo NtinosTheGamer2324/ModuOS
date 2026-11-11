@@ -10,6 +10,8 @@
 #include "moduos/kernel/spinlock.h"
 #include "moduos/kernel/errno.h"
 #include "moduos/fs/fd.h"   /* O_CREAT / O_EXCL / O_RDONLY / O_RDWR */
+#include "moduos/kernel/process/process.h"
+#include "moduos/kernel/user_identity.h"
 
 typedef struct {
     int       in_use;
@@ -17,6 +19,7 @@ typedef struct {
     uint64_t  size;                 /* bytes, page-aligned */
     size_t    frame_count;
     uint64_t *frames;               /* kmalloc'd, frame_count entries */
+    uint32_t  owner_euid;           /* creator; only it (or root) may unlink */
     uint32_t  refcount;             /* metadata refs: 1 while named +
                                       * 1 per outstanding un-mmap'd handle */
 } shm_object_t;
@@ -154,6 +157,12 @@ int shm_open(const char *name, int oflags, uint32_t mode, uint64_t size) {
     }
 
     spinlock_lock(&g_shm_lock);
+    {
+        /* Service endpoints (e.g. userctl) rely on nobody else being able
+         * to unlink and re-create their name. */
+        process_t *cur = process_get_current();
+        g_shm_objects[new_idx].owner_euid = cur ? cur->euid : 0;
+    }
     g_shm_objects[new_idx].size        = page_sz_size;
     g_shm_objects[new_idx].frame_count = frame_count;
     g_shm_objects[new_idx].frames      = frames;
@@ -182,6 +191,13 @@ int shm_unlink(const char *name) {
     if (idx < 0) {
         spinlock_unlock(&g_shm_lock);
         return -ENOENT;
+    }
+
+    process_t *cur = process_get_current();
+    if (cur && cur->euid != 0 && !uid_is_kernel(cur->euid) &&
+        cur->euid != g_shm_objects[idx].owner_euid) {
+        spinlock_unlock(&g_shm_lock);
+        return -EPERM;
     }
 
     g_shm_objects[idx].name[0] = 0; /* remove from namespace */

@@ -702,7 +702,10 @@ void scheduler_tick(void) {
              */
             void *ch = sp->wait_channel ? sp->wait_channel
                                         : (void *)(uintptr_t)sp->pid;
-            sp->wait_channel = NULL;
+            /* wakeup() matches on wait_channel and clears it itself;
+             * clearing it here first made the match fail, so timed
+             * sleepers were never woken. */
+            sp->wait_channel = ch;
             wakeup(ch);
             woke_someone = 1;
         }

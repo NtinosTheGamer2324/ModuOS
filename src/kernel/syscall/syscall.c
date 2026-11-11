@@ -164,10 +164,16 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_SETUID: {
             process_t *p = process_get_current();
             if (!p) return (uint64_t)-(int64_t)EPERM;
-            if (p->uid != KERNEL_UID && p->uid != 0) return (uint64_t)-(int64_t)EPERM;
-            if ((uint32_t)arg1 == KERNEL_UID) return (uint64_t)-(int64_t)EPERM;
-            p->uid = (uint32_t)arg1;
-            p->euid = (uint32_t)arg1;
+            uint32_t want = (uint32_t)arg1;
+            if (uid_is_kernel(want)) return (uint64_t)-(int64_t)EPERM;
+            if (p->euid == 0 || uid_is_kernel(p->euid)) {
+                p->uid = p->euid = p->suid = want;
+                return 0;
+            }
+            /* Unprivileged: may only toggle euid between real and saved. */
+            if (want != p->uid && want != p->suid)
+                return (uint64_t)-(int64_t)EPERM;
+            p->euid = want;
             return 0;
         }
 
@@ -178,8 +184,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
             if (!target) return (uint64_t)-(int64_t)EINVAL;
             if (self->uid != KERNEL_UID && self->uid != 0) return (uint64_t)-(int64_t)EPERM;
             if ((uint32_t)arg2 == KERNEL_UID) return (uint64_t)-(int64_t)EPERM;
-            target->uid = (uint32_t)arg2;
-            target->euid = (uint32_t)arg2;
+            target->uid = target->euid = target->suid = (uint32_t)arg2;
             return 0;
         }
 
@@ -293,9 +298,14 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
         case SYS_SETGID: {
             process_t *p = process_get_current();
             if (!p) return (uint64_t)-(int64_t)EPERM;
-            if (p->uid != 0) return (uint64_t)-(int64_t)EPERM;
-            p->gid = (uint32_t)arg1;
-            p->egid = (uint32_t)arg1;
+            uint32_t want = (uint32_t)arg1;
+            if (p->euid == 0 || uid_is_kernel(p->euid)) {
+                p->gid = p->egid = p->sgid = want;
+                return 0;
+            }
+            if (want != p->gid && want != p->sgid)
+                return (uint64_t)-(int64_t)EPERM;
+            p->egid = want;
             return 0;
         }
 

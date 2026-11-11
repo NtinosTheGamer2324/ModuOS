@@ -301,6 +301,9 @@ process_t *process_get_by_pid(uint32_t pid);
 
 static inline void process_sleep(uint64_t ms) {
     if (current) {
+        /* The tick handler ignores sleepers with 0 ticks left, so a
+         * zero-length sleep would block forever. */
+        if (ms == 0) { schedule(); return; }
         current->sleep_ticks = ms;
         sleep_on((void *)(uintptr_t)current->pid);
     }

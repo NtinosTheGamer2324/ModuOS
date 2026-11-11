@@ -320,10 +320,19 @@ process_t *process_create_with_args(const char *name, void (*entry_point)(void),
     proc->state    = PROCESS_STATE_READY;
     proc->priority = priority;
 
-    proc->uid = current ? current->uid : 0;
-    if (!current || uid_is_kernel(proc->uid))
-        proc->uid = 0;
-    proc->gid = current ? current->gid : 0;
+    /* Children carry the parent's complete credential set; the kernel
+     * identity is never propagated to user-visible processes. */
+    if (!current || uid_is_kernel(current->uid)) {
+        proc->uid  = proc->euid = proc->suid = 0;
+        proc->gid  = proc->egid = proc->sgid = 0;
+    } else {
+        proc->uid  = current->uid;
+        proc->euid = current->euid;
+        proc->suid = current->suid;
+        proc->gid  = current->gid;
+        proc->egid = current->egid;
+        proc->sgid = current->sgid;
+    }
 
     if (argc > 0 && argv) {
         proc->argv = copy_argv(argc, argv);
