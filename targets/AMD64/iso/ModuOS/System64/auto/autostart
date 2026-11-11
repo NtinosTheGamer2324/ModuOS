@@ -1,22 +1,27 @@
 // ModuOS System Services
 // This file is read by automan (PID 1 OR 2 (based on the kernel mood)) on boot
 
-// Core system services
-// currently absolutely nothing.
+// User services
+//service /Apps/calc_service.sqr // UserFS demo
+//bg /Apps/shm_demo_writer.sqr // SHARED MEMORY demo
+//bg /Apps/timed.sqr // This will FREEZE the system, i have no clue why, do not ask why. If someone can fix it, FIX IT. (I spent 5 hours debugging this piece of shit)
+//bg /Apps/zenith5.1.sqr // the best shell on earth.
 
-// Extra virtual consoles (SHIFT+SUPER+ALT+F2..F4), each runs getty -> login -> zenith
+// MDW
+// Recommended to run in VBox, QEMU and VMWARE lag WAY TOO MUCH.
+//bg /Apps/mdw.sqr // This is GUI, Very cool, see it, if you can. just uncomment them and comment zenith5.1.sqr
+//bg /Apps/shellmgr.sqr // same as MDW, this one launches all the needed apps for the desktop (taskbar, desktop, bindkeys)
+
+// Core system services
+service /Apps/userctl.sqr
+service /Apps/netd.sqr
+
+sleep 1s
+//service /Apps/ursd.sqr
+cls
+
+// virtual consoles (SHIFT+SUPER+ALT+F1..F4), each runs getty -> login -> zenith
+service /Apps/getty.sqr 1
 service /Apps/getty.sqr 2
 service /Apps/getty.sqr 3
 service /Apps/getty.sqr 4
-
-// User services
-//service /Apps/calc_service.sqr // UserFS demo
-//bg /Apps/userctl.sqr // Do not use, no work currently.
-//bg /Apps/shm_demo_writer.sqr // SHARED MEMORY demo
-bg /Apps/netd.sqr
-//bg /Apps/timed.sqr // This will FREEZE the system, i have no clue why, do not ask why. If someone can fix it, FIX IT. (I spent 5 hours debugging this piece of shit)
-bg /Apps/zenith5.1.sqr // the best shell on earth.
-
-// MDW
-//bg /Apps/mdw.sqr // This is GUI, Very cool, see it, if you can. just uncomment them and comment zenith5.1.sqr
-//bg /Apps/shellmgr.sqr // same as MDW, this one launches all the needed apps for the desktop (taskbar, desktop, bindkeys)
